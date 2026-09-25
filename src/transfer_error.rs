@@ -24,7 +24,7 @@ use crate::{
     error::{ErrorReport, is_peer_disconnect},
     fs_open::count_cache_failure,
     log_once::{KeyedGate, Logged, Reported},
-    metrics::{self, Counter},
+    metrics::{self, Signal},
     rate_checker::InsufficientRate,
     upstream_retry::RetryStop,
 };
@@ -135,7 +135,7 @@ struct UpstreamFailure {
     phase: UpstreamPhase,
     /// Bumped by [`UpstreamError::record_terminal`], never at construction:
     /// an error built and then handled as non-terminal must not count.
-    counter: Option<&'static Counter>,
+    counter: Option<&'static Signal>,
 }
 
 /// Request failures retain the target after redirects, aliases and scheme
@@ -183,7 +183,7 @@ impl UpstreamError {
         operation: &'static str,
         phase: UpstreamPhase,
         cause: Cause,
-        counter: Option<&'static Counter>,
+        counter: Option<&'static Signal>,
     ) -> Self {
         Self {
             failure: Arc::new(UpstreamFailure {

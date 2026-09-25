@@ -4,9 +4,9 @@
 
 use std::fmt::Display;
 
-use crate::swrite;
+use crate::{metrics::Signal, swrite};
 
-use super::fmt::HtmlEscaped;
+use super::fmt::{HtmlEscaped, Level, Nonzero, RelTime, now_epoch};
 
 // ---------------------------------------------------------------------------
 // Table builders — append rows directly via `swrite!`. `Table::cell` needs to
@@ -113,39 +113,121 @@ pub(super) use tr;
 /// carries that association in the markup itself and survives the same CSS.
 pub(super) struct DetailsList {
     out: String,
+    /// The wall-clock second every relative time in this list is measured
+    /// against, read once so two rows cannot disagree about "now".
+    now: i64,
 }
 
 impl DetailsList {
     pub(super) fn new() -> Self {
+        Self::with_now(now_epoch())
+    }
+
+    /// A list whose relative times are measured against `now`: tests pin it.
+    pub(super) fn with_now(now: i64) -> Self {
         let mut out = String::with_capacity(1024);
         out.push_str("<dl class=\"details\">");
-        Self { out }
+        Self { out, now }
     }
 
     pub(super) fn row(&mut self, label: &'static str, value: impl Display) {
-        swrite!(self.out, "<div><dt>{label}</dt><dd>{value}</dd></div>");
+        self.entry(label).value(value);
     }
 
     /// Like [`Self::row`], but renders the label with a `title` tooltip
-    /// shown when the user hovers over it. The `tooltip` is interpolated
-    /// directly into the `title=""` attribute without HTML-escaping; the
-    /// `&'static str` bound prevents user-controlled values from sneaking
-    /// in.
+    /// shown when the user hovers over it. See [`Entry::tip`].
     pub(super) fn row_tip(
         &mut self,
         label: &'static str,
         tooltip: &'static str,
         value: impl Display,
     ) {
-        swrite!(
-            self.out,
-            "<div><dt title=\"{tooltip}\">{label}</dt><dd>{value}</dd></div>"
-        );
+        self.entry(label).tip(tooltip).value(value);
+    }
+
+    /// A bad-sign counter: its value painted at `level` once non-zero, with
+    /// the time it last moved beside it.
+    pub(super) fn signal(
+        &mut self,
+        label: &'static str,
+        tooltip: &'static str,
+        level: Level,
+        signal: &Signal,
+    ) {
+        let value = signal.get();
+        self.entry(label)
+            .tip(tooltip)
+            .last(signal.last())
+            .value(Nonzero { value, level });
+    }
+
+    /// Start a row whose shape the returned [`Entry`] refines; nothing is
+    /// written until [`Entry::value`].
+    pub(super) fn entry(&mut self, label: &'static str) -> Entry<'_> {
+        Entry {
+            list: self,
+            label,
+            tip: None,
+            last: None,
+        }
     }
 
     pub(super) fn finish(mut self) -> String {
         self.out.push_str("</dl>");
         self.out
+    }
+}
+
+/// One `<dt>`/`<dd>` row of a [`DetailsList`] under construction.
+#[must_use = "a row is only written by `value`"]
+pub(super) struct Entry<'a> {
+    list: &'a mut DetailsList,
+    label: &'static str,
+    tip: Option<&'static str>,
+    last: Option<u64>,
+}
+
+impl Entry<'_> {
+    /// The label's `title` tooltip. Interpolated directly into the
+    /// attribute without HTML-escaping; the `&'static str` bound keeps
+    /// user-controlled values out.
+    pub(super) fn tip(mut self, tip: &'static str) -> Self {
+        self.tip = Some(tip);
+        self
+    }
+
+    /// When the counter this row shows last moved (Unix seconds), rendered
+    /// as a second `<dd>` ("last: 3 h ago") so the value cell itself stays
+    /// the bare figure.
+    pub(super) fn last(mut self, last: Option<u64>) -> Self {
+        self.last = last;
+        self
+    }
+
+    pub(super) fn value(self, value: impl Display) {
+        let Self {
+            list,
+            label,
+            tip,
+            last,
+        } = self;
+        let DetailsList { out, now } = list;
+        out.push_str("<div><dt");
+        if let Some(tip) = tip {
+            swrite!(out, " title=\"{tip}\"");
+        }
+        swrite!(out, ">{label}</dt><dd>{value}</dd>");
+        if let Some(last) = last {
+            swrite!(
+                out,
+                "<dd class=\"last\">last: {}</dd>",
+                RelTime {
+                    epoch: i64::try_from(last).unwrap_or(i64::MAX),
+                    now: *now,
+                }
+            );
+        }
+        out.push_str("</div>");
     }
 }
 
@@ -239,6 +321,7 @@ pub(super) fn write_section_error(out: &mut String, what: &'static str, err: &sq
 #[cfg(test)]
 mod tests {
     use super::{DetailsList, Table, write_collapsible_section};
+    use crate::web::fmt::{Level, Nonzero};
 
     #[test]
     fn table_wraps_header_row() {
@@ -297,6 +380,35 @@ mod tests {
              <div><dt>Label</dt><dd>7</dd></div>\
              <div><dt title=\"why\">Tipped</dt><dd>v</dd></div>\
              </dl>",
+        );
+    }
+
+    #[test]
+    fn a_signal_row_carries_its_last_occurrence_beside_the_value() {
+        /// 2023-11-14T22:13:20Z.
+        const NOW: i64 = 1_700_000_000;
+        let mut list = DetailsList::with_now(NOW);
+        list.entry("Moved")
+            .tip("why")
+            .last(Some(NOW.unsigned_abs() - 120))
+            .value(Nonzero {
+                value: 3,
+                level: Level::Warn,
+            });
+        list.entry("Never").last(None).value(0);
+        let html = list.finish();
+        // The value cell stays the bare figure; the stamp is its own `<dd>`.
+        assert!(
+            html.contains(
+                "<div><dt title=\"why\">Moved</dt><dd><span class=\"warn\">3</span></dd>\
+                 <dd class=\"last\">last: <time datetime=\"2023-11-14T22:11:20Z\" \
+                 title=\"14 Nov 2023 22:11:20 UTC\">2 min ago</time></dd></div>"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains("<div><dt>Never</dt><dd>0</dd></div>"),
+            "{html}"
         );
     }
 

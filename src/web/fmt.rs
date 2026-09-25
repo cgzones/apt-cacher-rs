@@ -46,8 +46,14 @@ impl Utc {
     }
 }
 
-impl Display for Utc {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+impl Utc {
+    /// Hand the ISO-8601 and the human rendering to `write`, or render
+    /// `<time>invalid time</time>` when either formatter fails.
+    fn with_parts(
+        self,
+        f: &mut Formatter<'_>,
+        write: impl FnOnce(&mut Formatter<'_>, &str, &str) -> fmt::Result,
+    ) -> fmt::Result {
         let mut buf = Vec::<u8>::with_capacity(48);
         if self.0.format_into(&mut buf, WEBUI_ISO_FORMAT).is_err() {
             return f.write_str("<time>invalid time</time>");
@@ -61,7 +67,72 @@ impl Display for Utc {
             return f.write_str("<time>invalid time</time>");
         };
         let (iso, display) = s.split_at(iso_len);
-        write!(f, "<time datetime=\"{iso}\">{display}</time>")
+        write(f, iso, display)
+    }
+}
+
+impl Display for Utc {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        self.with_parts(f, |f, iso, display| {
+            write!(f, "<time datetime=\"{iso}\">{display}</time>")
+        })
+    }
+}
+
+/// The current wall-clock second, the `now` every relative time on one
+/// rendered list is measured against.
+pub(super) fn now_epoch() -> i64 {
+    i64::try_from(coarsetime::Clock::now_since_epoch().as_secs()).unwrap_or(i64::MAX)
+}
+
+/// A coarse age in its most significant unit only: `45 s`, `12 min`, `3 h`,
+/// `5 d`. A reader glancing at "last: 3 h ago" wants the order of magnitude;
+/// the exact instant is in the `<time>` element's `title`.
+pub(super) struct Age(pub(super) u64);
+impl Display for Age {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        const MIN: u64 = 60;
+        const HOUR: u64 = 60 * MIN;
+        const DAY: u64 = 24 * HOUR;
+        match self.0 {
+            s if s < MIN => write!(f, "{s} s"),
+            s if s < HOUR => write!(f, "{} min", s / MIN),
+            s if s < DAY => write!(f, "{} h", s / HOUR),
+            s => write!(f, "{} d", s / DAY),
+        }
+    }
+}
+
+/// A Unix timestamp as a relative age inside a `<time>` element, e.g.
+/// `<time datetime="2026-09-25T10:00:00Z" title="25 Sep 2026 10:00:00 UTC">3 h ago</time>`,
+/// or `in 3 h` for one in the future. The relative figure is what a reader
+/// scans for; the absolute instant (for correlating with a log) is one hover
+/// away and machine-readable in `datetime`. `0` renders as `N/A`, the
+/// dashboard's "never" sentinel.
+pub(super) struct RelTime {
+    pub(super) epoch: i64,
+    pub(super) now: i64,
+}
+impl Display for RelTime {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self { epoch, now } = *self;
+        if epoch == 0 {
+            return f.write_str("N/A");
+        }
+        let Ok(ts) = OffsetDateTime::from_unix_timestamp(epoch) else {
+            return f.write_str("N/A");
+        };
+        Utc::from_offset(ts).with_parts(f, |f, iso, display| {
+            write!(f, "<time datetime=\"{iso}\" title=\"{display} UTC\">")?;
+            match now.cmp(&epoch) {
+                std::cmp::Ordering::Equal => f.write_str("just now")?,
+                std::cmp::Ordering::Greater => {
+                    write!(f, "{} ago", Age(now.abs_diff(epoch)))?;
+                }
+                std::cmp::Ordering::Less => write!(f, "in {}", Age(now.abs_diff(epoch)))?,
+            }
+            f.write_str("</time>")
+        })
     }
 }
 
@@ -313,6 +384,29 @@ impl Display for WarnNonzero {
     }
 }
 
+/// How loudly a non-zero bad-sign counter is painted: `Warn` for a condition
+/// the operator should look at, `Alert` for one that is broken.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Level {
+    Warn,
+    Alert,
+}
+
+/// `value` painted at `level` when non-zero, plain `0` otherwise: the one
+/// rendering of a [`crate::metrics::Signal`].
+pub(super) struct Nonzero {
+    pub(super) value: u64,
+    pub(super) level: Level,
+}
+impl Display for Nonzero {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.level {
+            Level::Warn => Display::fmt(&WarnNonzero(self.value), f),
+            Level::Alert => Display::fmt(&AlertNonzero(self.value), f),
+        }
+    }
+}
+
 /// Render `inner` as-is; if `predicate` is true, wrap it in `<span class="warn">`.
 pub(super) fn warn_if<T: Display>(inner: T, predicate: bool) -> Colorize<T> {
     Colorize {
@@ -502,7 +596,9 @@ impl Display for DiskUsage {
 mod tests {
     use std::fmt::Display;
 
-    use super::{CacheHitRatio, FmtTimestamp, Freshness, HtmlEscape, Meter, Pct, RatioClass};
+    use super::{
+        Age, CacheHitRatio, FmtTimestamp, Freshness, HtmlEscape, Meter, Pct, RatioClass, RelTime,
+    };
 
     /// 2023-11-14T22:13:20Z, so every rendered timestamp below is fixed.
     const NOW: i64 = 1_700_000_000;
@@ -685,5 +781,43 @@ mod tests {
         assert_eq!(render(Pct { num: 1, den: 4 }), "25.0%");
         assert_eq!(render(CacheHitRatio { hits: 1, total: 0 }), "N/A");
         assert_eq!(render(CacheHitRatio { hits: 3, total: 4 }), "75.0% (3 / 4)");
+    }
+
+    #[test]
+    fn age_keeps_only_the_most_significant_unit() {
+        assert_eq!(render(Age(0)), "0 s");
+        assert_eq!(render(Age(59)), "59 s");
+        assert_eq!(render(Age(60)), "1 min");
+        assert_eq!(render(Age(3599)), "59 min");
+        assert_eq!(render(Age(3600)), "1 h");
+        assert_eq!(render(Age(3 * 3600 + 59 * 60)), "3 h");
+        assert_eq!(render(Age(DAY.unsigned_abs())), "1 d");
+        assert_eq!(render(Age(40 * DAY.unsigned_abs())), "40 d");
+    }
+
+    #[test]
+    fn rel_time_renders_the_age_with_the_instant_in_its_title() {
+        assert_eq!(
+            render(RelTime {
+                epoch: NOW - 3 * 3600,
+                now: NOW,
+            }),
+            "<time datetime=\"2023-11-14T19:13:20Z\" title=\"14 Nov 2023 19:13:20 UTC\">3 h ago</time>",
+        );
+        assert_eq!(
+            render(RelTime {
+                epoch: NOW + 90,
+                now: NOW,
+            }),
+            "<time datetime=\"2023-11-14T22:14:50Z\" title=\"14 Nov 2023 22:14:50 UTC\">in 1 min</time>",
+        );
+        assert!(
+            render(RelTime {
+                epoch: NOW,
+                now: NOW
+            })
+            .contains(">just now</time>")
+        );
+        assert_eq!(render(RelTime { epoch: 0, now: NOW }), "N/A");
     }
 }

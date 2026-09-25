@@ -2,6 +2,12 @@
 //!
 //! All counters are additive and monotonic from process start, except peak
 //! values which track the maximum observed since startup.
+//!
+//! A counter the dashboard highlights once non-zero (a bad sign: a failure,
+//! a refusal, a cap hit) is a [`Signal`], which also stamps when it last
+//! moved; everything else is a plain [`Counter`]. Promoting a counter to a
+//! highlighted row means changing its type too, or its row cannot say
+//! whether the count is history or ongoing.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,6 +32,65 @@ impl Counter {
     pub(crate) fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
+}
+
+/// A bad-sign counter: a [`Counter`] that also remembers when it last moved.
+///
+/// Every counter the dashboard highlights once non-zero is one of these, so
+/// the page can say whether a lifetime count is history or is happening now
+/// ("last: 3 h ago") -- the highlight alone reads the same for a single
+/// failure at startup and a mirror failing every minute. The stamp is one
+/// relaxed store of a coarse wall-clock second per bump
+/// (`CLOCK_REALTIME_COARSE`), cheap enough for any site: these counters sit
+/// on failure and refusal paths, never on a per-byte one. Request-granular
+/// counters that are no alarm stay plain [`Counter`]s.
+#[derive(Debug)]
+pub(crate) struct Signal {
+    count: AtomicU64,
+    /// Unix seconds of the latest bump; 0 before the first.
+    last: AtomicU64,
+}
+
+impl Signal {
+    #[must_use]
+    const fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            last: AtomicU64::new(0),
+        }
+    }
+
+    /// Stamps before it counts, releasing the stamp with the count: a
+    /// reader that sees the new count sees its stamp too (see [`Self::last`]).
+    pub(crate) fn increment(&self) {
+        self.last.store(now_epoch_secs(), Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Release);
+    }
+
+    #[must_use]
+    pub(crate) fn get(&self) -> u64 {
+        self.count.load(Ordering::Acquire)
+    }
+
+    /// Unix seconds of the latest bump, `None` before the first. Read after
+    /// [`Self::get`] and the two can disagree by one in-flight bump, which
+    /// only ever makes the stamp newer than the count it is shown with: the
+    /// count is released after the stamp and acquired before it is read, so
+    /// a count never shows without the stamp of its own bump.
+    #[must_use]
+    pub(crate) fn last(&self) -> Option<u64> {
+        match self.last.load(Ordering::Relaxed) {
+            0 => None,
+            secs => Some(secs),
+        }
+    }
+}
+
+/// The coarse wall clock every [`Signal`] stamp is taken from.
+fn now_epoch_secs() -> u64 {
+    // A clock read before 1970 plus one second would be the only way to
+    // store the "never" sentinel; clamp so a bump always reads as a bump.
+    coarsetime::Clock::now_since_epoch().as_secs().max(1)
 }
 
 pub(crate) struct Peak(AtomicU64);
@@ -125,14 +190,14 @@ pub(crate) static CONNECTIONS_ACCEPTED: Counter = Counter::new();
 /// daemon: EMFILE/ENFILE (descriptor exhaustion), ENOBUFS/ENOMEM, and
 /// ECONNABORTED.  Climbing values mean the process is at its fd budget --
 /// check `max_connections` against `LimitNOFILE`.
-pub(crate) static ACCEPT_TRANSIENT_FAILURES: Counter = Counter::new();
+pub(crate) static ACCEPT_TRANSIENT_FAILURES: Signal = Signal::new();
 
 /// Upstream response class buckets (2xx/3xx/4xx/5xx/other).
 pub(crate) static UPSTREAM_STATUS_2XX: Counter = Counter::new();
 pub(crate) static UPSTREAM_STATUS_3XX: Counter = Counter::new();
 pub(crate) static UPSTREAM_STATUS_4XX: Counter = Counter::new();
-pub(crate) static UPSTREAM_STATUS_5XX: Counter = Counter::new();
-pub(crate) static UPSTREAM_STATUS_OTHER: Counter = Counter::new();
+pub(crate) static UPSTREAM_STATUS_5XX: Signal = Signal::new();
+pub(crate) static UPSTREAM_STATUS_OTHER: Signal = Signal::new();
 
 /// Selected upstream status codes tracked individually (200/301/302/304/307/308).
 pub(crate) static UPSTREAM_STATUS_200: Counter = Counter::new();
@@ -146,8 +211,8 @@ pub(crate) static UPSTREAM_STATUS_308: Counter = Counter::new();
 pub(crate) static CLIENT_STATUS_2XX: Counter = Counter::new();
 pub(crate) static CLIENT_STATUS_3XX: Counter = Counter::new();
 pub(crate) static CLIENT_STATUS_4XX: Counter = Counter::new();
-pub(crate) static CLIENT_STATUS_5XX: Counter = Counter::new();
-pub(crate) static CLIENT_STATUS_OTHER: Counter = Counter::new();
+pub(crate) static CLIENT_STATUS_5XX: Signal = Signal::new();
+pub(crate) static CLIENT_STATUS_OTHER: Signal = Signal::new();
 
 /// Selected client status codes tracked individually (200/206/304/410/416).
 pub(crate) static CLIENT_STATUS_200: Counter = Counter::new();
@@ -179,7 +244,7 @@ pub(crate) static VOLATILE_REFETCHED_OUTOFDATE: Counter = Counter::new();
 /// to the cache.
 pub(crate) static CHECKSUM_VERIFIED: Counter = Counter::new();
 /// Downloads rejected because their content did not match the expected digest.
-pub(crate) static CHECKSUM_MISMATCH: Counter = Counter::new();
+pub(crate) static CHECKSUM_MISMATCH: Signal = Signal::new();
 /// Verifiable-kind downloads committed to the cache without a known expected
 /// digest (best-effort coverage gap).
 pub(crate) static CHECKSUM_UNVERIFIED: Counter = Counter::new();
@@ -191,10 +256,10 @@ pub(crate) static CHECKSUM_UNVERIFIED: Counter = Counter::new();
 pub(crate) static INGEST_TOUCH_TRIGGERED: Counter = Counter::new();
 /// Index ingests skipped because the line in front of the ingest permits
 /// was full; each is retried on the index's next request.
-pub(crate) static INGEST_SKIPPED_QUEUE_FULL: Counter = Counter::new();
+pub(crate) static INGEST_SKIPPED_QUEUE_FULL: Signal = Signal::new();
 /// Index files whose ingest failed for good (too large, corrupt, over the
 /// CPU budget); not retried until a commit replaces the file.
-pub(crate) static INGEST_FAILED_MARKED: Counter = Counter::new();
+pub(crate) static INGEST_FAILED_MARKED: Signal = Signal::new();
 
 /// Body-write failures attributed to the client (`BrokenPipe` /
 /// `ConnectionReset` / `ConnectionAborted`).
@@ -215,7 +280,7 @@ pub(crate) static CLIENT_DISCONNECTED_MID_BODY: Counter = Counter::new();
 /// `is_unsafe_proxy_path`), or a cached route's field whose percent-decoded
 /// value its validator refuses (`ClassifyError::InvalidValue`: a `..`, a
 /// `/` smuggled as `%2F`, a control byte).
-pub(crate) static UNSAFE_PATH_REJECTED: Counter = Counter::new();
+pub(crate) static UNSAFE_PATH_REJECTED: Signal = Signal::new();
 /// Requests rejected because they targeted a `pdiff` resource.
 pub(crate) static PDIFF_REJECTED: Counter = Counter::new();
 
@@ -234,7 +299,7 @@ pub(crate) static TUNNEL_REJECTED_POLICY: Counter = Counter::new();
 /// CONNECT tunnels rejected with 429 because their source IP already held
 /// `https_tunnel_max_connections_per_client` tunnels (a per-IP cap; there
 /// is no global tunnel cap).
-pub(crate) static TUNNEL_REJECTED_CAPACITY: Counter = Counter::new();
+pub(crate) static TUNNEL_REJECTED_CAPACITY: Signal = Signal::new();
 /// Post-acceptance tunnel failures: the CONNECT was accepted (counted in
 /// `TUNNEL_CONNECTS_TOTAL`) but the tunnel did not complete cleanly.
 /// Covers hyper's HTTP-upgrade failure and the sendfile backend's failed
@@ -243,7 +308,7 @@ pub(crate) static TUNNEL_REJECTED_CAPACITY: Counter = Counter::new();
 /// failed forward of pipelined client bytes, and mid-transfer errors from
 /// `copy_bidirectional_with_sizes`. Climbing values point to flaky
 /// upstream tunnels or aborted clients.
-pub(crate) static TUNNEL_TRANSFER_FAILED: Counter = Counter::new();
+pub(crate) static TUNNEL_TRANSFER_FAILED: Signal = Signal::new();
 /// Established tunnels torn down because neither side sent a byte for
 /// `client_idle_timeout`.  Not a failure: a parked CONNECT socket is
 /// reclaimed instead of pinning fds and an upstream connection.
@@ -258,22 +323,22 @@ pub(crate) static CONNECT_TUNNEL_ACTIVE_PEAK: Peak = Peak::new();
 /// Plain-HTTP connections rejected at accept time because the per-source-IP
 /// cap (`max_connections_per_client_ip`) was reached. Climbing values
 /// indicate a noisy or malicious source IP; consider alerting.
-pub(crate) static CONNECTION_REJECTED_PER_IP_CAP: Counter = Counter::new();
+pub(crate) static CONNECTION_REJECTED_PER_IP_CAP: Signal = Signal::new();
 /// Connections rejected at accept time because the global cap
 /// (`max_connections`) was reached.  Climbing values mean the daemon is at
 /// its connection budget: either a flood, or a cap sized below the real
 /// client population (raise `max_connections` and `LimitNOFILE` together).
-pub(crate) static CONNECTION_REJECTED_GLOBAL_CAP: Counter = Counter::new();
+pub(crate) static CONNECTION_REJECTED_GLOBAL_CAP: Signal = Signal::new();
 /// Connections closed at accept time because the source address passes
 /// neither `allowed_proxy_clients` nor `allowed_webif_clients`, so no
 /// request from it could be served.  Counted instead of (not in addition
 /// to) the per-request `AUTHZ_REJECTED_*` counters, which such a client no
 /// longer reaches.
-pub(crate) static CONNECTION_REJECTED_ACL: Counter = Counter::new();
+pub(crate) static CONNECTION_REJECTED_ACL: Signal = Signal::new();
 /// Requests refused with 508 because their `Via` already named this proxy:
 /// the proxy was asked to fetch from itself.  Any value means an
 /// `allowed_mirrors` wildcard covers the proxy's own name.
-pub(crate) static PROXY_LOOP_REJECTED: Counter = Counter::new();
+pub(crate) static PROXY_LOOP_REJECTED: Signal = Signal::new();
 
 /// Highest concurrent connection count observed from any single source IP.
 /// Only updated while `max_connections_per_client_ip` is enabled (the
@@ -303,7 +368,7 @@ pub(crate) static UNHANDLED_REQUEST_HEADERS: Counter = Counter::new();
 /// at 0, and on a sendfile connection handed over to hyper for good (an
 /// HTTP/1.0 request, a request body) its later requests are not counted.
 pub(crate) static REQUEST_READ_PEER_DISCONNECT: Counter = Counter::new();
-pub(crate) static REQUEST_READ_PROTOCOL_ERROR: Counter = Counter::new();
+pub(crate) static REQUEST_READ_PROTOCOL_ERROR: Signal = Signal::new();
 
 /// Peak concurrency: connected clients, in-flight upstream downloads,
 /// in-flight client-side downloads.
@@ -361,7 +426,7 @@ pub(crate) static SERVED_PASSTHROUGH: Counter = Counter::new();
 /// attempt or a fallback that ends up connected counts nothing here (the
 /// attempts are `UPSTREAM_RETRIES`, the connect timeouts
 /// `HTTP_TIMEOUT_UPSTREAM_CONNECT`).
-pub(crate) static UPSTREAM_CONNECT_FAILED: Counter = Counter::new();
+pub(crate) static UPSTREAM_CONNECT_FAILED: Signal = Signal::new();
 /// Requests whose upstream was connected but whose exchange failed before a
 /// response head arrived: a reset, an EOF before the header terminator, a
 /// read timeout, a failed request write. Counted once per request when its
@@ -370,7 +435,7 @@ pub(crate) static UPSTREAM_CONNECT_FAILED: Counter = Counter::new();
 /// way and is replaced by a fresh one is not terminal and counts only
 /// `POOL_MISS_FAILED`; an unparsable or refused head is an
 /// `UPSTREAM_PROTOCOL_VIOLATION` instead.
-pub(crate) static UPSTREAM_HEAD_FAILED: Counter = Counter::new();
+pub(crate) static UPSTREAM_HEAD_FAILED: Signal = Signal::new();
 
 /// Splice clients demoted to ordinary cached-file delivery.
 pub(crate) static CLIENTS_DEMOTED: Counter = Counter::new();
@@ -381,7 +446,7 @@ pub(crate) static CLIENTS_DEMOTED: Counter = Counter::new();
 /// 1 MiB. Counted per pipe, two per plain-HTTP download; each refused pipe
 /// keeps its small default size, so its download flushes to the cache every
 /// few KiB instead of every MiB.
-pub(crate) static PIPE_RESIZE_REFUSED: Counter = Counter::new();
+pub(crate) static PIPE_RESIZE_REFUSED: Signal = Signal::new();
 
 /// Total body bytes pulled from upstream (sum across all backends).
 pub(crate) static BYTES_DOWNLOADED_UPSTREAM: Accumulator = Accumulator::new();
@@ -419,13 +484,13 @@ pub(crate) static POOL_RETURN_EVICTED: Counter = Counter::new();
 
 /// Downloads rejected by `CacheQuota::try_acquire` (would exceed `disk_quota`
 /// or leave less than `min_disk_free` on the cache filesystem).
-pub(crate) static DOWNLOAD_REJECTED_QUOTA: Counter = Counter::new();
+pub(crate) static DOWNLOAD_REJECTED_QUOTA: Signal = Signal::new();
 /// Downloads rejected because the upstream-declared object size exceeded the
 /// configured `max_object_size`.
-pub(crate) static DOWNLOAD_REJECTED_OVERSIZE: Counter = Counter::new();
+pub(crate) static DOWNLOAD_REJECTED_OVERSIZE: Signal = Signal::new();
 /// Requests rejected with 503 because the resource recently failed checksum
 /// verification and is inside its backoff window (upstream not contacted).
-pub(crate) static DOWNLOAD_REJECTED_VERIFY_THROTTLE: Counter = Counter::new();
+pub(crate) static DOWNLOAD_REJECTED_VERIFY_THROTTLE: Signal = Signal::new();
 
 /// Permanent-file cache lookup found a usable file.
 pub(crate) static CACHE_HITS: Counter = Counter::new();
@@ -469,13 +534,13 @@ pub(crate) static SERVED_CHANNEL: Counter = Counter::new();
 /// in the body of a response the proxy abandoned and only drains for
 /// connection reuse (splice's `UpstreamExchange::dispose`): that connection
 /// is just not pooled.
-pub(crate) static UPSTREAM_PROTOCOL_VIOLATION: Counter = Counter::new();
+pub(crate) static UPSTREAM_PROTOCOL_VIOLATION: Signal = Signal::new();
 
 /// Responses exceeding a local body buffering or relay limit. The response
 /// may be valid HTTP; these are not protocol faults. A body too large to
 /// drain for connection reuse is not counted: that connection is just not
 /// pooled.
-pub(crate) static UPSTREAM_BODY_LIMIT: Counter = Counter::new();
+pub(crate) static UPSTREAM_BODY_LIMIT: Signal = Signal::new();
 
 /// Mirror responses that returned `206 Partial Content` for a request the
 /// proxy issued without a `Range:` header. Treating these as 200-equivalent
@@ -483,17 +548,17 @@ pub(crate) static UPSTREAM_BODY_LIMIT: Counter = Counter::new();
 /// file complete at the partial length, so the proxy rejects them with 502
 /// instead. A specific telemetry slice of `UPSTREAM_PROTOCOL_VIOLATION`
 /// (both counters are bumped together at the reject site).
-pub(crate) static UPSTREAM_UNSOLICITED_206: Counter = Counter::new();
+pub(crate) static UPSTREAM_UNSOLICITED_206: Signal = Signal::new();
 
 /// Hyper-backend upstream errors observed *after* response headers were
 /// received, while streaming the body (peer aborted / framing error).
-pub(crate) static UPSTREAM_HYPER_BODY_ERR: Counter = Counter::new();
+pub(crate) static UPSTREAM_HYPER_BODY_ERR: Signal = Signal::new();
 
 /// Local cache I/O failures: any cached-file syscall (write/flush/read/
 /// rename/create/stat/open/seek) that fails, regardless of whether a
 /// 5xx is returned to the client. Distinct from `CACHE_SIZE_CORRUPTION`,
 /// which is specific to on-disk size accounting drift.
-pub(crate) static CACHE_IO_FAILURE: Counter = Counter::new();
+pub(crate) static CACHE_IO_FAILURE: Signal = Signal::new();
 
 /// Cache entries observed to be non-regular non-directory files (FIFO,
 /// socket, device, symlink).  Bumped by serving paths (which then return
@@ -517,7 +582,7 @@ pub(crate) static CACHE_IO_FAILURE: Counter = Counter::new();
 /// Treat the counter as "any non-regular entry where a regular file was
 /// expected"; if you need the strict FIFO/socket/device/symlink slice,
 /// filter at the call site.
-pub(crate) static CACHE_NON_REGULAR: Counter = Counter::new();
+pub(crate) static CACHE_NON_REGULAR: Signal = Signal::new();
 
 /// Cache entries observed to be directories in places where the cache
 /// layout does not allow one (an unknown host dir at the cache root, a
@@ -532,7 +597,7 @@ pub(crate) static CACHE_NON_REGULAR: Counter = Counter::new();
 /// `CACHE_NON_REGULAR` because the operator response differs: a stray
 /// directory is usually benign-but-wasteful; a stray FIFO/socket/symlink
 /// is a security-relevant tampering signal.
-pub(crate) static CACHE_DIRECTORY_UNEXPECTED: Counter = Counter::new();
+pub(crate) static CACHE_DIRECTORY_UNEXPECTED: Signal = Signal::new();
 
 /// Cache entries observed to be regular files where the layout does not
 /// allow one: at the cache root (whose only legitimate children are
@@ -545,7 +610,7 @@ pub(crate) static CACHE_DIRECTORY_UNEXPECTED: Counter = Counter::new();
 /// Distinct from `CACHE_NON_REGULAR` (FIFO/socket/device/symlink, which
 /// are security-relevant) and `CACHE_DIRECTORY_UNEXPECTED` (the
 /// directory-shaped counterpart inside mirror subtrees).
-pub(crate) static CACHE_UNEXPECTED_REGULAR: Counter = Counter::new();
+pub(crate) static CACHE_UNEXPECTED_REGULAR: Signal = Signal::new();
 
 /// Bytes copied client → upstream through the CONNECT tunnel, including a
 /// payload pipelined behind the `CONNECT` head (a TLS `ClientHello`).
@@ -574,7 +639,7 @@ pub(crate) static BYTES_TUNNELED_UPSTREAM_TO_CLIENT: Accumulator = Accumulator::
 /// error during request/response header exchange or body streaming
 /// (detected by walking the error source chain for an
 /// `io::ErrorKind::TimedOut`).
-pub(crate) static HTTP_TIMEOUT_UPSTREAM_READ: Counter = Counter::new();
+pub(crate) static HTTP_TIMEOUT_UPSTREAM_READ: Signal = Signal::new();
 /// HTTP timeout firings: upstream TCP/TLS handshake, counted per attempt
 /// (a request whose retries all time out counts each of them, and once in
 /// `UPSTREAM_CONNECT_FAILED`).
@@ -584,7 +649,7 @@ pub(crate) static HTTP_TIMEOUT_UPSTREAM_READ: Counter = Counter::new();
 /// connect timeout fires (detected by walking the connect error source
 /// chain for an `io::ErrorKind::TimedOut`). Also bumped when a CONNECT
 /// tunnel's upstream dial times out, in both backends.
-pub(crate) static HTTP_TIMEOUT_UPSTREAM_CONNECT: Counter = Counter::new();
+pub(crate) static HTTP_TIMEOUT_UPSTREAM_CONNECT: Signal = Signal::new();
 /// HTTP timeout firings: client failed to send request headers in time
 /// (slow-loris-shaped, or a stalled client between keep-alive requests).
 ///
@@ -605,7 +670,7 @@ pub(crate) static HTTP_TIMEOUT_CLIENT_HEADER: Counter = Counter::new();
 /// body delivery is not routed through these helpers and is not counted
 /// here. Header-write timeouts are tracked separately in
 /// `HTTP_TIMEOUT_CLIENT_HEADER_WRITE`.
-pub(crate) static HTTP_TIMEOUT_CLIENT_BODY: Counter = Counter::new();
+pub(crate) static HTTP_TIMEOUT_CLIENT_BODY: Signal = Signal::new();
 /// HTTP timeout firings: client failed to drain a response-header (or other
 /// small fixed control) write in time. Distinct from
 /// `HTTP_TIMEOUT_CLIENT_HEADER`, which counts request-header *reads* that
@@ -619,15 +684,15 @@ pub(crate) static HTTP_TIMEOUT_CLIENT_HEADER_WRITE: Counter = Counter::new();
 
 /// `max_upstream_downloads` saturation episodes — debounced (latched at cap,
 /// cleared when the active set drains to zero). Climbing → recurring saturation.
-pub(crate) static UPSTREAM_DOWNLOAD_CAP_TRANSITIONS: Counter = Counter::new();
+pub(crate) static UPSTREAM_DOWNLOAD_CAP_TRANSITIONS: Signal = Signal::new();
 
 /// Requests rejected (503) because the active-download set was already at the cap.
-pub(crate) static UPSTREAM_DOWNLOAD_REJECTED_CAP: Counter = Counter::new();
+pub(crate) static UPSTREAM_DOWNLOAD_REJECTED_CAP: Signal = Signal::new();
 
 /// Uncached passthrough requests refused (503) because
 /// `max_passthrough_relays` relays were already active, bumped by
 /// `passthrough_limiter::admit` for every backend.
-pub(crate) static PASSTHROUGH_REJECTED_CAP: Counter = Counter::new();
+pub(crate) static PASSTHROUGH_REJECTED_CAP: Signal = Signal::new();
 /// Highest number of concurrent passthrough relays since startup, sampled on
 /// every successful admission, whether or not `max_passthrough_relays` caps
 /// them (a refused relay never counted as active).
@@ -691,7 +756,7 @@ pub(crate) static SCHEME_CACHE_REMOVED: Counter = Counter::new();
 
 /// Database operations that returned an error. Any non-zero value
 /// indicates `SQLite` trouble worth investigating.
-pub(crate) static DB_OPERATION_FAILED: Counter = Counter::new();
+pub(crate) static DB_OPERATION_FAILED: Signal = Signal::new();
 
 /// Registered downloads that ended aborted instead of committed: any failed
 /// download (an upstream failure in any phase -- connect, head, body,
@@ -700,21 +765,21 @@ pub(crate) static DB_OPERATION_FAILED: Counter = Counter::new();
 /// discarded (checksum mismatch, verify or rename failure). A download the
 /// originator declined (relayed status, quota, throttle, ...) is not an
 /// abort.
-pub(crate) static DOWNLOADS_ABORTED: Counter = Counter::new();
+pub(crate) static DOWNLOADS_ABORTED: Signal = Signal::new();
 /// Downloads that found their `.partial` path still claimed by an earlier
 /// download of the same file (`partial_claim`) and wrote into a scratch file
 /// instead of resuming it.
 pub(crate) static PARTIAL_CLAIM_CONTENDED: Counter = Counter::new();
 
 /// Cache-size reconciliation events with a non-zero on-disk delta.
-pub(crate) static RECONCILE_EVENTS: Counter = Counter::new();
+pub(crate) static RECONCILE_EVENTS: Signal = Signal::new();
 /// Total absolute bytes corrected by reconciliation events.
 pub(crate) static RECONCILE_BYTES_REPAIRED: Accumulator = Accumulator::new();
 
 /// `cache_quota.rs` accounting-integrity errors ("Cache-quota reconcile
 /// overflowed", "Cache-size accounting overflowed on add" / "underflowed on
 /// subtract") — any non-zero is a bug signal.
-pub(crate) static CACHE_SIZE_CORRUPTION: Counter = Counter::new();
+pub(crate) static CACHE_SIZE_CORRUPTION: Signal = Signal::new();
 
 /// Authorization rejection: client request denied by the mirror allowlist.
 pub(crate) static AUTHZ_REJECTED_MIRROR: Counter = Counter::new();
@@ -727,12 +792,12 @@ pub(crate) static AUTHZ_REJECTED_TUNNEL_MIRROR: Counter = Counter::new();
 pub(crate) static AUTHZ_REJECTED_WEBUI: Counter = Counter::new();
 /// Authorization rejection: web-interface request refused with 421 because
 /// its `Host` names none of the proxy's own names (DNS-rebinding guard).
-pub(crate) static AUTHZ_REJECTED_WEBUI_HOST: Counter = Counter::new();
+pub(crate) static AUTHZ_REJECTED_WEBUI_HOST: Signal = Signal::new();
 
 /// Transfers cancelled because the upstream min-rate threshold was not met.
-pub(crate) static RATE_LIMIT_UPSTREAM: Counter = Counter::new();
+pub(crate) static RATE_LIMIT_UPSTREAM: Signal = Signal::new();
 /// Transfers cancelled because the client min-rate threshold was not met.
-pub(crate) static RATE_LIMIT_CLIENT: Counter = Counter::new();
+pub(crate) static RATE_LIMIT_CLIENT: Signal = Signal::new();
 
 /// `DatabaseCommand` enqueues via `send_db_command` (every send is counted).
 pub(crate) static DB_COMMANDS_SENT: Counter = Counter::new();
@@ -744,10 +809,10 @@ pub(crate) static DB_QUEUE_DEPTH_PEAK: Peak = Peak::new();
 /// `send_db_command_nonblocking` bumps only when `try_send` actually returned
 /// `Full` and it had to spill the command onto a task. So this counts
 /// observations of saturation, not waits.
-pub(crate) static DB_QUEUE_FULL_WAITS: Counter = Counter::new();
+pub(crate) static DB_QUEUE_FULL_WAITS: Signal = Signal::new();
 /// Debounced `DB_QUEUE_FULL_WAITS` — counts each saturation episode once
 /// (latched until the channel drains fully to empty).
-pub(crate) static DB_QUEUE_FULL_TRANSITIONS: Counter = Counter::new();
+pub(crate) static DB_QUEUE_FULL_TRANSITIONS: Signal = Signal::new();
 /// Commands dropped because the DB task channel was closed (graceful shutdown
 /// or unexpected receiver death). Bumped instead of panicking so request tasks
 /// can finish their response after the DB drain begins.
@@ -795,7 +860,7 @@ pub(crate) static CLEANUP_BYHASH_UNREFERENCED: Accumulator = Accumulator::new();
 /// indicates either disk corruption, an upstream mirror returning a different
 /// build than its index claims, or a stale cache file whose origin re-issued
 /// the same `Filename:` under a different content.
-pub(crate) static CLEANUP_CHECKSUM_MISMATCHES: Counter = Counter::new();
+pub(crate) static CLEANUP_CHECKSUM_MISMATCHES: Signal = Signal::new();
 /// Cleanup digest verifications skipped because the file carries a valid
 /// verified-marker xattr from an earlier cycle (same inode, size, algorithm
 /// and expected digest) — the daily re-hash then scales with churn instead
@@ -851,5 +916,34 @@ pub(crate) fn record_upstream_status(status: StatusCode) {
         StatusCode::TEMPORARY_REDIRECT => UPSTREAM_STATUS_307.increment(),
         StatusCode::PERMANENT_REDIRECT => UPSTREAM_STATUS_308.increment(),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Signal;
+
+    #[test]
+    fn a_signal_is_unstamped_until_its_first_bump() {
+        let signal = Signal::new();
+        assert_eq!(signal.get(), 0);
+        assert_eq!(signal.last(), None);
+    }
+
+    #[test]
+    fn a_signal_bump_counts_and_stamps_the_wall_clock() {
+        let signal = Signal::new();
+        let before = coarsetime::Clock::now_since_epoch().as_secs();
+        signal.increment();
+        signal.increment();
+        let after = coarsetime::Clock::now_since_epoch().as_secs();
+        assert_eq!(signal.get(), 2);
+        let last = signal.last().expect("a bumped signal is stamped");
+        // The coarse clock ticks every few milliseconds, so allow the one
+        // second the reads above can straddle.
+        assert!(
+            (before..=after + 1).contains(&last),
+            "{before} <= {last} <= {after}"
+        );
     }
 }

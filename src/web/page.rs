@@ -420,6 +420,9 @@ dl.details > div:hover { border-left-color: var(--h-accent); background: var(--d
 dl.details dt { font-size: 0.78em; color: var(--details-key-fg); font-weight: 600; }
 dl.details dd { color: var(--details-val-fg); font-weight: 500; font-size: 0.95em;
                 font-family: var(--mono); font-variant-numeric: tabular-nums; }
+/* When a bad-sign counter last moved: context for the figure above it. */
+dl.details dd.last { color: var(--details-key-fg); font-weight: 400; font-size: 0.75em;
+                     font-family: inherit; }
 
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .section-error { color: var(--error-fg); font-size: 0.85em; margin: 4px 0; }

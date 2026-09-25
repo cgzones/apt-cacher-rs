@@ -27,7 +27,7 @@ use crate::{
 };
 
 use super::{
-    fmt::{AlertNonzero, Colorize, RatioClass, WarnNonzero, alert_if, warn_if},
+    fmt::{Colorize, Level, RatioClass, WarnNonzero, alert_if, warn_if},
     table::DetailsList,
 };
 
@@ -185,35 +185,40 @@ fn build_requests_group(g: &mut Groups) {
                 },
             ),
         );
-        t.row_tip(
+        t.signal(
             "Connections Rejected (global cap)",
             "Connections dropped at accept time because `max_connections` was reached. Climbing values mean a flood or a cap sized below the real client population.",
-            WarnNonzero(metrics::CONNECTION_REJECTED_GLOBAL_CAP.get()),
+            Level::Warn,
+            &metrics::CONNECTION_REJECTED_GLOBAL_CAP,
         );
-        t.row_tip(
+        t.signal(
             "Connections Rejected (per-IP cap)",
             "Plain-HTTP connections dropped at accept time because `max_connections_per_client_ip` was reached. Stays at 0 while no source IP reaches the cap (128 by default, 0 disables it); climbing values point to a noisy or malicious source IP, or to many clients sharing one NAT address.",
-            WarnNonzero(metrics::CONNECTION_REJECTED_PER_IP_CAP.get()),
+            Level::Warn,
+            &metrics::CONNECTION_REJECTED_PER_IP_CAP,
         );
-        t.row_tip(
+        t.signal(
             "Connections Rejected (client ACL)",
             "Connections dropped at accept time because the source address is outside both `allowed_proxy_clients` and `allowed_webif_clients`.",
-            WarnNonzero(metrics::CONNECTION_REJECTED_ACL.get()),
+            Level::Warn,
+            &metrics::CONNECTION_REJECTED_ACL,
         );
-        t.row_tip(
+        t.signal(
             "Accept Failures (retried)",
             "accept(2) failures retried after a short pause instead of stopping the daemon: descriptor exhaustion (EMFILE/ENFILE), ENOBUFS/ENOMEM, ECONNABORTED. Climbing values mean the process is at its file-descriptor budget.",
-            WarnNonzero(metrics::ACCEPT_TRANSIENT_FAILURES.get()),
+            Level::Warn,
+            &metrics::ACCEPT_TRANSIENT_FAILURES,
         );
         t.row_tip(
             "Read Failures (peer disconnect)",
             "Header-read failures before any request was parsed, from a normal client close between keep-alive requests.",
             metrics::REQUEST_READ_PEER_DISCONNECT.get(),
         );
-        t.row_tip(
+        t.signal(
             "Read Failures (protocol error)",
             "Header-read failures from oversized or malformed headers. This is the abuse signal, unlike the peer-disconnect counter beside it.",
-            WarnNonzero(metrics::REQUEST_READ_PROTOCOL_ERROR.get()),
+            Level::Warn,
+            &metrics::REQUEST_READ_PROTOCOL_ERROR,
         );
         t.row_tip(
             "Unhandled Request Headers",
@@ -235,11 +240,10 @@ fn build_requests_group(g: &mut Groups) {
             "Configured-timeout firings while writing response headers to a client.",
             metrics::HTTP_TIMEOUT_CLIENT_HEADER_WRITE.get(),
         );
-        t.row_tip(
-            "Timeouts (client body write)",
-            "Configured-timeout firings while writing a response body to a client.",
-            metrics::HTTP_TIMEOUT_CLIENT_BODY.get(),
-        );
+        t.entry("Timeouts (client body write)")
+            .tip("Configured-timeout firings while writing a response body to a client.")
+            .last(metrics::HTTP_TIMEOUT_CLIENT_BODY.last())
+            .value(metrics::HTTP_TIMEOUT_CLIENT_BODY.get());
 
         t.row_tip(
             "Client 2xx",
@@ -256,15 +260,17 @@ fn build_requests_group(g: &mut Groups) {
             "Client-error responses. Not warned on: pdiff rejections and web-interface 404 probes land here routinely.",
             metrics::CLIENT_STATUS_4XX.get(),
         );
-        t.row_tip(
+        t.signal(
             "Client 5xx",
             "Server-error responses returned to clients.",
-            AlertNonzero(metrics::CLIENT_STATUS_5XX.get()),
+            Level::Alert,
+            &metrics::CLIENT_STATUS_5XX,
         );
-        t.row_tip(
+        t.signal(
             "Client Other",
             "Responses outside the 2xx-5xx classes.",
-            WarnNonzero(metrics::CLIENT_STATUS_OTHER.get()),
+            Level::Warn,
+            &metrics::CLIENT_STATUS_OTHER,
         );
         t.row("Client 200 OK", status_200);
         t.row("Client 206 Partial Content", status_206);
@@ -280,30 +286,35 @@ fn build_requests_group(g: &mut Groups) {
             "Client requests for pdiff resources, refused because `reject_pdiff_requests` is set.",
             metrics::PDIFF_REJECTED.get(),
         );
-        t.row_tip(
+        t.signal(
             "Rejected (unsafe path)",
             "Client requests refused with 400 because their path failed the traversal and encoding checks, including a percent-decoded cache-name field (`..`, `%2F`, a control byte).",
-            WarnNonzero(metrics::UNSAFE_PATH_REJECTED.get()),
+            Level::Warn,
+            &metrics::UNSAFE_PATH_REJECTED,
         );
-        t.row_tip(
+        t.signal(
             "Rejected (quota reached)",
             "Downloads denied because the configured disk quota is exhausted or the cache filesystem is down to `min_disk_free`.",
-            WarnNonzero(metrics::DOWNLOAD_REJECTED_QUOTA.get()),
+            Level::Warn,
+            &metrics::DOWNLOAD_REJECTED_QUOTA,
         );
-        t.row_tip(
+        t.signal(
             "Rejected (oversize)",
             "Downloads refused because the upstream object size exceeded `max_object_size`.",
-            WarnNonzero(metrics::DOWNLOAD_REJECTED_OVERSIZE.get()),
+            Level::Warn,
+            &metrics::DOWNLOAD_REJECTED_OVERSIZE,
         );
-        t.row_tip(
+        t.signal(
             "Rejected (verify-throttled)",
             "Requests refused with 503 because the resource recently failed checksum verification, clients that joined a refused download included.",
-            WarnNonzero(metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.get()),
+            Level::Warn,
+            &metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE,
         );
-        t.row_tip(
+        t.signal(
             "Proxy Loops Rejected",
             "Requests refused with 508 because their `Via` already named this proxy. Any value means an `allowed_mirrors` wildcard covers the proxy's own name.",
-            WarnNonzero(metrics::PROXY_LOOP_REJECTED.get()),
+            Level::Warn,
+            &metrics::PROXY_LOOP_REJECTED,
         );
         t.row_tip(
             "Authorization Rejected (mirror)",
@@ -325,10 +336,11 @@ fn build_requests_group(g: &mut Groups) {
             "Web-interface requests refused because the source address is outside `allowed_webif_clients`.",
             metrics::AUTHZ_REJECTED_WEBUI.get(),
         );
-        t.row_tip(
+        t.signal(
             "Authorization Rejected (web-interface host)",
             "Web-interface requests refused with 421 because their `Host` names neither an IP address, `localhost`, the system hostname nor a `webif_hostnames` entry. Any value means a client named a foreign host: a browser reached the dashboard under a rebound DNS name, or an admin uses a name missing from `webif_hostnames`.",
-            WarnNonzero(metrics::AUTHZ_REJECTED_WEBUI_HOST.get()),
+            Level::Warn,
+            &metrics::AUTHZ_REJECTED_WEBUI_HOST,
         );
     });
 }
@@ -386,20 +398,20 @@ fn build_cache_group(g: &mut Groups) {
                     .saturating_sub(UNCACHEABLES_MAX.get() as u64),
             ),
         );
-        t.row_tip(
-            "Reconcile Events",
-            "Cache reconciliation events that repaired on-disk size accounting.",
-            metrics::RECONCILE_EVENTS.get(),
-        );
+        t.entry("Reconcile Events")
+            .tip("Cache reconciliation events that repaired on-disk size accounting.")
+            .last(metrics::RECONCILE_EVENTS.last())
+            .value(metrics::RECONCILE_EVENTS.get());
         t.row_tip(
             "Reconcile Bytes Repaired",
             "Total size-accounting error corrected by those reconciliation events.",
             HumanFmt::Size(metrics::RECONCILE_BYTES_REPAIRED.get()),
         );
-        t.row_tip(
+        t.signal(
             "Size Accounting Corruption",
             "Overflow or underflow detected in the in-memory total-cache-size accounting (value clamped; repaired by the next reconcile).",
-            AlertNonzero(metrics::CACHE_SIZE_CORRUPTION.get()),
+            Level::Alert,
+            &metrics::CACHE_SIZE_CORRUPTION,
         );
     });
 }
@@ -411,10 +423,11 @@ fn build_integrity_group(g: &mut Groups) {
             "Downloaded resources (pool .debs, by-hash files, Packages indices) whose content hash matched a known digest.",
             metrics::CHECKSUM_VERIFIED.get(),
         );
-        t.row_tip(
+        t.signal(
             "Mismatch (rejected)",
             "Resources rejected because their content hash did not match the expected digest. Non-zero indicates a corrupt or tampered upstream response.",
-            AlertNonzero(metrics::CHECKSUM_MISMATCH.get()),
+            Level::Alert,
+            &metrics::CHECKSUM_MISMATCH,
         );
         t.row_tip(
             "Unverified (no known digest)",
@@ -431,15 +444,15 @@ fn build_integrity_group(g: &mut Groups) {
             "Cached indexes re-ingested because a request answered from cache found their digests missing (restart, eviction, an earlier skip). Climbing on every apt update means the registry cap is below the live working set.",
             metrics::INGEST_TOUCH_TRIGGERED.get(),
         );
-        t.row_tip(
-            "Ingests Skipped (queue full)",
-            "Index ingests skipped because the ingest line was full; each is retried on the index's next request.",
-            metrics::INGEST_SKIPPED_QUEUE_FULL.get(),
-        );
-        t.row_tip(
+        t.entry("Ingests Skipped (queue full)")
+            .tip("Index ingests skipped because the ingest line was full; each is retried on the index's next request.")
+            .last(metrics::INGEST_SKIPPED_QUEUE_FULL.last())
+            .value(metrics::INGEST_SKIPPED_QUEUE_FULL.get());
+        t.signal(
             "Ingests Failed (not retried)",
             "Index files that can never ingest (too large, corrupt, over the decode CPU budget); retried only once the file is replaced.",
-            AlertNonzero(metrics::INGEST_FAILED_MARKED.get()),
+            Level::Alert,
+            &metrics::INGEST_FAILED_MARKED,
         );
         t.row_tip(
             "Throttled Resources",
@@ -559,15 +572,17 @@ fn build_upstream_group(g: &mut Groups) {
             "Client-error responses received from upstream mirrors.",
             metrics::UPSTREAM_STATUS_4XX.get(),
         );
-        t.row_tip(
+        t.signal(
             "5xx",
             "Server-error responses received from upstream mirrors.",
-            WarnNonzero(metrics::UPSTREAM_STATUS_5XX.get()),
+            Level::Warn,
+            &metrics::UPSTREAM_STATUS_5XX,
         );
-        t.row_tip(
+        t.signal(
             "Other",
             "Upstream responses outside the 2xx-5xx classes.",
-            WarnNonzero(metrics::UPSTREAM_STATUS_OTHER.get()),
+            Level::Warn,
+            &metrics::UPSTREAM_STATUS_OTHER,
         );
         t.row("200 OK", status_200);
         t.row("301 Moved Permanently", status_301);
@@ -580,66 +595,63 @@ fn build_upstream_group(g: &mut Groups) {
             "Upstream connect attempts past a request's first: backoff retries after a failed connect, and Auto-mode dials of plain HTTP after a failed HTTPS probe.",
             metrics::UPSTREAM_RETRIES.get(),
         );
-        t.row_tip(
+        t.signal(
             "Connect Failures",
             "Requests whose upstream connect (TCP or TLS) failed for good, after the retries and the Auto-mode HTTPS-to-HTTP fallback. Counted once per request; a retried or fallen-back connect that succeeds counts nothing.",
-            WarnNonzero(metrics::UPSTREAM_CONNECT_FAILED.get()),
+            Level::Warn,
+            &metrics::UPSTREAM_CONNECT_FAILED,
         );
-        t.row_tip(
+        t.signal(
             "Head Failures",
             "Requests whose upstream was connected but whose exchange failed before a response head arrived: reset, EOF, timeout or request write. A malformed head counts as a Protocol Violation instead.",
-            WarnNonzero(metrics::UPSTREAM_HEAD_FAILED.get()),
+            Level::Warn,
+            &metrics::UPSTREAM_HEAD_FAILED,
         );
-        t.row_tip(
+        t.signal(
             "Pipe Resizes Refused (splice)",
             "Plain-HTTP download pipes the kernel refused to grow to 1 MiB (two per download): the service user's pipe quota fs.pipe-user-pages-soft is exhausted, or fs.pipe-max-size is below 1 MiB. Those downloads write the cache every few KiB instead of every MiB.",
-            WarnNonzero(metrics::PIPE_RESIZE_REFUSED.get()),
+            Level::Warn,
+            &metrics::PIPE_RESIZE_REFUSED,
         );
-        t.row_tip(
-            "Timeouts (connect)",
-            "Configured-timeout firings while connecting to an upstream mirror or a CONNECT tunnel target, counted per connect attempt.",
-            metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.get(),
-        );
-        t.row_tip(
-            "Timeouts (read)",
-            "Configured-timeout firings while reading upstream header or body bytes.",
-            metrics::HTTP_TIMEOUT_UPSTREAM_READ.get(),
-        );
-        t.row_tip(
-            "Download Cap Transitions",
-            "Concurrent-upstream-download cap state transitions.",
-            metrics::UPSTREAM_DOWNLOAD_CAP_TRANSITIONS.get(),
-        );
-        t.row_tip(
-            "Downloads Rejected (cap)",
-            "Downloads refused because the concurrent-upstream-download cap was reached.",
-            metrics::UPSTREAM_DOWNLOAD_REJECTED_CAP.get(),
-        );
-        t.row_tip(
+        t.entry("Timeouts (connect)")
+            .tip("Configured-timeout firings while connecting to an upstream mirror or a CONNECT tunnel target, counted per connect attempt.")
+            .last(metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.last())
+            .value(metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.get());
+        t.entry("Timeouts (read)")
+            .tip("Configured-timeout firings while reading upstream header or body bytes.")
+            .last(metrics::HTTP_TIMEOUT_UPSTREAM_READ.last())
+            .value(metrics::HTTP_TIMEOUT_UPSTREAM_READ.get());
+        t.entry("Download Cap Transitions")
+            .tip("Concurrent-upstream-download cap state transitions.")
+            .last(metrics::UPSTREAM_DOWNLOAD_CAP_TRANSITIONS.last())
+            .value(metrics::UPSTREAM_DOWNLOAD_CAP_TRANSITIONS.get());
+        t.entry("Downloads Rejected (cap)")
+            .tip("Downloads refused because the concurrent-upstream-download cap was reached.")
+            .last(metrics::UPSTREAM_DOWNLOAD_REJECTED_CAP.last())
+            .value(metrics::UPSTREAM_DOWNLOAD_REJECTED_CAP.get());
+        t.signal(
             "Passthroughs Rejected (cap)",
             "Uncached passthrough requests refused with 503 because `max_passthrough_relays` relays were already active.",
-            WarnNonzero(metrics::PASSTHROUGH_REJECTED_CAP.get()),
+            Level::Warn,
+            &metrics::PASSTHROUGH_REJECTED_CAP,
         );
-        t.row_tip(
-            "Downloads Aborted",
-            "Upstream downloads that ended without being cached: failed (upstream, cache or internal), cancelled, or discarded by the commit (checksum mismatch, verify or rename failure).",
-            metrics::DOWNLOADS_ABORTED.get(),
-        );
+        t.entry("Downloads Aborted")
+            .tip("Upstream downloads that ended without being cached: failed (upstream, cache or internal), cancelled, or discarded by the commit (checksum mismatch, verify or rename failure).")
+            .last(metrics::DOWNLOADS_ABORTED.last())
+            .value(metrics::DOWNLOADS_ABORTED.get());
         t.row_tip(
             "Partials Still In Use",
             "Downloads that found their `.partial` still held by an earlier download of the same file and fetched into a scratch file instead of resuming it.",
             metrics::PARTIAL_CLAIM_CONTENDED.get(),
         );
-        t.row_tip(
-            "Rate-Limit Cancellations (upstream)",
-            "Transfers cancelled because the configured minimum download rate was not met on the upstream side.",
-            metrics::RATE_LIMIT_UPSTREAM.get(),
-        );
-        t.row_tip(
-            "Rate-Limit Cancellations (client)",
-            "Transfers cancelled because the configured minimum download rate was not met on the client side.",
-            metrics::RATE_LIMIT_CLIENT.get(),
-        );
+        t.entry("Rate-Limit Cancellations (upstream)")
+            .tip("Transfers cancelled because the configured minimum download rate was not met on the upstream side.")
+            .last(metrics::RATE_LIMIT_UPSTREAM.last())
+            .value(metrics::RATE_LIMIT_UPSTREAM.get());
+        t.entry("Rate-Limit Cancellations (client)")
+            .tip("Transfers cancelled because the configured minimum download rate was not met on the client side.")
+            .last(metrics::RATE_LIMIT_CLIENT.last())
+            .value(metrics::RATE_LIMIT_CLIENT.get());
         t.row_tip(
             "Pool Reused",
             "Upstream requests served from an already-open pooled connection.",
@@ -702,25 +714,29 @@ fn build_upstream_group(g: &mut Groups) {
             "Entries dropped from the per-host scheme cache.",
             metrics::SCHEME_CACHE_REMOVED.get(),
         );
-        t.row_tip(
+        t.signal(
             "Protocol Violations",
             "Mirror responses that broke the HTTP contract: an unparsable or oversized response head, body over- or under-ran the announced Content-Length, missing or mismatched Content-Range, missing Content-Length on a non-volatile fetch, or 206 returned without a Range request.",
-            WarnNonzero(metrics::UPSTREAM_PROTOCOL_VIOLATION.get()),
+            Level::Warn,
+            &metrics::UPSTREAM_PROTOCOL_VIOLATION,
         );
-        t.row_tip(
+        t.signal(
             "Body Size Limits",
             "Responses exceeding a local body buffering or relay limit. These responses may be valid HTTP and do not count as Protocol Violations. A body merely too large to drain for connection reuse is not counted.",
-            WarnNonzero(metrics::UPSTREAM_BODY_LIMIT.get()),
+            Level::Warn,
+            &metrics::UPSTREAM_BODY_LIMIT,
         );
-        t.row_tip(
+        t.signal(
             "Unsolicited 206",
             "Mirror responses that returned 206 Partial Content for a request the proxy issued without a Range header. Rejected with 502 to avoid cache poisoning. A telemetry slice of Protocol Violations.",
-            WarnNonzero(metrics::UPSTREAM_UNSOLICITED_206.get()),
+            Level::Warn,
+            &metrics::UPSTREAM_UNSOLICITED_206,
         );
-        t.row_tip(
+        t.signal(
             "hyper Failures (body)",
             "Hyper-backend post-response body-stream errors.",
-            WarnNonzero(metrics::UPSTREAM_HYPER_BODY_ERR.get()),
+            Level::Warn,
+            &metrics::UPSTREAM_HYPER_BODY_ERR,
         );
     });
 }
@@ -753,15 +769,15 @@ fn build_tunnels_group(g: &mut Groups) {
             "CONNECT requests refused by the configured tunnel policy.",
             metrics::TUNNEL_REJECTED_POLICY.get(),
         );
-        t.row_tip(
-            "Rejected (capacity)",
-            "CONNECT requests refused with 429 because their source IP already held `https_tunnel_max_connections_per_client` tunnels.",
-            metrics::TUNNEL_REJECTED_CAPACITY.get(),
-        );
-        t.row_tip(
+        t.entry("Rejected (capacity)")
+            .tip("CONNECT requests refused with 429 because their source IP already held `https_tunnel_max_connections_per_client` tunnels.")
+            .last(metrics::TUNNEL_REJECTED_CAPACITY.last())
+            .value(metrics::TUNNEL_REJECTED_CAPACITY.get());
+        t.signal(
             "Transfer Failures",
             "Post-acceptance tunnel failures: the client gone before the relay started (HTTP upgrade or `200` write failure), upstream connect failure or timeout, or mid-transfer error. Counts tunnels that were accepted but did not complete cleanly.",
-            WarnNonzero(metrics::TUNNEL_TRANSFER_FAILED.get()),
+            Level::Warn,
+            &metrics::TUNNEL_TRANSFER_FAILED,
         );
         t.row_tip(
             "Closed (idle)",
@@ -788,10 +804,11 @@ fn build_cleanup_group(g: &mut Groups) {
             "By-hash index files reclaimed because their digest was absent from the mirror's current Release set (a subset of total evictions). The rest age out via `byhash_retention_days` when no current Release can be read.",
             metrics::CLEANUP_BYHASH_UNREFERENCED.get(),
         );
-        t.row_tip(
+        t.signal(
             "Checksum Mismatches",
             "Cache files removed because their content hash did not match the SHA256/SHA512 advertised in the upstream Packages stanza. Non-zero indicates corruption or a mirror inconsistency.",
-            AlertNonzero(metrics::CLEANUP_CHECKSUM_MISMATCHES.get()),
+            Level::Alert,
+            &metrics::CLEANUP_CHECKSUM_MISMATCHES,
         );
         t.row_tip(
             "Checksum Skips",
@@ -852,15 +869,17 @@ fn build_database_group(g: &mut Groups) {
             "Commands handed to the database task since the daemon started.",
             metrics::DB_COMMANDS_SENT.get(),
         );
-        t.row_tip(
+        t.signal(
             "Queue Full-Waits",
             "Times a producer had to wait because the command channel was full.",
-            WarnNonzero(metrics::DB_QUEUE_FULL_WAITS.get()),
+            Level::Warn,
+            &metrics::DB_QUEUE_FULL_WAITS,
         );
-        t.row_tip(
+        t.signal(
             "Queue Full-Transitions",
             "Times the command channel went from having room to being full.",
-            WarnNonzero(metrics::DB_QUEUE_FULL_TRANSITIONS.get()),
+            Level::Warn,
+            &metrics::DB_QUEUE_FULL_TRANSITIONS,
         );
         t.row_tip(
             "Commands Dropped (shutdown)",
@@ -907,35 +926,40 @@ fn build_database_group(g: &mut Groups) {
             "Cumulative `mirrors_v2.last_seen` rows the periodic task has written back to disk.",
             metrics::DB_MIRROR_LAST_SEEN_FLUSHED.get(),
         );
-        t.row_tip(
+        t.signal(
             "Operation Failures",
             "SQLite operations that failed.",
-            AlertNonzero(metrics::DB_OPERATION_FAILED.get()),
+            Level::Alert,
+            &metrics::DB_OPERATION_FAILED,
         );
     });
 }
 
 fn build_errors_group(g: &mut Groups) {
     g.group("Storage Errors", |t| {
-        t.row_tip(
+        t.signal(
             "Cache I/O Failures",
             "Cached-file syscall failures (write/flush/read/rename/create/stat/open/seek) on serving, download, scan and cleanup paths, regardless of whether a client response was affected.",
-            AlertNonzero(metrics::CACHE_IO_FAILURE.get()),
+            Level::Alert,
+            &metrics::CACHE_IO_FAILURE,
         );
-        t.row_tip(
+        t.signal(
             "Non-Regular Files",
             "Cache entries observed as non-regular non-directory files (FIFO, socket, device, symlink); also bumped for stray directories on some serving/sweep paths. Serving paths then return 5xx, download paths abort, the startup scan and this dashboard leave the entry in place, and cleanup unlinks it.",
-            AlertNonzero(metrics::CACHE_NON_REGULAR.get()),
+            Level::Alert,
+            &metrics::CACHE_NON_REGULAR,
         );
-        t.row_tip(
+        t.signal(
             "Unexpected Directories",
             "Cache entries observed as directories where the cache layout does not allow one (an unknown host at the cache root, a non-layout directory in a mirror, anything in a pool or by-hash leaf). Cleanup leaves the directory in place and emits a warn; the tmp/ subtree is the sole exception where the directory is recursively removed once aged. Usually needs an operator to investigate.",
-            WarnNonzero(metrics::CACHE_DIRECTORY_UNEXPECTED.get()),
+            Level::Warn,
+            &metrics::CACHE_DIRECTORY_UNEXPECTED,
         );
-        t.row_tip(
+        t.signal(
             "Unexpected Regular Files",
             "Cache entries observed as regular files where the cache layout does not allow one (the cache root, a non-deb file directly in a mirror directory, a non-UTF-8-named file cleanup cannot match). The file is left in place with a warn; typically an operator artefact rather than a tampering signal.",
-            WarnNonzero(metrics::CACHE_UNEXPECTED_REGULAR.get()),
+            Level::Warn,
+            &metrics::CACHE_UNEXPECTED_REGULAR,
         );
         t.row_tip(
             "Logstore Evictions",
