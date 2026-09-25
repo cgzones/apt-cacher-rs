@@ -27,13 +27,25 @@ use crate::{
 
 /// Content-Security-Policy applied to every HTML page.
 ///
-/// `style-src 'self'` permits the linked `/style.css` but blocks any `<style>`
-/// block or inline `style="..."` attribute. If a future change wants inline
-/// styles, it has to either move them into the stylesheet or extend the CSP —
-/// silent CSP rejections are easy to miss when only some users have devtools
-/// open.
-const HTML_CSP: &str = "default-src 'none'; style-src 'self'; img-src 'self' data:; \
-     base-uri 'none'; form-action 'none'";
+/// - `script-src 'self'` admits the linked `/app.js` and nothing else: no
+///   inline `<script>`, no `on*=` attribute, no `eval`.
+/// - `style-src 'self'` admits the linked `/style.css` but blocks any
+///   `<style>` block or inline `style="..."` attribute. It does *not* cover
+///   CSSOM writes (`el.style.x = ...`), which is why the scripts never make
+///   them (`assets.rs` tests for it).
+/// - `connect-src 'self'` lets the scripts re-fetch the page they are on.
+/// - `require-trusted-types-for 'script'` with `trusted-types 'none'` makes
+///   every HTML-parsing DOM sink throw and forbids creating a policy that
+///   could reopen one; the scripts build DOM from text only.
+/// - `frame-ancestors 'none'` is `X-Frame-Options: DENY` for CSP-aware
+///   browsers.
+///
+/// If a future change wants inline styles or scripts, it has to move them
+/// into the asset files or extend the CSP -- silent CSP rejections are easy
+/// to miss when only some users have devtools open.
+const HTML_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+     img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; \
+     frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'";
 
 /// A response from the local web interface.
 ///
@@ -143,6 +155,8 @@ impl WebResponse {
                 ("X-Frame-Options", "DENY"),
                 ("X-Robots-Tag", "noindex"),
                 ("Referrer-Policy", "no-referrer"),
+                ("Cross-Origin-Opener-Policy", "same-origin"),
+                ("Cross-Origin-Resource-Policy", "same-origin"),
             ],
             WebResponseKind::Static {
                 content_type: _,
@@ -150,6 +164,7 @@ impl WebResponse {
             } => &[
                 ("Cache-Control", "public, max-age=31536000, immutable"),
                 ("X-Content-Type-Options", "nosniff"),
+                ("Cross-Origin-Resource-Policy", "same-origin"),
             ],
             WebResponseKind::Static {
                 content_type: _,
@@ -157,6 +172,7 @@ impl WebResponse {
             } => &[
                 ("Cache-Control", "no-cache"),
                 ("X-Content-Type-Options", "nosniff"),
+                ("Cross-Origin-Resource-Policy", "same-origin"),
             ],
             WebResponseKind::Static {
                 content_type: _,
@@ -164,10 +180,12 @@ impl WebResponse {
             } => &[
                 ("Cache-Control", "public, max-age=86400"),
                 ("X-Content-Type-Options", "nosniff"),
+                ("Cross-Origin-Resource-Policy", "same-origin"),
             ],
             WebResponseKind::Json => &[
                 ("Cache-Control", "no-store"),
                 ("X-Content-Type-Options", "nosniff"),
+                ("Cross-Origin-Resource-Policy", "same-origin"),
             ],
             WebResponseKind::Error => &[],
         }
@@ -277,7 +295,20 @@ mod tests {
                 ("X-Frame-Options", "DENY"),
                 ("X-Robots-Tag", "noindex"),
                 ("Referrer-Policy", "no-referrer"),
+                ("Cross-Origin-Opener-Policy", "same-origin"),
+                ("Cross-Origin-Resource-Policy", "same-origin"),
             ]
+        );
+    }
+
+    /// The policy, spelled out: a change to it is a change to this test.
+    #[test]
+    fn html_csp_is_the_strict_policy() {
+        assert_eq!(
+            HTML_CSP,
+            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; \
+             connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; \
+             require-trusted-types-for 'script'; trusted-types 'none'"
         );
     }
 
@@ -297,6 +328,7 @@ mod tests {
                 &[
                     ("Cache-Control", cache_control),
                     ("X-Content-Type-Options", "nosniff"),
+                    ("Cross-Origin-Resource-Policy", "same-origin"),
                 ]
             );
             assert!(
@@ -317,6 +349,7 @@ mod tests {
             &[
                 ("Cache-Control", "no-store"),
                 ("X-Content-Type-Options", "nosniff"),
+                ("Cross-Origin-Resource-Policy", "same-origin"),
             ]
         );
         assert!(header(r.extra_headers(), "X-Frame-Options").is_none());

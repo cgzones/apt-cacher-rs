@@ -9,12 +9,25 @@
 //! - [`table`]: `Table`/`DetailsList`, the `tr!` row macro, section wrappers.
 //! - [`page`]: query options, theme, the `<html>` skeleton and `<nav>`, the
 //!   favicon.
-//! - [`assets`]: the embedded stylesheet under its content-hashed URL.
+//! - [`assets`]: the embedded stylesheet and script bundle under their
+//!   content-hashed URLs.
 //! - [`response`]: `WebResponse`, its header table and the hyper body wrapper.
 //! - [`dashboard`]: `DashboardData` gathering and the details sections.
 //! - [`metrics_page`]: the Metrics section.
 //! - [`tables`]: the row tables and the per-mirror directory walk.
 //! - [`logs`]: the `/logs` page.
+//!
+//! # Scripts are optional
+//!
+//! Both pages are complete without JavaScript: curl, a text browser or a
+//! browser with scripts off sees every figure as server-rendered text,
+//! opens sections through `open=`, keeps them open with the keep-open
+//! links, and auto-refreshes through `refresh=`. The script bundle
+//! (`/app.js`, `assets/js/`) only enhances that markup and must keep it
+//! that way: a feature whose script fails leaves the page as the server
+//! rendered it. Its constraints are the HTML pages' Content-Security-Policy
+//! (`response.rs`): no inline script or style, no HTML-parsing DOM sink
+//! (Trusted Types), no CSSOM writes, no third-party origin.
 
 mod assets;
 mod dashboard;

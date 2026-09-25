@@ -9,7 +9,10 @@ use std::{
 
 use crate::swrite;
 
-use super::{assets::STYLESHEET, fmt::HtmlEscape};
+use super::{
+    assets::{SCRIPT, STYLESHEET},
+    fmt::HtmlEscape,
+};
 
 /// The system hostname, read once at first use.
 ///
@@ -223,6 +226,7 @@ pub(super) fn build_page(
     let theme_attr = options.theme.html_attr();
     let refresh = RefreshMeta(options.refresh_secs.unwrap_or(0));
     let stylesheet = STYLESHEET.url();
+    let script = SCRIPT.url();
     format!(
         "<!DOCTYPE html>\
          <html lang=\"en\"{theme_attr}>\
@@ -232,6 +236,7 @@ pub(super) fn build_page(
          <title>{title}</title>\
          <link rel=\"stylesheet\" href=\"{stylesheet}\">\
          {FAVICON_LINK}\
+         <script defer src=\"{script}\"></script>\
          {refresh}\
          </head>\
          <body>{body_html}</body>\

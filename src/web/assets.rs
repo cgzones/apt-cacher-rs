@@ -1,5 +1,7 @@
 //! The web interface's static assets, embedded at build time from
-//! `src/web/assets/` and served under content-hashed URLs.
+//! `src/web/assets/` and served under content-hashed URLs: the stylesheet
+//! and the optional script bundle (`/app.js`, the files under `js/` joined
+//! in order; `js/core.js` says what they may and may not do).
 //!
 //! A page links an asset as `{path}?v={version}`, the version being the
 //! first 16 hex digits of the asset's SHA-256. A new build whose asset
@@ -91,8 +93,16 @@ pub(super) static STYLESHEET: Asset = Asset::new(
     include_str!("assets/style.css"),
 );
 
+/// The optional scripts, one bundle. `core.js` comes first: it defines the
+/// `ACR` namespace the others register with. `text/javascript` per RFC 9239.
+pub(super) static SCRIPT: Asset = Asset::new(
+    "/app.js",
+    "text/javascript; charset=utf-8",
+    concat!(include_str!("assets/js/core.js")),
+);
+
 /// Every asset, for the route handler.
-static ALL: [&Asset; 1] = [&STYLESHEET];
+static ALL: [&Asset; 2] = [&STYLESHEET, &SCRIPT];
 
 /// The asset served at `path`, if any.
 pub(super) fn find(path: &str) -> Option<&'static Asset> {
@@ -153,7 +163,95 @@ mod tests {
     #[test]
     fn assets_are_found_by_their_path() {
         assert!(find("/style.css").is_some_and(|asset| asset.path == STYLESHEET.path));
+        assert!(find("/app.js").is_some_and(|asset| asset.path == SCRIPT.path));
         assert!(find("/style.css?v=1").is_none());
         assert!(find("/nope.css").is_none());
+        assert_ne!(STYLESHEET.version(), SCRIPT.version());
+    }
+
+    /// The one absolute URL the scripts may name: the SVG namespace, which
+    /// is an identifier, never fetched.
+    const SVG_NS: &str = "http://www.w3.org/2000/svg";
+
+    /// What the scripts must never contain. HTML-parsing sinks and
+    /// string-to-code (Trusted Types and `script-src 'self'` would refuse
+    /// them, leaving a feature broken instead of a hole), CSSOM writes (which
+    /// `style-src 'self'` does NOT cover, so the policy cannot catch them),
+    /// dynamic imports and script URLs.
+    const BANNED: &[&str] = &[
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+        "DOMParser",
+        "createContextualFragment",
+        "parseHTMLUnsafe",
+        "setHTMLUnsafe",
+        ".srcdoc",
+        "eval(",
+        "Function(",
+        "setTimeout(\"",
+        "setTimeout('",
+        "setInterval(\"",
+        "setInterval('",
+        ".style",
+        "setAttribute(\"style\"",
+        "setAttribute('style'",
+        "attributeStyleMap",
+        "cssText",
+        "insertRule",
+        "CSSStyleSheet",
+        "adoptedStyleSheets",
+        "javascript:",
+        "import(",
+        "importScripts",
+        "document.cookie",
+        "createPolicy",
+    ];
+
+    /// The first `.onfoo =` assignment in `js`: handlers are attached with
+    /// addEventListener throughout, which keeps them greppable and makes a
+    /// stray handler *attribute* stand out in review.
+    fn handler_assignment(js: &str) -> Option<&str> {
+        js.match_indices(".on").find_map(|(at, _)| {
+            let rest = js.get(at + 3..)?;
+            let name = rest.bytes().take_while(u8::is_ascii_lowercase).count();
+            let after = rest.get(name..)?.trim_start_matches(' ');
+            (name > 0 && after.starts_with('=') && !after.starts_with("=="))
+                .then(|| js.get(at..at + 3 + name))
+                .flatten()
+        })
+    }
+
+    #[test]
+    fn the_script_bundle_stays_inside_the_policy() {
+        let js = SCRIPT.body;
+        assert!(js.is_ascii(), "the scripts are ASCII only");
+        assert!(
+            js.starts_with(include_str!("assets/js/core.js")),
+            "core.js leads the bundle: it defines ACR"
+        );
+        for banned in BANNED {
+            assert!(!js.contains(banned), "the scripts use `{banned}`");
+        }
+        let without_namespace = js.replace(SVG_NS, "");
+        for scheme in ["http:", "https:", "data:", "blob:", "ws:", "wss:"] {
+            assert!(
+                !without_namespace.contains(scheme),
+                "the scripts name a `{scheme}` URL"
+            );
+        }
+        assert_eq!(handler_assignment(js), None);
+        assert_eq!(handler_assignment("x.onload = f"), Some(".onload"));
+        assert_eq!(handler_assignment("x.onState(f); a.on == b"), None);
+    }
+
+    #[test]
+    fn the_stylesheet_loads_nothing_else() {
+        let css = STYLESHEET.body;
+        assert!(css.is_ascii(), "the stylesheet is ASCII only");
+        for banned in ["@import", "url(", "expression("] {
+            assert!(!css.contains(banned), "the stylesheet uses `{banned}`");
+        }
     }
 }

@@ -1,0 +1,40 @@
+name: JavaScript
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    name: Syntax check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Hand-written, dependency-free scripts: a syntax check per file is the
+      # whole toolchain (no npm, no package.json). The banned-API and ASCII
+      # checks are Rust unit tests in src/web/assets.rs.
+      - name: node --check
+        run: |
+          for f in src/web/assets/js/*.js; do
+            echo "$f"
+            node --check "$f"
+          done
+
+      # The browser runs the files as one script, joined in the order
+      # src/web/assets.rs lists them: check that bundle too.
+      - name: node --check (bundle)
+        run: |
+          sed -n '/static SCRIPT/,/^);/p' src/web/assets.rs \
+            | grep -o 'assets/js/[a-z]*\.js' \
+            | sed 's|^|src/web/|' | xargs cat > "$RUNNER_TEMP/app.js"
+          node --check "$RUNNER_TEMP/app.js"
