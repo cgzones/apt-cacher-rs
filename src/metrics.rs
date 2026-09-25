@@ -834,9 +834,10 @@ pub(crate) static UPSTREAM_RETRIES: Counter = Counter::new();
 /// only its rate says how far back the web log page reaches.
 pub(crate) static LOGSTORE_EVICTIONS: Counter = Counter::new();
 
-/// Peak cache disk-quota utilization in basis points (10000 = 100%),
-/// clamped at 100%: an over-quota accounted size reads as 10000, not more.
-/// Only meaningful when `disk_quota` is configured; otherwise stays at 0.
+/// Peak cache disk-quota utilization in basis points (10000 = 100%). Not
+/// clamped: an over-quota accounted size reads above 10000, like the
+/// current utilization shown beside it. Only meaningful when `disk_quota`
+/// is configured; otherwise stays at 0.
 pub(crate) static CACHE_QUOTA_UTIL_PEAK_BPS: Peak = Peak::new();
 
 /// HTTPS upgrade attempted on an HTTP request (Auto / uncached scheme).

@@ -37,9 +37,9 @@ use crate::{
 
 use super::{
     fmt::{
-        CacheHitRatio, Colorize, DiskUsage, EnabledDisabled, FmtMTimeAge, FmtTimestamp, Gauge,
-        HtmlEscape, MinRate, OptOrUnlimited, OptSize, Pct, RatioClass, RelTime, Saturation, Utc,
-        Window, YesNo, as_size,
+        CacheHitRatio, Colorize, Count, DiskUsage, EnabledDisabled, FmtMTimeAge, FmtTimestamp,
+        Gauge, HtmlEscape, MinRate, OptOrUnlimited, OptSize, Pct, RatioClass, RelTime, Saturation,
+        Utc, Window, YesNo, as_size,
     },
     metrics_page::build_metrics_html,
     page::{Heading, Page, PageTitle, QueryOptions, SetupHint, build_nav_html, build_page},
@@ -530,13 +530,13 @@ fn build_daemon_status_html(
         .kind(Kind::Live)
         .value(format_args!(
             "{} (peak {})",
-            active_client_downloads(),
-            metrics::ACTIVE_CLIENT_DOWNLOADS_PEAK.get(),
+            Count::len(active_client_downloads()),
+            Count(metrics::ACTIVE_CLIENT_DOWNLOADS_PEAK.get()),
         ));
     t.entry("Metadata Cache Entries")
         .kind(Kind::Live)
         .tip("Process-local entries cached from per-file ETag and Last-Modified xattrs. Skips fgetxattr(2) on subsequent conditional-request hits; rebuilt lazily after restart.")
-        .value(cache_metadata::store().len());
+        .value(Count::len(cache_metadata::store().len()));
     t.finish()
 }
 
@@ -853,7 +853,11 @@ fn build_cache_stats_html(
 ) -> String {
     let total_download_count: i64 = mirrors.iter().map(|m| m.download_count).sum();
     let total_delivery_count: i64 = mirrors.iter().map(|m| m.delivery_count).sum();
-    let cache_hits = total_delivery_count.saturating_sub(total_download_count);
+    // Floored at 0: the two counts are pruned independently, so more
+    // downloads than deliveries can be on record.
+    let cache_hits = total_delivery_count
+        .saturating_sub(total_download_count)
+        .max(0);
 
     let uncacheable_count = get_uncacheables().read().len();
 
@@ -889,13 +893,15 @@ fn build_cache_stats_html(
         .value(Window(bandwidth_week));
     t.entry("Uncacheable Resources")
         .kind(Kind::Live)
-        .value(uncacheable_count);
+        .value(Count::len(uncacheable_count));
     t.entry("Cached Files")
         .kind(Kind::Live)
         .tip("From a walk of the mirror directories, cached for up to a minute.")
         .value(format_args!(
             "{} debs / {} metadata / {} by-hash",
-            aggregate.deb_files, aggregate.metadata_files, aggregate.byhash_files
+            Count::len(aggregate.deb_files),
+            Count::len(aggregate.metadata_files),
+            Count::len(aggregate.byhash_files)
         ));
     t.entry("Oldest Cached File")
         .kind(Kind::Live)

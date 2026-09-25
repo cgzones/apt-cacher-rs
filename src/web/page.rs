@@ -408,6 +408,8 @@ td { padding: 4px 10px; border-bottom: 1px solid var(--td-border); font-family: 
      font-size: 0.92em; font-variant-numeric: tabular-nums; max-width: 220px;
      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 tr:hover td { background: var(--row-hover-bg); }
+/* Figures line up by their last digit. */
+th.num, td.num { text-align: right; }
 /* A rule down the leading edge is the row's state, not a hover effect. */
 tr.row-aging td:first-child { box-shadow: inset 3px 0 var(--warn); }
 tr.row-stale td:first-child { box-shadow: inset 3px 0 var(--alert); }

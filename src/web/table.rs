@@ -19,18 +19,39 @@ pub(super) struct Table {
     /// Reused across cells so [`Table::cell`] can inspect a rendered value
     /// without allocating per cell.
     scratch: String,
+    /// Bit `i` set: column `i` holds figures, right-aligned so their digits
+    /// line up (see [`Table::numeric`]).
+    numeric: u64,
+    /// The column the next [`Table::cell`] fills.
+    column: usize,
 }
 
 impl Table {
+    /// A table whose columns at `columns` hold figures -- counts, sizes,
+    /// shares -- which are right-aligned (headers included) so the digits of
+    /// consecutive rows line up in the tabular numerals the stylesheet sets.
+    pub(super) fn numeric(headers: &[&'static str], columns: &[usize]) -> Self {
+        let numeric = columns.iter().fold(0_u64, |bits, &col| bits | (1 << col));
+        Self::build(headers, numeric)
+    }
+
     pub(super) fn new(headers: &[&'static str]) -> Self {
+        Self::build(headers, 0)
+    }
+
+    fn build(headers: &[&'static str], numeric: u64) -> Self {
         // Realistic dashboard tables (Mirrors, Origins) easily exceed 10 KB.
         // Pre-size to skip the reallocation chain.
         let mut out = String::with_capacity(16 * 1024);
         // The wrapper is what scrolls when the table is wider than its
         // section; without it a wide table forces a page-wide scrollbar.
         out.push_str("<div class=\"tablewrap\"><table><thead><tr>");
-        for h in headers {
-            out.push_str("<th scope=\"col\">");
+        for (col, h) in headers.iter().enumerate() {
+            out.push_str(if numeric & (1 << col) == 0 {
+                "<th scope=\"col\">"
+            } else {
+                "<th scope=\"col\" class=\"num\">"
+            });
             out.push_str(h);
             out.push_str("</th>");
         }
@@ -38,10 +59,13 @@ impl Table {
         Self {
             out,
             scratch: String::with_capacity(128),
+            numeric,
+            column: 0,
         }
     }
 
     pub(super) fn start_row(&mut self) {
+        self.column = 0;
         self.out.push_str("<tr>");
     }
 
@@ -49,6 +73,7 @@ impl Table {
     /// rule down the row's leading edge. `attr` is a whole ` class="..."`
     /// fragment (see `fmt::Freshness::row_class`), empty for no marker.
     pub(super) fn start_row_marked(&mut self, attr: &'static str) {
+        self.column = 0;
         swrite!(self.out, "<tr{attr}>");
     }
 
@@ -66,14 +91,25 @@ impl Table {
     /// `<span>`) cannot be reused verbatim in an attribute, so they are
     /// emitted bare.
     pub(super) fn cell(&mut self, value: impl Display) {
-        let Self { out, scratch } = self;
+        let Self {
+            out,
+            scratch,
+            numeric,
+            column,
+        } = self;
         scratch.clear();
         swrite!(scratch, "{value}");
+        let class = if *numeric & (1 << *column) == 0 {
+            ""
+        } else {
+            " class=\"num\""
+        };
+        *column += 1;
 
         if scratch.len() > Self::TITLE_THRESHOLD && !scratch.contains('<') {
-            swrite!(out, "<td title=\"{scratch}\">{scratch}</td>");
+            swrite!(out, "<td{class} title=\"{scratch}\">{scratch}</td>");
         } else {
-            swrite!(out, "<td>{scratch}</td>");
+            swrite!(out, "<td{class}>{scratch}</td>");
         }
     }
 
@@ -532,6 +568,29 @@ mod tests {
             "{html}"
         );
         assert!(!html.contains("title=\"<span"), "{html}");
+    }
+
+    #[test]
+    fn numeric_columns_are_marked_in_header_and_cells() {
+        let mut table = Table::numeric(&["Name", "Count"], &[1]);
+        for _ in 0..2 {
+            table.start_row();
+            table.cell("a");
+            table.cell(7);
+            table.end_row();
+        }
+        let html = table.finish();
+        assert!(
+            html.contains("<th scope=\"col\">Name</th><th scope=\"col\" class=\"num\">Count</th>"),
+            "{html}"
+        );
+        // The column restarts with every row.
+        assert_eq!(
+            html.matches("<tr><td>a</td><td class=\"num\">7</td></tr>")
+                .count(),
+            2,
+            "{html}"
+        );
     }
 
     #[test]

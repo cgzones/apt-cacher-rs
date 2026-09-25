@@ -29,7 +29,7 @@ use crate::{
 
 use super::{
     fmt::{
-        FmtLastSeenHealth, FmtTimestamp, Freshness, HtmlEscape, HtmlEscaped, Level, Nonzero,
+        Count, FmtLastSeenHealth, FmtTimestamp, Freshness, HtmlEscape, HtmlEscaped, Level, Nonzero,
         as_size,
     },
     table::{Table, tr, write_section_error},
@@ -442,23 +442,26 @@ pub(super) async fn build_mirror_table(
         aggregate.merge(*stats);
     }
 
-    let mut table = Table::new(&[
-        "Mirror",
-        "Last Seen",
-        "First Seen",
-        "Last Cleanup",
-        "Upstream Fetches",
-        "Client Deliveries",
-        "Cache Efficiency",
-        "Disk Space",
-        "File Count",
-        "Avg / Max Size",
-        "Debs / Metadata",
-        MIRROR_HEALTH_HEADERS[0],
-        MIRROR_HEALTH_HEADERS[1],
-        MIRROR_HEALTH_HEADERS[2],
-        MIRROR_HEALTH_HEADERS[3],
-    ]);
+    let mut table = Table::numeric(
+        &[
+            "Mirror",
+            "Last Seen",
+            "First Seen",
+            "Last Cleanup",
+            "Upstream Fetches",
+            "Client Deliveries",
+            "Cache Efficiency",
+            "Disk Space",
+            "File Count",
+            "Avg / Max Size",
+            "Debs / Metadata",
+            MIRROR_HEALTH_HEADERS[0],
+            MIRROR_HEALTH_HEADERS[1],
+            MIRROR_HEALTH_HEADERS[2],
+            MIRROR_HEALTH_HEADERS[3],
+        ],
+        &[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+    );
 
     // The per-mirror failure counts join by the `MirrorUri` rendering
     // (`mirror_health::key`); a failing mirror without a row of its own is
@@ -487,12 +490,12 @@ pub(super) async fn build_mirror_table(
             format_args!(
                 "{} ({})",
                 HumanFmt::Size(downloaded_bytes),
-                mirror.download_count
+                Count::db(mirror.download_count)
             ),
             format_args!(
                 "{} ({})",
                 HumanFmt::Size(delivered_bytes),
-                mirror.delivery_count
+                Count::db(mirror.delivery_count)
             ),
             EfficiencyCell {
                 downloaded: mirror.total_download_size,
@@ -502,13 +505,17 @@ pub(super) async fn build_mirror_table(
                 size: stats.size,
                 total: aggregate.size,
             },
-            stats.files,
+            Count::len(stats.files),
             AvgMaxCell {
                 files: stats.files,
                 size: stats.size,
                 max_file: stats.max_file_size,
             },
-            format_args!("{} / {}", stats.deb_files, stats.metadata_files),
+            format_args!(
+                "{} / {}",
+                Count::len(stats.deb_files),
+                Count::len(stats.metadata_files)
+            ),
             health_cell(mirror_health.unreachable, Level::Warn),
             health_cell(mirror_health.protocol, Level::Warn),
             health_cell(mirror_health.checksum, Level::Alert),
@@ -633,17 +640,20 @@ pub(super) fn render_client_table(
     let mut sorted: Vec<&ClientStatEntry> = clients.iter().collect();
     sorted.sort_unstable_by_key(|c| Reverse(c.last_seen));
 
-    let mut table = Table::new(&[
-        "IP",
-        "Last Seen",
-        "Upstream Fetched",
-        "Served to Client",
-        "Requests",
-        CLIENT_TROUBLE_HEADERS[0],
-        CLIENT_TROUBLE_HEADERS[1],
-        CLIENT_TROUBLE_HEADERS[2],
-        CLIENT_TROUBLE_HEADERS[3],
-    ]);
+    let mut table = Table::numeric(
+        &[
+            "IP",
+            "Last Seen",
+            "Upstream Fetched",
+            "Served to Client",
+            "Requests",
+            CLIENT_TROUBLE_HEADERS[0],
+            CLIENT_TROUBLE_HEADERS[1],
+            CLIENT_TROUBLE_HEADERS[2],
+            CLIENT_TROUBLE_HEADERS[3],
+        ],
+        &[2, 3, 4, 5, 6, 7, 8],
+    );
 
     let warn = |value| Nonzero {
         value,
@@ -669,9 +679,9 @@ pub(super) fn render_client_table(
             },
             HumanFmt::Size(downloaded),
             HumanFmt::Size(delivered),
-            client.request_count,
+            Count::db(client.request_count),
             warn(counts.slow),
-            counts.disconnect,
+            Count(counts.disconnect),
             warn(counts.cap_refused),
             warn(counts.unauthorized),
         );
@@ -686,7 +696,7 @@ pub(super) fn render_client_table(
             "N/A",
             "N/A",
             warn(counts.slow),
-            counts.disconnect,
+            Count(counts.disconnect),
             warn(counts.cap_refused),
             warn(counts.unauthorized),
         );
@@ -744,13 +754,16 @@ pub(super) fn render_top_packages_table(
     }
 
     let rows = packages.len();
-    let headers: &[&str] = match view {
+    let (headers, numeric): (&[&str], &[usize]) = match view {
         // "Package Size" meant the size of one copy in one table and the
         // cumulative bytes in the other; name each for what it counts.
-        TopPackagesView::ByCount => &["Package", "Deliveries", "Size Each"],
-        TopPackagesView::BySize => &["Package", "Delivered Total", "Deliveries", "Size Each"],
+        TopPackagesView::ByCount => (&["Package", "Deliveries", "Size Each"], &[1, 2]),
+        TopPackagesView::BySize => (
+            &["Package", "Delivered Total", "Deliveries", "Size Each"],
+            &[1, 2, 3],
+        ),
     };
-    let mut table = Table::new(headers);
+    let mut table = Table::numeric(headers, numeric);
 
     for pkg in packages {
         let pkg_size = as_size(pkg.package_size);
@@ -758,7 +771,7 @@ pub(super) fn render_top_packages_table(
             TopPackagesView::ByCount => tr!(
                 table,
                 HtmlEscape(&pkg.debname),
-                pkg.delivery_count,
+                Count::db(pkg.delivery_count),
                 HumanFmt::Size(pkg_size),
             ),
             TopPackagesView::BySize => {
@@ -767,7 +780,7 @@ pub(super) fn render_top_packages_table(
                     table,
                     HtmlEscape(&pkg.debname),
                     HumanFmt::Size(total),
-                    pkg.delivery_count,
+                    Count::db(pkg.delivery_count),
                     HumanFmt::Size(pkg_size),
                 );
             }

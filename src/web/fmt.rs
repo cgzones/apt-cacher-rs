@@ -146,15 +146,17 @@ impl Display for Gauge {
         match cap {
             Some(cap) if cap > 0 => write!(
                 f,
-                "{current} / {cap}<meter class=\"gauge\" min=\"0\" max=\"{cap}\" low=\"{}\" high=\"{}\" optimum=\"0\" value=\"{}\"></meter>",
+                "{} / {}<meter class=\"gauge\" min=\"0\" max=\"{cap}\" low=\"{}\" high=\"{}\" optimum=\"0\" value=\"{}\"></meter>",
+                Count(current),
+                Count(cap),
                 cap.div_ceil(2),
                 (cap.saturating_mul(4)).div_ceil(5),
                 current.min(cap),
             )?,
-            Some(_) | None => write!(f, "{current} / unlimited")?,
+            Some(_) | None => write!(f, "{} / unlimited", Count(current))?,
         }
         if let Some(peak) = peak {
-            write!(f, " <span class=\"peak\">peak {peak}</span>")?;
+            write!(f, " <span class=\"peak\">peak {}</span>", Count(peak))?;
         }
         Ok(())
     }
@@ -187,7 +189,12 @@ impl Display for Saturation {
         if attempts > 0 {
             #[expect(clippy::cast_precision_loss, reason = "only for display purposes")]
             let pct = refused as f64 / attempts as f64 * 100.0;
-            write!(f, "; {verb} {pct:.1}% ({refused} of {attempts})")?;
+            write!(
+                f,
+                "; {verb} {pct:.1}% ({} of {})",
+                Count(refused),
+                Count(attempts)
+            )?;
         }
         Ok(())
     }
@@ -450,6 +457,44 @@ impl<T: Display> Display for Colorize<T> {
     }
 }
 
+/// A count, digit-grouped once it has five digits or more: `12 345`,
+/// `1 234 567` (a narrow no-break space between groups, so the figure never
+/// wraps and no locale reads it as a decimal point). Four digits stay as
+/// they are: `2026` reads as a number, `2 026` as two.
+#[derive(Clone, Copy)]
+pub(super) struct Count(pub(super) u64);
+impl Count {
+    /// A count from an `i64` database column, clamped at 0 like
+    /// [`as_size`].
+    pub(super) fn db(value: i64) -> Self {
+        Self(as_size(value))
+    }
+
+    /// A count of in-memory entries.
+    pub(super) fn len(value: usize) -> Self {
+        Self(value as u64)
+    }
+}
+impl Display for Count {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        const SEPARATOR: &str = "\u{202f}";
+        let value = self.0;
+        if value < 10_000 {
+            return write!(f, "{value}");
+        }
+        let mut divisor = 1;
+        while value / divisor >= 1000 {
+            divisor *= 1000;
+        }
+        write!(f, "{}", value / divisor)?;
+        while divisor > 1 {
+            divisor /= 1000;
+            write!(f, "{SEPARATOR}{:03}", value / divisor % 1000)?;
+        }
+        Ok(())
+    }
+}
+
 /// Render `0` plain; render any positive value inside `<span class="alert">`.
 pub(super) struct AlertNonzero(pub(super) u64);
 impl Display for AlertNonzero {
@@ -457,7 +502,7 @@ impl Display for AlertNonzero {
         if self.0 == 0 {
             f.write_str("0")
         } else {
-            write!(f, "<span class=\"alert\">{}</span>", self.0)
+            write!(f, "<span class=\"alert\">{}</span>", Count(self.0))
         }
     }
 }
@@ -469,7 +514,7 @@ impl Display for WarnNonzero {
         if self.0 == 0 {
             f.write_str("0")
         } else {
-            write!(f, "<span class=\"warn\">{}</span>", self.0)
+            write!(f, "<span class=\"warn\">{}</span>", Count(self.0))
         }
     }
 }
@@ -611,9 +656,19 @@ impl Display for CacheHitRatio {
         if self.total <= 0 {
             f.write_str("N/A")
         } else {
+            // Floored at 0: the persisted delivery and download counts are
+            // pruned separately (usage_retention_days), so more downloads
+            // than deliveries can be on record; a hit ratio cannot be
+            // negative.
+            let hits = self.hits.clamp(0, self.total);
             #[expect(clippy::cast_precision_loss, reason = "only for display purposes")]
-            let pct = self.hits as f64 / self.total as f64 * 100.0;
-            write!(f, "{pct:.1}% ({} / {})", self.hits, self.total)
+            let pct = hits as f64 / self.total as f64 * 100.0;
+            write!(
+                f,
+                "{pct:.1}% ({} / {})",
+                Count::db(hits),
+                Count::db(self.total)
+            )
         }
     }
 }
@@ -687,8 +742,8 @@ mod tests {
     use std::fmt::Display;
 
     use super::{
-        Age, CacheHitRatio, FmtTimestamp, Freshness, Gauge, HtmlEscape, Meter, Pct, RatioClass,
-        RelTime, Saturation, Span,
+        Age, CacheHitRatio, Count, FmtTimestamp, Freshness, Gauge, HtmlEscape, Meter, Pct,
+        RatioClass, RelTime, Saturation, Span,
     };
 
     /// 2023-11-14T22:13:20Z, so every rendered timestamp below is fixed.
@@ -970,5 +1025,24 @@ mod tests {
             }),
             "at cap 2 h 13 min; refused 4.2% (12 of 285)",
         );
+    }
+
+    #[test]
+    fn counts_group_digits_from_five_on() {
+        assert_eq!(render(Count(0)), "0");
+        assert_eq!(render(Count(9_999)), "9999");
+        assert_eq!(render(Count(10_000)), "10\u{202f}000");
+        assert_eq!(render(Count(1_234_567)), "1\u{202f}234\u{202f}567");
+        assert_eq!(render(Count(100_000_005)), "100\u{202f}000\u{202f}005");
+        assert_eq!(
+            render(Count(u64::MAX)),
+            "18\u{202f}446\u{202f}744\u{202f}073\u{202f}709\u{202f}551\u{202f}615"
+        );
+    }
+
+    #[test]
+    fn a_hit_ratio_is_never_negative() {
+        // More downloads than deliveries on record: 0 hits, not -25 %.
+        assert_eq!(render(CacheHitRatio { hits: -1, total: 4 }), "0.0% (0 / 4)");
     }
 }

@@ -752,11 +752,14 @@ impl CacheQuota {
         let Some(quota) = self.inner.quota_config else {
             return;
         };
-        // bps = current * 10000 / quota, computed in u128 to avoid overflow.
-        // Clamp to 10_000 (= 100.00 %) so over-quota states do not produce a
-        // misleading sentinel; `quota` is NonZero so no div-by-zero.
+        // bps = current * 10000 / quota, computed in u128 to avoid overflow;
+        // `quota` is NonZero so no div-by-zero. Not clamped at 100 %: the
+        // cache can run over its quota (reservations settle after the
+        // gate, cleanup trails), and the dashboard shows the current
+        // utilization unclamped beside this peak -- "105%, peak 100%" read
+        // as a contradiction.
         let bps = u128::from(current).saturating_mul(10_000) / std::num::NonZeroU128::from(quota);
-        let bps = u64::try_from(bps.min(10_000)).expect("10_000 fits in u64");
+        let bps = u64::try_from(bps).unwrap_or(u64::MAX);
         metrics::CACHE_QUOTA_UTIL_PEAK_BPS.update(bps);
     }
 
@@ -1022,6 +1025,15 @@ mod tests {
     /// A `Content-Length` of `v` blocks.
     fn exact(v: u64) -> ContentLength {
         ContentLength::Exact(nz(v))
+    }
+
+    /// An over-quota cache records its true utilization as the peak, so the
+    /// dashboard cannot show "105%, peak 100%".
+    #[test]
+    fn the_utilization_peak_is_not_clamped_at_the_quota() {
+        let quota = CacheQuota::new(0, Some(NonZero::new(100).expect("non-zero")));
+        quota.sample_utilization_peak_with(105);
+        assert!(metrics::CACHE_QUOTA_UTIL_PEAK_BPS.get() >= 10_500);
     }
 
     #[test]
