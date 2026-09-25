@@ -21,7 +21,7 @@
 //! it.  A successful scan publishes that figure for the dashboard
 //! (`metrics::ORPHANED_PARTIAL_*`).
 
-use std::{borrow::Cow, num::NonZero, path::Path};
+use std::{borrow::Cow, net::Ipv6Addr, num::NonZero, path::Path};
 
 use hashbrown::HashMap;
 use tracing::{debug, error, trace};
@@ -164,6 +164,16 @@ static FLAT_WALK: WalkContext = WalkContext {
     anomalies: AnomalyLevel::Warn,
 };
 
+/// Before IPv6 cache directories were bracketed, an IPv6 alias target
+/// could create a bare address, optionally followed by `:port`. The two
+/// forms can be ambiguous, so recognition must not guess a destination.
+fn is_legacy_ipv6_dir(name: &str) -> bool {
+    name.parse::<Ipv6Addr>().is_ok()
+        || name.rsplit_once(':').is_some_and(|(host, port)| {
+            host.parse::<Ipv6Addr>().is_ok() && port.parse::<NonZero<u16>>().is_ok()
+        })
+}
+
 /// Returns the size in bytes and the file count of the entire cache.
 /// Files that cannot be accessed are not included; a message is logged for each.
 pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, CacheScanError> {
@@ -190,13 +200,13 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
     // entry is matched via an O(1) HashMap lookup instead of an inner O(m)
     // scan, and each row's nested-mirror set costs one sorted-prefix scan of
     // its own bucket rather than an O(n) scan per directory entry.  Keys are
-    // owned `String`s because the `Cow` from `format_cache_dir` may borrow
+    // owned `String`s because the `Cow` from `format_authority` may borrow
     // from local data (the formatted port).
     let mut mirrors_by_dir: HashMap<String, HostBucket<'_>> = HashMap::with_capacity(mirrors.len());
     for mirror in &mirrors {
         let site = mirror.site();
         let bucket = mirrors_by_dir
-            .entry(site.host.format_cache_dir(site.port).into_owned())
+            .entry(site.host.format_authority(site.port).into_owned())
             .or_insert_with(|| HostBucket {
                 host: site.host,
                 port: site.port,
@@ -248,8 +258,15 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
             .to_str()
             .and_then(|name| mirrors_by_dir.get(name))
         else {
+            // A legacy directory is unexpected disk usage like any other
+            // unmatched one, so it goes through the same report (and metric);
+            // only the consequence names the migration.
             entry.report_unexpected(
-                "no registered mirror matches it, so not counting it or its contents towards the cache size",
+                if entry.name().to_str().is_some_and(is_legacy_ipv6_dir) {
+                    "it is a legacy IPv6 cache directory with an unbracketed host name, so its contents are no longer served or counted towards the cache size or disk quota; stop the daemon and verify the original host and port before moving its contents to the current authority directory (bracketed IPv6, or IPv4 for a mapped address), or remove the obsolete directory"
+                } else {
+                    "no registered mirror matches it, so not counting it or its contents towards the cache size"
+                },
             );
             continue;
         };
@@ -480,6 +497,30 @@ fn classify_mirror_subdir(entry: &Entry<'_, Level>, mirror_path: &str, nested: &
 mod tests {
     use super::*;
     use crate::{cache_quota::QUOTA_BLOCK_SIZE, partial_claim::PartialClaim};
+
+    #[test]
+    fn legacy_ipv6_directories_include_aliases_and_mapped_addresses() {
+        for name in [
+            "2001:db8::1",
+            "2001:db8::1:8080", // Could also be a portless IPv6 address.
+            "2001:db8::1:65535",
+            "::ffff:192.0.2.1",
+            "::ffff:192.0.2.1:3142",
+        ] {
+            assert!(is_legacy_ipv6_dir(name), "{name}");
+        }
+        for name in [
+            "[2001:db8::1]",
+            "[2001:db8::1]:8080",
+            "192.0.2.1:8080",
+            "deb.debian.org:8080",
+            "tmp",
+            "2001:db8::1:65536",
+            "2001:db8::1:port",
+        ] {
+            assert!(!is_legacy_ipv6_dir(name), "{name}");
+        }
+    }
 
     /// Kept partials are disk usage the quota counts, so the scan tallies
     /// the `tmp/` below a mirror and the ones inside the flat tree.

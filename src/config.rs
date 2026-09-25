@@ -251,6 +251,11 @@ impl DomainName {
     ///
     /// IPv6 addresses are bracketed per §3.2.2.
     /// A port is appended with `:` when present.
+    ///
+    /// This is also the per-host cache directory name
+    /// (`cache_paths::CachePaths::host_dir`): only the bracketed form keeps
+    /// an IPv6 host with a port (`[2001:db8::1]:8080`) apart from the
+    /// portless address that ends in the same digits (`[2001:db8::1:8080]`).
     #[must_use]
     pub(crate) fn format_authority(&self, port: Option<NonZero<u16>>) -> Cow<'_, str> {
         match (self.is_ipv6(), port) {
@@ -258,18 +263,6 @@ impl DomainName {
             (true, None) => Cow::Owned(format!("[{self}]")),
             (false, Some(port)) => Cow::Owned(format!("{self}:{port}")),
             (false, None) => Cow::Borrowed(self.as_str()),
-        }
-    }
-
-    /// Format as a cache directory name component.
-    ///
-    /// Unlike [`format_authority`](Self::format_authority), IPv6 addresses
-    /// are **not** bracketed - the bare address is used as a directory name.
-    #[must_use]
-    pub(crate) fn format_cache_dir(&self, port: Option<NonZero<u16>>) -> Cow<'_, str> {
-        match port {
-            Some(port) => Cow::Owned(format!("{self}:{port}")),
-            None => Cow::Borrowed(self.as_str()),
         }
     }
 }
@@ -321,12 +314,6 @@ impl<'de> Deserialize<'de> for DomainName {
         let s: String = Deserialize::deserialize(deserializer)?;
 
         Self::new(s).map_err(|s| D::Error::custom(format!("Invalid domain `{s}`")))
-    }
-}
-
-impl AsRef<std::ffi::OsStr> for DomainName {
-    fn as_ref(&self) -> &std::ffi::OsStr {
-        self.as_str().as_ref()
     }
 }
 
@@ -511,18 +498,6 @@ impl std::fmt::Display for ClientHost {
 impl std::fmt::Display for CacheHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
-    }
-}
-
-impl AsRef<std::ffi::OsStr> for ClientHost {
-    fn as_ref(&self) -> &std::ffi::OsStr {
-        self.0.as_ref()
-    }
-}
-
-impl AsRef<std::ffi::OsStr> for CacheHost {
-    fn as_ref(&self) -> &std::ffi::OsStr {
-        self.0.as_ref()
     }
 }
 
@@ -2382,13 +2357,12 @@ mod test {
     #[test]
     fn host_wrapper_deref_exposes_format_helpers() {
         // `Deref<Target = DomainName>` is the contract every caller
-        // relies on for `as_str` / `format_cache_dir` / `format_authority`.
+        // relies on for `as_str` / `format_authority`.
         let client = clh("example.test");
         let cache = cah("example.test");
         let port = NonZero::new(8080);
-        assert_eq!(client.format_cache_dir(port).as_ref(), "example.test:8080");
-        assert_eq!(cache.format_cache_dir(port).as_ref(), "example.test:8080");
         assert_eq!(client.format_authority(port).as_ref(), "example.test:8080");
+        assert_eq!(cache.format_authority(port).as_ref(), "example.test:8080");
     }
 
     #[test]

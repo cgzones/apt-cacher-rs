@@ -30,7 +30,10 @@
 //! Flat repositories anchor at the host-level `flat/` sibling rather than
 //! nesting beneath a per-mirror subdirectory, and the URL path becomes the
 //! on-disk path verbatim below it.  `{host}` is the alias-resolved cache
-//! host ([`MirrorSite`]); the `{mirror_path}` and leaf strings are validated
+//! host ([`MirrorSite`]) in its URI authority form
+//! (`DomainName::format_authority`): an IPv6 host is bracketed
+//! (`[2001:db8::1]:8080`), which keeps it apart from the portless address
+//! ending in the same digits.  The `{mirror_path}` and leaf strings are validated
 //! relative before they get here (`valid_mirrorname` / `valid_filename`),
 //! which every join re-asserts.
 //!
@@ -160,7 +163,7 @@ impl std::fmt::Display for MirrorSite<'_> {
     /// the host level, for log lines naming a mirror by where it is cached.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self { host, port, path } = self;
-        write!(f, "{}/{path}", host.format_cache_dir(*port))
+        write!(f, "{}/{path}", host.format_authority(*port))
     }
 }
 
@@ -208,7 +211,7 @@ impl<'a> CachePaths<'a> {
     /// mirror of one cache host plus its `flat/` sibling.
     #[must_use]
     pub(crate) fn host_dir(self, host: &CacheHost, port: Option<NonZero<u16>>) -> PathBuf {
-        let host_dir = host.format_cache_dir(port);
+        let host_dir = host.format_authority(port);
         self.assemble([Some(Path::new(host_dir.as_ref()))])
     }
 
@@ -216,7 +219,7 @@ impl<'a> CachePaths<'a> {
     /// repository served from `host`, scanned once per host.
     #[must_use]
     pub(crate) fn flat_root(self, host: &CacheHost, port: Option<NonZero<u16>>) -> PathBuf {
-        let host_dir = host.format_cache_dir(port);
+        let host_dir = host.format_authority(port);
         self.assemble([
             Some(Path::new(host_dir.as_ref())),
             Some(Path::new(SUBDIR_FLAT)),
@@ -311,7 +314,7 @@ impl<'a> CachePaths<'a> {
         leaf: Option<&Path>,
     ) -> PathBuf {
         let MirrorSite { host, port, path } = site;
-        let host_dir = host.format_cache_dir(port);
+        let host_dir = host.format_authority(port);
         self.assemble([
             Some(Path::new(host_dir.as_ref())),
             anchor.subdir().map(Path::new),
@@ -544,6 +547,44 @@ mod tests {
             }
             .to_string(),
             "deb.debian.org/debian"
+        );
+    }
+
+    /// An IPv6 host directory is the URI authority form. The bare address
+    /// followed by `:port` would name `(2001:db8::1, 8080)` and the portless
+    /// `2001:db8::1:8080` alike, merging two mirrors' trees (and the scan's
+    /// buckets, so cleanup would reconcile each against the other's index).
+    #[test]
+    fn an_ipv6_host_dir_is_bracketed_and_never_collides() {
+        let host = cache_host("2001:db8::1");
+        let site = MirrorSite {
+            host: &host,
+            port: NonZero::new(8080),
+            path: "debian",
+        };
+        assert_eq!(
+            PATHS().host_dir(&host, None),
+            PathBuf::from("/cache/[2001:db8::1]")
+        );
+        assert_eq!(
+            PATHS().mirror_dir(site),
+            PathBuf::from("/cache/[2001:db8::1]:8080/debian")
+        );
+        assert_eq!(
+            PATHS().flat_root(&host, NonZero::new(8080)),
+            PathBuf::from("/cache/[2001:db8::1]:8080/flat")
+        );
+        assert_eq!(site.to_string(), "[2001:db8::1]:8080/debian");
+
+        let longer = cache_host("2001:db8::1:8080");
+        assert_ne!(
+            PATHS().host_dir(&host, NonZero::new(8080)),
+            PATHS().host_dir(&longer, None),
+            "a port and an address ending in the same digits share no directory"
+        );
+        assert_eq!(
+            PATHS().host_dir(&longer, None),
+            PathBuf::from("/cache/[2001:db8::1:8080]")
         );
     }
 
