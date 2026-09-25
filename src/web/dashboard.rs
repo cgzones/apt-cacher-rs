@@ -219,7 +219,7 @@ async fn build_mirror_fs_section(
     let health = mirror_health::snapshot();
 
     let ((section, aggregate), free_disk_bytes) = tokio::join!(
-        build_mirror_table(mirrors, &health, now_epoch, &config.cache_directory),
+        build_mirror_table(mirrors, &health, now_epoch, config),
         // statvfs() can stall on slow/hung filesystems (NFS, FUSE, dying
         // disks); run it on the blocking pool so it cannot wedge the tokio
         // worker.

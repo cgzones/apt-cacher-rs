@@ -604,6 +604,14 @@ dl.details dd.last { color: var(--details-key-fg); font-weight: 400; font-size: 
 .dot.ok { background: var(--ok); }
 .dot.warn { background: var(--warn); }
 .dot.alert { background: var(--alert); }
+/* The scheme a mirror is dialled with, between the dot and the name. Plain
+   HTTP by configuration is no alarm and stays muted; only a failed HTTPS
+   probe is painted. */
+.scheme { display: inline-block; font-family: var(--mono); font-size: 0.72em; font-weight: 600;
+          padding: 0 4px; margin-right: 6px; border-radius: 3px; vertical-align: middle;
+          border: 1px solid var(--section-border); color: var(--details-key-fg); cursor: help; }
+.scheme.https { color: var(--ok); }
+.scheme.warn { color: var(--warn); border-color: var(--warn); }
 /* The time scope of a column or row that differs from its neighbours'. */
 .scope { display: inline-block; font-size: 0.72em; font-weight: 600; padding: 0 5px;
          border-radius: 8px; background: var(--count-bg); color: var(--details-key-fg);

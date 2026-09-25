@@ -17,12 +17,14 @@ use crate::{
     cache_paths::{CachePaths, SUBDIR_FLAT_BYHASH},
     cache_walk::{AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkContext, Walker},
     client_trouble::ClientTrouble,
+    config::Config,
     database::{ClientStatEntry, MirrorStatEntry, OriginEntry, TopPackageEntry},
     deb_mirror::is_deb_package,
     error::ErrorReport,
     humanfmt::HumanFmt,
     metrics,
     mirror_health::MirrorHealth,
+    scheme_cache::{self, SchemeKeyRef, SchemeVerdict},
     swrite,
     uncacheables::get_uncacheables,
 };
@@ -255,9 +257,12 @@ mod mirror_cells {
 
     use crate::humanfmt::HumanFmt;
 
-    use crate::mirror_health::MirrorHealth;
+    use crate::{
+        mirror_health::MirrorHealth,
+        scheme_cache::{Scheme, SchemeVerdict},
+    };
 
-    use super::super::fmt::Meter;
+    use super::super::fmt::{Age, HtmlEscape, Meter};
 
     /// The coloured dot in front of a mirror's name: green without a failure
     /// since start, red once one of its files failed checksum verification
@@ -299,6 +304,69 @@ mod mirror_cells {
                 }
             }
             f.write_str("\"></span>")
+        }
+    }
+
+    /// The scheme a mirror is dialled with, a chip between its health dot
+    /// and its name: `https`, `http`, or `?` before the first contact
+    /// decides it. The title says why, for the mirror and for every alias
+    /// host that is dialled for it (each has a scheme of its own). Only a
+    /// failed HTTPS probe -- of the mirror or of an alias -- warns.
+    pub(super) struct SchemeChip<'a> {
+        pub verdict: SchemeVerdict,
+        /// Alias hosts of this mirror with their own verdicts.
+        pub aliases: &'a [(&'a str, SchemeVerdict)],
+    }
+    impl Display for SchemeChip<'_> {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            let Self { verdict, aliases } = *self;
+            let (scheme, text) = match verdict.scheme() {
+                Some(Scheme::Https) => ("https", "https"),
+                Some(Scheme::Http) => ("http", "http"),
+                None => ("unknown", "?"),
+            };
+            let fallback = std::iter::once(verdict)
+                .chain(aliases.iter().map(|&(_, alias)| alias))
+                .any(|v| matches!(v, SchemeVerdict::HttpFallback { reprobe_in: _ }));
+            let warn = if fallback { " warn" } else { "" };
+            write!(
+                f,
+                "<span class=\"scheme {scheme}{warn}\" title=\"{}",
+                Why(verdict)
+            )?;
+            for &(host, alias) in aliases {
+                write!(f, " Alias {}: {}", HtmlEscape(host), Why(alias))?;
+            }
+            write!(f, "\">{text}</span>")
+        }
+    }
+
+    /// One sentence on why a host is dialled as it is, for a title.
+    struct Why(SchemeVerdict);
+    impl Display for Why {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            match self.0 {
+                SchemeVerdict::HttpOnlyListed => {
+                    f.write_str("Plain HTTP: the host is listed in http_only_mirrors.")
+                }
+                SchemeVerdict::HttpNever => {
+                    f.write_str("Plain HTTP: https_upgrade_mode is Never.")
+                }
+                SchemeVerdict::HttpsForced => {
+                    f.write_str("HTTPS: https_upgrade_mode is Always.")
+                }
+                SchemeVerdict::HttpsUpgraded => {
+                    f.write_str("HTTPS: upgraded from plain HTTP (https_upgrade_mode Auto).")
+                }
+                SchemeVerdict::HttpFallback { reprobe_in } => write!(
+                    f,
+                    "Plain HTTP: the HTTPS probe failed (no TLS or a certificate that did not verify). Fix the mirror's TLS, or list it in http_only_mirrors to stop probing; HTTPS is probed again in {}.",
+                    Age(reprobe_in.as_secs().max(1))
+                ),
+                SchemeVerdict::Undecided => f.write_str(
+                    "Not dialled since start: the next request probes HTTPS and falls back to plain HTTP (https_upgrade_mode Auto).",
+                ),
+            }
         }
     }
 
@@ -392,13 +460,47 @@ fn health_cell(value: u64, level: Level) -> Nonzero {
     Nonzero { value, level }
 }
 
+/// The Mirrors table's name column: what the dot and the chip in front of
+/// each name mean.
+const MIRROR_HEADER: &str = "<span title=\"The dot is the mirror's upstream health since start (hover it for the failures); the chip is the scheme it is dialled with now (hover it for why).\">Mirror</span>";
+
+/// The [`mirror_cells::SchemeChip`] parts of `mirror`: its own verdict and
+/// one per alias host configured for it, each looked up on the mirror's port.
+fn scheme_verdicts<'a>(
+    mirror: &MirrorStatEntry,
+    config: &'a Config,
+) -> (SchemeVerdict, Vec<(&'a str, SchemeVerdict)>) {
+    let port = mirror.port().map(std::num::NonZero::get);
+    let verdict = scheme_cache::verdict_for(
+        SchemeKeyRef {
+            host: mirror.host.as_str(),
+            port,
+        },
+        config,
+    );
+    let aliases = config
+        .aliases
+        .iter()
+        .filter(|alias| alias.main.as_str() == mirror.host.as_str())
+        .flat_map(|alias| &alias.aliases)
+        .map(|host| {
+            let host = host.as_str();
+            (
+                host,
+                scheme_cache::verdict_for(SchemeKeyRef { host, port }, config),
+            )
+        })
+        .collect();
+    (verdict, aliases)
+}
+
 pub(super) async fn build_mirror_table(
     mirrors: &[MirrorStatEntry],
     health: &HashMap<Box<str>, MirrorHealth>,
     now_epoch: i64,
-    cache_path: &Path,
+    config: &Config,
 ) -> (Section, DirStats) {
-    use mirror_cells::{AvgMaxCell, DirSizeCell, EfficiencyCell, HealthDot};
+    use mirror_cells::{AvgMaxCell, DirSizeCell, EfficiencyCell, HealthDot, SchemeChip};
 
     if mirrors.is_empty() && health.is_empty() {
         return (Section::EMPTY, DirStats::default());
@@ -407,7 +509,7 @@ pub(super) async fn build_mirror_table(
     let mut sorted: Vec<&MirrorStatEntry> = mirrors.iter().collect();
     sorted.sort_unstable_by_key(|m| Reverse(m.last_seen));
 
-    let paths = CachePaths::new(cache_path);
+    let paths = CachePaths::new(&config.cache_directory);
     let mirror_paths: Vec<PathBuf> = sorted
         .iter()
         .map(|mirror| paths.mirror_dir(mirror.site()))
@@ -444,7 +546,7 @@ pub(super) async fn build_mirror_table(
 
     let mut table = Table::numeric(
         &[
-            "Mirror",
+            MIRROR_HEADER,
             "Last Seen",
             "First Seen",
             "Last Cleanup",
@@ -476,15 +578,21 @@ pub(super) async fn build_mirror_table(
         swrite!(key, "{}", mirror.uri());
         let mirror_health = health.get(key.as_str()).copied().unwrap_or_default();
         unmatched.retain(|(k, _)| *k != key);
+        let (verdict, aliases) = scheme_verdicts(mirror, config);
 
         tr!(
             marked Freshness::of(mirror.last_seen, now_epoch).row_class(),
             table,
             // The dot makes the cell markup, which `Table::cell` never titles,
-            // so the name carries its own title for when it is cut off.
+            // so the name carries its own title for when it is cut off. The
+            // name stays last in the cell.
             format_args!(
-                "{}<span title=\"{uri}\">{uri}</span>",
+                "{}{}<span title=\"{uri}\">{uri}</span>",
                 HealthDot(mirror_health),
+                SchemeChip {
+                    verdict,
+                    aliases: &aliases,
+                },
                 uri = HtmlEscaped(mirror.uri())
             ),
             FmtLastSeenHealth {
@@ -536,7 +644,8 @@ pub(super) async fn build_mirror_table(
     }
 
     // A mirror that failed before it ever answered has no persisted row:
-    // everything but its failure counts is unknown.
+    // everything but its failure counts is unknown, its scheme chip
+    // included (the row has only the rendered name to go by).
     unmatched.sort_unstable_by_key(|(key, _)| *key);
     for (key, mirror_health) in &unmatched {
         tr!(

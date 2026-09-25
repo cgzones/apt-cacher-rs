@@ -252,6 +252,105 @@ pub(crate) fn resolve(key: SchemeKeyRef<'_>, config: &Config) -> SchemeDecision 
     decide(cached, is_http_only, config.https_upgrade_mode)
 }
 
+/// A live cache entry, as the dashboard reads it: the scheme and, for a
+/// learned HTTP scheme, how long until it expires and `Auto` probes HTTPS
+/// again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LiveScheme {
+    pub(crate) scheme: Scheme,
+    /// `Some` for an HTTP entry only; HTTPS entries do not age.
+    pub(crate) expires_in: Option<coarsetime::Duration>,
+}
+
+/// The live entry for `key`, `None` without one (never learned, evicted
+/// after a terminal failure, or an expired HTTP entry).
+#[must_use]
+pub(crate) fn live_entry(key: SchemeKeyRef<'_>) -> Option<LiveScheme> {
+    live_entry_at(key, Instant::now())
+}
+
+/// [`live_entry`] at the given clock reading.
+fn live_entry_at(key: SchemeKeyRef<'_>, now: Instant) -> Option<LiveScheme> {
+    let entry = *cache().read().get(&key)?;
+    let scheme = entry.live_at(now)?;
+    let expires_in = match scheme {
+        Scheme::Https => None,
+        Scheme::Http => Some(HTTP_SCHEME_TTL.saturating_sub(now.duration_since(entry.learned))),
+    };
+    Some(LiveScheme { scheme, expires_in })
+}
+
+/// The scheme a mirror is dialled with now and why, for the dashboard's
+/// Mirrors table. Each points the operator at one config option, or at the
+/// mirror; only [`Self::HttpFallback`] is a bad sign.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SchemeVerdict {
+    /// Plain HTTP because `http_only_mirrors` lists the host.
+    HttpOnlyListed,
+    /// Plain HTTP because `https_upgrade_mode` is `Never`.
+    HttpNever,
+    /// HTTPS because `https_upgrade_mode` is `Always` (no fallback).
+    HttpsForced,
+    /// HTTPS, learned by an `Auto` upgrade probe that succeeded.
+    HttpsUpgraded,
+    /// Plain HTTP under `Auto` after a failed HTTPS probe: the host has no
+    /// TLS, or presented a certificate that did not verify. HTTPS is probed
+    /// again once the entry expires, `reprobe_in` from now.
+    HttpFallback { reprobe_in: coarsetime::Duration },
+    /// `Auto` with no live entry: not dialled since start (or since the entry
+    /// was evicted or expired); the next request probes HTTPS.
+    Undecided,
+}
+
+impl SchemeVerdict {
+    /// The scheme the next request uses, `None` while undecided.
+    #[must_use]
+    pub(crate) const fn scheme(self) -> Option<Scheme> {
+        match self {
+            Self::HttpOnlyListed | Self::HttpNever | Self::HttpFallback { reprobe_in: _ } => {
+                Some(Scheme::Http)
+            }
+            Self::HttpsForced | Self::HttpsUpgraded => Some(Scheme::Https),
+            Self::Undecided => None,
+        }
+    }
+}
+
+/// The verdict for a host from the configuration and its live cache entry.
+/// Pure, like [`decide`], whose precedence it follows: the configured HTTP
+/// cases first (a live entry cannot contradict them, as no upgrade is
+/// attempted for such a host), then the mode.
+#[must_use]
+fn verdict(mode: HttpsUpgradeMode, is_http_only: bool, live: Option<LiveScheme>) -> SchemeVerdict {
+    if is_http_only {
+        return SchemeVerdict::HttpOnlyListed;
+    }
+    match mode {
+        HttpsUpgradeMode::Never => SchemeVerdict::HttpNever,
+        HttpsUpgradeMode::Always => SchemeVerdict::HttpsForced,
+        HttpsUpgradeMode::Auto => match live {
+            Some(LiveScheme {
+                scheme: Scheme::Https,
+                expires_in: _,
+            }) => SchemeVerdict::HttpsUpgraded,
+            Some(LiveScheme {
+                scheme: Scheme::Http,
+                expires_in,
+            }) => SchemeVerdict::HttpFallback {
+                reprobe_in: expires_in.unwrap_or(coarsetime::Duration::from_ticks(0)),
+            },
+            None => SchemeVerdict::Undecided,
+        },
+    }
+}
+
+/// [`verdict`] for `key` from the global cache and `config`.
+#[must_use]
+pub(crate) fn verdict_for(key: SchemeKeyRef<'_>, config: &Config) -> SchemeVerdict {
+    let is_http_only = config.http_only_mirrors.iter().any(|m| m.permits(key.host));
+    verdict(config.https_upgrade_mode, is_http_only, live_entry(key))
+}
+
 /// Cache the scheme a successful upstream connection used. Vacant-only: a
 /// live entry is left untouched, an expired HTTP entry is replaced (and dated
 /// afresh). Returns `true` if newly inserted, so the caller can emit its own
@@ -447,6 +546,104 @@ mod tests {
         assert!(record_success_at(host, Scheme::Http, t0));
         assert_eq!(record_failure_at(host, t0 + HTTP_SCHEME_TTL), None);
         assert_eq!(cached_scheme_at(host, t0), None, "the entry is gone");
+    }
+
+    /// A live HTTP entry reports the time until Auto probes HTTPS again; an
+    /// HTTPS one does not age.
+    #[test]
+    fn a_live_entry_carries_its_remaining_lifetime() {
+        let http = key("live-http.test.invalid");
+        let https = key("live-https.test.invalid");
+        let t0 = Instant::now();
+        let ten_min = coarsetime::Duration::from_secs(600);
+        assert_eq!(live_entry_at(http, t0), None);
+        assert!(record_success_at(http, Scheme::Http, t0));
+        assert!(record_success_at(https, Scheme::Https, t0));
+        assert_eq!(
+            live_entry_at(http, t0 + ten_min),
+            Some(LiveScheme {
+                scheme: Scheme::Http,
+                expires_in: Some(HTTP_SCHEME_TTL - ten_min),
+            })
+        );
+        assert_eq!(live_entry_at(http, t0 + HTTP_SCHEME_TTL), None, "expired");
+        assert_eq!(
+            live_entry_at(https, t0 + HTTP_SCHEME_TTL),
+            Some(LiveScheme {
+                scheme: Scheme::Https,
+                expires_in: None,
+            })
+        );
+    }
+
+    #[test]
+    fn the_verdict_names_why_a_mirror_is_dialled_as_it_is() {
+        let https = Some(LiveScheme {
+            scheme: Scheme::Https,
+            expires_in: None,
+        });
+        let reprobe_in = coarsetime::Duration::from_secs(1200);
+        let http = Some(LiveScheme {
+            scheme: Scheme::Http,
+            expires_in: Some(reprobe_in),
+        });
+        for mode in [
+            HttpsUpgradeMode::Never,
+            HttpsUpgradeMode::Auto,
+            HttpsUpgradeMode::Always,
+        ] {
+            for live in [None, https, http] {
+                assert_eq!(
+                    verdict(mode, true, live),
+                    SchemeVerdict::HttpOnlyListed,
+                    "configured HTTP wins: {mode:?} {live:?}"
+                );
+            }
+            assert_eq!(
+                verdict(mode, false, None).scheme().is_none(),
+                mode == HttpsUpgradeMode::Auto
+            );
+        }
+        assert_eq!(
+            verdict(HttpsUpgradeMode::Never, false, http),
+            SchemeVerdict::HttpNever
+        );
+        assert_eq!(
+            verdict(HttpsUpgradeMode::Always, false, None),
+            SchemeVerdict::HttpsForced
+        );
+        assert_eq!(
+            verdict(HttpsUpgradeMode::Auto, false, https),
+            SchemeVerdict::HttpsUpgraded
+        );
+        assert_eq!(
+            verdict(HttpsUpgradeMode::Auto, false, http),
+            SchemeVerdict::HttpFallback { reprobe_in }
+        );
+        assert_eq!(
+            verdict(HttpsUpgradeMode::Auto, false, None),
+            SchemeVerdict::Undecided
+        );
+    }
+
+    /// The table looks entries up by the row's own port: an explicit `:80`
+    /// is a key of its own, as it is for the backends that record it.
+    #[test]
+    fn an_explicit_default_port_is_its_own_entry() {
+        let bare = SchemeKeyRef {
+            host: "explicit-port.test.invalid",
+            port: None,
+        };
+        let explicit = SchemeKeyRef {
+            port: Some(80),
+            ..bare
+        };
+        assert!(record_success(explicit, Scheme::Http));
+        assert_eq!(live_entry(bare), None);
+        assert_eq!(
+            live_entry(explicit).map(|live| live.scheme),
+            Some(Scheme::Http)
+        );
     }
 
     #[test]
