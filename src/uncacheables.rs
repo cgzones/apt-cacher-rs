@@ -1,40 +1,67 @@
 //! The most recently seen uncacheable requests, for the web interface's
 //! uncacheable table.
 //!
-//! A bounded ring of `(requested host, requested path)` pairs: re-recording
-//! a pair moves it to the most-recent end, and only a *fresh* pair bumps
-//! [`metrics::UNCACHEABLE`], so that counter tracks distinct uncacheable
-//! resources rather than request volume - which is what lets the dashboard
-//! derive the ring's eviction count from it.
+//! A bounded ring of `(requested host and port, requested path)` entries:
+//! re-recording an entry moves it to the most-recent end, and only a *fresh*
+//! entry bumps [`metrics::UNCACHEABLE`], so that counter tracks distinct
+//! uncacheable resources rather than request volume - which is what lets the
+//! dashboard derive the ring's eviction count from it.
 
-use std::{num::NonZero, sync::LazyLock};
+use std::{borrow::Cow, num::NonZero, sync::LazyLock};
 
 use crate::{config::ClientHost, metrics, nonzero, ringbuffer::RingBuffer};
 
 pub(crate) const UNCACHEABLES_MAX: NonZero<usize> = nonzero!(20);
 
-static UNCACHEABLES: LazyLock<parking_lot::RwLock<RingBuffer<(ClientHost, String)>>> =
+/// One uncacheable request: the host and port the client named, and the
+/// path it asked for. The port is part of the identity, as a mirror's is.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Uncacheable {
+    pub(crate) host: ClientHost,
+    pub(crate) port: Option<NonZero<u16>>,
+    pub(crate) path: String,
+}
+
+impl Uncacheable {
+    /// The requested URI authority, `host[:port]` (an IPv6 host bracketed).
+    #[must_use]
+    pub(crate) fn authority(&self) -> Cow<'_, str> {
+        let Self {
+            host,
+            port,
+            path: _,
+        } = self;
+        host.format_authority(*port)
+    }
+}
+
+static UNCACHEABLES: LazyLock<parking_lot::RwLock<RingBuffer<Uncacheable>>> =
     LazyLock::new(|| parking_lot::RwLock::new(RingBuffer::new(UNCACHEABLES_MAX)));
 
 /// Record a request as uncacheable for web-interface display.
 ///
 /// A re-recorded entry moves to the end, refreshing its most-recently-seen
 /// position.
-pub(crate) fn record_uncacheable(host: &ClientHost, path: &str) {
+pub(crate) fn record_uncacheable(host: &ClientHost, port: Option<NonZero<u16>>, path: &str) {
     let uncacheables = &mut *UNCACHEABLES.write();
 
     if let Some(idx) = uncacheables
         .iter()
-        .position(|(h, p)| h == host && p == path)
+        .position(|entry| entry.host == *host && entry.port == port && entry.path == path)
     {
         let entry = uncacheables.remove(idx).expect("entry exists");
-        debug_assert_eq!(entry.0, *host, "host was used as lookup key");
-        debug_assert_eq!(entry.1, path, "path was used as lookup key");
+        debug_assert_eq!(entry.host, *host, "host was used as lookup key");
+        debug_assert_eq!(entry.port, port, "port was used as lookup key");
+        debug_assert_eq!(entry.path, path, "path was used as lookup key");
 
         uncacheables.push(entry);
     } else {
-        uncacheables.push((host.to_owned(), path.to_owned()));
-        // Bump only on a fresh (host, path) insertion so the counter
+        uncacheables.push(Uncacheable {
+            host: host.clone(),
+            port,
+            path: path.to_owned(),
+        });
+        // Bump only on a fresh (host, port, path) insertion so the counter
         // tracks unique resources observed (not raw request count). This
         // is what the dashboard's "Uncacheable Evictions" line subtracts
         // UNCACHEABLES_MAX from.
@@ -42,7 +69,7 @@ pub(crate) fn record_uncacheable(host: &ClientHost, path: &str) {
     }
 }
 
-pub(crate) fn get_uncacheables() -> &'static parking_lot::RwLock<RingBuffer<(ClientHost, String)>> {
+pub(crate) fn get_uncacheables() -> &'static parking_lot::RwLock<RingBuffer<Uncacheable>> {
     &UNCACHEABLES
 }
 
@@ -58,7 +85,7 @@ mod tests {
         get_uncacheables()
             .read()
             .iter()
-            .map(|(h, p)| (h.to_string(), p.clone()))
+            .map(|entry| (entry.authority().into_owned(), entry.path.clone()))
             .collect()
     }
 
@@ -66,7 +93,7 @@ mod tests {
         get_uncacheables()
             .read()
             .iter()
-            .any(|(h, p)| h == host && p == path)
+            .any(|entry| entry.host == *host && entry.port.is_none() && entry.path == path)
     }
 
     /// One test drives the whole ring: the store is a process-global, so
@@ -82,9 +109,9 @@ mod tests {
 
         // Fresh pairs bump the metric, once each.
         let before = metrics::UNCACHEABLE.get();
-        record_uncacheable(&a, "/x");
-        record_uncacheable(&b, "/x");
-        record_uncacheable(&a, "/y");
+        record_uncacheable(&a, None, "/x");
+        record_uncacheable(&b, None, "/x");
+        record_uncacheable(&a, None, "/y");
         assert_eq!(metrics::UNCACHEABLE.get() - before, 3);
         assert!(contains(&a, "/x"));
         assert!(contains(&b, "/x"));
@@ -100,7 +127,7 @@ mod tests {
 
         // Re-recording moves the pair to the most-recent end without a bump.
         let before = metrics::UNCACHEABLE.get();
-        record_uncacheable(&a, "/x");
+        record_uncacheable(&a, None, "/x");
         assert_eq!(metrics::UNCACHEABLE.get() - before, 0);
         assert_eq!(get_uncacheables().read().len(), 3);
         assert_eq!(
@@ -116,7 +143,7 @@ mod tests {
         // oldest pair (b, /x) is the first one evicted.
         let before = metrics::UNCACHEABLE.get();
         for i in 0..cap {
-            record_uncacheable(&a, &format!("/fill{i}"));
+            record_uncacheable(&a, None, &format!("/fill{i}"));
         }
         assert_eq!(metrics::UNCACHEABLE.get() - before, cap as u64);
         let ring = get_uncacheables().read();
@@ -131,10 +158,25 @@ mod tests {
 
         // A refresh of the oldest surviving pair keeps it out of the next
         // eviction, which takes /fill1 instead.
-        record_uncacheable(&a, "/fill0");
-        record_uncacheable(&a, "/extra");
+        record_uncacheable(&a, None, "/fill0");
+        record_uncacheable(&a, None, "/extra");
         assert!(contains(&a, "/fill0"));
         assert!(!contains(&a, "/fill1"));
         assert_eq!(snapshot().last().map(|(_, p)| p.as_str()), Some("/extra"));
+
+        // The port is part of the key and of the rendered authority, and an
+        // IPv6 host renders bracketed.
+        let before = metrics::UNCACHEABLE.get();
+        record_uncacheable(&a, NonZero::new(8080), "/extra");
+        record_uncacheable(&host("2001:db8::1"), NonZero::new(8080), "/v6");
+        assert_eq!(metrics::UNCACHEABLE.get() - before, 2);
+        let tail: Vec<_> = snapshot().split_off(cap - 2);
+        assert_eq!(
+            tail,
+            [
+                ("a.example:8080".to_owned(), "/extra".to_owned()),
+                ("[2001:db8::1]:8080".to_owned(), "/v6".to_owned()),
+            ]
+        );
     }
 }

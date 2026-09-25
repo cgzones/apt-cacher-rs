@@ -17,7 +17,7 @@ use crate::{
     cache_paths::{CachePaths, SUBDIR_FLAT_BYHASH},
     cache_walk::{AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkContext, Walker},
     client_trouble::ClientTrouble,
-    config::Config,
+    config::{ClientHost, Config},
     database::{ClientStatEntry, MirrorStatEntry, OriginEntry, TopPackageEntry},
     deb_mirror::is_deb_package,
     error::ErrorReport,
@@ -262,13 +262,14 @@ mod mirror_cells {
     use std::time::Duration;
 
     use crate::{
+        config::ClientHost,
         mirror_health::MirrorHealth,
         mirror_indexes::{self, IndexAge, IndexState, MirrorIndexes},
         mirror_perf::MirrorPerf,
         scheme_cache::{Scheme, SchemeVerdict},
     };
 
-    use super::super::fmt::{Age, HtmlEscape, Latency, Meter, UtcText, warn_if};
+    use super::super::fmt::{Age, HtmlEscape, HtmlEscaped, Latency, Meter, UtcText, warn_if};
 
     /// The coloured dot in front of a mirror's name: green without a failure
     /// since start, red once one of its files failed checksum verification
@@ -321,7 +322,7 @@ mod mirror_cells {
     pub(super) struct SchemeChip<'a> {
         pub verdict: SchemeVerdict,
         /// Alias hosts of this mirror with their own verdicts.
-        pub aliases: &'a [(&'a str, SchemeVerdict)],
+        pub aliases: &'a [(&'a ClientHost, SchemeVerdict)],
     }
     impl Display for SchemeChip<'_> {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -341,7 +342,7 @@ mod mirror_cells {
                 Why(verdict)
             )?;
             for &(host, alias) in aliases {
-                write!(f, " Alias {}: {}", HtmlEscape(host), Why(alias))?;
+                write!(f, " Alias {}: {}", HtmlEscaped(host), Why(alias))?;
             }
             write!(f, "\">{text}</span>")
         }
@@ -619,7 +620,7 @@ const MIRROR_HEADER: &str = "<span title=\"The dot is the mirror's upstream heal
 fn scheme_verdicts<'a>(
     mirror: &MirrorStatEntry,
     config: &'a Config,
-) -> (SchemeVerdict, Vec<(&'a str, SchemeVerdict)>) {
+) -> (SchemeVerdict, Vec<(&'a ClientHost, SchemeVerdict)>) {
     let port = mirror.port().map(std::num::NonZero::get);
     let verdict = scheme_cache::verdict_for(
         SchemeKeyRef {
@@ -634,11 +635,11 @@ fn scheme_verdicts<'a>(
         .filter(|alias| alias.main.as_str() == mirror.host.as_str())
         .flat_map(|alias| &alias.aliases)
         .map(|host| {
-            let host = host.as_str();
-            (
-                host,
-                scheme_cache::verdict_for(SchemeKeyRef { host, port }, config),
-            )
+            let key = SchemeKeyRef {
+                host: host.as_str(),
+                port,
+            };
+            (host, scheme_cache::verdict_for(key, config))
         })
         .collect();
     (verdict, aliases)
@@ -1054,8 +1055,12 @@ pub(super) fn build_uncacheable_table() -> Section {
     let rows = uncacheables.len();
     let mut table = Table::new(&["Requested Host", "Requested Path"]);
 
-    for (host, path) in uncacheables.iter() {
-        tr!(table, HtmlEscaped(host), HtmlEscape(path));
+    for entry in uncacheables.iter() {
+        tr!(
+            table,
+            HtmlEscape(&entry.authority()),
+            HtmlEscape(&entry.path)
+        );
     }
     drop(uncacheables);
 

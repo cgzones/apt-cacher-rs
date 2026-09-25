@@ -647,7 +647,7 @@ pub(super) async fn connect_upstream(
     mirror: &Mirror,
     scheme: Option<Scheme>,
 ) -> Result<(UpstreamConn, Scheme), ConnectError> {
-    let host = mirror.host().as_str();
+    let host = mirror.host();
 
     match scheme {
         Some(Scheme::Http) => {
@@ -729,9 +729,9 @@ pub(super) async fn connect_upstream(
 /// Establish a TCP connection to the given host and port.
 ///
 /// Times out after the configured HTTP timeout.
-pub(super) async fn tcp_connect(host: &str, port: u16) -> std::io::Result<TcpStream> {
+pub(super) async fn tcp_connect(host: &ClientHost, port: u16) -> std::io::Result<TcpStream> {
     let http_timeout = global_config().http_timeout;
-    tokio::time::timeout(http_timeout, TcpStream::connect((host, port)))
+    tokio::time::timeout(http_timeout, TcpStream::connect((host.as_str(), port)))
         .await
         .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
             // Per attempt; a request whose connect fails for good is counted
@@ -802,18 +802,19 @@ fn handshake_timed_out(http_timeout: Duration) -> ConnectError {
 ///
 /// Times out after the configured HTTP timeout.
 #[cfg(feature = "tls_rustls")]
-async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectError> {
+async fn tls_connect(tcp: TcpStream, host: &ClientHost) -> Result<TlsStream, ConnectError> {
     let connector = tokio_rustls::TlsConnector::from(Arc::clone(
         TLS_CLIENT_CONFIG.get().expect("initialized in main()"),
     ));
 
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|err| {
-        // Pure function of the host string: never retryable.
-        ConnectError::permanent(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            format!("failed to parse server name:  {err}"),
-        ))
-    })?;
+    let server_name =
+        rustls::pki_types::ServerName::try_from(host.as_str().to_owned()).map_err(|err| {
+            // Pure function of the host string: never retryable.
+            ConnectError::permanent(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("failed to parse server name:  {err}"),
+            ))
+        })?;
 
     debug!("splice proxy: starting TLS handshake with {host}");
     let http_timeout = global_config().http_timeout;
@@ -870,12 +871,12 @@ fn native_tls_connector() -> Result<tokio_native_tls::TlsConnector, ConnectError
 ///
 /// Times out after the configured HTTP timeout.
 #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
-async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectError> {
+async fn tls_connect(tcp: TcpStream, host: &ClientHost) -> Result<TlsStream, ConnectError> {
     let connector = native_tls_connector()?;
 
     debug!("splice proxy: starting TLS handshake with {host}");
     let http_timeout = global_config().http_timeout;
-    let tls_stream = tokio::time::timeout(http_timeout, connector.connect(host, tcp))
+    let tls_stream = tokio::time::timeout(http_timeout, connector.connect(host.as_str(), tcp))
         .await
         .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| handshake_timed_out(http_timeout))?
         // `native_tls::Error` carries no `io::ErrorKind`; only a certificate

@@ -334,9 +334,9 @@ impl DomainName {
     #[must_use]
     pub(crate) fn format_authority(&self, port: Option<NonZero<u16>>) -> Cow<'_, str> {
         match (self.is_ipv6(), port) {
-            (true, Some(port)) => Cow::Owned(format!("[{self}]:{port}")),
-            (true, None) => Cow::Owned(format!("[{self}]")),
-            (false, Some(port)) => Cow::Owned(format!("{self}:{port}")),
+            (true, Some(port)) => Cow::Owned(format!("[{}]:{port}", self.as_str())),
+            (true, None) => Cow::Owned(format!("[{}]", self.as_str())),
+            (false, Some(port)) => Cow::Owned(format!("{}:{port}", self.as_str())),
             (false, None) => Cow::Borrowed(self.as_str()),
         }
     }
@@ -362,9 +362,35 @@ impl PartialOrd for DomainName {
     }
 }
 
+/// The URI host form, `format_authority(None)`: an IPv6 address bracketed,
+/// so a log line or page appending `:port` or `/path` stays unambiguous.
+/// Keys, database rows and list matching use the bare [`DomainName::as_str`].
 impl std::fmt::Display for DomainName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.as_str().fmt(f)
+        if self.is_ipv6() {
+            f.write_str("[")?;
+            f.write_str(self.as_str())?;
+            f.write_str("]")
+        } else {
+            self.as_str().fmt(f)
+        }
+    }
+}
+
+/// [`DomainName`]'s `Display` for a host held only as its bare canonical
+/// text (`DomainName::as_str`, e.g. a checksum-registry scope): an IPv6
+/// address bracketed, so a log line naming it stays unambiguous.
+pub(crate) struct HostText<'a>(pub(crate) &'a str);
+
+impl std::fmt::Display for HostText<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self(host) = self;
+        // Only an IPv6 address has a colon in its canonical text.
+        if host.contains(':') {
+            write!(f, "[{host}]")
+        } else {
+            f.write_str(host)
+        }
     }
 }
 
@@ -2222,6 +2248,15 @@ mod test {
         }
         assert_eq!(canonical.as_str(), "2001:db8::1");
         assert_eq!(canonical.format_authority(None), "[2001:db8::1]");
+        assert_eq!(canonical.to_string(), "[2001:db8::1]", "logs bracket it");
+        for host in ["2001:db8::1", "deb.debian.org", "192.0.2.1"] {
+            assert_eq!(
+                HostText(host).to_string(),
+                dn(host).to_string(),
+                "bare text renders like its host"
+            );
+        }
+        assert_eq!(dn("DEB.debian.org").to_string(), "deb.debian.org");
         assert_eq!(dn("[0:0::1]").as_str(), "::1");
 
         for host in [

@@ -3168,9 +3168,11 @@ async fn pre_process_client_request(
             | StatusCode::FOUND
             | StatusCode::TEMPORARY_REDIRECT
             | StatusCode::PERMANENT_REDIRECT
-    ) && let Some(moved_uri) =
-        parse_redirect_location(&fwd_response, requested_host.as_str(), parts.uri.path())
-    {
+    ) && let Some(moved_uri) = parse_redirect_location(
+        &fwd_response,
+        &requested_host.format_authority(requested_port),
+        parts.uri.path(),
+    ) {
         debug!("Requested URI: {}, Moved URI: {moved_uri}", parts.uri);
 
         if moved_uri.scheme().is_some_and(|scheme| {
@@ -3200,7 +3202,7 @@ async fn pre_process_client_request(
             return passthrough_response(
                 redirected_response,
                 Subject::Passthrough {
-                    host: requested_host.to_string(),
+                    host: requested_host.format_authority(requested_port).into_owned(),
                     path: request_path,
                     client,
                     request_received_at: passthrough_request_received_at,
@@ -3216,7 +3218,7 @@ async fn pre_process_client_request(
     passthrough_response(
         fwd_response,
         Subject::Passthrough {
-            host: requested_host.to_string(),
+            host: requested_host.format_authority(requested_port).into_owned(),
             path: request_path,
             client,
             request_received_at: passthrough_request_received_at,

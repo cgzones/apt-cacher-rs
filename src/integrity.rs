@@ -45,6 +45,7 @@ use parking_lot::Mutex;
 use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use tracing::{debug, error, warn};
 
+use crate::config::HostText;
 use crate::error::ErrorReport;
 use crate::fs_open::{hint_sequential_read, tokio_nofollow_options};
 use crate::ingest_ledger::{Claim, IngestLedger, Outcome};
@@ -862,7 +863,8 @@ fn log_unsupported_packages_compression(leaf: &str, host: &str) {
     }
     warn_once_or_debug!(
         "Unsupported Packages compression `{}` from host {host}; skipping registry ingest, its debs stay unverified",
-        leaf.escape_debug()
+        leaf.escape_debug(),
+        host = HostText(host),
     );
 }
 
@@ -1242,6 +1244,7 @@ fn schedule_ingest(file: &IndexFile<'_>, trigger: IngestTrigger) {
             warn_once_or_debug!(
                 "Skipping registry ingest of index `{}` for host {host} mirror {mirror_path} (ingest queue full); retrying on its next request",
                 file.path.display(),
+                host = HostText(host),
             );
             return;
         }
@@ -1397,12 +1400,14 @@ fn log_ingest_result(
                 "Failed to ingest index `{}` for host {host} mirror {mirror_path}; not retried until the file changes:  {}",
                 dest.display(),
                 ErrorReport(err),
+                host = HostText(host),
             );
         }
         (IngestResult::Failed(err), Outcome::Ingested | Outcome::Retry) => warn_once_or_debug!(
             "Failed to ingest index `{}` for host {host} mirror {mirror_path}; retrying on its next request:  {}",
             dest.display(),
             ErrorReport(err),
+            host = HostText(host),
         ),
         // Sync point for `wait_for_log("Index ingestion completed")`; keep the wording stable.
         (IngestResult::Done, _) => debug!("Index ingestion completed for `{}`", dest.display()),
@@ -1764,8 +1769,11 @@ async fn ingest_packages_file(
 
     let mut stanzas = StanzaStream::new(
         reader,
-        index_parser::Stanza::new_sha256_only()
-            .with_source(format!("{host}/{mirror_path} index `{}`", path.display())),
+        index_parser::Stanza::new_sha256_only().with_source(format!(
+            "{host}/{mirror_path} index `{}`",
+            path.display(),
+            host = HostText(host)
+        )),
     );
     loop {
         match stanzas.next().await {
@@ -1885,7 +1893,8 @@ async fn ingest_release_file(
     if !registry.insert_release(host, mirror_path, release_dir, date, &entries) {
         debug!(
             "Not registering index `{}` for host {host} mirror {mirror_path}; a newer Release/InRelease of `{release_dir}` is already registered",
-            path.display()
+            path.display(),
+            host = HostText(host),
         );
     }
     Ok(ReleaseSeen {
@@ -1916,7 +1925,8 @@ fn ingest_stanza_into_registry(
         // the length gate: a name no cache file can have.
         warn_once_or_debug!(
             "Not registering the digest of a {} byte Filename value from host {host} mirror {mirror_path}; no cache file can have that name",
-            filename.len()
+            filename.len(),
+            host = HostText(host),
         );
         return;
     };

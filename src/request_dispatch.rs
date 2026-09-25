@@ -562,7 +562,11 @@ pub(crate) async fn dispatch_request(
             // module docs), so the uncacheables ring buffer and its
             // `UNCACHEABLE` counter are fed here rather than at each
             // backend's forwarding step.
-            record_uncacheable(&requested_host, split_query(path_and_query).0);
+            record_uncacheable(
+                &requested_host,
+                requested_port,
+                split_query(path_and_query).0,
+            );
             DispatchOutcome::Passthrough {
                 reason,
                 requested_host,
