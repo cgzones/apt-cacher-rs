@@ -23,7 +23,7 @@ use hashbrown::{Equivalent, HashMap, hash_map::EntryRef};
 use http::uri::Authority;
 use parking_lot::RwLock;
 
-use crate::config::{Config, HttpsUpgradeMode};
+use crate::config::{Config, DomainName, HttpsUpgradeMode};
 use crate::deb_mirror::Mirror;
 use crate::metrics;
 
@@ -90,13 +90,64 @@ impl<'a> From<&'a Mirror> for SchemeKeyRef<'a> {
     }
 }
 
+/// The authority's host keys the cache in the bare canonical text a
+/// `Mirror` host carries: an IPv6 literal loses the brackets its URI
+/// spelling needs (RFC 3986 §3.2.2) by slicing, so the lookup stays
+/// allocation-free. The authority must already be canonical (hyper's
+/// `request_with_retry` passes it through [`canonical_authority`] first), or
+/// the two backends would key one host under two spellings.
 impl<'a> From<&'a Authority> for SchemeKeyRef<'a> {
     fn from(auth: &'a Authority) -> Self {
+        debug_assert!(
+            canonical_authority(auth).is_none(),
+            "scheme-cache key from the non-canonical authority `{auth}`"
+        );
+        let host = auth.host();
+        let host = host
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .unwrap_or(host);
         Self {
-            host: auth.host(),
+            host,
             port: auth.port_u16(),
         }
     }
+}
+
+/// The canonical spelling of `auth`, or `None` when it already is canonical
+/// (or its host is no valid mirror host, which the callers' own gates
+/// reject): a DNS name lowercased, an IPv6 literal in its RFC 5952 text
+/// (`[0:0::1]` and `[::1]` are one host), the port kept as its number
+/// (`:080` is `:80`).
+///
+/// Every host the proxy keys state on is the canonical [`DomainName`] text.
+/// A client URI or a redirect `Location` may spell the same host otherwise,
+/// and hyper's upstream request would then key the scheme cache, and match
+/// `http_only_mirrors`, under a name no `Mirror` carries.
+#[must_use]
+pub(crate) fn canonical_authority(auth: &Authority) -> Option<Authority> {
+    let host = auth.host();
+    // Fast path, no allocation: a lowercase DNS name or an IPv4 address
+    // (whose parser admits only the canonical dotted quad) is canonical.
+    if !host.starts_with('[') && !host.bytes().any(|b| b.is_ascii_uppercase()) {
+        return None;
+    }
+    let bare = match host.strip_prefix('[') {
+        Some(inner) => inner.strip_suffix(']')?,
+        None => host,
+    };
+    let canonical = DomainName::new(bare.to_owned()).ok()?;
+    // Port 0 is left alone (`None`): no mirror listens there, and the edge
+    // refuses it, while dropping it would silently dial the default port.
+    let port = match auth.port_u16() {
+        Some(port) => Some(NonZero::new(port)?),
+        None => None,
+    };
+    let rendered = canonical.format_authority(port);
+    if rendered == auth.as_str() {
+        return None;
+    }
+    Authority::try_from(rendered.as_ref()).ok()
 }
 
 impl Equivalent<SchemeKey> for SchemeKeyRef<'_> {
@@ -415,6 +466,8 @@ fn record_failure_at(key: SchemeKeyRef<'_>, now: Instant) -> Option<Scheme> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ClientHost;
+    use crate::deb_mirror::MirrorKind;
 
     fn key(host: &str) -> SchemeKeyRef<'_> {
         SchemeKeyRef { host, port: None }
@@ -429,6 +482,63 @@ mod tests {
 
         let bare = Authority::try_from("example.invalid").expect("valid authority");
         assert_eq!(SchemeKeyRef::from(&bare).port, None);
+    }
+
+    /// hyper keys on the request authority, splice on the `Mirror`: an IPv6
+    /// mirror must be one entry in both, keyed on the bare canonical text.
+    #[test]
+    fn key_from_an_ipv6_authority_matches_the_mirror_key() {
+        let auth = Authority::try_from("[2001:db8::1]:8080").expect("valid authority");
+        let from_auth = SchemeKeyRef::from(&auth);
+        let mirror = Mirror::new(
+            ClientHost::new("2001:db8::1".to_owned()).expect("valid host"),
+            NonZero::new(8080),
+            "debian".to_owned(),
+            MirrorKind::Structured,
+        );
+        let from_mirror = SchemeKeyRef::from(&mirror);
+        let SchemeKeyRef { host, port } = from_auth;
+        assert_eq!((host, port), (from_mirror.host, from_mirror.port));
+        assert_eq!(host, "2001:db8::1");
+
+        assert!(record_success(from_mirror, Scheme::Http));
+        assert_eq!(
+            live_entry(from_auth).map(|live| live.scheme),
+            Some(Scheme::Http),
+            "an entry splice learned is the one hyper reads"
+        );
+    }
+
+    #[test]
+    fn canonical_authority_folds_every_spelling_of_a_host() {
+        for (raw, canonical) in [
+            ("DEB.Debian.ORG", "deb.debian.org"),
+            ("Deb.debian.org:8080", "deb.debian.org:8080"),
+            ("[2001:DB8::1]", "[2001:db8::1]"),
+            ("[2001:db8:0:0:0:0:0:1]:3142", "[2001:db8::1]:3142"),
+            ("[0:0::1]", "[::1]"),
+        ] {
+            let auth = Authority::try_from(raw).expect("valid authority");
+            let folded = canonical_authority(&auth).expect("non-canonical input");
+            assert_eq!(folded.as_str(), canonical, "{raw}");
+            assert_eq!(
+                canonical_authority(&folded),
+                None,
+                "{canonical} is a fixpoint"
+            );
+        }
+        for already in [
+            "deb.debian.org",
+            "deb.debian.org:80",
+            "192.0.2.1:8080",
+            "[::1]",
+            "[2001:db8::1]:8080",
+            // Port 0 is left alone rather than dropped to the default port.
+            "[0:0::1]:0",
+        ] {
+            let auth = Authority::try_from(already).expect("valid authority");
+            assert_eq!(canonical_authority(&auth), None, "{already}");
+        }
     }
 
     #[test]

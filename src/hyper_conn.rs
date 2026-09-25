@@ -88,7 +88,7 @@ use crate::{
         dispatch_request, preflight_method, preflight_target, preflight_via,
     },
     response_head::{ResponseHead, ResponseKind, retry_after_secs},
-    scheme_cache::{self, SchemeDecision},
+    scheme_cache::{self, SchemeDecision, canonical_authority},
     static_assert,
     transfer_error::{CacheError, DeliveryFailure, DownloadFailure, InternalError, UpstreamError},
     tunnel_limiter,
@@ -299,23 +299,16 @@ pub(crate) async fn request_with_retry(
 
     let (mut parts, _body) = request.into_parts();
 
-    // Host names are case-insensitive: key the scheme cache, and the
-    // `http_only_mirrors` match `scheme_cache::resolve` does, on the lowercase
-    // host every other part of the proxy uses (`ClientHost`), as the splice
-    // backend's `Mirror` key already is. The raw spelling of a client URI or
-    // a redirect `Location` would miss an http-only entry and grow one cache
-    // entry per casing.
-    if let Some(auth) = parts.uri.authority()
-        && auth.host().bytes().any(|b| b.is_ascii_uppercase())
-    {
-        let host = auth.host().to_ascii_lowercase();
-        let lowered = match auth.port_u16() {
-            Some(port) => format!("{host}:{port}"),
-            None => host,
-        };
+    // Key the scheme cache, and the `http_only_mirrors` match
+    // `scheme_cache::resolve` does, on the canonical host every other part of
+    // the proxy uses (`ClientHost`), as the splice backend's `Mirror` key
+    // already is: a DNS name lowercased, an IPv6 literal in its one text
+    // form. The raw spelling of a client URI or a redirect `Location` would
+    // miss an http-only entry and grow one cache entry per spelling. This is
+    // the single choke point every hyper upstream request passes.
+    if let Some(canonical) = parts.uri.authority().and_then(canonical_authority) {
         let mut uri_parts = parts.uri.into_parts();
-        uri_parts.authority =
-            Some(Authority::try_from(lowered).expect("lowercasing keeps the authority valid"));
+        uri_parts.authority = Some(canonical);
         parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
     }
 
