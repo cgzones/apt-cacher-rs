@@ -52,10 +52,11 @@ use crate::limits::{self, LimitedReader, PackagesCompression};
 use crate::{
     cache_layout::{ByHashContent, ConnectionDetails, ResourceKind},
     cache_quota::QuotaReservation,
-    deb_mirror::normalize_uri_path,
+    deb_mirror::{Mirror, normalize_uri_path},
     guards::DownloadWriteLease,
-    index_parser::{self, HashAlgo, IndexFormat, StanzaStream, StreamedDigest},
+    index_parser::{self, HashAlgo, IndexFormat, ReleaseHeader, StanzaStream, StreamedDigest},
     metrics,
+    mirror_indexes::{self, ReleaseSeen},
     partial_file::TempPath,
     verified_marker,
 };
@@ -359,13 +360,13 @@ pub(crate) struct RenamePlan {
     /// the basename used directly as the registry-lookup key; for other
     /// kinds it is kept only for log context.
     pub(crate) debname: String,
-    /// Upstream host. Part of the registry key, alongside `mirror_path`.
-    pub(crate) host: String,
-    /// Mirror's repo-prefix path (`Mirror::path()`). Part of the registry
-    /// key so two distinct mirrors served from the same host (e.g.
-    /// `host/m1/pool/...` vs `host/m2/pool/...`) cannot poison each other's
-    /// expected digests via same-named packages.
-    pub(crate) mirror_path: String,
+    /// The canonical mirror. Its host and repo-prefix path
+    /// (`Mirror::path()`) are the registry key, so two distinct mirrors
+    /// served from the same host (e.g. `host/m1/pool/...` vs
+    /// `host/m2/pool/...`) cannot poison each other's expected digests via
+    /// same-named packages; the whole mirror names it in the
+    /// `mirror_indexes` a committed `Release` records.
+    pub(crate) mirror: Mirror,
     /// The raw request URI path (pre-normalisation). Used for `Release`
     /// relative-path resolution and as the relative-key component of the
     /// `Packages` registry lookup (see `verify_and_rename`).
@@ -822,8 +823,8 @@ fn compact_order(state: &mut ScopeState) {
 fn log_registry_miss(plan: &RenamePlan, key: &str) {
     warn_once_or_debug!(
         "No expected digest in the checksum registry for host {} mirror {} key `{}`; caching {} unverified",
-        plan.host,
-        plan.mirror_path,
+        plan.mirror.host(),
+        plan.mirror.path(),
         key.escape_debug(),
         plan.debname
     );
@@ -834,7 +835,7 @@ fn log_registry_miss(plan: &RenamePlan, key: &str) {
 /// no digest for `key`.
 fn registry_verify_kind(plan: &RenamePlan, key: &str) -> VerifyKind {
     global_checksum_registry()
-        .lookup(&plan.host, &plan.mirror_path, key)
+        .lookup(plan.mirror.host().as_str(), plan.mirror.path(), key)
         .map_or_else(
             || {
                 log_registry_miss(plan, key);
@@ -1074,7 +1075,9 @@ pub(crate) async fn verify_and_rename(
             if matches!(error, CommitError::ChecksumMismatch) {
                 warn!(
                     "Checksum mismatch for {} from host {} mirror {}; discarding the download, not caching",
-                    plan.debname, plan.host, plan.mirror_path,
+                    plan.debname,
+                    plan.mirror.host(),
+                    plan.mirror.path(),
                 );
             }
             return Err(CommitFailure {
@@ -1092,7 +1095,7 @@ pub(crate) async fn verify_and_rename(
                 error!(
                     "Failed to run the verification task for {} from host {}; discarding the download, not caching:  {}",
                     plan.debname,
-                    plan.host,
+                    plan.mirror.host(),
                     ErrorReport(&join_err),
                 );
                 CommitError::VerifyIo(std::io::Error::other(join_err))
@@ -1230,16 +1233,15 @@ fn schedule_ingest(file: &IndexFile<'_>, trigger: IngestTrigger) {
         return;
     };
     let registry = global_checksum_registry();
-    let epoch = registry.scope_epoch(file.host, file.mirror_path);
+    let (host, mirror_path) = (file.mirror.host().as_str(), file.mirror.path());
+    let epoch = registry.scope_epoch(host, mirror_path);
     let (claim, slot) = match admit(&INGEST_LEDGER, ingest_pool(&kind), file.path, epoch) {
         Admission::Nothing => return,
         Admission::Refused => {
             metrics::INGEST_SKIPPED_QUEUE_FULL.increment();
             warn_once_or_debug!(
-                "Skipping registry ingest of index `{}` for host {} mirror {} (ingest queue full); retrying on its next request",
+                "Skipping registry ingest of index `{}` for host {host} mirror {mirror_path} (ingest queue full); retrying on its next request",
                 file.path.display(),
-                file.host,
-                file.mirror_path,
             );
             return;
         }
@@ -1248,19 +1250,10 @@ fn schedule_ingest(file: &IndexFile<'_>, trigger: IngestTrigger) {
     if trigger == IngestTrigger::Touch {
         metrics::INGEST_TOUCH_TRIGGERED.increment();
     }
-    let host = file.host.to_owned();
-    let mirror_path = file.mirror_path.to_owned();
+    let mirror = file.mirror.clone();
     let dest = file.path.to_path_buf();
     let buffer_size = global_config().buffer_size;
-    tokio::spawn(run_ingest_job(
-        claim,
-        slot,
-        kind,
-        host,
-        mirror_path,
-        dest,
-        buffer_size,
-    ));
+    tokio::spawn(run_ingest_job(claim, slot, kind, mirror, dest, buffer_size));
 }
 
 /// Answer a request for a cached index without a commit (a cache hit, a
@@ -1280,11 +1273,30 @@ pub(crate) fn note_cached_index_touch(
             resource_kind: conn_details.resource_kind,
             debname: &conn_details.debname,
             raw_uri_path,
-            host: conn_details.mirror.host().as_str(),
-            mirror_path: conn_details.mirror.path(),
+            mirror: &conn_details.mirror,
             path: cache_path,
         },
         IngestTrigger::Touch,
+    );
+}
+
+/// The upstream answered a revalidation of a cached `Release`/`InRelease`
+/// with a 304: the mirror still serves it, so its suite counts as confirmed
+/// now (`mirror_indexes`). A suite no ingest recorded yet -- the touch
+/// ingest `note_cached_index_touch` just scheduled may still be running --
+/// takes the confirmation once it is recorded; `raw_uri_path` is the
+/// request path as received.
+pub(crate) fn note_release_revalidated(conn_details: &ConnectionDetails, raw_uri_path: &str) {
+    if conn_details.resource_kind != ResourceKind::Release || !global_config().verify_checksums {
+        return;
+    }
+    let Some(release_dir) = release_dir_from_uri_path(raw_uri_path) else {
+        return;
+    };
+    mirror_indexes::confirm(
+        &conn_details.mirror,
+        &release_dir,
+        coarsetime::Clock::now_since_epoch().as_secs(),
     );
 }
 
@@ -1295,17 +1307,17 @@ async fn run_ingest_job(
     // Held for the whole job, reruns included; see `INGEST_SLOTS`.
     _slot: SemaphorePermit<'static>,
     kind: IngestKind,
-    host: String,
-    mirror_path: String,
+    mirror: Mirror,
     dest: PathBuf,
     buffer_size: usize,
 ) {
     let registry = global_checksum_registry();
+    let (host, mirror_path) = (mirror.host().as_str(), mirror.path());
     loop {
-        let result = ingest_once(registry, &kind, &host, &mirror_path, &dest, buffer_size).await;
+        let result = ingest_once(registry, &kind, &mirror, &dest, buffer_size).await;
         let outcome = result.outcome();
-        log_ingest_result(&result, outcome, &host, &mirror_path, &dest);
-        if !claim.finish(outcome, registry.scope_epoch(&host, &mirror_path)) {
+        log_ingest_result(&result, outcome, host, mirror_path, &dest);
+        if !claim.finish(outcome, registry.scope_epoch(host, mirror_path)) {
             return;
         }
     }
@@ -1317,11 +1329,11 @@ async fn run_ingest_job(
 async fn ingest_once(
     registry: &ChecksumRegistry,
     kind: &IngestKind,
-    host: &str,
-    mirror_path: &str,
+    mirror: &Mirror,
     dest: &Path,
     buffer_size: usize,
 ) -> IngestResult {
+    let (host, mirror_path) = (mirror.host().as_str(), mirror.path());
     let result = match kind {
         IngestKind::Packages {
             compression,
@@ -1355,7 +1367,14 @@ async fn ingest_once(
             .await
         }
         IngestKind::Release { release_dir } => {
-            ingest_release_file(registry, host, mirror_path, dest, release_dir).await
+            ingest_release_file(registry, host, mirror_path, dest, release_dir)
+                .await
+                .map(|seen| {
+                    // Whether or not the registry took its entries: an older
+                    // `Release` than the registered one is still what the
+                    // mirror served last.
+                    mirror_indexes::record(mirror, release_dir, seen);
+                })
         }
     };
     match result {
@@ -1418,8 +1437,8 @@ pub(crate) struct IndexFile<'a> {
     pub(crate) debname: &'a str,
     /// The raw request URI path (`Release`'s directory comes from it).
     pub(crate) raw_uri_path: &'a str,
-    pub(crate) host: &'a str,
-    pub(crate) mirror_path: &'a str,
+    /// The canonical mirror; its host and path are the registry scope.
+    pub(crate) mirror: &'a Mirror,
     /// The cache file the ingest reads; the ledger key.
     pub(crate) path: &'a Path,
 }
@@ -1432,16 +1451,14 @@ impl<'a> From<&'a RenamePlan> for IndexFile<'a> {
             streamed_digest: _,
             resource_kind,
             debname,
-            host,
-            mirror_path,
+            mirror,
             raw_uri_path,
         } = plan;
         Self {
             resource_kind: *resource_kind,
             debname,
             raw_uri_path,
-            host,
-            mirror_path,
+            mirror,
             path: dest_path,
         }
     }
@@ -1463,7 +1480,7 @@ fn ingest_kind(file: &IndexFile<'_>) -> Option<IngestKind> {
     let packages_kind = |format: IndexFormat| {
         let compression = PackagesCompression::from_filename(leaf);
         if compression.is_none() {
-            log_unsupported_packages_compression(leaf, file.host);
+            log_unsupported_packages_compression(leaf, file.mirror.host().as_str());
         }
         compression.map(|compression| IngestKind::Packages {
             compression,
@@ -1778,11 +1795,22 @@ async fn ingest_packages_file(
 /// Shared by registry ingest ([`ingest_release_file`]) and the by-hash cleanup
 /// reference-set builder.
 pub(crate) async fn read_release_to_string(path: &Path) -> std::io::Result<String> {
+    read_release(path).await.map(|(content, _mtime)| content)
+}
+
+/// [`read_release_to_string`], with the modification time of the file read
+/// (its `fstat`, so the pair describes one inode).
+async fn read_release(path: &Path) -> std::io::Result<(String, std::time::SystemTime)> {
     let file = tokio_nofollow_options().read(true).open(path).await?;
+    let mtime = file
+        .metadata()
+        .await?
+        .modified()
+        .expect("Platform should support modification timestamps via setup check");
     let mut limited = LimitedReader::new(file, limits::MAX_RELEASE_SIZE);
     let mut buf = String::new();
     tokio::io::AsyncReadExt::read_to_string(&mut limited, &mut buf).await?;
-    Ok(buf)
+    Ok((buf, mtime))
 }
 
 /// How far ahead of the wall clock a parsed `Date:` may be before
@@ -1824,15 +1852,20 @@ fn clamp_future_release_date(date: Option<i64>) -> Option<i64> {
 /// (see `ChecksumRegistry::insert_release`) and still returns `Ok`. A
 /// far-future `Date:` is clamped to absent first (see
 /// [`clamp_future_release_date`]).
+///
+/// Returns what the file said about its age for `mirror_indexes`, with the
+/// file's mtime as the time the mirror last served or confirmed it (a
+/// commit writes the file, an upstream 304 touches it).
 async fn ingest_release_file(
     registry: &ChecksumRegistry,
     host: &str,
     mirror_path: &str,
     path: &Path,
     release_dir: &str,
-) -> std::io::Result<()> {
-    let content = read_release_to_string(path).await?;
-    let date = clamp_future_release_date(index_parser::parse_release_date(&content));
+) -> std::io::Result<ReleaseSeen> {
+    let (content, mtime) = read_release(path).await?;
+    let header = index_parser::parse_release_header(&content);
+    let date = clamp_future_release_date(header.date);
     let dir = release_dir.trim_end_matches('/');
     let entries: Vec<(String, [u8; 32])> = index_parser::parse_release_checksums(&content, |rel| {
         // Only Packages files are verified at layer C.
@@ -1855,7 +1888,13 @@ async fn ingest_release_file(
             path.display()
         );
     }
-    Ok(())
+    Ok(ReleaseSeen {
+        header: ReleaseHeader {
+            date,
+            valid_until: header.valid_until,
+        },
+        confirmed_at: time::OffsetDateTime::from(mtime).unix_timestamp(),
+    })
 }
 
 /// Register one stanza's `(Filename, SHA256)` pair. A stanza without a
@@ -1887,6 +1926,7 @@ fn ingest_stanza_into_registry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::structured_mirror;
     use std::io::Write as _;
 
     fn temp_file_with(content: &[u8]) -> tempfile::NamedTempFile {
@@ -2545,8 +2585,7 @@ mod tests {
                 resource_kind: class.resource_kind,
                 debname: &class.debname,
                 raw_uri_path: &raw_uri_path,
-                host: "h",
-                mirror_path: &class.mirror_path,
+                mirror: &structured_mirror("h", &class.mirror_path),
                 path: Path::new("/cache/x"),
             });
             let format = if let Some(IngestKind::PackagesSniff { format }) = kind {
@@ -2771,6 +2810,35 @@ mod tests {
                 "debian/dists/sid/main/binary-amd64/Packages.xz"
             ),
             Some([0x11; 32])
+        );
+    }
+
+    /// The ingest reports what the file said about its age for
+    /// `mirror_indexes`: the (clamped) date, the Valid-Until and the file's
+    /// mtime as the time the mirror served it.
+    #[tokio::test]
+    async fn a_release_ingest_reports_its_dates_and_mtime() {
+        let reg = ChecksumRegistry::new(NonZero::new(64).expect("non-zero"));
+        let release = temp_file_with(
+            b"Date: Sun, 20 Sep 2026 08:53:33 UTC\nValid-Until: Sun, 27 Sep 2026 08:53:33 UTC\nSHA256:\n",
+        );
+        filetime::set_file_mtime(
+            release.path(),
+            filetime::FileTime::from_unix_time(1_789_900_000, 0),
+        )
+        .expect("set mtime");
+        let seen = ingest_release_file(&reg, "h", "debian", release.path(), "debian/dists/sid")
+            .await
+            .expect("ingest");
+        assert_eq!(
+            seen,
+            ReleaseSeen {
+                header: ReleaseHeader {
+                    date: Some(1_789_894_413),
+                    valid_until: Some(1_789_894_413 + 7 * 86_400),
+                },
+                confirmed_at: 1_789_900_000,
+            }
         );
     }
 
@@ -3212,12 +3280,12 @@ mod tests {
 
     #[test]
     fn index_kinds_are_classified_once_for_commit_and_touch() {
+        let mirror = structured_mirror("h", "debian");
         let file = |resource_kind, debname, raw_uri_path| IndexFile {
             resource_kind,
             debname,
             raw_uri_path,
-            host: "h",
-            mirror_path: "debian",
+            mirror: &mirror,
             path: Path::new("/cache/x"),
         };
         assert!(matches!(

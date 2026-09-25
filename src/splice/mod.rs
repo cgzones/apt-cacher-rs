@@ -75,7 +75,7 @@ use crate::http_range::{
     HttpDate, ParsedRange, cache_file_http_date, format_http_date, http_parse_range,
 };
 use crate::humanfmt::HumanFmt;
-use crate::integrity::{self, note_cached_index_touch};
+use crate::integrity::{self, note_cached_index_touch, note_release_revalidated};
 use crate::parallel_hack::{NUDGE_BODY, log_nudge, nudge_head, should_nudge};
 use crate::partial_file::{self, TempPath};
 use crate::passthrough_limiter;
@@ -1573,6 +1573,7 @@ async fn splice_proxy_drive(
     let (total_content_length, body_content_length, resume_offset) = match plan {
         DownloadPlan::NotModified(stale) => {
             note_cached_index_touch(conn_details, original_uri_path, &stale.path);
+            note_release_revalidated(conn_details, original_uri_path);
             // Upstream confirms the cached copy is still current: refresh the
             // freshness window and serve the cached file via sendfile.
             debug!(

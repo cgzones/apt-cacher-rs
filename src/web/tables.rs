@@ -24,6 +24,7 @@ use crate::{
     humanfmt::HumanFmt,
     metrics,
     mirror_health::MirrorHealth,
+    mirror_indexes::MirrorIndexes,
     mirror_perf::MirrorPerf,
     scheme_cache::{self, SchemeKeyRef, SchemeVerdict},
     swrite,
@@ -262,11 +263,12 @@ mod mirror_cells {
 
     use crate::{
         mirror_health::MirrorHealth,
+        mirror_indexes::{self, IndexAge, IndexState, MirrorIndexes},
         mirror_perf::MirrorPerf,
         scheme_cache::{Scheme, SchemeVerdict},
     };
 
-    use super::super::fmt::{Age, HtmlEscape, Latency, Meter, warn_if};
+    use super::super::fmt::{Age, HtmlEscape, Latency, Meter, UtcText, warn_if};
 
     /// The coloured dot in front of a mirror's name: green without a failure
     /// since start, red once one of its files failed checksum verification
@@ -443,6 +445,67 @@ mod mirror_cells {
         }
     }
 
+    /// A mirror's index age (`mirror_indexes`): its freshest suite's age
+    /// when last served, notice once past two weeks (the mirror stopped
+    /// syncing), warn once a suite was served past its `Valid-Until:`. The
+    /// title lists every suite.
+    pub(super) struct IndexAgeCell<'a> {
+        pub indexes: Option<&'a MirrorIndexes>,
+        /// `verify_checksums`, whose ingest reads the indexes.
+        pub enabled: bool,
+    }
+    impl Display for IndexAgeCell<'_> {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            if !self.enabled {
+                return f.write_str("requires verify_checksums");
+            }
+            let Some((indexes, age)) = self
+                .indexes
+                .and_then(|indexes| mirror_indexes::assess(indexes).map(|age| (indexes, age)))
+            else {
+                return f.write_str("N/A");
+            };
+            let IndexAge {
+                freshest_lag,
+                state,
+            } = age;
+            let class = match state {
+                IndexState::Expired => " class=\"warn\"",
+                IndexState::Behind => " class=\"notice\"",
+                IndexState::Fresh => "",
+            };
+            write!(f, "<span{class} title=\"")?;
+            let mut sep = "";
+            for (suite, index) in indexes.suites() {
+                write!(f, "{sep}{}: ", HtmlEscape(suite))?;
+                match index.date {
+                    Some(date) => write!(f, "dated {}", UtcText(date))?,
+                    None => f.write_str("undated")?,
+                }
+                if let Some(valid_until) = index.valid_until {
+                    write!(f, ", valid until {}", UtcText(valid_until))?;
+                }
+                write!(f, ", last served {}", UtcText(index.confirmed_at))?;
+                if let Some(lag) = index.lag() {
+                    write!(f, " ({} old then)", Age(lag))?;
+                }
+                if index.expired() {
+                    f.write_str(", served expired: apt refuses it")?;
+                }
+                sep = "; ";
+            }
+            f.write_str("\">")?;
+            match freshest_lag {
+                Some(lag) => Display::fmt(&Age(lag), f)?,
+                None => f.write_str("undated")?,
+            }
+            if state == IndexState::Expired {
+                f.write_str(", expired")?;
+            }
+            f.write_str("</span>")
+        }
+    }
+
     pub(super) struct DirSizeCell {
         pub size: u64,
         pub total: u64,
@@ -528,6 +591,9 @@ const MIRROR_HEALTH_HEADERS: [&str; 4] = [
     "<span title=\"Downloads aborted because a body read timed out (http_timeout) or the mirror fell below min_download_rate over rate_check_timeframe.\">Timeouts / Slow</span> <span class=\"scope\">since start</span>",
 ];
 
+/// The Mirrors table's index-age column (`mirror_indexes`).
+const MIRROR_INDEX_HEADER: &str = "<span title=\"Age of this mirror's freshest Release/InRelease when the mirror last served or confirmed it, judged by its freshest suite (a frozen release pocket beside a syncing -updates is fine). Over two weeks is a notice: the mirror has likely stopped syncing; report it to the mirror's operator or switch to another mirror. A suite served past its Valid-Until warns: apt refuses that index. Hover a cell for every suite. Needs verify_checksums, whose ingest reads the index.\">Newest Index</span> <span class=\"scope\">since start</span>";
+
 /// The Mirrors table's latency and throughput columns (`mirror_perf`),
 /// in-memory figures since the daemon started like the failure counts.
 const MIRROR_PERF_HEADERS: [&str; 2] = [
@@ -579,6 +645,7 @@ fn scheme_verdicts<'a>(
 pub(super) struct MirrorSnapshots {
     pub(super) health: HashMap<Box<str>, MirrorHealth>,
     pub(super) perf: HashMap<Box<str>, MirrorPerf>,
+    pub(super) indexes: HashMap<Box<str>, MirrorIndexes>,
 }
 
 pub(super) async fn build_mirror_table(
@@ -588,10 +655,15 @@ pub(super) async fn build_mirror_table(
     config: &Config,
 ) -> (Section, DirStats) {
     use mirror_cells::{
-        AvgMaxCell, DirSizeCell, EfficiencyCell, HealthDot, SchemeChip, ThroughputCell, TtfbCell,
+        AvgMaxCell, DirSizeCell, EfficiencyCell, HealthDot, IndexAgeCell, SchemeChip,
+        ThroughputCell, TtfbCell,
     };
 
-    let MirrorSnapshots { health, perf } = snapshots;
+    let MirrorSnapshots {
+        health,
+        perf,
+        indexes,
+    } = snapshots;
     let ttfb_warn_above = config.http_timeout / 2;
     let rate_warn_below = config
         .min_download_rate
@@ -658,6 +730,7 @@ pub(super) async fn build_mirror_table(
             MIRROR_HEALTH_HEADERS[3],
             MIRROR_PERF_HEADERS[0],
             MIRROR_PERF_HEADERS[1],
+            MIRROR_INDEX_HEADER,
         ],
         &[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
     );
@@ -745,6 +818,10 @@ pub(super) async fn build_mirror_table(
                 perf: perf.get(key.as_str()).copied(),
                 warn_below: rate_warn_below,
             },
+            IndexAgeCell {
+                indexes: indexes.get(key.as_str()),
+                enabled: config.verify_checksums,
+            },
         );
     }
 
@@ -777,6 +854,7 @@ pub(super) async fn build_mirror_table(
             // Never answered, so never measured.
             "N/A",
             "N/A",
+            "N/A",
         );
     }
 
@@ -806,10 +884,18 @@ pub(super) fn db_error_section(label: &'static str, err: &sqlx::Error) -> Sectio
     Section { html: buf, rows: 0 }
 }
 
+/// The Origins table's index-date column (`mirror_indexes`).
+const ORIGIN_INDEX_HEADER: &str = "<span title=\"The Date of the newest Release/InRelease of this distribution the mirror served since start: how current the index behind this origin is. Needs verify_checksums, whose ingest reads the index.\">Index Date</span> <span class=\"scope\">since start</span>";
+
 /// Renders borrowed rows (like [`build_mirror_table`]) rather than owning
 /// them: the rows come from the memoized aggregate block, which several
-/// concurrent renders share.
-pub(super) fn render_origin_table(origins: &[OriginEntry], now_epoch: i64) -> Section {
+/// concurrent renders share. `indexes` is the `mirror_indexes` snapshot,
+/// joined on the mirror and the distribution (the suite).
+pub(super) fn render_origin_table(
+    origins: &[OriginEntry],
+    indexes: &HashMap<Box<str>, MirrorIndexes>,
+    now_epoch: i64,
+) -> Section {
     if origins.is_empty() {
         return Section::EMPTY;
     }
@@ -824,9 +910,17 @@ pub(super) fn render_origin_table(origins: &[OriginEntry], now_epoch: i64) -> Se
         "Component",
         "Architecture",
         "Last Seen",
+        ORIGIN_INDEX_HEADER,
     ]);
 
+    let mut key = String::new();
     for origin in sorted {
+        key.clear();
+        swrite!(key, "{}", origin.mirror_uri());
+        let index_date = indexes
+            .get(key.as_str())
+            .and_then(|indexes| indexes.suite(&origin.distribution))
+            .and_then(|index| index.date);
         tr!(
             marked Freshness::of(origin.last_seen, now_epoch).row_class(),
             table,
@@ -837,6 +931,10 @@ pub(super) fn render_origin_table(origins: &[OriginEntry], now_epoch: i64) -> Se
             FmtLastSeenHealth {
                 last_seen: origin.last_seen,
                 now_epoch
+            },
+            RelTime {
+                epoch: index_date.unwrap_or(0),
+                now: now_epoch
             },
         );
     }

@@ -641,30 +641,57 @@ pub(crate) fn parse_release_checksums<'a>(
     })
 }
 
-/// The `Date:` of a `Release`/`InRelease`, as unix seconds, read from the
-/// header paragraph only (it ends at the first checksum section; the
-/// clearsigned wrapper's `Hash:` line is not a field of interest). Debian
-/// writes the zone as `UTC`, which RFC 2822 lacks, so a trailing `UTC` is
-/// read as `+0000`. `None` when the field is missing or unparsable.
-pub(crate) fn parse_release_date(content: &str) -> Option<i64> {
-    use time::format_description::well_known::Rfc2822;
+/// The dates in a `Release`/`InRelease` header paragraph, as unix seconds:
+/// `Date:` (when the archive generated it) and `Valid-Until:` (after which
+/// apt refuses it). Either is `None` when missing or unparsable.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ReleaseHeader {
+    pub(crate) date: Option<i64>,
+    pub(crate) valid_until: Option<i64>,
+}
+
+/// The [`ReleaseHeader`] of a `Release`/`InRelease`, read from the header
+/// paragraph only (it ends at the first checksum section; the clearsigned
+/// wrapper's `Hash:` line is not a field of interest). The first occurrence
+/// of each field counts.
+pub(crate) fn parse_release_header(content: &str) -> ReleaseHeader {
+    let mut header = ReleaseHeader::default();
+    let (mut date_seen, mut valid_until_seen) = (false, false);
     for line in content.lines() {
         if matches!(line, "MD5Sum:" | "SHA1:" | "SHA256:" | "SHA512:")
             || line.starts_with("-----BEGIN PGP SIGNATURE")
         {
-            return None;
+            break;
         }
-        if let Some(value) = line.strip_prefix("Date:") {
-            let value = value.trim();
-            let normalized = value
-                .strip_suffix(" UTC")
-                .map_or_else(|| value.to_owned(), |head| format!("{head} +0000"));
-            return time::OffsetDateTime::parse(&normalized, &Rfc2822)
-                .ok()
-                .map(time::OffsetDateTime::unix_timestamp);
+        if let Some(value) = line.strip_prefix("Date:")
+            && !date_seen
+        {
+            date_seen = true;
+            header.date = parse_release_timestamp(value);
+        } else if let Some(value) = line.strip_prefix("Valid-Until:")
+            && !valid_until_seen
+        {
+            valid_until_seen = true;
+            header.valid_until = parse_release_timestamp(value);
+        }
+        if date_seen && valid_until_seen {
+            break;
         }
     }
-    None
+    header
+}
+
+/// A `Release` date field's value as unix seconds. Debian writes the zone as
+/// `UTC`, which RFC 2822 lacks, so a trailing `UTC` is read as `+0000`.
+fn parse_release_timestamp(value: &str) -> Option<i64> {
+    use time::format_description::well_known::Rfc2822;
+    let value = value.trim();
+    let normalized = value
+        .strip_suffix(" UTC")
+        .map_or_else(|| value.to_owned(), |head| format!("{head} +0000"));
+    time::OffsetDateTime::parse(&normalized, &Rfc2822)
+        .ok()
+        .map(time::OffsetDateTime::unix_timestamp)
 }
 
 /// A content-addressed digest referenced by a `Release`/`InRelease`, tagged by
@@ -1476,23 +1503,54 @@ SHA256:
 
     #[test]
     fn release_date_is_parsed_from_the_header_paragraph() {
+        let date = |content| parse_release_header(content).date;
         let release = "Origin: Debian\nDate: Sun, 20 Sep 2026 08:53:33 UTC\nSHA256:\n 00 1 main/binary-amd64/Packages\n";
-        assert_eq!(parse_release_date(release), Some(1_789_894_413));
+        assert_eq!(date(release), Some(1_789_894_413));
         let offset = "Date: Sun, 20 Sep 2026 08:53:33 +0000\n";
-        assert_eq!(parse_release_date(offset), Some(1_789_894_413));
+        assert_eq!(date(offset), Some(1_789_894_413));
         let inrelease = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\nOrigin: Debian\nDate: Sun, 20 Sep 2026 08:53:33 UTC\nSHA256:\n";
-        assert_eq!(parse_release_date(inrelease), Some(1_789_894_413));
-        assert_eq!(parse_release_date("Origin: Debian\nSHA256:\n"), None);
-        assert_eq!(parse_release_date("Date: yesterday\n"), None);
+        assert_eq!(date(inrelease), Some(1_789_894_413));
+        assert_eq!(date("Origin: Debian\nSHA256:\n"), None);
+        assert_eq!(date("Date: yesterday\n"), None);
         // A `Date:`-looking line after a checksum section header is not the
         // header paragraph's `Date:`. Unindented (unlike an entry line under
         // the section) so that, absent the section cutoff, it would parse
         // successfully -- the case actually exercises the cutoff rather than
         // passing on `Date:`'s own indentation requirement.
+        assert_eq!(date("SHA256:\nDate: Sun, 20 Sep 2026 08:53:33 UTC\n"), None);
+    }
+
+    #[test]
+    fn valid_until_is_parsed_beside_the_date() {
+        let release = "Origin: Debian\nDate: Sun, 20 Sep 2026 08:53:33 UTC\nValid-Until: Sun, 27 Sep 2026 08:53:33 UTC\nSHA256:\n 00 1 main/binary-amd64/Packages\n";
         assert_eq!(
-            parse_release_date("SHA256:\nDate: Sun, 20 Sep 2026 08:53:33 UTC\n"),
+            parse_release_header(release),
+            ReleaseHeader {
+                date: Some(1_789_894_413),
+                valid_until: Some(1_789_894_413 + 7 * 86_400),
+            }
+        );
+        // Clearsigned, the field before the date.
+        let inrelease = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\nValid-Until: Sun, 27 Sep 2026 08:53:33 +0000\nDate: Sun, 20 Sep 2026 08:53:33 UTC\nSHA256:\n";
+        assert_eq!(
+            parse_release_header(inrelease).valid_until,
+            Some(1_789_894_413 + 7 * 86_400)
+        );
+        // Absent, and after the checksum section: not the header's.
+        assert_eq!(
+            parse_release_header("Date: Sun, 20 Sep 2026 08:53:33 UTC\n").valid_until,
             None
         );
+        assert_eq!(
+            parse_release_header(
+                "Date: Sun, 20 Sep 2026 08:53:33 UTC\nSHA256:\nValid-Until: Sun, 27 Sep 2026 08:53:33 UTC\n"
+            )
+            .valid_until,
+            None
+        );
+        // Unparsable: absent, without hiding the date.
+        let bad = parse_release_header("Date: Sun, 20 Sep 2026 08:53:33 UTC\nValid-Until: soon\n");
+        assert_eq!((bad.date, bad.valid_until), (Some(1_789_894_413), None));
     }
 
     #[test]

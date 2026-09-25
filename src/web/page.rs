@@ -454,6 +454,7 @@ pub(super) const CSS: &str = r#"
     --ok: light-dark(#1d6b34, #58c07a);
     --warn: light-dark(#8a5200, #d9a441);
     --alert: light-dark(#a32b2b, #e8807f);
+    --notice: light-dark(#2d5f8a, #86b8e3);
     --error-fg: light-dark(#a32b2b, #e8807f);
 }
 :root[data-theme="light"] { color-scheme: light; }
@@ -596,6 +597,8 @@ dl.details dd.last { color: var(--details-key-fg); font-weight: 400; font-size: 
 .setup code { font-family: var(--mono); font-size: 0.95em; background: var(--count-bg);
               padding: 1px 5px; border-radius: 3px; }
 .ok { color: var(--ok); font-weight: 600; }
+/* Informational, below a warning: worth a look, nothing is failing yet. */
+.notice { color: var(--notice); font-weight: 600; }
 .warn { color: var(--warn); font-weight: 600; }
 .alert { color: var(--alert); font-weight: 700; }
 /* A mirror's upstream health at a glance, in front of its name. */

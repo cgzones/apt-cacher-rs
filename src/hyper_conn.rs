@@ -70,7 +70,7 @@ use crate::{
     global_cache_quota, global_config, global_verify_throttle, global_webif_hosts,
     guards::{Consequence, DownloadBarrier, InitBarrier, Settled},
     humanfmt::HumanFmt,
-    integrity::note_cached_index_touch,
+    integrity::{note_cached_index_touch, note_release_revalidated},
     limits::VOLATILE_CACHE_MAX_AGE,
     log_once, metrics,
     mirror_perf::{self, HeadTiming},
@@ -2247,6 +2247,7 @@ async fn serve_new_file_worker(
     let (total_content_length, body_content_length, resume_offset) = match plan {
         DownloadPlan::NotModified((file, file_path)) => {
             note_cached_index_touch(conn_details, req.uri().path(), &file_path);
+            note_release_revalidated(conn_details, req.uri().path());
             if !conn_details.client.is_cleanup_synthetic() {
                 metrics::VOLATILE_REFETCHED_UPTODATE.increment();
             }

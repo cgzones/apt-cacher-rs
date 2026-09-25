@@ -776,8 +776,7 @@ impl RenameBarrier {
                 dest_path,
                 resource_kind: data.resource_kind,
                 debname: data.lease.key.debname.clone(),
-                host: data.lease.key.mirror.host().as_str().to_owned(),
-                mirror_path: data.lease.key.mirror.path().to_owned(),
+                mirror: data.lease.key.mirror.clone(),
                 raw_uri_path: data.raw_uri_path.clone(),
                 streamed_digest,
             }

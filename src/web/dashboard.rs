@@ -27,7 +27,7 @@ use crate::{
     error::ErrorReport,
     fd_usage, global_cache_quota, global_config,
     humanfmt::HumanFmt,
-    metrics, mirror_health, mirror_perf,
+    metrics, mirror_health, mirror_indexes, mirror_perf,
     passthrough_limiter::active_relays,
     swrite,
     tunnel_limiter::{active_tunnels, busiest_client_tunnels},
@@ -219,6 +219,7 @@ async fn build_mirror_fs_section(
     let snapshots = MirrorSnapshots {
         health: mirror_health::snapshot(),
         perf: mirror_perf::snapshot(),
+        indexes: mirror_indexes::snapshot(),
     };
 
     let ((section, aggregate), free_disk_bytes) = tokio::join!(
@@ -283,7 +284,7 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
     };
 
     let origin = match origins {
-        Ok(rows) => render_origin_table(rows, now_epoch),
+        Ok(rows) => render_origin_table(rows, &mirror_indexes::snapshot(), now_epoch),
         Err(err) => db_error_section("origins", err),
     };
     let client = match clients {

@@ -248,6 +248,18 @@ impl Display for Saturation {
     }
 }
 
+/// A Unix timestamp as plain text, `25 Sep 2026 10:00:00 UTC`, for a
+/// `title` attribute, which cannot hold the markup [`RelTime`] renders.
+pub(super) struct UtcText(pub(super) i64);
+impl Display for UtcText {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Ok(ts) = OffsetDateTime::from_unix_timestamp(self.0) else {
+            return f.write_str("an invalid time");
+        };
+        Utc::from_offset(ts).with_parts(f, |f, _iso, display| write!(f, "{display} UTC"))
+    }
+}
+
 /// A Unix timestamp as a relative age inside a `<time>` element, e.g.
 /// `<time datetime="2026-09-25T10:00:00Z" title="25 Sep 2026 10:00:00 UTC">3 h ago</time>`,
 /// or `in 3 h` for one in the future. The relative figure is what a reader
@@ -782,7 +794,7 @@ mod tests {
 
     use super::{
         Age, CacheHitRatio, Count, FmtLastSeenHealth, FmtMTimeAge, Freshness, Gauge, HtmlEscape,
-        Latency, Meter, Pct, RatioClass, RelTime, Saturation, Span,
+        Latency, Meter, Pct, RatioClass, RelTime, Saturation, Span, UtcText,
     };
 
     /// 2023-11-14T22:13:20Z, so every rendered timestamp below is fixed.
@@ -1029,6 +1041,11 @@ mod tests {
             .contains(">just now</time>")
         );
         assert_eq!(render(RelTime { epoch: 0, now: NOW }), "N/A");
+    }
+
+    #[test]
+    fn a_plain_utc_time_is_markup_free() {
+        assert_eq!(render(UtcText(NOW)), "14 Nov 2023 22:13:20 UTC");
     }
 
     #[test]
