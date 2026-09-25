@@ -199,8 +199,10 @@ pub(crate) static UPSTREAM_STATUS_4XX: Counter = Counter::new();
 pub(crate) static UPSTREAM_STATUS_5XX: Signal = Signal::new();
 pub(crate) static UPSTREAM_STATUS_OTHER: Signal = Signal::new();
 
-/// Selected upstream status codes tracked individually (200/301/302/304/307/308).
+/// Selected upstream status codes tracked individually
+/// (200/206/301/302/304/307/308). 206 is every resumed download's answer.
 pub(crate) static UPSTREAM_STATUS_200: Counter = Counter::new();
+pub(crate) static UPSTREAM_STATUS_206: Counter = Counter::new();
 pub(crate) static UPSTREAM_STATUS_301: Counter = Counter::new();
 pub(crate) static UPSTREAM_STATUS_302: Counter = Counter::new();
 pub(crate) static UPSTREAM_STATUS_304: Counter = Counter::new();
@@ -214,12 +216,22 @@ pub(crate) static CLIENT_STATUS_4XX: Counter = Counter::new();
 pub(crate) static CLIENT_STATUS_5XX: Signal = Signal::new();
 pub(crate) static CLIENT_STATUS_OTHER: Signal = Signal::new();
 
-/// Selected client status codes tracked individually (200/206/304/410/416).
+/// Selected client status codes tracked individually (200/206/304/410/416
+/// and the three 5xx codes this proxy answers with itself).
 pub(crate) static CLIENT_STATUS_200: Counter = Counter::new();
 pub(crate) static CLIENT_STATUS_206: Counter = Counter::new();
 pub(crate) static CLIENT_STATUS_304: Counter = Counter::new();
 pub(crate) static CLIENT_STATUS_410: Counter = Counter::new();
 pub(crate) static CLIENT_STATUS_416: Counter = Counter::new();
+/// `500`: a cache access failure or an aborted download (internal failure,
+/// cancellation) -- the local side broke.
+pub(crate) static CLIENT_STATUS_500: Signal = Signal::new();
+/// `502`: an upstream fetch failed or its answer was refused
+/// (`"Upstream Error"`, `RejectReason`), or a relayed upstream 502.
+pub(crate) static CLIENT_STATUS_502: Signal = Signal::new();
+/// `503`: a deliberate refusal (disk quota or `min_disk_free`, the
+/// download/passthrough caps, the verify throttle), or a relayed upstream 503.
+pub(crate) static CLIENT_STATUS_503: Signal = Signal::new();
 
 /// Volatile-resource hit served from cache within `VOLATILE_CACHE_MAX_AGE`.
 /// Ratio against `VOLATILE_REFETCHED` indicates whether max-age is well-tuned.
@@ -876,7 +888,9 @@ pub(crate) static LAST_CLEANUP_FILES_REMOVED: StateU64 = StateU64::new();
 pub(crate) static LAST_CLEANUP_BYTES_RECLAIMED: StateU64 = StateU64::new();
 
 /// Record a client response status code into the matching class counter plus the
-/// fine-grained bucket for statuses we track individually.
+/// fine-grained bucket for statuses we track individually. The class is
+/// bumped first, so a reader that loads the codes before their class never
+/// sees the codes exceed it.
 pub(crate) fn record_client_status(status: StatusCode) {
     match status.as_u16() {
         200..=299 => CLIENT_STATUS_2XX.increment(),
@@ -892,13 +906,16 @@ pub(crate) fn record_client_status(status: StatusCode) {
         StatusCode::NOT_MODIFIED => CLIENT_STATUS_304.increment(),
         StatusCode::GONE => CLIENT_STATUS_410.increment(),
         StatusCode::RANGE_NOT_SATISFIABLE => CLIENT_STATUS_416.increment(),
+        StatusCode::INTERNAL_SERVER_ERROR => CLIENT_STATUS_500.increment(),
+        StatusCode::BAD_GATEWAY => CLIENT_STATUS_502.increment(),
+        StatusCode::SERVICE_UNAVAILABLE => CLIENT_STATUS_503.increment(),
         _ => {}
     }
 }
 
 /// Record an upstream response status code. Tracks status-class buckets and
-/// the individually-tracked codes (200/301/302/304/307/308) independently
-/// from the client-side `record_client_status`.
+/// the individually-tracked codes (200/206/301/302/304/307/308) independently
+/// from the client-side `record_client_status`, class first like it.
 pub(crate) fn record_upstream_status(status: StatusCode) {
     match status.as_u16() {
         200..=299 => UPSTREAM_STATUS_2XX.increment(),
@@ -910,6 +927,7 @@ pub(crate) fn record_upstream_status(status: StatusCode) {
 
     match status {
         StatusCode::OK => UPSTREAM_STATUS_200.increment(),
+        StatusCode::PARTIAL_CONTENT => UPSTREAM_STATUS_206.increment(),
         StatusCode::MOVED_PERMANENTLY => UPSTREAM_STATUS_301.increment(),
         StatusCode::FOUND => UPSTREAM_STATUS_302.increment(),
         StatusCode::NOT_MODIFIED => UPSTREAM_STATUS_304.increment(),
@@ -921,7 +939,31 @@ pub(crate) fn record_upstream_status(status: StatusCode) {
 
 #[cfg(test)]
 mod tests {
-    use super::Signal;
+    use http::StatusCode;
+
+    use super::*;
+
+    /// Each code a row is shown for lands in its row and its class; other
+    /// tests bump the same globals concurrently, so only growth is asserted.
+    #[test]
+    fn status_codes_land_in_their_row_and_class() {
+        let (u206, u2xx) = (UPSTREAM_STATUS_206.get(), UPSTREAM_STATUS_2XX.get());
+        record_upstream_status(StatusCode::PARTIAL_CONTENT);
+        assert!(UPSTREAM_STATUS_206.get() > u206);
+        assert!(UPSTREAM_STATUS_2XX.get() > u2xx);
+
+        for (status, row) in [
+            (StatusCode::INTERNAL_SERVER_ERROR, &CLIENT_STATUS_500),
+            (StatusCode::BAD_GATEWAY, &CLIENT_STATUS_502),
+            (StatusCode::SERVICE_UNAVAILABLE, &CLIENT_STATUS_503),
+        ] {
+            let (code, class) = (row.get(), CLIENT_STATUS_5XX.get());
+            record_client_status(status);
+            assert!(row.get() > code, "{status}");
+            assert!(CLIENT_STATUS_5XX.get() > class, "{status}");
+            assert!(row.last().is_some(), "{status}");
+        }
+    }
 
     #[test]
     fn a_signal_is_unstamped_until_its_first_bump() {

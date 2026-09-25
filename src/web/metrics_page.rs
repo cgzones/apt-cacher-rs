@@ -21,8 +21,12 @@
 use std::fmt::{self, Display, Formatter};
 
 use crate::{
-    database_task::DB_TASK_QUEUE_SENDER, global_checksum_registry, global_verify_throttle,
-    humanfmt::HumanFmt, metrics, swrite, tunnel_limiter::active_tunnels,
+    database_task::DB_TASK_QUEUE_SENDER,
+    global_checksum_registry, global_verify_throttle,
+    humanfmt::HumanFmt,
+    metrics::{self, Counter},
+    swrite,
+    tunnel_limiter::active_tunnels,
     uncacheables::UNCACHEABLES_MAX,
 };
 
@@ -101,10 +105,14 @@ fn delivery_path(
     requests_label: &'static str,
     bytes_label: &'static str,
     tip: &'static str,
-    requests: u64,
-    served: u64,
+    requests: &Counter,
+    served: &Counter,
     bytes: u64,
 ) {
+    // Served first: its request is counted before it, so this order cannot
+    // read more served than started.
+    let served = served.get();
+    let requests = requests.get();
     t.row_tip(
         requests_label,
         tip,
@@ -137,17 +145,20 @@ pub(super) fn build_metrics_html() -> String {
 }
 
 fn build_requests_group(g: &mut Groups) {
-    let requests_total = metrics::REQUESTS_TOTAL.get();
+    // Every subset is loaded before the total it is compared against: the
+    // total is bumped first, so this order can only under-read the subset
+    // and a comparison cannot flash a warning for one refresh.
     let served_total = metrics::SERVED_TOTAL.get();
-    let webui_requests = metrics::WEBUI_REQUESTS.get();
+    let requests_total = metrics::REQUESTS_TOTAL.get();
     let served_webui = metrics::SERVED_WEBUI.get();
+    let webui_requests = metrics::WEBUI_REQUESTS.get();
     let connections_accepted = metrics::CONNECTIONS_ACCEPTED.get();
 
-    let status_2xx = metrics::CLIENT_STATUS_2XX.get();
     let status_200 = metrics::CLIENT_STATUS_200.get();
     let status_206 = metrics::CLIENT_STATUS_206.get();
-    let status_3xx = metrics::CLIENT_STATUS_3XX.get();
+    let status_2xx = metrics::CLIENT_STATUS_2XX.get();
     let status_304 = metrics::CLIENT_STATUS_304.get();
+    let status_3xx = metrics::CLIENT_STATUS_3XX.get();
 
     g.group("Requests", |t| {
         t.row_tip(
@@ -247,38 +258,56 @@ fn build_requests_group(g: &mut Groups) {
 
         t.row_tip(
             "Client 2xx",
-            "Successful responses returned to clients. Warns when the class total does not match the 200 and 206 counters below it.",
-            warn_if(status_2xx, status_2xx != status_200 + status_206),
+            "Successful responses returned to clients. A relayed 203 or 204 counts here without a code row of its own, so the class may exceed 200 + 206; it warns only if the code rows exceed the class, which is a counting bug.",
+            warn_if(status_2xx, status_200 + status_206 > status_2xx),
         );
+        t.row("Client 200 OK", status_200);
+        t.row("Client 206 Partial Content", status_206);
         t.row_tip(
             "Client 3xx",
-            "Redirect and not-modified responses returned to clients. Warns when the class total does not match the 304 counter below it.",
-            warn_if(status_3xx, status_3xx != status_304),
+            "Redirect and not-modified responses returned to clients. A relayed upstream redirect counts here without a code row of its own, so the class may exceed 304; it warns only if 304 exceeds the class, which is a counting bug.",
+            warn_if(status_3xx, status_304 > status_3xx),
         );
+        t.row("Client 304 Not Modified", status_304);
         t.row_tip(
             "Client 4xx",
             "Client-error responses. Not warned on: pdiff rejections and web-interface 404 probes land here routinely.",
             metrics::CLIENT_STATUS_4XX.get(),
         );
+        t.row("Client 410 Gone", metrics::CLIENT_STATUS_410.get());
+        t.row(
+            "Client 416 Range Not Satisfiable",
+            metrics::CLIENT_STATUS_416.get(),
+        );
         t.signal(
             "Client 5xx",
-            "Server-error responses returned to clients.",
-            Level::Alert,
+            "Server-error responses returned to clients, relayed upstream errors included. A mix of causes with different remedies, so the class only warns; the code rows below say which one moved.",
+            Level::Warn,
             &metrics::CLIENT_STATUS_5XX,
+        );
+        t.signal(
+            "Client 500 Internal Server Error",
+            "The proxy itself failed: a cache read or write broke (\"Cache Access Failure\") or a download aborted for an internal reason. Look at Storage Errors and the log.",
+            Level::Alert,
+            &metrics::CLIENT_STATUS_500,
+        );
+        t.signal(
+            "Client 502 Bad Gateway",
+            "An upstream fetch failed or its answer was refused (\"Upstream Error\"), or the mirror itself answered 502. See the Mirrors table for which mirror.",
+            Level::Warn,
+            &metrics::CLIENT_STATUS_502,
+        );
+        t.signal(
+            "Client 503 Service Unavailable",
+            "A deliberate refusal: the disk quota or min_disk_free, max_upstream_downloads, max_passthrough_relays or the checksum verify throttle; or the mirror itself answered 503. The Rejected rows say which.",
+            Level::Warn,
+            &metrics::CLIENT_STATUS_503,
         );
         t.signal(
             "Client Other",
             "Responses outside the 2xx-5xx classes.",
             Level::Warn,
             &metrics::CLIENT_STATUS_OTHER,
-        );
-        t.row("Client 200 OK", status_200);
-        t.row("Client 206 Partial Content", status_206);
-        t.row("Client 304 Not Modified", status_304);
-        t.row("Client 410 Gone", metrics::CLIENT_STATUS_410.get());
-        t.row(
-            "Client 416 Range Not Satisfiable",
-            metrics::CLIENT_STATUS_416.get(),
         );
 
         t.row_tip(
@@ -349,9 +378,9 @@ fn build_cache_group(g: &mut Groups) {
     let hits = metrics::CACHE_HITS.get();
     let misses = metrics::CACHE_MISSES.get();
     let lookups = hits + misses;
-    let refetched = metrics::VOLATILE_REFETCHED.get();
     let refetched_uptodate = metrics::VOLATILE_REFETCHED_UPTODATE.get();
     let refetched_outofdate = metrics::VOLATILE_REFETCHED_OUTOFDATE.get();
+    let refetched = metrics::VOLATILE_REFETCHED.get();
 
     g.group("Cache", |t| {
         t.row_tip(
@@ -469,8 +498,8 @@ fn build_delivery_group(g: &mut Groups) {
             "sendfile Requests \u{2192} Served",
             "sendfile Bytes",
             "Cached responses served via Linux sendfile(2) zero-copy: requests that entered this path \u{2192} requests whose body was fully delivered.",
-            metrics::REQUESTS_SENDFILE.get(),
-            metrics::SERVED_SENDFILE.get(),
+            &metrics::REQUESTS_SENDFILE,
+            &metrics::SERVED_SENDFILE,
             metrics::BYTES_SERVED_SENDFILE.get(),
         );
         delivery_path(
@@ -478,8 +507,8 @@ fn build_delivery_group(g: &mut Groups) {
             "splice Requests \u{2192} Served",
             "splice Bytes",
             "Responses streamed from upstream to client via Linux splice(2) zero-copy (small userspace-written tails such as header prefixes included).",
-            metrics::REQUESTS_SPLICE.get(),
-            metrics::SERVED_SPLICE.get(),
+            &metrics::REQUESTS_SPLICE,
+            &metrics::SERVED_SPLICE,
             metrics::BYTES_SERVED_SPLICE.get(),
         );
         delivery_path(
@@ -487,8 +516,8 @@ fn build_delivery_group(g: &mut Groups) {
             "copy Requests \u{2192} Served",
             "copy Bytes",
             "Cached responses served via plain userspace read/write copy.",
-            metrics::REQUESTS_COPY.get(),
-            metrics::SERVED_COPY.get(),
+            &metrics::REQUESTS_COPY,
+            &metrics::SERVED_COPY,
             metrics::BYTES_SERVED_COPY.get(),
         );
         delivery_path(
@@ -496,8 +525,8 @@ fn build_delivery_group(g: &mut Groups) {
             "channel Requests \u{2192} Served",
             "channel Bytes",
             "Responses streamed via the hyper ChannelBody path while their upstream download is still in flight: the client that started the download and any late joiners.",
-            metrics::REQUESTS_CHANNEL.get(),
-            metrics::SERVED_CHANNEL.get(),
+            &metrics::REQUESTS_CHANNEL,
+            &metrics::SERVED_CHANNEL,
             metrics::BYTES_SERVED_CHANNEL.get(),
         );
         delivery_path(
@@ -505,8 +534,8 @@ fn build_delivery_group(g: &mut Groups) {
             "passthrough Requests \u{2192} Served",
             "passthrough Bytes",
             "Uncached responses proxied through to clients without storing anything on disk.",
-            metrics::REQUESTS_PASSTHROUGH.get(),
-            metrics::SERVED_PASSTHROUGH.get(),
+            &metrics::REQUESTS_PASSTHROUGH,
+            &metrics::SERVED_PASSTHROUGH,
             metrics::BYTES_SERVED_PASSTHROUGH.get(),
         );
         t.row_tip(
@@ -528,25 +557,30 @@ fn build_delivery_group(g: &mut Groups) {
 }
 
 fn build_upstream_group(g: &mut Groups) {
-    let status_2xx = metrics::UPSTREAM_STATUS_2XX.get();
-    let status_3xx = metrics::UPSTREAM_STATUS_3XX.get();
+    // Subsets before the totals they are compared against (the total is
+    // bumped first); see `build_requests_group`.
     let status_200 = metrics::UPSTREAM_STATUS_200.get();
+    let status_206 = metrics::UPSTREAM_STATUS_206.get();
     let status_301 = metrics::UPSTREAM_STATUS_301.get();
     let status_302 = metrics::UPSTREAM_STATUS_302.get();
     let status_304 = metrics::UPSTREAM_STATUS_304.get();
     let status_307 = metrics::UPSTREAM_STATUS_307.get();
     let status_308 = metrics::UPSTREAM_STATUS_308.get();
+    let status_2xx = metrics::UPSTREAM_STATUS_2XX.get();
+    let status_3xx = metrics::UPSTREAM_STATUS_3XX.get();
 
+    // The other way round here: a checkout bumps its miss arm *before*
+    // `POOL_NEW`, so the new-connection count is the one loaded first.
     let pool_new = metrics::POOL_NEW.get();
     let miss_empty = metrics::POOL_MISS_EMPTY.get();
     let miss_dead = metrics::POOL_MISS_DEAD.get();
     let miss_failed = metrics::POOL_MISS_FAILED.get();
     let miss_no_scheme = metrics::POOL_MISS_NO_SCHEME.get();
 
-    let upgrade_attempted = metrics::HTTPS_UPGRADE_ATTEMPTED.get();
     let upgrade_succeeded = metrics::HTTPS_UPGRADE_SUCCEEDED.get();
     let upgrade_reverted = metrics::HTTPS_UPGRADE_REVERTED.get();
     let upgrade_failed = metrics::HTTPS_UPGRADE_FAILED.get();
+    let upgrade_attempted = metrics::HTTPS_UPGRADE_ATTEMPTED.get();
 
     g.group("Upstream", |t| {
         t.row_tip(
@@ -556,15 +590,15 @@ fn build_upstream_group(g: &mut Groups) {
         );
         t.row_tip(
             "2xx",
-            "Successful responses received from upstream mirrors. Warns when the class total does not match the 200 counter below it.",
-            warn_if(status_2xx, status_2xx != status_200),
+            "Successful responses received from upstream mirrors. Warns only if the 200 and 206 rows exceed it, which is a counting bug; another 2xx code counts here without a row of its own.",
+            warn_if(status_2xx, status_200 + status_206 > status_2xx),
         );
         t.row_tip(
             "3xx",
-            "Redirect and not-modified responses from upstream. Warns when the class total does not match the individual 3xx counters below it.",
+            "Redirect and not-modified responses from upstream. Warns only if the individual 3xx rows exceed it, which is a counting bug; another 3xx code counts here without a row of its own.",
             warn_if(
                 status_3xx,
-                status_3xx != status_301 + status_302 + status_304 + status_307 + status_308,
+                status_301 + status_302 + status_304 + status_307 + status_308 > status_3xx,
             ),
         );
         t.row_tip(
@@ -585,6 +619,11 @@ fn build_upstream_group(g: &mut Groups) {
             &metrics::UPSTREAM_STATUS_OTHER,
         );
         t.row("200 OK", status_200);
+        t.row_tip(
+            "206 Partial Content",
+            "Answers to a resumed download's Range request.",
+            status_206,
+        );
         t.row("301 Moved Permanently", status_301);
         t.row("302 Found", status_302);
         t.row("304 Not Modified", status_304);
@@ -659,10 +698,10 @@ fn build_upstream_group(g: &mut Groups) {
         );
         t.row_tip(
             "Pool New",
-            "Newly opened upstream connections. Warns unless the four miss counters below it sum to this value: every new connection falls through from exactly one miss arm.",
+            "Newly opened upstream connections. Every new connection falls through from exactly one miss arm, but a miss whose connect then fails opens none, so the four miss rows below may exceed it; it warns only if it exceeds their sum, which is a counting bug.",
             warn_if(
                 pool_new,
-                pool_new != miss_empty + miss_dead + miss_failed + miss_no_scheme,
+                pool_new > miss_empty + miss_dead + miss_failed + miss_no_scheme,
             ),
         );
         t.row_tip("Pool Miss (empty)", "No pooled connection was available.", miss_empty);
@@ -688,10 +727,10 @@ fn build_upstream_group(g: &mut Groups) {
         );
         t.row_tip(
             "HTTPS Upgrade Attempted",
-            "Plain-HTTP requests the daemon tried to upgrade to HTTPS. Warns unless the three outcome counters below it sum to this value.",
+            "Plain-HTTP requests the daemon tried to upgrade to HTTPS. Each resolves to exactly one of the three outcomes below, which trail it while an upgrade is in flight; it warns only if they exceed it, which is a counting bug.",
             warn_if(
                 upgrade_attempted,
-                upgrade_attempted != upgrade_succeeded + upgrade_reverted + upgrade_failed,
+                upgrade_succeeded + upgrade_reverted + upgrade_failed > upgrade_attempted,
             ),
         );
         t.row_tip(
