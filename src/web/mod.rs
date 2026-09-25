@@ -8,13 +8,15 @@
 //! - [`host_gate`]: the `Host` names the web interface answers to.
 //! - [`table`]: `Table`/`DetailsList`, the `tr!` row macro, section wrappers.
 //! - [`page`]: query options, theme, the `<html>` skeleton and `<nav>`, the
-//!   stylesheet and favicon.
+//!   favicon.
+//! - [`assets`]: the embedded stylesheet under its content-hashed URL.
 //! - [`response`]: `WebResponse`, its header table and the hyper body wrapper.
 //! - [`dashboard`]: `DashboardData` gathering and the details sections.
 //! - [`metrics_page`]: the Metrics section.
 //! - [`tables`]: the row tables and the per-mirror directory walk.
 //! - [`logs`]: the `/logs` page.
 
+mod assets;
 mod dashboard;
 mod fmt;
 pub(crate) mod host_gate;
@@ -36,7 +38,8 @@ use crate::{AppState, healthcheck::cached_health_report, metrics};
 use self::{
     dashboard::serve_dashboard,
     logs::serve_logs,
-    page::{CSS, FAVICON_SVG, parse_query},
+    page::{FAVICON_SVG, parse_query},
+    response::Caching,
 };
 
 // ---------------------------------------------------------------------------
@@ -56,13 +59,16 @@ pub(crate) async fn serve_web_interface(uri: &http::Uri, appstate: &AppState) ->
         "/" => serve_dashboard(appstate, options).await,
         "/logs" => serve_logs(options).await,
         "/healthcheck" => serve_healthcheck().await,
-        "/style.css" => WebResponse::static_resource("text/css; charset=utf-8", CSS),
         "/favicon.svg" | "/favicon.ico" => {
-            WebResponse::static_resource("image/svg+xml", FAVICON_SVG)
+            WebResponse::static_resource("image/svg+xml", FAVICON_SVG, Caching::Day)
         }
         _ => {
-            debug!("Unknown local web interface resource: {uri:?}");
-            WebResponse::not_found("Local interface resource not available")
+            if let Some(asset) = assets::find(location) {
+                asset.response(uri.query())
+            } else {
+                debug!("Unknown local web interface resource: {uri:?}");
+                WebResponse::not_found("Local interface resource not available")
+            }
         }
     };
 

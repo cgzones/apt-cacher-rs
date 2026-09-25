@@ -52,13 +52,30 @@ enum WebResponseKind {
     /// Dashboard or logs page; served with `no-store` cache and full
     /// security headers.
     Html,
-    /// Static asset (CSS/SVG) with long-lived caching and `nosniff`.
-    Static { content_type: &'static str },
+    /// Static asset (CSS/SVG), `nosniff`, cached as `caching` says.
+    Static {
+        content_type: &'static str,
+        caching: Caching,
+    },
     /// Machine-readable healthcheck payload; `no-store` like Html, none of
     /// the document-oriented security headers.
     Json,
     /// Plain-text error response.
     Error,
+}
+
+/// How long a browser may keep a static asset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Caching {
+    /// Requested under this build's content-hashed URL (`web::assets`):
+    /// those bytes never change, so they are kept for good.
+    Immutable,
+    /// An asset requested without its current hash: served, but revalidated
+    /// on every use, so it is never remembered under a URL naming other
+    /// bytes.
+    Revalidate,
+    /// The favicon, whose URL browsers probe without a hash: a day.
+    Day,
 }
 
 impl WebResponse {
@@ -70,11 +87,18 @@ impl WebResponse {
         }
     }
 
-    pub(super) fn static_resource(content_type: &'static str, content: &'static str) -> Self {
+    pub(super) fn static_resource(
+        content_type: &'static str,
+        content: &'static str,
+        caching: Caching,
+    ) -> Self {
         Self {
             status: StatusCode::OK,
             body: bytes::Bytes::from_static(content.as_bytes()),
-            kind: WebResponseKind::Static { content_type },
+            kind: WebResponseKind::Static {
+                content_type,
+                caching,
+            },
         }
     }
 
@@ -97,7 +121,10 @@ impl WebResponse {
     pub(crate) fn content_type(&self) -> &'static str {
         match self.kind {
             WebResponseKind::Html => "text/html; charset=utf-8",
-            WebResponseKind::Static { content_type } => content_type,
+            WebResponseKind::Static {
+                content_type,
+                caching: _,
+            } => content_type,
             WebResponseKind::Json => "application/json",
             WebResponseKind::Error => "text/plain; charset=utf-8",
         }
@@ -117,7 +144,24 @@ impl WebResponse {
                 ("X-Robots-Tag", "noindex"),
                 ("Referrer-Policy", "no-referrer"),
             ],
-            WebResponseKind::Static { .. } => &[
+            WebResponseKind::Static {
+                content_type: _,
+                caching: Caching::Immutable,
+            } => &[
+                ("Cache-Control", "public, max-age=31536000, immutable"),
+                ("X-Content-Type-Options", "nosniff"),
+            ],
+            WebResponseKind::Static {
+                content_type: _,
+                caching: Caching::Revalidate,
+            } => &[
+                ("Cache-Control", "no-cache"),
+                ("X-Content-Type-Options", "nosniff"),
+            ],
+            WebResponseKind::Static {
+                content_type: _,
+                caching: Caching::Day,
+            } => &[
                 ("Cache-Control", "public, max-age=86400"),
                 ("X-Content-Type-Options", "nosniff"),
             ],
@@ -239,21 +283,27 @@ mod tests {
 
     #[test]
     fn static_kind_headers() {
-        let r = WebResponse::static_resource("text/css", "body{}");
-        assert_eq!(r.status, StatusCode::OK);
-        assert_eq!(&r.body[..], b"body{}");
-        assert_eq!(r.content_type(), "text/css");
-        assert_eq!(
-            r.extra_headers(),
-            &[
-                ("Cache-Control", "public, max-age=86400"),
-                ("X-Content-Type-Options", "nosniff"),
-            ]
-        );
-        assert!(
-            header(r.extra_headers(), "Content-Security-Policy").is_none(),
-            "assets carry no document CSP"
-        );
+        for (caching, cache_control) in [
+            (Caching::Immutable, "public, max-age=31536000, immutable"),
+            (Caching::Revalidate, "no-cache"),
+            (Caching::Day, "public, max-age=86400"),
+        ] {
+            let r = WebResponse::static_resource("text/css", "body{}", caching);
+            assert_eq!(r.status, StatusCode::OK);
+            assert_eq!(&r.body[..], b"body{}");
+            assert_eq!(r.content_type(), "text/css");
+            assert_eq!(
+                r.extra_headers(),
+                &[
+                    ("Cache-Control", cache_control),
+                    ("X-Content-Type-Options", "nosniff"),
+                ]
+            );
+            assert!(
+                header(r.extra_headers(), "Content-Security-Policy").is_none(),
+                "assets carry no document CSP"
+            );
+        }
     }
 
     #[test]

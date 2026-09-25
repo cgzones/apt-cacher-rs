@@ -1,6 +1,6 @@
 //! Page chrome shared by the dashboard and the logs page: the query-string
-//! options (`theme`, `refresh`), the `<html>` skeleton, the `<nav>` bar, the
-//! stylesheet served at `/style.css` and the favicon.
+//! options (`theme`, `refresh`), the `<html>` skeleton, the `<nav>` bar and
+//! the favicon.
 
 use std::{
     fmt::{self, Display, Formatter},
@@ -9,7 +9,7 @@ use std::{
 
 use crate::swrite;
 
-use super::fmt::HtmlEscape;
+use super::{assets::STYLESHEET, fmt::HtmlEscape};
 
 /// The system hostname, read once at first use.
 ///
@@ -222,6 +222,7 @@ pub(super) fn build_page(
 ) -> String {
     let theme_attr = options.theme.html_attr();
     let refresh = RefreshMeta(options.refresh_secs.unwrap_or(0));
+    let stylesheet = STYLESHEET.url();
     format!(
         "<!DOCTYPE html>\
          <html lang=\"en\"{theme_attr}>\
@@ -229,7 +230,7 @@ pub(super) fn build_page(
          <meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>{title}</title>\
-         <link rel=\"stylesheet\" href=\"/style.css\">\
+         <link rel=\"stylesheet\" href=\"{stylesheet}\">\
          {FAVICON_LINK}\
          {refresh}\
          </head>\
@@ -418,13 +419,6 @@ pub(super) fn build_nav_html(page: Page, options: QueryOptions) -> String {
     html.push_str("</nav>");
     html
 }
-
-// ---------------------------------------------------------------------------
-// Stylesheet, served at /style.css; its header comment describes the theme
-// mechanism.
-// ---------------------------------------------------------------------------
-
-pub(super) const CSS: &str = include_str!("assets/style.css");
 
 // ---------------------------------------------------------------------------
 // Favicon — small inline SVG (box/archive icon), served at /favicon.svg
