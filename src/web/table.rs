@@ -116,6 +116,65 @@ pub(super) struct DetailsList {
     /// The wall-clock second every relative time in this list is measured
     /// against, read once so two rows cannot disagree about "now".
     now: i64,
+    /// How many of this list's rows are highlighted; see [`Highlights`].
+    highlights: Highlights,
+}
+
+/// Rows painted as alerts or warnings, for the Metrics section's badge.
+///
+/// A row counts once, at its worst level, its parts included: a status
+/// class and the code beneath it that moved are one thing to look at, not
+/// two. Counted from the rendered row -- a highlight is exactly a
+/// `class="alert"` / `class="warn"` span -- so the count cannot drift from
+/// what the page paints.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct Highlights {
+    pub(super) alerts: usize,
+    pub(super) warnings: usize,
+}
+
+impl Highlights {
+    fn count_row(&mut self, row: &str) {
+        if row.contains("class=\"alert\"") {
+            self.alerts += 1;
+        } else if row.contains("class=\"warn\"") {
+            self.warnings += 1;
+        }
+    }
+
+    pub(super) fn add(&mut self, other: Self) {
+        let Self { alerts, warnings } = other;
+        self.alerts += alerts;
+        self.warnings += warnings;
+    }
+}
+
+impl Display for Highlights {
+    /// `2 alerts / 5 warnings`, each figure painted at its level once
+    /// non-zero.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { alerts, warnings } = *self;
+        let plural = |n: usize| if n == 1 { "" } else { "s" };
+        if alerts > 0 {
+            write!(
+                f,
+                "<span class=\"alert\">{alerts} alert{}</span>",
+                plural(alerts)
+            )?;
+        } else {
+            f.write_str("0 alerts")?;
+        }
+        f.write_str(" / ")?;
+        if warnings > 0 {
+            write!(
+                f,
+                "<span class=\"warn\">{warnings} warning{}</span>",
+                plural(warnings)
+            )
+        } else {
+            f.write_str("0 warnings")
+        }
+    }
 }
 
 impl DetailsList {
@@ -131,7 +190,11 @@ impl DetailsList {
     fn open(class: &'static str, now: i64) -> Self {
         let mut out = String::with_capacity(1024);
         swrite!(out, "<dl class=\"{class}\">");
-        Self { out, now }
+        Self {
+            out,
+            now,
+            highlights: Highlights::default(),
+        }
     }
 
     pub(super) fn row(&mut self, label: &'static str, value: impl Display) {
@@ -174,9 +237,14 @@ impl DetailsList {
         }
     }
 
-    pub(super) fn finish(mut self) -> String {
+    pub(super) fn finish(self) -> String {
+        self.finish_counted().0
+    }
+
+    /// [`Self::finish`], with how many rows are highlighted.
+    pub(super) fn finish_counted(mut self) -> (String, Highlights) {
         self.out.push_str("</dl>");
-        self.out
+        (self.out, self.highlights)
     }
 }
 
@@ -248,7 +316,12 @@ impl Entry<'_> {
             last,
             note,
         } = self;
-        let DetailsList { out, now } = list;
+        let DetailsList {
+            out,
+            now,
+            highlights,
+        } = list;
+        let row_start = out.len();
         out.push_str(if parts.is_some() {
             "<div class=\"whole\"><dt"
         } else {
@@ -275,6 +348,7 @@ impl Entry<'_> {
             swrite!(out, "<dd class=\"parts\">{parts}</dd>");
         }
         out.push_str("</div>");
+        highlights.count_row(out.get(row_start..).unwrap_or_default());
     }
 }
 
@@ -296,11 +370,31 @@ pub(super) fn write_collapsible_details(
     open: bool,
     body: &str,
 ) {
+    write_collapsible_details_badged(out, title, id, open, "", body);
+}
+
+/// [`write_collapsible_details`] with `badge` beside the title, readable
+/// while the section is collapsed.
+pub(super) fn write_collapsible_details_badged(
+    out: &mut String,
+    title: &'static str,
+    id: &'static str,
+    open: bool,
+    badge: impl Display,
+    body: &str,
+) {
     let open_attr = if open { " open" } else { "" };
+    let mut badge_html = String::new();
+    swrite!(badge_html, "{badge}");
+    let badge_wrapped = if badge_html.is_empty() {
+        String::new()
+    } else {
+        format!(" <span class=\"count\">{badge_html}</span>")
+    };
     swrite!(
         out,
         "<div class=\"section\"><details{open_attr}>\
-         <summary><h2 id=\"{id}\">{title}</h2></summary>\
+         <summary><h2 id=\"{id}\">{title}</h2>{badge_wrapped}</summary>\
          {body}</details></div>"
     );
 }
@@ -367,7 +461,7 @@ pub(super) fn write_section_error(out: &mut String, what: &'static str, err: &sq
 
 #[cfg(test)]
 mod tests {
-    use super::{DetailsList, Table, write_collapsible_section};
+    use super::{DetailsList, Highlights, Table, write_collapsible_section};
     use crate::web::fmt::{Level, Nonzero};
 
     #[test]
@@ -474,6 +568,49 @@ mod tests {
              <dd class=\"parts\"><dl class=\"parts\">\
              <div><dt>Part A</dt><dd>1</dd></div><div><dt>Part B</dt><dd>2</dd></div>\
              </dl></dd></div></dl>",
+        );
+    }
+
+    #[test]
+    fn a_row_counts_once_at_its_worst_level_parts_included() {
+        let mut list = DetailsList::with_now(0);
+        list.row("Plain", 0);
+        list.entry("Warned").value(Nonzero {
+            value: 2,
+            level: Level::Warn,
+        });
+        // A warned total with an alerted part is one alert.
+        list.entry("Total")
+            .parts(|p| {
+                p.entry("Part").value(Nonzero {
+                    value: 1,
+                    level: Level::Alert,
+                });
+            })
+            .value(Nonzero {
+                value: 1,
+                level: Level::Warn,
+            });
+        let (_, highlights) = list.finish_counted();
+        assert_eq!(
+            highlights,
+            Highlights {
+                alerts: 1,
+                warnings: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn the_badge_paints_only_non_zero_figures() {
+        assert_eq!(Highlights::default().to_string(), "0 alerts / 0 warnings");
+        assert_eq!(
+            Highlights {
+                alerts: 1,
+                warnings: 3,
+            }
+            .to_string(),
+            "<span class=\"alert\">1 alert</span> / <span class=\"warn\">3 warnings</span>",
         );
     }
 

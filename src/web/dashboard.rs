@@ -44,7 +44,10 @@ use super::{
     metrics_page::build_metrics_html,
     page::{Heading, Page, PageTitle, QueryOptions, SetupHint, build_nav_html, build_page},
     response::WebResponse,
-    table::{DetailsList, write_collapsible_details, write_collapsible_section, write_section},
+    table::{
+        DetailsList, Highlights, write_collapsible_details, write_collapsible_details_badged,
+        write_collapsible_section, write_section,
+    },
     tables::{
         DirStats, Section, TOP_PACKAGES_LIMIT, TopPackagesView, build_mirror_table,
         build_uncacheable_table, db_error_section, render_client_table, render_origin_table,
@@ -70,6 +73,9 @@ struct DashboardData {
     maintenance_html: String,
     cache_stats_html: String,
     metrics_html: String,
+    /// Highlighted rows in the collapsed Metrics section, shown on its
+    /// header so an alert is not hidden behind the fold.
+    metrics_highlights: Highlights,
     hero_html: String,
     /// Whether any mirror has ever been contacted. A dashboard of zeroes on
     /// a fresh install needs the setup hint more than it needs the tables.
@@ -369,7 +375,7 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
         rd,
     );
 
-    let metrics_html = build_metrics_html();
+    let (metrics_html, metrics_highlights) = build_metrics_html();
     let hero_html = build_hero_html(
         mirror_rows,
         cache_size,
@@ -389,6 +395,7 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
         maintenance_html,
         cache_stats_html,
         metrics_html,
+        metrics_highlights,
         hero_html,
         seen_traffic,
         generation_start: start,
@@ -1013,11 +1020,12 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         false,
         &data.configuration_html,
     );
-    write_collapsible_details(
+    write_collapsible_details_badged(
         &mut body,
         "Metrics",
         "metrics-head",
         false,
+        data.metrics_highlights,
         &data.metrics_html,
     );
 

@@ -42,7 +42,7 @@ use crate::{
 
 use super::{
     fmt::{Level, Nonzero, alert_if, warn_if},
-    table::DetailsList,
+    table::{DetailsList, Highlights},
 };
 
 /// Percentage suffix rendered only when the total is non-zero.
@@ -116,6 +116,7 @@ impl Shown {
 /// followed by the [`DetailsList`] its closure fills in.
 struct Groups {
     out: String,
+    highlights: Highlights,
 }
 
 impl Groups {
@@ -123,21 +124,20 @@ impl Groups {
         Self {
             // The full metrics section is comfortably past 40 KB of markup.
             out: String::with_capacity(64 * 1024),
+            highlights: Highlights::default(),
         }
     }
 
     fn group(&mut self, title: &'static str, build: impl FnOnce(&mut DetailsList)) {
         let mut list = DetailsList::new();
         build(&mut list);
-        swrite!(
-            self.out,
-            "<h3 class=\"group\">{title}</h3>{}",
-            list.finish()
-        );
+        let (html, highlights) = list.finish_counted();
+        self.highlights.add(highlights);
+        swrite!(self.out, "<h3 class=\"group\">{title}</h3>{html}");
     }
 
-    fn finish(self) -> String {
-        self.out
+    fn finish(self) -> (String, Highlights) {
+        (self.out, self.highlights)
     }
 }
 
@@ -190,7 +190,9 @@ fn delivery_path(
     t.row_tip(bytes_label, bytes_tip, HumanFmt::Size(bytes));
 }
 
-pub(super) fn build_metrics_html() -> String {
+/// The section's markup and how many of its rows are highlighted, for the
+/// badge its collapsed header carries.
+pub(super) fn build_metrics_html() -> (String, Highlights) {
     let config = global_config();
     let shown = Shown::new(config.https_upgrade_mode, config.https_tunnel_enabled);
     let mut g = Groups::new();
