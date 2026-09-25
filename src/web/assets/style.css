@@ -173,6 +173,9 @@ dl.details dd.last { color: var(--details-key-fg); font-weight: 400; font-size: 
                      font-family: inherit; }
 
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+/* A grid item defaults to its content's width, which would stretch a wide
+   table past a phone's screen instead of letting its wrapper scroll. */
+.grid-2 > * { min-width: 0; }
 .section-error { color: var(--error-fg); font-size: 0.85em; margin: 4px 0; }
 .empty { color: var(--details-key-fg); font-size: 0.9em; margin: 4px 0; }
 .setup code { font-family: var(--mono); font-size: 0.95em; background: var(--count-bg);
