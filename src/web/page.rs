@@ -429,6 +429,20 @@ dl.parts > div { display: flex; flex-direction: column; padding-left: 8px;
                  border-left: 2px solid var(--section-border); }
 dl.parts dt { font-size: 0.72em; }
 dl.parts dd { font-size: 0.9em; }
+/* A limiter's gauge: the bar is coloured by the meter's own low/high marks
+   (50 % / 80 % of the cap), no inline style needed. */
+meter.gauge { width: 90px; height: 8px; vertical-align: middle; margin-left: 6px; }
+meter.gauge::-webkit-meter-bar { background: var(--count-bg); border: none; border-radius: 3px; }
+meter.gauge::-webkit-meter-optimum-value { background: var(--ok); border-radius: 3px; }
+meter.gauge::-webkit-meter-suboptimum-value { background: var(--warn); border-radius: 3px; }
+meter.gauge::-webkit-meter-even-less-good-value { background: var(--alert); border-radius: 3px; }
+meter.gauge:-moz-meter-optimum::-moz-meter-bar { background: var(--ok); }
+meter.gauge:-moz-meter-sub-optimum::-moz-meter-bar { background: var(--warn); }
+meter.gauge:-moz-meter-sub-sub-optimum::-moz-meter-bar { background: var(--alert); }
+.peak { color: var(--details-key-fg); font-size: 0.85em; margin-left: 6px; }
+/* Context under a value (time at cap, refusal share). */
+dl.details dd.note { color: var(--details-key-fg); font-weight: 400; font-size: 0.75em;
+                     font-family: inherit; }
 /* When a bad-sign counter last moved: context for the figure above it. */
 dl.details dd.last { color: var(--details-key-fg); font-weight: 400; font-size: 0.75em;
                      font-family: inherit; }

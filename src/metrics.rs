@@ -93,6 +93,96 @@ fn now_epoch_secs() -> u64 {
     coarsetime::Clock::now_since_epoch().as_secs().max(1)
 }
 
+/// Cumulative time a limiter spent at its cap since process start: how long
+/// requests were being refused or made to wait, which a refusal count alone
+/// cannot tell apart (a burst of refusals in one second vs. a cap that is
+/// hit all day).
+///
+/// The limiter calls [`Self::enter`] when an admission brings it to its cap
+/// and [`Self::leave`] when a release takes it below; both are idempotent,
+/// so a caller that cannot tell whether it was at the cap may call `leave`
+/// on every release. Each is a relaxed load in the common case (not at the
+/// cap, or already there), an RMW only on a transition. Where the limiter
+/// is not updated under a lock, a transition racing an opposite one can end
+/// or start a span one release late; the figure is for sizing a cap, not
+/// for billing.
+pub(crate) struct CapClock {
+    /// Coarse monotonic ticks when the current span at the cap began; 0
+    /// while below the cap.
+    since: AtomicU64,
+    /// Ticks spent at the cap in finished spans.
+    total: AtomicU64,
+}
+
+impl CapClock {
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self {
+            since: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+        }
+    }
+
+    /// The limiter reached its cap.
+    pub(crate) fn enter(&self) {
+        if self.since.load(Ordering::Relaxed) == 0 {
+            self.enter_at(now_ticks());
+        }
+    }
+
+    /// The limiter is below its cap (again).
+    pub(crate) fn leave(&self) {
+        if self.since.load(Ordering::Relaxed) != 0 {
+            self.leave_at(now_ticks());
+        }
+    }
+
+    /// Whether a span at the cap is running.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn is_at_cap(&self) -> bool {
+        self.since.load(Ordering::Relaxed) != 0
+    }
+
+    /// Time spent at the cap, the running span included.
+    #[must_use]
+    pub(crate) fn total(&self) -> std::time::Duration {
+        self.total_at(now_ticks())
+    }
+
+    fn enter_at(&self, now: u64) {
+        // Lost race: another admission started the span already.
+        if self
+            .since
+            .compare_exchange(0, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {}
+    }
+
+    fn leave_at(&self, now: u64) {
+        let since = self.since.swap(0, Ordering::Relaxed);
+        if since != 0 {
+            self.total
+                .fetch_add(now.saturating_sub(since), Ordering::Relaxed);
+        }
+    }
+
+    fn total_at(&self, now: u64) -> std::time::Duration {
+        let since = self.since.load(Ordering::Relaxed);
+        let running = if since == 0 {
+            0
+        } else {
+            now.saturating_sub(since)
+        };
+        coarsetime::Duration::from_ticks(self.total.load(Ordering::Relaxed) + running).into()
+    }
+}
+
+/// The coarse monotonic clock every [`CapClock`] span is measured with.
+fn now_ticks() -> u64 {
+    coarsetime::Instant::now().as_ticks()
+}
+
 pub(crate) struct Peak(AtomicU64);
 
 impl Peak {
@@ -331,6 +421,9 @@ pub(crate) static TUNNEL_IDLE_CLOSED: Counter = Counter::new();
 /// `https_tunnel_max_connections_per_client` (see
 /// `TUNNEL_REJECTED_CAPACITY` for that cap's refusals).
 pub(crate) static CONNECT_TUNNEL_ACTIVE_PEAK: Peak = Peak::new();
+/// Time at least one source IP held `https_tunnel_max_connections_per_client`
+/// tunnels (so its next CONNECT would be refused).
+pub(crate) static TUNNEL_PER_CLIENT_CAP_CLOCK: CapClock = CapClock::new();
 
 /// Plain-HTTP connections rejected at accept time because the per-source-IP
 /// cap (`max_connections_per_client_ip`) was reached. Climbing values
@@ -358,6 +451,9 @@ pub(crate) static PROXY_LOOP_REJECTED: Signal = Signal::new();
 /// with a generously high value, watch this peak settle, then lower the
 /// cap to a comfortable margin above it.
 pub(crate) static PER_CLIENT_IP_PEAK: Peak = Peak::new();
+/// Time at least one source IP held `max_connections_per_client_ip`
+/// connections (so its next connection would be refused).
+pub(crate) static CONNECTION_PER_IP_CAP_CLOCK: CapClock = CapClock::new();
 
 /// HTTP request headers outside the daemon's known set
 /// (`warn_once_or_info!("Unhandled HTTP header …")`), counted per header --
@@ -703,6 +799,13 @@ pub(crate) static UPSTREAM_DOWNLOAD_CAP_TRANSITIONS: Signal = Signal::new();
 
 /// Requests rejected (503) because the active-download set was already at the cap.
 pub(crate) static UPSTREAM_DOWNLOAD_REJECTED_CAP: Signal = Signal::new();
+/// New originations admitted against `max_upstream_downloads` (one per
+/// `UpstreamSlot` minted); with `UPSTREAM_DOWNLOAD_REJECTED_CAP` the share of
+/// originations the cap refused. Late joiners open no slot and count in
+/// neither.
+pub(crate) static UPSTREAM_DOWNLOADS_ADMITTED: Counter = Counter::new();
+/// Time the upstream slots spent at `max_upstream_downloads`.
+pub(crate) static UPSTREAM_DOWNLOAD_CAP_CLOCK: CapClock = CapClock::new();
 
 /// Uncached passthrough requests refused (503) because
 /// `max_passthrough_relays` relays were already active, bumped by
@@ -712,6 +815,11 @@ pub(crate) static PASSTHROUGH_REJECTED_CAP: Signal = Signal::new();
 /// every successful admission, whether or not `max_passthrough_relays` caps
 /// them (a refused relay never counted as active).
 pub(crate) static PASSTHROUGH_ACTIVE_PEAK: Peak = Peak::new();
+/// Passthrough relays admitted (`passthrough_limiter::admit`), capped or
+/// not; with `PASSTHROUGH_REJECTED_CAP` the share the cap refused.
+pub(crate) static PASSTHROUGH_ADMITTED: Counter = Counter::new();
+/// Time the passthrough relays spent at `max_passthrough_relays`.
+pub(crate) static PASSTHROUGH_CAP_CLOCK: CapClock = CapClock::new();
 
 /// Upstream connect attempts past a request's first, in both backends:
 /// every backoff retry (`upstream_retry::Backoff::next_retry`) and every
@@ -851,6 +959,12 @@ pub(crate) static DB_QUEUE_FULL_WAITS: Signal = Signal::new();
 /// Debounced `DB_QUEUE_FULL_WAITS` — counts each saturation episode once
 /// (latched until the channel drains fully to empty).
 pub(crate) static DB_QUEUE_FULL_TRANSITIONS: Signal = Signal::new();
+/// Time the DB command channel spent full (`db_channel_capacity`), so that
+/// request paths waited on database writes. Entered when a producer finds
+/// the channel full, left when the DB task finishes a chunk and finds room;
+/// senders parked on the full channel do not re-sample it, so a span can
+/// end at the task's check while they refill it.
+pub(crate) static DB_QUEUE_CAP_CLOCK: CapClock = CapClock::new();
 /// Commands dropped because the DB task channel was closed (graceful shutdown
 /// or unexpected receiver death). Bumped instead of panicking so request tasks
 /// can finish their response after the DB drain begins.
@@ -968,6 +1082,25 @@ mod tests {
     use http::StatusCode;
 
     use super::*;
+
+    #[test]
+    fn a_cap_clock_accumulates_spans_at_the_cap() {
+        let clock = CapClock::new();
+        assert_eq!(clock.total_at(100), std::time::Duration::ZERO);
+        clock.enter_at(1_000);
+        // Idempotent: a second admission at the cap keeps the span's start.
+        clock.enter_at(5_000);
+        assert!(clock.is_at_cap());
+        clock.leave_at(9_000);
+        clock.leave_at(9_500);
+        assert!(!clock.is_at_cap());
+        let first: std::time::Duration = coarsetime::Duration::from_ticks(8_000).into();
+        assert_eq!(clock.total_at(20_000), first);
+        // A running span counts up to "now".
+        clock.enter_at(30_000);
+        let running: std::time::Duration = coarsetime::Duration::from_ticks(8_000 + 2_000).into();
+        assert_eq!(clock.total_at(32_000), running);
+    }
 
     /// Each code a row is shown for lands in its row and its class; other
     /// tests bump the same globals concurrently, so only growth is asserted.

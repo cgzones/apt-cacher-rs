@@ -1,10 +1,9 @@
 //! The collapsed Metrics section of the dashboard: every counter in
-//! `metrics.rs` except six peak gauges shown next to their live values
-//! elsewhere (`CONNECTED_CLIENTS_PEAK`, `PER_CLIENT_IP_PEAK`,
-//! `ACTIVE_UPSTREAM_DOWNLOADS_PEAK`, `ACTIVE_CLIENT_DOWNLOADS_PEAK` and
-//! `PASSTHROUGH_ACTIVE_PEAK` in Daemon Status, `CACHE_QUOTA_UTIL_PEAK_BPS` in
-//! the disk-usage cell), split into titled subsections with the alert/warn
-//! policy applied per row.
+//! `metrics.rs` except the limiter gauges and their peaks, time-at-cap
+//! clocks and admission counters (the Capacity section, `dashboard.rs`),
+//! `ACTIVE_CLIENT_DOWNLOADS_PEAK` (Daemon Status) and
+//! `CACHE_QUOTA_UTIL_PEAK_BPS` (the disk-usage cell), split into titled
+//! subsections with the alert/warn policy applied per row.
 //!
 //! Two rules keep this readable, because a flat list of ~150 counters (of
 //! which nearly all read zero on a healthy daemon) buries the handful that
@@ -21,17 +20,15 @@
 use std::fmt::{self, Display, Formatter};
 
 use crate::{
-    database_task::DB_TASK_QUEUE_SENDER,
     global_checksum_registry, global_verify_throttle,
     humanfmt::HumanFmt,
     metrics::{self, Counter},
     swrite,
-    tunnel_limiter::active_tunnels,
     uncacheables::UNCACHEABLES_MAX,
 };
 
 use super::{
-    fmt::{Colorize, Level, Nonzero, RatioClass, WarnNonzero, alert_if, warn_if},
+    fmt::{Level, Nonzero, WarnNonzero, alert_if, warn_if},
     table::DetailsList,
 };
 
@@ -835,12 +832,6 @@ fn build_tunnels_group(g: &mut Groups) {
             "HTTPS-tunnel CONNECT requests accepted since the daemon started.",
             metrics::TUNNEL_CONNECTS_TOTAL.get(),
         );
-        t.row_tip("Connects (active)", "Tunnels currently open.", active_tunnels());
-        t.row_tip(
-            "Connects (peak)",
-            "Peak concurrent tunnels observed since startup.",
-            metrics::CONNECT_TUNNEL_ACTIVE_PEAK.get(),
-        );
         t.row_tip(
             "Bytes (client \u{2192} upstream)",
             "Bytes copied client-to-upstream through tunnels, however the tunnel ended (cleanly, idle-closed or failed), including bytes pipelined behind the CONNECT request.",
@@ -921,36 +912,7 @@ fn build_cleanup_group(g: &mut Groups) {
 }
 
 fn build_database_group(g: &mut Groups) {
-    let database_tx = DB_TASK_QUEUE_SENDER
-        .get()
-        .expect("Sender initialized in main_loop()");
-    let channel_max = database_tx.max_capacity();
-    let in_flight = channel_max.saturating_sub(database_tx.capacity());
-
-    let depth_class = RatioClass::new(in_flight as u64, channel_max as u64);
-    let peak = metrics::DB_QUEUE_DEPTH_PEAK.get();
-    let peak_class = RatioClass::new(peak, channel_max as u64);
-
     g.group("Database", |t| {
-        t.row_tip(
-            "Queue Depth (current / max)",
-            "Commands queued for the database task against the channel's capacity. A depth that sits near the cap means the writer is the bottleneck.",
-            format_args!(
-                "{} / {channel_max}",
-                Colorize {
-                    inner: in_flight,
-                    class: depth_class,
-                },
-            ),
-        );
-        t.row_tip(
-            "Queue Depth Peak",
-            "Highest queue depth observed since the daemon started.",
-            Colorize {
-                inner: peak,
-                class: peak_class,
-            },
-        );
         t.row_tip(
             "Commands Sent",
             "Commands handed to the database task since the daemon started.",

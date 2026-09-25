@@ -170,6 +170,7 @@ impl DetailsList {
             tip: None,
             parts: None,
             last: None,
+            note: None,
         }
     }
 
@@ -189,6 +190,8 @@ pub(super) struct Entry<'a> {
     /// [`Entry::parts`]).
     parts: Option<String>,
     last: Option<u64>,
+    /// A line of context under the value (see [`Entry::note`]).
+    note: Option<String>,
 }
 
 impl Entry<'_> {
@@ -227,6 +230,15 @@ impl Entry<'_> {
         self
     }
 
+    /// A line of context under the value, e.g. how long a limiter spent at
+    /// its cap: a second `<dd>`, so the value cell stays the bare figure.
+    pub(super) fn note(mut self, note: impl Display) -> Self {
+        let mut rendered = String::new();
+        swrite!(rendered, "{note}");
+        self.note = Some(rendered);
+        self
+    }
+
     pub(super) fn value(self, value: impl Display) {
         let Self {
             list,
@@ -234,6 +246,7 @@ impl Entry<'_> {
             tip,
             parts,
             last,
+            note,
         } = self;
         let DetailsList { out, now } = list;
         out.push_str(if parts.is_some() {
@@ -254,6 +267,9 @@ impl Entry<'_> {
                     now: *now,
                 }
             );
+        }
+        if let Some(note) = note {
+            swrite!(out, "<dd class=\"note\">{note}</dd>");
         }
         if let Some(parts) = parts {
             swrite!(out, "<dd class=\"parts\">{parts}</dd>");

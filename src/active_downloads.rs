@@ -614,6 +614,7 @@ impl UpstreamSlot {
         max: Option<NonZero<usize>>,
     ) -> Self {
         *upstream_slots += 1;
+        metrics::UPSTREAM_DOWNLOADS_ADMITTED.increment();
         record_cap_saturation(*upstream_slots, max);
         Self {
             registry: registry.clone(),
@@ -715,8 +716,11 @@ fn record_cap_saturation(upstream_slots: usize, max: Option<NonZero<usize>>) {
     let Some(max) = max else {
         return;
     };
-    if upstream_slots >= max.get() && !AT_CAP.swap(true, Ordering::AcqRel) {
-        metrics::UPSTREAM_DOWNLOAD_CAP_TRANSITIONS.increment();
+    if upstream_slots >= max.get() {
+        metrics::UPSTREAM_DOWNLOAD_CAP_CLOCK.enter();
+        if !AT_CAP.swap(true, Ordering::AcqRel) {
+            metrics::UPSTREAM_DOWNLOAD_CAP_TRANSITIONS.increment();
+        }
     }
 }
 
@@ -732,6 +736,10 @@ fn record_cap_saturation(upstream_slots: usize, max: Option<NonZero<usize>>) {
 /// here is what makes [`UpstreamSlot`]'s drop global-free (and so
 /// unit-testable).
 fn record_cap_drain(upstream_slots: usize) {
+    // Any release takes a set at the cap below it: the time-at-cap span ends
+    // here (a no-op when no span runs), unlike the transition latch, which
+    // waits for a full drain.
+    metrics::UPSTREAM_DOWNLOAD_CAP_CLOCK.leave();
     if upstream_slots == 0 {
         AT_CAP.store(false, Ordering::Release);
     }

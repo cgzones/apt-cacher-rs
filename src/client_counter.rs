@@ -13,12 +13,24 @@ use crate::{
 static CONNECTED_CLIENTS: AtomicUsize = AtomicUsize::new(0);
 static CLIENT_DOWNLOADS: AtomicUsize = AtomicUsize::new(0);
 
-static CONNECTIONS_PER_IP: std::sync::LazyLock<PerIpCounter> =
-    std::sync::LazyLock::new(|| PerIpCounter::new(Some(&metrics::PER_CLIENT_IP_PEAK)));
+static CONNECTIONS_PER_IP: std::sync::LazyLock<PerIpCounter> = std::sync::LazyLock::new(|| {
+    PerIpCounter::new(
+        Some(&metrics::PER_CLIENT_IP_PEAK),
+        &metrics::CONNECTION_PER_IP_CAP_CLOCK,
+    )
+});
 
 #[must_use]
 pub(crate) fn connected_clients() -> usize {
     CONNECTED_CLIENTS.load(Ordering::Relaxed)
+}
+
+/// The most connections any single source IP holds right now, the live
+/// figure `max_connections_per_client_ip` is compared against (0 while that
+/// cap is disabled: the per-IP map is then not maintained).
+#[must_use]
+pub(crate) fn busiest_client_connections() -> usize {
+    CONNECTIONS_PER_IP.busiest()
 }
 
 /// Smallest global connection cap the derived default settles on.

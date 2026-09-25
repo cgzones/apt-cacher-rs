@@ -17,27 +17,29 @@ use crate::{
     build_info::{APP_VERSION, FEATURES_ONE_LINE},
     cache_metadata,
     cleanup::{CLEANUP_INTERVAL_SECS, next_cleanup_epoch},
-    client_counter::{active_client_downloads, connected_clients},
+    client_counter::{active_client_downloads, busiest_client_connections, connected_clients},
     client_trouble,
     config::HttpsUpgradeMode,
     database::{
         BandwidthWindows, ClientStatEntry, Database, MirrorStatEntry, OriginEntry, TopPackages,
     },
+    database_task::DB_TASK_QUEUE_SENDER,
     error::ErrorReport,
     global_cache_quota, global_config,
     humanfmt::HumanFmt,
     metrics, mirror_health,
     passthrough_limiter::active_relays,
     swrite,
-    tunnel_limiter::active_tunnels,
+    tunnel_limiter::{active_tunnels, busiest_client_tunnels},
     uncacheables::{UNCACHEABLES_MAX, get_uncacheables},
     warn_once_or_debug,
 };
 
 use super::{
     fmt::{
-        CacheHitRatio, Colorize, DiskUsage, EnabledDisabled, FmtMTimeAge, FmtTimestamp, HtmlEscape,
-        MinRate, OptOrUnlimited, OptSize, Pct, RatioClass, Utc, Window, YesNo, as_size,
+        CacheHitRatio, Colorize, DiskUsage, EnabledDisabled, FmtMTimeAge, FmtTimestamp, Gauge,
+        HtmlEscape, MinRate, OptOrUnlimited, OptSize, Pct, RatioClass, Saturation, Utc, Window,
+        YesNo, as_size,
     },
     metrics_page::build_metrics_html,
     page::{Heading, Page, PageTitle, QueryOptions, SetupHint, build_nav_html, build_page},
@@ -62,6 +64,8 @@ struct DashboardData {
     top_packages_by_count: Section,
     top_packages_by_size: Section,
     daemon_status_html: String,
+    /// One gauge per limiter; see [`build_capacity_html`].
+    capacity_html: String,
     configuration_html: String,
     maintenance_html: String,
     cache_stats_html: String,
@@ -350,13 +354,8 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
 
     let next_cleanup_epoch = next_cleanup_epoch();
 
-    let daemon_status_html = build_daemon_status_html(
-        rd,
-        now,
-        memory_stats,
-        database_size,
-        active_mirror_downloads,
-    );
+    let daemon_status_html = build_daemon_status_html(rd, now, memory_stats, database_size);
+    let capacity_html = build_capacity_html(rd, active_mirror_downloads);
 
     let configuration_html = build_configuration_html(rd);
     let maintenance_html = build_maintenance_html(mirror_rows, now_epoch, next_cleanup_epoch);
@@ -385,6 +384,7 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
         top_packages_by_count,
         top_packages_by_size,
         daemon_status_html,
+        capacity_html,
         configuration_html,
         maintenance_html,
         cache_stats_html,
@@ -490,14 +490,8 @@ fn build_daemon_status_html(
     now: Utc,
     memory_stats: Option<memory_stats::MemoryStats>,
     database_size: Option<u64>,
-    active_mirror_downloads: usize,
 ) -> String {
     let start = Utc::from_offset(rd.start_time);
-
-    let logstore = LOGSTORE.get().expect("initialized in main()");
-    let log_entries = logstore.entries().len();
-    let log_cap = rd.config.logstore_capacity.get();
-    let log_class = RatioClass::new(log_entries as u64, log_cap as u64);
 
     let mut t = DetailsList::new();
     t.row("Version", APP_VERSION);
@@ -532,36 +526,6 @@ fn build_daemon_status_html(
         },
     );
     t.row(
-        "Connected Clients",
-        format_args!(
-            "{} (peak {})",
-            connected_clients(),
-            metrics::CONNECTED_CLIENTS_PEAK.get(),
-        ),
-    );
-    if let Some(cap) = rd.config.max_connections {
-        t.row_tip(
-            "Connection Cap (global)",
-            "`max_connections`: connections beyond it are closed at accept time. Defaults to three quarters of the soft RLIMIT_NOFILE.",
-            cap,
-        );
-    }
-    if let Some(cap) = rd.config.max_connections_per_client_ip {
-        t.row_tip(
-            "Per-Client-IP Connections (peak / cap)",
-            "Highest concurrent connection count observed from any single source IP since startup, against the configured cap. Use to right-size `max_connections_per_client_ip`.",
-            format_args!("{} / {}", metrics::PER_CLIENT_IP_PEAK.get(), cap),
-        );
-    }
-    t.row(
-        "Active Upstream Downloads",
-        format_args!(
-            "{active_mirror_downloads} / {} (peak {})",
-            OptOrUnlimited(rd.config.max_upstream_downloads),
-            metrics::ACTIVE_UPSTREAM_DOWNLOADS_PEAK.get(),
-        ),
-    );
-    t.row(
         "Active Client Downloads",
         format_args!(
             "{} (peak {})",
@@ -570,31 +534,145 @@ fn build_daemon_status_html(
         ),
     );
     t.row_tip(
-        "Active Passthrough Relays",
-        "Uncached requests currently relayed to an upstream, against `max_passthrough_relays`, with the peak since startup.",
-        format_args!(
-            "{} / {} (peak {})",
-            active_relays(),
-            OptOrUnlimited(rd.config.max_passthrough_relays),
-            metrics::PASSTHROUGH_ACTIVE_PEAK.get(),
-        ),
-    );
-    t.row("Active HTTPS Tunnels", active_tunnels());
-    t.row_tip(
         "Metadata Cache Entries",
         "Process-local entries cached from per-file ETag and Last-Modified xattrs. Skips fgetxattr(2) on subsequent conditional-request hits; rebuilt lazily after restart.",
         cache_metadata::store().len(),
     );
-    t.row(
-        "Log Entries",
-        format_args!(
-            "{} / {log_cap}",
-            Colorize {
-                inner: log_entries,
-                class: log_class,
-            }
-        ),
-    );
+    t.finish()
+}
+
+/// A configured `usize` cap as the `u64` every gauge renders.
+fn cap_of(cap: Option<std::num::NonZero<usize>>) -> Option<u64> {
+    cap.map(|cap| cap.get() as u64)
+}
+
+/// The Capacity section: one gauge per limiter -- live count against its
+/// cap, peak since start -- with how long the limiter spent at its cap and
+/// the share of admissions it refused, so an operator can tell a cap sized
+/// too low (long at cap, a real refusal share) from a burst.
+fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> String {
+    let config = &rd.config;
+    let mut t = DetailsList::new();
+
+    let refused = metrics::UPSTREAM_DOWNLOAD_REJECTED_CAP.get();
+    t.entry("Upstream Download Slots")
+        .tip("Downloads with an upstream connection open, against max_upstream_downloads; a new download past it is refused with 503. Long at cap with a real refusal share means the cap is below the load (or a slow mirror holds slots: see the Mirrors table).")
+        .note(Saturation {
+            at_cap: metrics::UPSTREAM_DOWNLOAD_CAP_CLOCK.total(),
+            refused,
+            attempts: metrics::UPSTREAM_DOWNLOADS_ADMITTED.get() + refused,
+            verb: "refused",
+        })
+        .value(Gauge {
+            current: active_mirror_downloads as u64,
+            cap: cap_of(config.max_upstream_downloads),
+            peak: Some(metrics::ACTIVE_UPSTREAM_DOWNLOADS_PEAK.get()),
+        });
+
+    let refused = metrics::PASSTHROUGH_REJECTED_CAP.get();
+    t.entry("Passthrough Relays")
+        .tip("Uncached requests currently relayed to an upstream, against max_passthrough_relays; a relay past it is refused with 503.")
+        .note(Saturation {
+            at_cap: metrics::PASSTHROUGH_CAP_CLOCK.total(),
+            refused,
+            attempts: metrics::PASSTHROUGH_ADMITTED.get() + refused,
+            verb: "refused",
+        })
+        .value(Gauge {
+            current: active_relays() as u64,
+            cap: cap_of(config.max_passthrough_relays),
+            peak: Some(metrics::PASSTHROUGH_ACTIVE_PEAK.get()),
+        });
+
+    let accepted = metrics::CONNECTIONS_ACCEPTED.get();
+    let mut connected = t
+        .entry("Connected Clients")
+        .tip("Open client connections, against max_connections (by default three quarters of the soft RLIMIT_NOFILE); a connection past it is closed at accept time. Raise max_connections and LimitNOFILE together.");
+    if config.max_connections.is_some() {
+        let refused = metrics::CONNECTION_REJECTED_GLOBAL_CAP.get();
+        connected = connected.note(format_args!(
+            "refused {refused} of {accepted} accepted connections"
+        ));
+    }
+    connected.value(Gauge {
+        current: connected_clients() as u64,
+        cap: cap_of(config.max_connections),
+        peak: Some(metrics::CONNECTED_CLIENTS_PEAK.get()),
+    });
+
+    if let Some(cap) = config.max_connections_per_client_ip {
+        t.entry("Connections per Client IP")
+            .tip("Connections held by the busiest single source IP, against max_connections_per_client_ip; its next connection is closed at accept time. The peak is the most any IP held since start: deploy generously, watch it settle, then lower the cap to a margin above it. The Clients table names refused clients.")
+            .note(Saturation {
+                at_cap: metrics::CONNECTION_PER_IP_CAP_CLOCK.total(),
+                refused: metrics::CONNECTION_REJECTED_PER_IP_CAP.get(),
+                attempts: accepted,
+                verb: "refused",
+            })
+            .value(Gauge {
+                current: busiest_client_connections() as u64,
+                cap: Some(cap.get() as u64),
+                peak: Some(metrics::PER_CLIENT_IP_PEAK.get()),
+            });
+    }
+
+    if config.https_tunnel_enabled {
+        t.entry("HTTPS Tunnels")
+            .tip("CONNECT tunnels open across all clients. There is no global tunnel cap; the per-client one is the row beside it.")
+            .value(format_args!(
+                "{} <span class=\"peak\">peak {}</span>",
+                active_tunnels(),
+                metrics::CONNECT_TUNNEL_ACTIVE_PEAK.get()
+            ));
+        if let Some(cap) = config.https_tunnel_max_connections_per_client {
+            let refused = metrics::TUNNEL_REJECTED_CAPACITY.get();
+            t.entry("HTTPS Tunnels per Client")
+                .tip("Tunnels held by the busiest single source IP, against https_tunnel_max_connections_per_client; its next CONNECT is refused with 429. The Clients table names refused clients.")
+                .note(Saturation {
+                    at_cap: metrics::TUNNEL_PER_CLIENT_CAP_CLOCK.total(),
+                    refused,
+                    attempts: metrics::TUNNEL_CONNECTS_TOTAL.get() + refused,
+                    verb: "refused",
+                })
+                .value(Gauge {
+                    current: busiest_client_tunnels() as u64,
+                    cap: Some(cap.get() as u64),
+                    peak: None,
+                });
+        }
+    }
+
+    let database_tx = DB_TASK_QUEUE_SENDER
+        .get()
+        .expect("Sender initialized in main_loop()");
+    let channel_max = database_tx.max_capacity();
+    t.entry("DB Command Queue")
+        .tip("Commands queued for the database task, against db_channel_capacity. While it is full, request paths wait on database writes: raise db_channel_capacity, or flush sooner with db_batch_flush_max_count / db_batch_flush_interval_secs.")
+        .note(Saturation {
+            at_cap: metrics::DB_QUEUE_CAP_CLOCK.total(),
+            refused: metrics::DB_QUEUE_FULL_WAITS.get(),
+            attempts: metrics::DB_COMMANDS_SENT.get(),
+            verb: "found full",
+        })
+        .value(Gauge {
+            current: channel_max.saturating_sub(database_tx.capacity()) as u64,
+            cap: Some(channel_max as u64),
+            peak: Some(metrics::DB_QUEUE_DEPTH_PEAK.get()),
+        });
+
+    let logstore = LOGSTORE.get().expect("initialized in main()");
+    t.entry("Log Ring")
+        .tip("Entries held for the /logs page, against logstore_capacity. A full ring is normal: the oldest entry makes room for the newest. Raise logstore_capacity to reach further back.")
+        .note(format_args!(
+            "{} evicted since start",
+            metrics::LOGSTORE_EVICTIONS.get()
+        ))
+        .value(Gauge {
+            current: logstore.entries().len() as u64,
+            cap: Some(config.logstore_capacity.get() as u64),
+            peak: None,
+        });
+
     t.finish()
 }
 
@@ -919,6 +997,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
     // is wrong. Configuration in particular used to sit second, above the
     // figures anyone actually opens this page for.
     write_section(&mut body, "Cache Statistics", &data.cache_stats_html);
+    write_section(&mut body, "Capacity", &data.capacity_html);
     write_section(&mut body, "Daemon Status", &data.daemon_status_html);
     write_collapsible_details(
         &mut body,

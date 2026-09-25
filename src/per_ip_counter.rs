@@ -19,20 +19,42 @@ use crate::metrics;
 /// entry, so the map is bounded by concurrent clients rather than by clients
 /// ever seen.
 pub(crate) struct PerIpCounter {
-    held: parking_lot::Mutex<HashMap<IpAddr, usize>>,
+    held: parking_lot::Mutex<Held>,
     /// Gauge sampled on every admission, where the cap surfaces one. Kept
     /// here rather than at the call site so the count and the gauge cannot
     /// be read from different instants.
     peak: Option<&'static metrics::Peak>,
+    /// Runs while at least one IP holds its cap, so the dashboard can say
+    /// how long the cap was refusing someone. Moved under the map lock, so
+    /// its spans are exact.
+    cap_clock: &'static metrics::CapClock,
+}
+
+/// The map and, under the same lock, how many IPs sit at their cap.
+#[derive(Default)]
+struct Held {
+    per_ip: HashMap<IpAddr, usize>,
+    at_cap: usize,
 }
 
 impl PerIpCounter {
     #[must_use]
-    pub(crate) fn new(peak: Option<&'static metrics::Peak>) -> Self {
+    pub(crate) fn new(
+        peak: Option<&'static metrics::Peak>,
+        cap_clock: &'static metrics::CapClock,
+    ) -> Self {
         Self {
-            held: parking_lot::Mutex::new(HashMap::new()),
+            held: parking_lot::Mutex::new(Held::default()),
             peak,
+            cap_clock,
         }
+    }
+
+    /// The most permits any single IP holds right now: the live figure the
+    /// per-IP cap is compared against.
+    #[must_use]
+    pub(crate) fn busiest(&self) -> usize {
+        self.held.lock().per_ip.values().copied().max().unwrap_or(0)
     }
 
     /// Admit one more concurrent user of `ip` while fewer than `max` are
@@ -46,18 +68,29 @@ impl PerIpCounter {
         ip: IpAddr,
         max: NonZero<usize>,
     ) -> Option<PerIpPermit> {
-        let mut map = self.held.lock();
-        let count = map.entry(ip).or_insert(0);
+        let mut held = self.held.lock();
+        let Held { per_ip, at_cap } = &mut *held;
+        let count = per_ip.entry(ip).or_insert(0);
         if *count >= max.get() {
             return None;
         }
         *count += 1;
-        let held = *count as u64;
-        drop(map);
-        if let Some(peak) = self.peak {
-            peak.update(held);
+        let now_held = *count as u64;
+        if *count == max.get() {
+            *at_cap += 1;
+            if *at_cap == 1 {
+                self.cap_clock.enter();
+            }
         }
-        Some(PerIpPermit { counter: self, ip })
+        drop(held);
+        if let Some(peak) = self.peak {
+            peak.update(now_held);
+        }
+        Some(PerIpPermit {
+            counter: self,
+            ip,
+            max,
+        })
     }
 
     /// Whether `ip` currently holds a permit. Only the tests need it; the
@@ -65,7 +98,7 @@ impl PerIpCounter {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn tracks(&self, ip: IpAddr) -> bool {
-        self.held.lock().contains_key(&ip)
+        self.held.lock().per_ip.contains_key(&ip)
     }
 }
 
@@ -73,18 +106,29 @@ impl PerIpCounter {
 pub(crate) struct PerIpPermit {
     counter: &'static PerIpCounter,
     ip: IpAddr,
+    /// The cap this permit was admitted under, so the release knows whether
+    /// it takes its IP off the cap.
+    max: NonZero<usize>,
 }
 
 impl Drop for PerIpPermit {
     fn drop(&mut self) {
-        let mut map = self.counter.held.lock();
-        if let hashbrown::hash_map::Entry::Occupied(mut entry) = map.entry(self.ip) {
+        let mut held = self.counter.held.lock();
+        let Held { per_ip, at_cap } = &mut *held;
+        if let hashbrown::hash_map::Entry::Occupied(mut entry) = per_ip.entry(self.ip) {
             let count = entry.get_mut();
+            if *count == self.max.get() {
+                *at_cap = at_cap.saturating_sub(1);
+                if *at_cap == 0 {
+                    self.counter.cap_clock.leave();
+                }
+            }
             *count -= 1;
             if *count == 0 {
                 entry.remove();
             }
         }
+        drop(held);
     }
 }
 
@@ -93,8 +137,33 @@ mod tests {
     use super::*;
     use crate::nonzero;
 
+    static CLOCK: metrics::CapClock = metrics::CapClock::new();
     static COUNTER: std::sync::LazyLock<PerIpCounter> =
-        std::sync::LazyLock::new(|| PerIpCounter::new(None));
+        std::sync::LazyLock::new(|| PerIpCounter::new(None, &CLOCK));
+
+    /// The clock runs while any IP sits at its cap, and stops once none
+    /// does: two IPs at the cap, one released, still at the cap.
+    #[test]
+    fn the_cap_clock_runs_while_any_ip_is_at_its_cap() {
+        static CLOCK: metrics::CapClock = metrics::CapClock::new();
+        static COUNTER: std::sync::LazyLock<PerIpCounter> =
+            std::sync::LazyLock::new(|| PerIpCounter::new(None, &CLOCK));
+        let a: IpAddr = "192.0.2.41".parse().expect("test address");
+        let b: IpAddr = "192.0.2.42".parse().expect("test address");
+
+        let a1 = COUNTER.try_acquire(a, nonzero!(2)).expect("slot");
+        assert!(!CLOCK.is_at_cap(), "one of two is not the cap");
+        let a2 = COUNTER.try_acquire(a, nonzero!(2)).expect("slot");
+        assert!(CLOCK.is_at_cap());
+        let b1 = COUNTER.try_acquire(b, nonzero!(1)).expect("slot");
+        assert_eq!(COUNTER.busiest(), 2);
+        drop(a2);
+        assert!(CLOCK.is_at_cap(), "b still holds its cap");
+        drop(b1);
+        assert!(!CLOCK.is_at_cap());
+        drop(a1);
+        assert_eq!(COUNTER.busiest(), 0);
+    }
 
     #[test]
     fn permits_are_capped_per_ip_and_released_on_drop() {

@@ -80,6 +80,7 @@ pub(crate) async fn send_db_command(cmd: DatabaseCommand) {
     // the channel is saturated and whether its configured size needs tuning.
     if tx.capacity() == 0 {
         metrics::DB_QUEUE_FULL_WAITS.increment();
+        metrics::DB_QUEUE_CAP_CLOCK.enter();
     }
     if tx.send(cmd).await.is_err() {
         metrics::DB_COMMANDS_DROPPED_SHUTDOWN.increment();
@@ -132,6 +133,7 @@ pub(crate) fn send_db_command_nonblocking(cmd: DatabaseCommand) {
         Ok(()) => record_queue_depth(tx),
         Err(TrySendError::Full(cmd)) => {
             metrics::DB_QUEUE_FULL_WAITS.increment();
+            metrics::DB_QUEUE_CAP_CLOCK.enter();
             let tx = tx.clone();
             tokio::task::spawn(async move {
                 if tx.send(cmd).await.is_err() {
@@ -566,6 +568,11 @@ pub(crate) async fn db_loop(
                 // full-wait/depth counters remain per send.
                 let was_full = count.saturating_add(db_thread_rx.len()) >= max_capacity;
                 stage_received(&database, &mut cache, &mut buf, &mut received, flush_max_count).await;
+                // Room again once this chunk is staged, unless parked senders
+                // refilled it meanwhile: the time-at-cap span ends here.
+                if db_thread_rx.len() < max_capacity {
+                    metrics::DB_QUEUE_CAP_CLOCK.leave();
+                }
 
                 if was_full && !at_cap {
                     // `send_db_command` awaits on a full queue, so request

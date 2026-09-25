@@ -24,7 +24,6 @@
 //! [`REFUSAL_BODY`].
 
 use std::num::NonZero;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{client_info::ClientInfo, metrics, warn_once_or_info};
 
@@ -32,39 +31,92 @@ use crate::{client_info::ClientInfo, metrics, warn_once_or_info};
 /// overload convention: a 503 with a specific body).
 pub(crate) const REFUSAL_BODY: &str = "Too many concurrent passthrough requests";
 
-/// Passthrough relays currently held, across all clients.
-static ACTIVE_RELAYS: AtomicUsize = AtomicUsize::new(0);
+/// The relays held across all clients, and the clock of the time they sat
+/// at the cap.
+///
+/// The count and the clock move under one lock, as in `PerIpCounter`: with
+/// the count an atomic and the clock updated beside it, an admission
+/// landing between a release's decrement and its `leave` saw the span still
+/// running (its `enter` a no-op), and the `leave` then stopped the span with
+/// the cap full again -- under-counting the time at cap for as long as that
+/// relay ran.
+struct RelayCounter {
+    held: parking_lot::Mutex<usize>,
+    cap_clock: &'static metrics::CapClock,
+}
+
+impl RelayCounter {
+    #[must_use]
+    const fn new(cap_clock: &'static metrics::CapClock) -> Self {
+        Self {
+            held: parking_lot::const_mutex(0),
+            cap_clock,
+        }
+    }
+
+    /// Admit one more relay while fewer than `max` are held (`None`: no
+    /// cap), or return `None` at the cap. Counts and updates the peak gauge
+    /// either way, so the dashboard reflects real activity on an uncapped
+    /// deployment too.
+    fn try_acquire(&'static self, max: Option<NonZero<usize>>) -> Option<RelaySlot> {
+        let mut held = self.held.lock();
+        if max.is_some_and(|max| *held >= max.get()) {
+            return None;
+        }
+        *held += 1;
+        let now_held = *held;
+        if max.is_some_and(|max| now_held >= max.get()) {
+            self.cap_clock.enter();
+        }
+        drop(held);
+        metrics::PASSTHROUGH_ADMITTED.increment();
+        metrics::PASSTHROUGH_ACTIVE_PEAK.update(now_held as u64);
+        Some(RelaySlot { counter: self })
+    }
+
+    #[must_use]
+    fn active(&self) -> usize {
+        *self.held.lock()
+    }
+}
+
+static RELAYS: RelayCounter = RelayCounter::new(&metrics::PASSTHROUGH_CAP_CLOCK);
 
 /// Current number of active passthrough relays.
 #[must_use]
 pub(crate) fn active_relays() -> usize {
-    ACTIVE_RELAYS.load(Ordering::Relaxed)
+    RELAYS.active()
 }
 
 /// One admitted passthrough relay; released on drop. Hold it for as long as
 /// the relay can move bytes: across `splice_simple_proxy`, inside the hyper
 /// response body.
-#[derive(Debug)]
 pub(crate) struct RelaySlot {
-    _private: (),
+    counter: &'static RelayCounter,
+}
+
+impl std::fmt::Debug for RelaySlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { counter: _ } = self;
+        f.write_str("RelaySlot")
+    }
 }
 
 impl Drop for RelaySlot {
     fn drop(&mut self) {
-        ACTIVE_RELAYS.fetch_sub(1, Ordering::Relaxed);
+        let mut held = self.counter.held.lock();
+        *held -= 1;
+        // A release from the cap takes the relays below it; a no-op when no
+        // span runs. Under the lock, so no admission can refill the cap
+        // between the decrement and the clock.
+        self.counter.cap_clock.leave();
+        drop(held);
     }
 }
 
-/// Admit one more relay while fewer than `max` are held (`None`: no cap), or
-/// return `None` at the cap. Counts and updates the peak gauge either way,
-/// so the dashboard reflects real activity on an uncapped deployment too.
+/// [`RelayCounter::try_acquire`] on the process-wide relay count.
 fn try_acquire(max: Option<NonZero<usize>>) -> Option<RelaySlot> {
-    let admitted = ACTIVE_RELAYS.try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
-        max.is_none_or(|max| held < max.get()).then_some(held + 1)
-    });
-    let held = admitted.ok()? + 1;
-    metrics::PASSTHROUGH_ACTIVE_PEAK.update(held as u64);
-    Some(RelaySlot { _private: () })
+    RELAYS.try_acquire(max)
 }
 
 /// [`try_acquire`] against `max_passthrough_relays`, counting and logging a
@@ -111,6 +163,33 @@ mod tests {
         let third = try_acquire(Some(max)).expect("a released slot is handed out again");
         drop(first);
         drop(third);
+    }
+
+    /// The clock runs exactly while the relays sit at the cap, whatever the
+    /// order of admissions and releases.
+    #[test]
+    fn the_cap_clock_runs_exactly_while_the_relays_are_at_the_cap() {
+        static CLOCK: metrics::CapClock = metrics::CapClock::new();
+        static COUNTER: RelayCounter = RelayCounter::new(&CLOCK);
+        let max = NonZero::new(2);
+
+        let first = COUNTER.try_acquire(max).expect("first slot");
+        assert!(!CLOCK.is_at_cap(), "one of two is not the cap");
+        let second = COUNTER.try_acquire(max).expect("second slot");
+        assert!(CLOCK.is_at_cap());
+        assert!(
+            COUNTER.try_acquire(max).is_none(),
+            "the cap refuses a third"
+        );
+        assert!(CLOCK.is_at_cap(), "a refusal leaves the span running");
+        drop(first);
+        assert!(!CLOCK.is_at_cap());
+        let third = COUNTER.try_acquire(max).expect("a released slot");
+        assert!(CLOCK.is_at_cap(), "refilling the cap restarts the span");
+        drop(second);
+        drop(third);
+        assert!(!CLOCK.is_at_cap());
+        assert_eq!(COUNTER.active(), 0);
     }
 
     #[test]

@@ -103,6 +103,96 @@ impl Display for Age {
     }
 }
 
+/// A duration in its two most significant units: `2 h 13 min`, `45 s`,
+/// `3 d 4 h`. For accumulated spans (time spent at a cap), where the second
+/// unit is what tells two readings apart.
+pub(super) struct Span(pub(super) u64);
+impl Display for Span {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        const MIN: u64 = 60;
+        const HOUR: u64 = 60 * MIN;
+        const DAY: u64 = 24 * HOUR;
+        let s = self.0;
+        let (major, major_unit, minor, minor_unit) = if s < MIN {
+            return write!(f, "{s} s");
+        } else if s < HOUR {
+            (s / MIN, "min", s % MIN, "s")
+        } else if s < DAY {
+            (s / HOUR, "h", s % HOUR / MIN, "min")
+        } else {
+            (s / DAY, "d", s % DAY / HOUR, "h")
+        };
+        if minor == 0 {
+            write!(f, "{major} {major_unit}")
+        } else {
+            write!(f, "{major} {major_unit} {minor} {minor_unit}")
+        }
+    }
+}
+
+/// A limiter's live gauge: `current / cap`, a `<meter>` against the cap
+/// and the peak since start as a label, e.g. `3 / 20 [meter] peak 20`. No
+/// cap renders `unlimited` and no bar. The meter's `low`/`high` marks sit at
+/// the same 50 % / 80 % thresholds as [`RatioClass`], so the browser paints
+/// the bar green, amber or red with no inline style (the CSP forbids one).
+pub(super) struct Gauge {
+    pub(super) current: u64,
+    pub(super) cap: Option<u64>,
+    pub(super) peak: Option<u64>,
+}
+impl Display for Gauge {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self { current, cap, peak } = *self;
+        match cap {
+            Some(cap) if cap > 0 => write!(
+                f,
+                "{current} / {cap}<meter class=\"gauge\" min=\"0\" max=\"{cap}\" low=\"{}\" high=\"{}\" optimum=\"0\" value=\"{}\"></meter>",
+                cap.div_ceil(2),
+                (cap.saturating_mul(4)).div_ceil(5),
+                current.min(cap),
+            )?,
+            Some(_) | None => write!(f, "{current} / unlimited")?,
+        }
+        if let Some(peak) = peak {
+            write!(f, " <span class=\"peak\">peak {peak}</span>")?;
+        }
+        Ok(())
+    }
+}
+
+/// How a capped limiter fared since start: the time spent at its cap and
+/// the share of admissions it refused, e.g. `at cap 2 h 13 min; refused
+/// 4.2% (12 of 285)`.
+pub(super) struct Saturation {
+    pub(super) at_cap: std::time::Duration,
+    pub(super) refused: u64,
+    /// Admissions and refusals together.
+    pub(super) attempts: u64,
+    /// What a refusal is called for this limiter ("refused", "waited").
+    pub(super) verb: &'static str,
+}
+impl Display for Saturation {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self {
+            at_cap,
+            refused,
+            attempts,
+            verb,
+        } = *self;
+        if at_cap.is_zero() {
+            f.write_str("never at cap")?;
+        } else {
+            write!(f, "at cap {}", Span(at_cap.as_secs()))?;
+        }
+        if attempts > 0 {
+            #[expect(clippy::cast_precision_loss, reason = "only for display purposes")]
+            let pct = refused as f64 / attempts as f64 * 100.0;
+            write!(f, "; {verb} {pct:.1}% ({refused} of {attempts})")?;
+        }
+        Ok(())
+    }
+}
+
 /// A Unix timestamp as a relative age inside a `<time>` element, e.g.
 /// `<time datetime="2026-09-25T10:00:00Z" title="25 Sep 2026 10:00:00 UTC">3 h ago</time>`,
 /// or `in 3 h` for one in the future. The relative figure is what a reader
@@ -597,7 +687,8 @@ mod tests {
     use std::fmt::Display;
 
     use super::{
-        Age, CacheHitRatio, FmtTimestamp, Freshness, HtmlEscape, Meter, Pct, RatioClass, RelTime,
+        Age, CacheHitRatio, FmtTimestamp, Freshness, Gauge, HtmlEscape, Meter, Pct, RatioClass,
+        RelTime, Saturation, Span,
     };
 
     /// 2023-11-14T22:13:20Z, so every rendered timestamp below is fixed.
@@ -819,5 +910,65 @@ mod tests {
             .contains(">just now</time>")
         );
         assert_eq!(render(RelTime { epoch: 0, now: NOW }), "N/A");
+    }
+
+    #[test]
+    fn span_keeps_two_units() {
+        assert_eq!(render(Span(45)), "45 s");
+        assert_eq!(render(Span(60)), "1 min");
+        assert_eq!(render(Span(61)), "1 min 1 s");
+        assert_eq!(render(Span(2 * 3600 + 13 * 60 + 59)), "2 h 13 min");
+        assert_eq!(render(Span(3 * 86_400 + 4 * 3600 + 5)), "3 d 4 h");
+    }
+
+    #[test]
+    fn gauge_draws_the_cap_with_the_ratio_thresholds() {
+        assert_eq!(
+            render(Gauge {
+                current: 3,
+                cap: Some(20),
+                peak: Some(20),
+            }),
+            "3 / 20<meter class=\"gauge\" min=\"0\" max=\"20\" low=\"10\" high=\"16\" optimum=\"0\" value=\"3\"></meter> <span class=\"peak\">peak 20</span>",
+        );
+        // Over the cap (a lowered cap on reload): the bar is full, never past it.
+        assert!(
+            render(Gauge {
+                current: 25,
+                cap: Some(20),
+                peak: None,
+            })
+            .contains("value=\"20\"")
+        );
+        assert_eq!(
+            render(Gauge {
+                current: 4,
+                cap: None,
+                peak: Some(9),
+            }),
+            "4 / unlimited <span class=\"peak\">peak 9</span>",
+        );
+    }
+
+    #[test]
+    fn saturation_reports_time_at_cap_and_refusal_share() {
+        assert_eq!(
+            render(Saturation {
+                at_cap: std::time::Duration::ZERO,
+                refused: 0,
+                attempts: 0,
+                verb: "refused",
+            }),
+            "never at cap",
+        );
+        assert_eq!(
+            render(Saturation {
+                at_cap: std::time::Duration::from_mins(2 * 60 + 13),
+                refused: 12,
+                attempts: 285,
+                verb: "refused",
+            }),
+            "at cap 2 h 13 min; refused 4.2% (12 of 285)",
+        );
     }
 }

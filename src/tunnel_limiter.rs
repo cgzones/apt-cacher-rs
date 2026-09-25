@@ -16,7 +16,14 @@ use crate::{
 /// [`metrics::CONNECT_TUNNEL_ACTIVE_PEAK`], maintained by
 /// [`ActiveTunnelGuard`] whether or not the per-IP cap is configured.
 static TUNNEL_CONNECTIONS: std::sync::LazyLock<PerIpCounter> =
-    std::sync::LazyLock::new(|| PerIpCounter::new(None));
+    std::sync::LazyLock::new(|| PerIpCounter::new(None, &metrics::TUNNEL_PER_CLIENT_CAP_CLOCK));
+
+/// The most tunnels any single source IP holds right now, the live figure
+/// `https_tunnel_max_connections_per_client` is compared against.
+#[must_use]
+pub(crate) fn busiest_client_tunnels() -> usize {
+    TUNNEL_CONNECTIONS.busiest()
+}
 
 /// Total active tunnels across all source IPs. Updated by
 /// [`ActiveTunnelGuard`] on every CONNECT regardless of whether the
