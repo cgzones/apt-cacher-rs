@@ -321,7 +321,7 @@ fn build_requests_group(g: &mut Groups) {
             .figure(status_4xx)
             .value(Count(status_4xx));
         t.entry("Client 5xx")
-            .tip("Server-error responses returned to clients, relayed upstream errors included. A mix of causes with different remedies, so the class only warns; the code rows say which one moved.")
+            .tip("Server-error responses returned to clients, relayed upstream errors included. A mix of causes with different remedies, so the class only warns; the code rows say which one moved. The rarer codes this proxy answers itself count in the class alone: 501 (unknown method), 505 (unsupported HTTP version) and 508 (Proxy Loops Rejected).")
             .parts(|p| {
                 p.signal(
                     "Client 500 Internal Server Error",
@@ -340,6 +340,12 @@ fn build_requests_group(g: &mut Groups) {
                     "A deliberate refusal: disk_quota or min_disk_free, max_upstream_downloads, max_passthrough_relays or the checksum verify throttle (Download Admission says which); or the mirror itself answered 503.",
                     Level::Warn,
                     &metrics::CLIENT_STATUS_503,
+                );
+                p.signal(
+                    "Client 504 Gateway Timeout",
+                    "Late joiners of a download cancelled because the mirror delivered below min_download_rate (Rate-Limit Cancellations (upstream)), or the mirror itself answered 504. The Mirrors table names the mirror.",
+                    Level::Warn,
+                    &metrics::CLIENT_STATUS_504,
                 );
             })
             .signal(Level::Warn, &metrics::CLIENT_STATUS_5XX);

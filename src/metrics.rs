@@ -310,7 +310,9 @@ pub(crate) static CLIENT_STATUS_5XX: Signal = Signal::new();
 pub(crate) static CLIENT_STATUS_OTHER: Signal = Signal::new();
 
 /// Selected client status codes tracked individually (200/206/304/410/416
-/// and the three 5xx codes this proxy answers with itself).
+/// and the 5xx codes this proxy commonly answers with itself). The rarer
+/// ones -- 501 (unknown method), 505 (HTTP version), 508 (proxy loop, also
+/// `PROXY_LOOP_REJECTED`) -- count only in `CLIENT_STATUS_5XX`.
 pub(crate) static CLIENT_STATUS_200: Counter = Counter::new();
 pub(crate) static CLIENT_STATUS_206: Counter = Counter::new();
 pub(crate) static CLIENT_STATUS_304: Counter = Counter::new();
@@ -325,6 +327,9 @@ pub(crate) static CLIENT_STATUS_502: Signal = Signal::new();
 /// `503`: a deliberate refusal (disk quota or `min_disk_free`, the
 /// download/passthrough caps, the verify throttle), or a relayed upstream 503.
 pub(crate) static CLIENT_STATUS_503: Signal = Signal::new();
+/// `504`: a late joiner of a download cancelled for a slow mirror
+/// (`min_download_rate`, `RATE_LIMIT_UPSTREAM`), or a relayed upstream 504.
+pub(crate) static CLIENT_STATUS_504: Signal = Signal::new();
 
 /// Volatile-resource hit served from cache within `VOLATILE_CACHE_MAX_AGE`.
 /// Ratio against `VOLATILE_REFETCHED` indicates whether max-age is well-tuned.
@@ -1094,6 +1099,7 @@ pub(crate) fn record_client_status(status: StatusCode) {
         StatusCode::INTERNAL_SERVER_ERROR => CLIENT_STATUS_500.increment(),
         StatusCode::BAD_GATEWAY => CLIENT_STATUS_502.increment(),
         StatusCode::SERVICE_UNAVAILABLE => CLIENT_STATUS_503.increment(),
+        StatusCode::GATEWAY_TIMEOUT => CLIENT_STATUS_504.increment(),
         _ => {}
     }
 }
@@ -1160,6 +1166,7 @@ mod tests {
             (StatusCode::INTERNAL_SERVER_ERROR, &CLIENT_STATUS_500),
             (StatusCode::BAD_GATEWAY, &CLIENT_STATUS_502),
             (StatusCode::SERVICE_UNAVAILABLE, &CLIENT_STATUS_503),
+            (StatusCode::GATEWAY_TIMEOUT, &CLIENT_STATUS_504),
         ] {
             let (code, class) = (row.get(), CLIENT_STATUS_5XX.get());
             record_client_status(status);
