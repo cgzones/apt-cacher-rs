@@ -1339,6 +1339,9 @@ async fn write_body_prefix<'a>(
         range_plan.content_length,
     );
     if !client_slice.is_empty() {
+        // The loop's `BodyTransfer` binds its own once it starts; a body that
+        // fits the prefix never reaches it.
+        let _client_count = client_counter::ClientDownload::new();
         let config = global_config();
         let mut prefix_rc = RateChecker::from_config(config);
         let before = rates.client_bytes_sent;
