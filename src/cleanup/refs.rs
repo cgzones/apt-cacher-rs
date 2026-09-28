@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use coarsetime::Clock;
 use hashbrown::HashSet;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use crate::cache_layout::CacheLayout;
 use crate::cache_walk::{
@@ -14,8 +14,10 @@ use crate::error::ErrorReport;
 use crate::fs_open::{count_cache_failure, probe_dir};
 use crate::index_parser::{ByHashRef, HashAlgo, hex_decode_exact, parse_release_byhash_digests};
 use crate::integrity::read_release_to_string;
-use crate::metrics;
+use crate::log_once::Logged;
 use crate::warn_once_or_debug;
+
+use super::engine::CleanupUnitError;
 
 /// The set of by-hash digests referenced by a mirror's current
 /// `Release`/`InRelease` files, for one by-hash directory. Built by
@@ -234,22 +236,17 @@ pub(super) fn active_origin_distributions(origins: Option<&[OriginEntry]>) -> Op
 }
 
 /// Whether a per-layout by-hash tree exists as a real directory. A hard I/O
-/// error is logged (and counted) and treated as absent, so the expensive
-/// Release reconciliation for that tree is skipped this cycle. `probe_dir`
+/// error is logged (and counted) here and abandons the unit, so the tree is
+/// left unswept this cycle and the run reports the failed step. `probe_dir`
 /// reports a symlinked / non-directory root as absent with its own warning.
-pub(super) async fn byhash_dir_present(path: &Path) -> bool {
-    match probe_dir(path, "by-hash cleanup").await {
-        Ok(present) => present,
-        Err(err) => {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "Failed to probe by-hash directory `{}`; treating it as absent and skipping its by-hash cleanup:  {}",
-                path.display(),
-                ErrorReport(&err)
-            );
-            false
-        }
-    }
+pub(super) async fn byhash_dir_present(path: &Path) -> Result<bool, CleanupUnitError> {
+    probe_dir(path, "by-hash cleanup").await.map_err(|err| {
+        CleanupUnitError(Logged::cache_io_failure(format_args!(
+            "Failed to probe by-hash directory `{}`; abandoning its by-hash cleanup this cycle:  {}",
+            path.display(),
+            ErrorReport(&err)
+        )))
+    })
 }
 
 #[cfg(test)]
@@ -257,7 +254,7 @@ mod tests {
     use super::*;
     use crate::config::ClientHost;
     use crate::limits::RETENTION_TIME;
-    use crate::{index_parser::hex_encode, swrite};
+    use crate::{index_parser::hex_encode, metrics, swrite};
 
     fn origin(distribution: &str, age: Duration) -> OriginEntry {
         let now = Clock::now_since_epoch().as_secs();

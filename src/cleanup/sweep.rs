@@ -49,6 +49,11 @@ pub(super) struct SweepResult {
     /// their algorithm was covered (by-hash reference reclaim), threaded up to
     /// `CLEANUP_BYHASH_UNREFERENCED` by the by-hash unit.
     pub(super) removed_unreferenced: u64,
+    /// Entries left in place, or a directory left unread, on a cache I/O
+    /// failure, each logged where it failed (see [`UnitStats::io_failures`]).
+    ///
+    /// [`UnitStats::io_failures`]: super::engine::UnitStats::io_failures
+    pub(super) io_failures: u64,
 }
 
 /// Per-[`SpanClass`] retention spans consulted by [`sweep_candidates`]: each
@@ -138,6 +143,7 @@ pub(super) async fn sweep_candidates(
     let mut bytes_removed = 0u64;
     let mut files_removed = 0u64;
     let mut removed_unreferenced = 0u64;
+    let mut io_failures = 0u64;
 
     for (name, &class) in candidates {
         let path = root.join(name);
@@ -168,6 +174,7 @@ pub(super) async fn sweep_candidates(
                 None
             }
             Err(err) => {
+                io_failures += 1;
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
                     "Failed to inspect cached file `{}`; retaining it:  {}",
@@ -183,6 +190,7 @@ pub(super) async fn sweep_candidates(
         };
 
         let Some(created) = age_reference_time(&data, &path) else {
+            io_failures += 1;
             continue;
         };
 
@@ -210,6 +218,7 @@ pub(super) async fn sweep_candidates(
         let size = data.len();
 
         if let Err(err) = tokio::fs::remove_file(&path).await {
+            io_failures += 1;
             metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "Failed to remove cached file `{}`; retaining it:  {}",
@@ -234,6 +243,7 @@ pub(super) async fn sweep_candidates(
         files_removed,
         bytes_removed,
         removed_unreferenced,
+        io_failures,
     }
 }
 
@@ -280,17 +290,20 @@ pub(super) async fn sweep_aged_metadata(
         files_removed: 0,
         bytes_removed: 0,
         removed_unreferenced: 0,
+        io_failures: 0,
     };
 
     let mut walker = Walker::new(dir, &METADATA_WALK, OnMissing::Tolerate, ());
 
-    while let Some(entry) = walker.next().await {
+    while let Some(mut entry) = walker.next().await {
         match entry.kind() {
             // `by-hash/`, `tmp/` and flat URL-dirs are swept by their own
             // units.
             EntryKind::Dir => continue,
             EntryKind::NonRegular => {
-                remove_non_regular(&entry.path()).await;
+                if !remove_non_regular(&entry.path()).await {
+                    result.io_failures += 1;
+                }
                 continue;
             }
             EntryKind::File => {}
@@ -311,6 +324,7 @@ pub(super) async fn sweep_aged_metadata(
         let path = entry.path();
 
         let Some(created) = age_reference_time(&data, &path) else {
+            result.io_failures += 1;
             continue;
         };
 
@@ -330,6 +344,7 @@ pub(super) async fn sweep_aged_metadata(
         let size = data.len();
 
         if let Err(err) = tokio::fs::remove_file(&path).await {
+            result.io_failures += 1;
             metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "Failed to remove stale metadata file `{}`; retaining it:  {}",
@@ -347,6 +362,7 @@ pub(super) async fn sweep_aged_metadata(
         result.files_removed += 1;
     }
 
+    result.io_failures += walker.io_failures();
     result
 }
 

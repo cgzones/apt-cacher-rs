@@ -40,7 +40,7 @@ use crate::cleanup::partials::cleanup_tmp_dir;
 use crate::cleanup::refs::{
     ByHashReferenceSet, active_origin_distributions, build_byhash_reference_set, byhash_dir_present,
 };
-use crate::cleanup::scan::{remove_non_regular, scan_candidates};
+use crate::cleanup::scan::{ScannedTree, remove_non_regular, scan_candidates};
 use crate::cleanup::sweep::{SpanTable, SweepResult, sweep_aged_metadata, sweep_candidates};
 
 /// Retention class of a scanned cache-tree entry, selecting its sweep span from
@@ -70,7 +70,8 @@ pub(super) enum SpanClass {
 ///
 /// The failure was logged - with its path, verb and consequence - and counted
 /// (`CACHE_IO_FAILURE`) where it happened: the walker's one directory-failure
-/// line (`cache_walk::WalkContext::dir_failure`, `DirFailure::Abort`).  The
+/// line (`cache_walk::WalkContext::dir_failure`, `DirFailure::Abort`), or the
+/// by-hash root probe (`refs::byhash_dir_present`).  The
 /// carried [`Logged`] is the proof, so every arm this passes through
 /// (`run_reconcile_unit`, `run_byhash_unit`, `run_mirror_units`) maps it
 /// silently; there is exactly one line per abandoned unit.
@@ -87,24 +88,27 @@ pub(super) struct CleanupDone {
     pub(super) removed_unreferenced: u64,
     /// See [`UnitStats::tmp_bytes_removed`].
     pub(super) tmp_bytes_removed: u64,
-    /// Units of this mirror that did not do their job, each logged where it
-    /// stopped: abandoned on a directory they could not read, or a sweep
-    /// bailed on an incomplete reference set ([`UnitStats::bailed`]).
+    /// Units of this mirror that did not do their whole job, each logged
+    /// where it stopped: abandoned on a directory they could not read, or
+    /// [`UnitStats::failed`].  A unit counts once however many of its entries
+    /// failed.
     pub(super) failed_units: u64,
 }
 
 impl CleanupDone {
-    /// Close out a mirror from the sum of its units' [`UnitStats`]:
-    /// `files_retained` is derived (scanned minus removed) rather than tallied,
-    /// so the two can never disagree.
-    fn tally(mirror: Mirror, stats: UnitStats, abandoned: u64) -> Self {
+    /// Close out a mirror from the sum of its units' [`UnitStats`] and the
+    /// count of its failed units: `files_retained` is derived (scanned minus
+    /// removed) rather than tallied, so the two can never disagree.
+    fn tally(mirror: Mirror, stats: UnitStats, failed_units: u64) -> Self {
         let UnitStats {
             scanned,
             removed,
             bytes_removed,
             removed_unreferenced,
             tmp_bytes_removed,
-            bailed,
+            // Per unit, folded into `failed_units` by `run_mirror_units`.
+            bailed: _,
+            io_failures: _,
         } = stats;
         Self {
             mirror,
@@ -113,7 +117,7 @@ impl CleanupDone {
             bytes_removed,
             removed_unreferenced,
             tmp_bytes_removed,
-            failed_units: abandoned + bailed,
+            failed_units,
         }
     }
 }
@@ -143,6 +147,13 @@ pub(super) struct UnitStats {
     /// could not be fetched, parsed or looked up): nothing of that tree is
     /// reclaimed this cycle, which the dashboard labels as a failed step.
     pub bailed: u64,
+    /// Entries the unit left in place, or directories it left unread, on a
+    /// cache I/O failure (an unreadable file type, metadata or timestamp, a
+    /// failed unlink or verification), each logged and counted
+    /// (`CACHE_IO_FAILURE`) where it failed. The rest of the unit ran, but
+    /// what it could not reach is unreclaimed, so the dashboard labels it as
+    /// a failed step. A vanished entry is no failure.
+    pub io_failures: u64,
 }
 
 impl UnitStats {
@@ -151,9 +162,22 @@ impl UnitStats {
     /// `removed_unreferenced` stays zero there; the by-hash facets thread it
     /// through their own path.
     fn fold(&mut self, swept: SweepResult) {
-        self.removed += swept.files_removed;
-        self.bytes_removed += swept.bytes_removed;
-        self.removed_unreferenced += swept.removed_unreferenced;
+        let SweepResult {
+            files_removed,
+            bytes_removed,
+            removed_unreferenced,
+            io_failures,
+        } = swept;
+        self.removed += files_removed;
+        self.bytes_removed += bytes_removed;
+        self.removed_unreferenced += removed_unreferenced;
+        self.io_failures += io_failures;
+    }
+
+    /// Whether this unit left part of its job undone: a bailed sweep or an
+    /// I/O failure it skipped past.
+    const fn failed(&self) -> bool {
+        self.bailed > 0 || self.io_failures > 0
     }
 
     /// Accumulate one finished unit into the per-mirror running total. The
@@ -167,6 +191,7 @@ impl UnitStats {
             removed_unreferenced,
             tmp_bytes_removed,
             bailed,
+            io_failures,
         } = unit;
         self.scanned += scanned;
         self.removed += removed;
@@ -174,6 +199,7 @@ impl UnitStats {
         self.removed_unreferenced += removed_unreferenced;
         self.tmp_bytes_removed += tmp_bytes_removed;
         self.bailed += bailed;
+        self.io_failures += io_failures;
     }
 
     /// Account one checksum-mismatch eviction performed during a reduce.
@@ -378,13 +404,16 @@ pub(super) async fn run_mirror_units(
     };
 
     let mut totals = UnitStats::default();
-    let mut abandoned = 0;
+    let mut failed_units = 0;
 
     for unit in &units {
         match run_unit(unit, &ctx).await {
-            Ok(unit_stats) => totals.accumulate(unit_stats),
+            Ok(unit_stats) => {
+                failed_units += u64::from(unit_stats.failed());
+                totals.accumulate(unit_stats);
+            }
             Err(CleanupUnitError(_logged @ Logged { .. })) => {
-                abandoned += 1;
+                failed_units += 1;
                 debug!(
                     "Abandoned a cleanup unit for mirror {mirror}; continuing with the mirror's remaining units"
                 );
@@ -392,7 +421,7 @@ pub(super) async fn run_mirror_units(
         }
     }
 
-    CleanupDone::tally(mirror, totals, abandoned)
+    CleanupDone::tally(mirror, totals, failed_units)
 }
 
 /// Everything a unit needs that is fixed for the whole mirror: its identity, the
@@ -510,6 +539,7 @@ async fn run_partials_unit(unit: &PartialsUnit, ctx: &MirrorCtx<'_>) -> UnitStat
 
     UnitStats {
         tmp_bytes_removed: reaped.bytes,
+        io_failures: reaped.io_failures,
         ..UnitStats::default()
     }
 }
@@ -550,6 +580,7 @@ async fn run_metadata_unit(unit: &MetadataUnit, ctx: &MirrorCtx<'_>) -> UnitStat
         removed_unreferenced: 0,
         tmp_bytes_removed: 0,
         bailed: 0,
+        io_failures: swept.io_failures,
     }
 }
 
@@ -567,6 +598,8 @@ struct ByHashOutcome {
     /// Subset of `removed` that were unreferenced but algorithm-covered.
     removed_unreferenced: u64,
     bytes_removed: u64,
+    /// See [`UnitStats::io_failures`].
+    io_failures: u64,
 }
 
 /// Execute a [`ByHashUnit`]: probe the by-hash tree, build its `Release`
@@ -590,8 +623,9 @@ async fn run_byhash_unit(
     let layout = unit.layout;
 
     // Cheap absence check: skip the origins query + Release reads for a mirror
-    // whose per-layout by-hash tree does not exist.
-    if !byhash_dir_present(&unit.root).await {
+    // whose per-layout by-hash tree does not exist. A failed probe abandons
+    // the unit.
+    if !byhash_dir_present(&unit.root).await? {
         return Ok(UnitStats::default());
     }
 
@@ -639,6 +673,7 @@ async fn run_byhash_unit(
         removed_unreferenced: outcome.removed_unreferenced,
         tmp_bytes_removed: 0,
         bailed: 0,
+        io_failures: outcome.io_failures,
     })
 }
 
@@ -675,13 +710,16 @@ async fn sweep_byhash_dir(
 ) -> Result<ByHashOutcome, CleanupUnitError> {
     let mut candidates: HashMap<OsString, SpanClass> = HashMap::new();
     let mut referenced_kept = 0u64;
+    let mut io_failures = 0u64;
 
     let mut walker = Walker::new(byhash_path, &BYHASH_WALK, OnMissing::Tolerate, ());
 
     while let Some(entry) = walker.next().await {
         match entry.kind() {
             EntryKind::NonRegular => {
-                remove_non_regular(&entry.path()).await;
+                if !remove_non_regular(&entry.path()).await {
+                    io_failures += 1;
+                }
                 continue;
             }
             EntryKind::Dir => {
@@ -715,6 +753,7 @@ async fn sweep_byhash_dir(
         candidates.insert(name.to_owned(), class);
     }
 
+    io_failures += walker.io_failures();
     match walker.finish() {
         WalkOutcome::Complete | WalkOutcome::RootMissing => {}
         WalkOutcome::Aborted { logged, err: _ } => return Err(CleanupUnitError(logged)),
@@ -744,6 +783,7 @@ async fn sweep_byhash_dir(
         removed: swept.files_removed,
         removed_unreferenced: swept.removed_unreferenced,
         bytes_removed: swept.bytes_removed,
+        io_failures: io_failures + swept.io_failures,
     })
 }
 
@@ -770,7 +810,10 @@ async fn run_reconcile_unit(
     } = mirror_ctx;
 
     // An unreadable directory was logged by the walker; the unit is abandoned.
-    let mut cached_files = scan_candidates(&unit.tree, &entry.path).await?;
+    let ScannedTree {
+        candidates: mut cached_files,
+        io_failures,
+    } = scan_candidates(&unit.tree, &entry.path).await?;
 
     trace!("Cached files ({}): {cached_files:?}", cached_files.len());
 
@@ -781,6 +824,7 @@ async fn run_reconcile_unit(
         removed_unreferenced: 0,
         tmp_bytes_removed: 0,
         bailed: 0,
+        io_failures,
     };
 
     let ctx = ReconcileCtx {

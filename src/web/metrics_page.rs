@@ -1343,7 +1343,7 @@ fn build_cleanup_group(g: &mut Groups) {
             );
         } else {
             t.entry("Last Run")
-                .tip("When this process's most recent cleanup run finished, and whether it failed: aborted (the mirror list could not be read, so nothing was reclaimed) or some steps failed (a mirror task that panicked, a directory that could not be read, an index that could not be fetched or parsed so a mirror's sweep was skipped, the rescan after it). The log names each. Maintenance shows the last run from the database.")
+                .tip("When this process's most recent cleanup run finished, and whether it failed: aborted (the mirror list could not be read, so nothing was reclaimed) or some steps failed (a mirror task that panicked, a directory that could not be read, an index that could not be fetched or parsed so a mirror's sweep was skipped, a cached file that could not be inspected or removed, the rescan after it). The log names each. Maintenance shows the last run from the database.")
                 .value(LastRun {
                     finished: RelTime {
                         epoch: i64::try_from(finished_at).unwrap_or(i64::MAX),

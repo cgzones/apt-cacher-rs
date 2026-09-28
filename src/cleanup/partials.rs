@@ -103,7 +103,7 @@ pub(super) async fn cleanup_tmp_dir(
 
     let mut walker = Walker::new(tmp_dir, &TMP_WALK, OnMissing::Tolerate, ());
 
-    while let Some(entry) = walker.next().await {
+    while let Some(mut entry) = walker.next().await {
         let Some(mdata) = entry.metadata().await else {
             continue;
         };
@@ -152,16 +152,16 @@ pub(super) async fn cleanup_tmp_dir(
         }
 
         let path = entry.path();
-        let removed_len = match entry.kind() {
+        let removed = match entry.kind() {
             // Neither is counted towards the cache size, so neither frees
             // accounted bytes.
-            EntryKind::Dir => remove_stray_dir(&path).await.then_some(0),
-            EntryKind::NonRegular => remove_non_regular(&path).await.then_some(0),
+            EntryKind::Dir => Reaped::unless_failed(remove_stray_dir(&path).await),
+            EntryKind::NonRegular => Reaped::unless_failed(remove_non_regular(&path).await),
             EntryKind::File if is_partial => reap_partial(&path, &mdata, cutoffs),
             EntryKind::File => match tokio::fs::remove_file(&path).await {
                 Ok(()) => {
                     debug!("Removed stale tmp entry `{}`", path.display());
-                    Some(mdata.len())
+                    Reaped::Removed(mdata.len())
                 }
                 Err(err) => {
                     metrics::CACHE_IO_FAILURE.increment();
@@ -170,26 +170,54 @@ pub(super) async fn cleanup_tmp_dir(
                         path.display(),
                         ErrorReport(&err)
                     );
-                    None
+                    Reaped::Failed
                 }
             },
         };
-        if let Some(len) = removed_len {
-            reaped.entries += 1;
-            reaped.bytes = reaped.bytes.saturating_add(accounted_size(len));
+        match removed {
+            Reaped::Removed(len) => {
+                reaped.entries += 1;
+                reaped.bytes = reaped.bytes.saturating_add(accounted_size(len));
+            }
+            Reaped::Kept => {}
+            Reaped::Failed => reaped.io_failures += 1,
         }
     }
 
+    reaped.io_failures += walker.io_failures();
     reaped
 }
 
+/// What became of one stale `tmp/` entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reaped {
+    /// Unlinked, freeing a regular file of this length (zero for anything
+    /// else: only regular files count towards the cache size).
+    Removed(u64),
+    /// Left in place on purpose: a download claims it, or it changed since
+    /// the walk judged it.
+    Kept,
+    /// Left in place on a cache I/O failure, logged where it failed.
+    Failed,
+}
+
+impl Reaped {
+    /// A non-file removal's outcome: `removed` says whether the entry is gone.
+    const fn unless_failed(removed: bool) -> Self {
+        if removed {
+            Self::Removed(0)
+        } else {
+            Self::Failed
+        }
+    }
+}
+
 /// Unlink the stale partial at `path` the walk read as `walked`, unless a
-/// download claims it or it changed since: the length it had when removed,
-/// `None` when it stays.
+/// download claims it or it changed since.
 ///
-/// That length comes from the final `lstat(2)` under the claim lock, not
-/// from the walk: it is what the unlink took off the disk.
-fn reap_partial(path: &Path, walked: &Metadata, cutoffs: PartialCutoffs) -> Option<u64> {
+/// A removal carries the length from the final `lstat(2)` under the claim
+/// lock, not from the walk: it is what the unlink took off the disk.
+fn reap_partial(path: &Path, walked: &Metadata, cutoffs: PartialCutoffs) -> Reaped {
     let reap = tokio::task::block_in_place(|| {
         reap_unclaimed(path, FileId::of(walked), |now| {
             // The walk reported an unreadable mtime for this very entry, and
@@ -201,21 +229,21 @@ fn reap_partial(path: &Path, walked: &Metadata, cutoffs: PartialCutoffs) -> Opti
     match reap {
         Reap::Removed { len } => {
             debug!("Removed stale tmp entry `{}`", path.display());
-            Some(len)
+            Reaped::Removed(len)
         }
         Reap::Claimed => {
             debug!(
                 "Keeping stale partial `{}`: a download is using it",
                 path.display()
             );
-            None
+            Reaped::Kept
         }
         Reap::Changed => {
             debug!(
                 "Skipping stale partial `{}`: it was replaced, removed or written to since the walk",
                 path.display()
             );
-            None
+            Reaped::Kept
         }
         Reap::StatFailed(err) => {
             metrics::CACHE_IO_FAILURE.increment();
@@ -224,7 +252,7 @@ fn reap_partial(path: &Path, walked: &Metadata, cutoffs: PartialCutoffs) -> Opti
                 path.display(),
                 ErrorReport(&err)
             );
-            None
+            Reaped::Failed
         }
         Reap::RemoveFailed(err) => {
             metrics::CACHE_IO_FAILURE.increment();
@@ -233,7 +261,7 @@ fn reap_partial(path: &Path, walked: &Metadata, cutoffs: PartialCutoffs) -> Opti
                 path.display(),
                 ErrorReport(&err)
             );
-            None
+            Reaped::Failed
         }
     }
 }
@@ -245,6 +273,11 @@ pub(super) struct TmpReap {
     pub(super) entries: u64,
     /// Sizes of the regular files among them.
     pub(super) bytes: u64,
+    /// Entries left in place, or a directory left unread, on a cache I/O
+    /// failure, each logged where it failed (see [`UnitStats::io_failures`]).
+    ///
+    /// [`UnitStats::io_failures`]: super::engine::UnitStats::io_failures
+    pub(super) io_failures: u64,
 }
 
 #[cfg(test)]
@@ -254,7 +287,9 @@ mod tests {
 
     use filetime::{FileTime, set_file_mtime};
 
-    use super::{EMPTY_PARTIAL_MIN_AGE, PartialCutoffs, TmpReap, cleanup_tmp_dir, reap_partial};
+    use super::{
+        EMPTY_PARTIAL_MIN_AGE, PartialCutoffs, Reaped, TmpReap, cleanup_tmp_dir, reap_partial,
+    };
     use crate::partial_claim::PartialClaim;
 
     const PARTIAL_MAX_AGE: Duration = Duration::from_hours(1);
@@ -295,6 +330,7 @@ mod tests {
             reaped.bytes, 4096,
             "the aged partial's accounted block feeds the quota reconcile"
         );
+        assert_eq!(reaped.io_failures, 0);
         assert!(tmp.join("young.partial").exists(), "young partial kept");
         assert!(!tmp.join("old.partial").exists(), "aged partial reaped");
     }
@@ -322,7 +358,8 @@ mod tests {
             reaped,
             TmpReap {
                 entries: 1,
-                bytes: 4096
+                bytes: 4096,
+                io_failures: 0,
             }
         );
         assert!(!tmp.join("resumed.partial").exists());
@@ -351,7 +388,7 @@ mod tests {
         let walked = stat();
         // Written to since the walk: no longer stale.
         set_file_mtime(&path, FileTime::from_system_time(now)).expect("touch");
-        assert_eq!(reap_partial(&path, &walked, cutoffs), None);
+        assert_eq!(reap_partial(&path, &walked, cutoffs), Reaped::Kept);
         assert!(path.exists());
 
         // Replaced by a new, equally aged file (the old inode held open so
@@ -362,12 +399,12 @@ mod tests {
         let old = std::fs::File::open(&path).expect("open old");
         std::fs::remove_file(&path).expect("unlink old");
         plant_file(tmp, "rechecked.partial", b"new", now, PARTIAL_MAX_AGE * 2);
-        assert_eq!(reap_partial(&path, &walked, cutoffs), None);
+        assert_eq!(reap_partial(&path, &walked, cutoffs), Reaped::Kept);
         assert!(path.exists(), "the new file is not the one judged");
         drop(old);
 
         let walked = stat();
-        assert_eq!(reap_partial(&path, &walked, cutoffs), Some(3));
+        assert_eq!(reap_partial(&path, &walked, cutoffs), Reaped::Removed(3));
         assert!(!path.exists());
     }
 
@@ -477,6 +514,38 @@ mod tests {
             !tmp.join("eight-days").exists(),
             "eight-day stray dir reaped"
         );
+    }
+
+    /// A stale partial that cannot be unlinked stays, and the pass reports
+    /// the failure, so cleanup's last-run result names the failed step.
+    // A partial is reaped through `block_in_place`, which needs the
+    // multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unremovable_stale_partial_is_reported_as_a_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if nix::unistd::Uid::effective().is_root() {
+            // root ignores mode bits, so the unlink would succeed.
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp = dir.path();
+        let now = SystemTime::now();
+        plant_file(tmp, "stale.partial", b"resume", now, PARTIAL_MAX_AGE * 2);
+        std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+
+        let reaped = cleanup_tmp_dir(tmp, now, PARTIAL_MAX_AGE).await;
+
+        std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        assert_eq!(
+            reaped,
+            TmpReap {
+                entries: 0,
+                bytes: 0,
+                io_failures: 1,
+            }
+        );
+        assert!(tmp.join("stale.partial").exists(), "retained");
     }
 
     #[tokio::test]

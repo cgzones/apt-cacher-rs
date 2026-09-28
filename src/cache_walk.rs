@@ -137,7 +137,8 @@ pub(crate) enum OnMissing {
 #[derive(Debug)]
 pub(crate) enum WalkOutcome {
     /// Every reachable directory was read (a [`DirFailure::Continue`] skip
-    /// still counts as complete - it was logged where it happened).
+    /// still counts as complete - it was logged where it happened, and
+    /// counted in [`Walker::io_failures`]).
     Complete,
     /// The root does not exist and the walk was [`OnMissing::Tolerate`].
     RootMissing,
@@ -277,6 +278,8 @@ pub(crate) struct Walker<T> {
     descend: Option<T>,
     root_missing: bool,
     aborted: Option<(Logged, io::Error)>,
+    /// See [`Walker::io_failures`].
+    io_failures: u64,
 }
 
 impl<T: Copy + Send + Sync> Walker<T> {
@@ -304,6 +307,7 @@ impl<T: Copy + Send + Sync> Walker<T> {
             descend: None,
             root_missing: false,
             aborted: None,
+            io_failures: 0,
         }
     }
 
@@ -348,7 +352,13 @@ impl<T: Copy + Send + Sync> Walker<T> {
                     file_type,
                     metadata,
                 } = listed;
-                if let Some(kind) = classify(self.ctx, &open.frame.path, &name, file_type) {
+                if let Some(kind) = classify(
+                    self.ctx,
+                    &open.frame.path,
+                    &name,
+                    file_type,
+                    &mut self.io_failures,
+                ) {
                     break Yielded {
                         name,
                         listing,
@@ -398,7 +408,19 @@ impl<T: Copy + Send + Sync> Walker<T> {
             kind: *kind,
             prefetched: metadata.as_ref(),
             descend: &mut self.descend,
+            io_failures: &mut self.io_failures,
         })
+    }
+
+    /// Directories and entries this walk skipped on an I/O failure so far,
+    /// each logged and counted (`CACHE_IO_FAILURE`) where it happened: a
+    /// directory it could not read or iterate, an entry whose file type or
+    /// [`Entry::metadata`] could not be read.  A vanished entry is no
+    /// failure.  For a caller that must tell a complete pass from one that
+    /// left entries unvisited, such as cleanup's per-run failure tally.
+    #[must_use]
+    pub(crate) const fn io_failures(&self) -> u64 {
+        self.io_failures
     }
 
     /// Report how the walk ended.  Dropping the walker instead is fine for a
@@ -442,6 +464,7 @@ impl<T: Copy + Send + Sync> Walker<T> {
 
     /// The one site logging and counting a directory-level failure.
     fn dir_failed(&mut self, verb: &'static str, path: &Path, err: io::Error) {
+        self.io_failures += 1;
         let logged = Logged::cache_io_failure(format_args!(
             "Failed to {verb} {} `{}`; {}:  {}",
             self.ctx.what,
@@ -459,12 +482,14 @@ impl<T: Copy + Send + Sync> Walker<T> {
 
 /// Classify one listed entry of directory `dir`, reporting a non-regular
 /// one on sight.  `None` means the entry dropped out of the walk (vanished,
-/// or its type could not be read - logged and counted here).
+/// or its type could not be read - logged and counted here, and in
+/// `io_failures`).
 fn classify(
     ctx: &'static WalkContext,
     dir: &Path,
     name: &OsStr,
     file_type: io::Result<FileType>,
+    io_failures: &mut u64,
 ) -> Option<EntryKind> {
     match file_type {
         Ok(ft) if ft.is_file() => Some(EntryKind::File),
@@ -501,6 +526,7 @@ fn classify(
             None
         }
         Err(err) => {
+            *io_failures += 1;
             metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "Failed to get the file type of `{}`; {}:  {}",
@@ -529,6 +555,9 @@ pub(crate) struct Entry<'w, T> {
     /// The lstat taken while listing, in a [`Walker::stat_files`] walk.
     prefetched: Option<&'w io::Result<Metadata>>,
     descend: &'w mut Option<T>,
+    /// The walker's [`Walker::io_failures`], bumped by a failed
+    /// [`Entry::metadata`].
+    io_failures: &'w mut u64,
 }
 
 impl<T: Copy + Send + Sync> Entry<'_, T> {
@@ -614,8 +643,9 @@ impl<T: Copy + Send + Sync> Entry<'_, T> {
     /// walk took while listing it.  `None` means it dropped out of the walk:
     /// it vanished or changed type since it was listed (`debug!`), or the
     /// stat failed (`error!` + `CACHE_IO_FAILURE`, with the walk's
-    /// [`WalkContext::entry_failure`] clause).
-    pub(crate) async fn metadata(&self) -> Option<Metadata> {
+    /// [`WalkContext::entry_failure`] clause, counted in
+    /// [`Walker::io_failures`]).
+    pub(crate) async fn metadata(&mut self) -> Option<Metadata> {
         let on_demand;
         let result = if let Some(prefetched) = self.prefetched {
             prefetched.as_ref()
@@ -651,6 +681,7 @@ impl<T: Copy + Send + Sync> Entry<'_, T> {
                 None
             }
             Err(err) => {
+                *self.io_failures += 1;
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
                     "Failed to get metadata of `{}`; {}:  {}",
@@ -747,7 +778,7 @@ mod tests {
 
         let mut walker = Walker::new(dir.path(), &CONTINUE, OnMissing::Fail, ());
         {
-            let entry = walker.next().await.expect("one entry");
+            let mut entry = walker.next().await.expect("one entry");
             assert_eq!(entry.kind(), EntryKind::File);
             let meta = entry.metadata().await.expect("stat");
             assert_eq!(meta.len(), 5);
@@ -797,7 +828,7 @@ mod tests {
             };
             let mut names = Vec::new();
             let mut bytes = 0;
-            while let Some(entry) = walker.next().await {
+            while let Some(mut entry) = walker.next().await {
                 assert_eq!(entry.kind(), EntryKind::File);
                 bytes += entry.metadata().await.expect("stat").len();
                 names.push(entry.name().to_os_string());
@@ -821,7 +852,7 @@ mod tests {
 
         let mut walker = Walker::new(dir.path(), &CONTINUE, OnMissing::Fail, ()).stat_files();
         let mut seen = 0;
-        while let Some(entry) = walker.next().await {
+        while let Some(mut entry) = walker.next().await {
             seen += 1;
             match entry.kind() {
                 EntryKind::File => {
@@ -847,18 +878,19 @@ mod tests {
         std::fs::write(gone_dir.path().join("gone"), b"x").expect("gone");
         {
             let mut walker = Walker::new(gone_dir.path(), &CONTINUE, OnMissing::Fail, ());
-            let entry = walker.next().await.expect("one entry");
+            let mut entry = walker.next().await.expect("one entry");
             std::fs::remove_file(entry.path()).expect("unlink");
             assert!(
                 entry.metadata().await.is_none(),
                 "an entry that vanished after the listing drops out of the walk"
             );
+            assert_eq!(walker.io_failures(), 0, "a vanished entry is no failure");
         }
 
         let swapped_dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(swapped_dir.path().join("swapped"), b"x").expect("swapped");
         let mut walker = Walker::new(swapped_dir.path(), &CONTINUE, OnMissing::Fail, ());
-        let entry = walker.next().await.expect("one entry");
+        let mut entry = walker.next().await.expect("one entry");
         assert_eq!(entry.kind(), EntryKind::File);
         std::fs::remove_file(entry.path()).expect("unlink");
         std::fs::create_dir(entry.path()).expect("mkdir");
@@ -866,6 +898,7 @@ mod tests {
             entry.metadata().await.is_none(),
             "an entry whose type changed after the listing drops out of the walk"
         );
+        assert_eq!(walker.io_failures(), 0, "a swapped entry is no failure");
     }
 
     /// The on-demand lstat is relative to the listed directory, as the
@@ -883,7 +916,7 @@ mod tests {
             assert_eq!(entry.kind(), EntryKind::Dir);
             entry.descend(());
         }
-        let entry = walker.next().await.expect("f");
+        let mut entry = walker.next().await.expect("f");
         assert_eq!(entry.name(), "f");
         std::fs::rename(root.path().join("sub"), root.path().join("moved")).expect("rename sub");
         let meta = entry
@@ -1008,6 +1041,18 @@ mod tests {
             ]
         );
         assert!(metrics::CACHE_IO_FAILURE.get() > before);
+
+        let mut walker = Walker::new(dir.path(), &CONTINUE, OnMissing::Fail, ());
+        while let Some(mut entry) = walker.next().await {
+            if entry.kind() == EntryKind::Dir {
+                entry.descend(());
+            }
+        }
+        assert_eq!(
+            walker.io_failures(),
+            1,
+            "the skipped directory is the walk's one failure"
+        );
 
         let (events, outcome) = collect(dir.path(), &ABORT, OnMissing::Fail, &["locked"]).await;
         assert!(

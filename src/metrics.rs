@@ -1100,9 +1100,10 @@ pub(crate) static LAST_CLEANUP_BYTES_RECLAIMED: StateU64 = StateU64::new();
 /// Last cleanup run: the steps that failed, each logged where it failed --
 /// a mirror task that panicked, a cleanup unit abandoned on a directory it
 /// could not read, a sweep bailed on an incomplete reference set (an index
-/// that could not be fetched or parsed), the post-cleanup rescan -- or
-/// [`CLEANUP_ABORTED`] for a run that stopped before any mirror. Set before
-/// `LAST_CLEANUP_FINISHED_AT`, like the rest.
+/// that could not be fetched or parsed), a unit that left entries in place
+/// on an I/O failure (once per unit, however many entries), the
+/// post-cleanup rescan -- or [`CLEANUP_ABORTED`] for a run that stopped
+/// before any mirror. Set before `LAST_CLEANUP_FINISHED_AT`, like the rest.
 pub(crate) static LAST_CLEANUP_FAILURES: StateU64 = StateU64::new();
 /// [`LAST_CLEANUP_FAILURES`] of a run aborted before any mirror (the mirror
 /// list could not be read), so no cache file could be reclaimed.

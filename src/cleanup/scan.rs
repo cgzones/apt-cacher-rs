@@ -67,6 +67,17 @@ static RECONCILE_WALK: WalkContext = WalkContext {
     anomalies: AnomalyLevel::Warn,
 };
 
+/// What [`scan_candidates`] found.
+pub(super) struct ScannedTree {
+    /// The deb candidates, keyed as the doc of [`scan_candidates`] says.
+    pub(super) candidates: HashMap<OsString, SpanClass>,
+    /// Entries left in place on a cache I/O failure, each logged where it
+    /// failed (see [`UnitStats::io_failures`]).
+    ///
+    /// [`UnitStats::io_failures`]: super::engine::UnitStats::io_failures
+    pub(super) io_failures: u64,
+}
+
 /// Unified on-disk candidate scanner, driven by the unit's [`TreeSpec`].
 ///
 /// [`Walk::Shallow`] is the structured pool's shape: depth-1, basename keys,
@@ -84,14 +95,17 @@ static RECONCILE_WALK: WalkContext = WalkContext {
 pub(super) async fn scan_candidates(
     tree: &TreeSpec,
     mirror_path: &str,
-) -> Result<HashMap<OsString, SpanClass>, CleanupUnitError> {
+) -> Result<ScannedTree, CleanupUnitError> {
     let mut ret = HashMap::new();
+    let mut io_failures = 0;
     let mut walker = Walker::new(&tree.root, &RECONCILE_WALK, OnMissing::Tolerate, ());
 
     while let Some(mut entry) = walker.next().await {
         match entry.kind() {
             EntryKind::NonRegular => {
-                remove_non_regular(&entry.path()).await;
+                if !remove_non_regular(&entry.path()).await {
+                    io_failures += 1;
+                }
                 continue;
             }
             EntryKind::Dir => {
@@ -173,8 +187,12 @@ pub(super) async fn scan_candidates(
         ret.insert(key.into_os_string(), SpanClass::Deb);
     }
 
+    io_failures += walker.io_failures();
     match walker.finish() {
-        WalkOutcome::Complete | WalkOutcome::RootMissing => Ok(ret),
+        WalkOutcome::Complete | WalkOutcome::RootMissing => Ok(ScannedTree {
+            candidates: ret,
+            io_failures,
+        }),
         WalkOutcome::Aborted { logged, err: _ } => Err(CleanupUnitError(logged)),
     }
 }
@@ -226,7 +244,10 @@ mod tests {
             root: dir.path().to_path_buf(),
             walk: Walk::Shallow,
         };
-        let map = scan_candidates(&tree, "debian").await.expect("scan");
+        let map = scan_candidates(&tree, "debian")
+            .await
+            .expect("scan")
+            .candidates;
         assert!(map.contains_key(OsStr::new("a_1.0_amd64.deb")));
         assert!(
             !map.keys()
@@ -261,7 +282,10 @@ mod tests {
                 boundaries: Vec::new(),
             },
         };
-        let map = scan_candidates(&tree, "apt").await.expect("scan");
+        let map = scan_candidates(&tree, "apt")
+            .await
+            .expect("scan")
+            .candidates;
         assert!(map.contains_key(OsStr::new("amd64/c_1.0_amd64.deb")));
         assert_eq!(map.len(), 1, "skip_subdirs are not entered");
     }
@@ -284,7 +308,10 @@ mod tests {
                 boundaries: vec!["apt/amd64/special".to_owned()],
             },
         };
-        let map = scan_candidates(&tree, "apt").await.expect("scan");
+        let map = scan_candidates(&tree, "apt")
+            .await
+            .expect("scan")
+            .candidates;
         // `amd64/` is the container of the nested mirror: entered, its own
         // debs are candidates; `amd64/special/` is the nested mirror's own.
         assert!(map.contains_key(OsStr::new("amd64/p_1.0_all.deb")));
@@ -306,7 +333,10 @@ mod tests {
             root: dir.path().to_path_buf(),
             walk: Walk::Shallow,
         };
-        let map = scan_candidates(&tree, "debian").await.expect("scan");
+        let map = scan_candidates(&tree, "debian")
+            .await
+            .expect("scan")
+            .candidates;
         assert_eq!(map.len(), 1);
         assert!(map.contains_key(OsStr::new("a_1.0_amd64.deb")));
         assert!(!link.exists(), "the symlink is unlinked, not a candidate");
@@ -319,7 +349,10 @@ mod tests {
             root: dir.path().join("absent"),
             walk: Walk::Shallow,
         };
-        let map = scan_candidates(&tree, "debian").await.expect("scan");
+        let map = scan_candidates(&tree, "debian")
+            .await
+            .expect("scan")
+            .candidates;
         assert!(map.is_empty());
     }
 }

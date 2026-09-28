@@ -246,6 +246,7 @@ async fn process_stanza(
                 hex_encode(&computed),
             );
             if let Err(err) = tokio::fs::remove_file(&path).await {
+                ctx.tally.io_failures += 1;
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
                     "Failed to remove checksum-mismatched cache file `{}`; retaining it:  {}",
@@ -273,6 +274,7 @@ async fn process_stanza(
             );
         }
         Verdict::IoError(err) => {
+            ctx.tally.io_failures += 1;
             error!(
                 "Failed to verify cache file `{}` against its {} digest; retaining it:  {}",
                 path.display(),
