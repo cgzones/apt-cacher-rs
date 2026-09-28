@@ -394,9 +394,10 @@ pub(crate) static UNSAFE_PATH_REJECTED: Signal = Signal::new();
 /// Requests rejected because they targeted a `pdiff` resource.
 pub(crate) static PDIFF_REJECTED: Counter = Counter::new();
 
-/// Unique `(host, path)` resources marked uncacheable. Bumped only on the
-/// first observation that inserts a new ring entry; repeated requests for
-/// the same resource do not bump it. Once the count exceeds
+/// `(host, port, path)` resources marked uncacheable. Bumped only on an
+/// observation that inserts a new ring entry; repeated requests for a
+/// resource still in the ring do not bump it (one evicted and seen again
+/// does). Once the count exceeds
 /// `UNCACHEABLES_MAX`, the surplus equals the number of ring evictions.
 pub(crate) static UNCACHEABLE: Counter = Counter::new();
 
@@ -474,9 +475,10 @@ pub(crate) static CONNECTION_PER_IP_CAP_CLOCK: CapClock = CapClock::new();
 pub(crate) static UNHANDLED_REQUEST_HEADERS: Counter = Counter::new();
 
 /// Request-header reads that failed before any request was parsed, broken
-/// down by whether the peer was the cause (reset/eof) or the byte stream
-/// itself was malformed (oversized headers, garbage). Useful for separating
-/// "client went away" noise from genuine protocol abuse.
+/// down by whether the peer was the cause (reset/eof) or the read itself
+/// failed otherwise (an oversized head, a socket error). A complete head that
+/// fails to parse is answered 400/505 and counts in neither. Useful for
+/// separating "client went away" noise from genuine protocol abuse.
 ///
 /// Scope: only updated by the sendfile backend's manual header-read loop.
 /// Hyper parses headers internally and counts nothing here: in
@@ -575,9 +577,10 @@ pub(crate) static BYTES_DOWNLOADED_UPSTREAM: Accumulator = Accumulator::new();
 
 /// Requests that attached to an in-flight download instead of fetching anew.
 /// High values relative to `CACHE_MISSES + VOLATILE_REFETCHED` mean
-/// coalescing carries real traffic. Every late joiner is also counted in its
-/// flavor's miss bucket: `CACHE_MISSES` for a permanent resource,
-/// `VOLATILE_REFETCHED` for a volatile one.
+/// coalescing carries real traffic. Every client late joiner is also counted
+/// in its flavor's miss bucket: `CACHE_MISSES` for a permanent resource,
+/// `VOLATILE_REFETCHED` for a volatile one. Cleanup's index fetches join too
+/// and count here, but in no miss bucket (`count_lookup` skips them).
 pub(crate) static LATE_JOINERS_TOTAL: Counter = Counter::new();
 /// Most late joiners any single download has had: the entry's joiner count
 /// only grows while the download lives (a joiner that leaves early is not
@@ -691,9 +694,9 @@ pub(crate) static UPSTREAM_UNSOLICITED_206: Signal = Signal::new();
 
 /// Hyper-backend upstream errors observed *after* response headers were
 /// received, while streaming the body: a reset, a read or TLS failure, a
-/// framing error. A body the upstream ended before its announced length is
-/// an `UPSTREAM_PROTOCOL_VIOLATION` instead, as in splice, and not counted
-/// here.
+/// read timeout (also `HTTP_TIMEOUT_UPSTREAM_READ`). A body the upstream
+/// ended before its announced length, or whose chunked framing broke, is an
+/// `UPSTREAM_PROTOCOL_VIOLATION` instead, as in splice, and not counted here.
 pub(crate) static UPSTREAM_HYPER_BODY_ERR: Signal = Signal::new();
 
 /// Local cache I/O failures: any cached-file syscall (write/flush/read/
@@ -799,7 +802,9 @@ pub(crate) static HTTP_TIMEOUT_UPSTREAM_CONNECT: Signal = Signal::new();
 /// In `cfg(not(feature = "sendfile"))` builds (non-default) the hyper path's
 /// `header_read_timeout` is configured from `client_idle_timeout` and does
 /// fire on idle/slow-header clients, but it is not counted here -- it logs at
-/// debug level instead, so this counter stays at 0 on those builds.
+/// debug level instead, so this counter stays at 0 on those builds; likewise a
+/// sendfile connection handed over to hyper for good (an HTTP/1.0 request, a
+/// request body) stops counting here.
 pub(crate) static HTTP_TIMEOUT_CLIENT_HEADER: Counter = Counter::new();
 /// HTTP timeout firings: client failed to drain the response body within
 /// `http_timeout` (slow reader, dropped link). A client falling below
@@ -825,10 +830,13 @@ pub(crate) static HTTP_TIMEOUT_CLIENT_BODY: Signal = Signal::new();
 pub(crate) static HTTP_TIMEOUT_CLIENT_HEADER_WRITE: Counter = Counter::new();
 
 /// `max_upstream_downloads` saturation episodes — debounced (latched at cap,
-/// cleared when the active set drains to zero). Climbing → recurring saturation.
+/// cleared when the upstream slots drain to zero). Climbing → recurring
+/// saturation.
 pub(crate) static UPSTREAM_DOWNLOAD_CAP_TRANSITIONS: Signal = Signal::new();
 
-/// Requests rejected (503) because the active-download set was already at the cap.
+/// Requests rejected (503) because the upstream slots (downloads with an
+/// upstream connection open, see `ACTIVE_UPSTREAM_DOWNLOADS_PEAK`) were
+/// already at `max_upstream_downloads`.
 pub(crate) static UPSTREAM_DOWNLOAD_REJECTED_CAP: Signal = Signal::new();
 /// New originations admitted against `max_upstream_downloads` (one per
 /// `UpstreamSlot` minted); with `UPSTREAM_DOWNLOAD_REJECTED_CAP` the share of
@@ -937,11 +945,13 @@ pub(crate) static DOWNLOADS_ABORTED_INTERNAL: Signal = Signal::new();
 /// (`DownloadFailure::Cancelled`): its task was cancelled, typically
 /// because every client it served went away.
 pub(crate) static DOWNLOADS_ABORTED_CANCELLED: Signal = Signal::new();
-/// Registered downloads the originator ended without fetching a body
+/// Registered downloads the originator ended without caching anything
 /// (`InitBarrier::decline`): the upstream status is relayed uncached, the
 /// planner refused the answer, the disk quota or the verify throttle
 /// refused it, the passthrough cap refused the relay, a buffered volatile
-/// body came back empty. Not an abort: no transfer broke mid-way. A refusal by `max_upstream_downloads` never registers a download
+/// body came back empty, or (splice only) the client's own `Range` proved
+/// unsatisfiable against the upstream head and was answered 416. Not an
+/// abort: no transfer broke mid-way. A refusal by `max_upstream_downloads` never registers a download
 /// and counts only in `UPSTREAM_DOWNLOAD_REJECTED_CAP`.
 pub(crate) static DOWNLOADS_DECLINED: Counter = Counter::new();
 /// Downloads that found their `.partial` path still claimed by an earlier
@@ -1050,7 +1060,9 @@ pub(crate) static CLEANUP_BYTES_RECLAIMED: Accumulator = Accumulator::new();
 /// By-hash files evicted because their digest was absent from the mirror's
 /// current `Release`/`InRelease` set (reference-based reclaim). A subset of
 /// `CLEANUP_EVICTIONS`; the remainder of by-hash evictions are aged out by the
-/// `byhash_retention_days` backstop when no current Release could be read.
+/// `byhash_retention_days` backstop: no current Release could be read, the
+/// Release set does not cover the file's hash algorithm, or its name is not
+/// one cleanup can classify.
 pub(crate) static CLEANUP_BYHASH_UNREFERENCED: Accumulator = Accumulator::new();
 /// Cache files removed by cleanup because their content hash did not match the
 /// value advertised in the upstream Packages stanza. A non-zero counter
