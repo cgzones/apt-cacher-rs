@@ -55,8 +55,9 @@ pub(crate) struct TunnelTarget {
 }
 
 impl TunnelTarget {
-    /// What `TcpStream::connect` dials: the bare host text (an IPv6 address
-    /// without brackets, which a resolver would read as a name) and the port.
+    /// What `upstream_dial::connect` dials: the bare host text (an IPv6
+    /// address without brackets, which a resolver would read as a name) and
+    /// the port.
     #[must_use]
     pub(crate) fn dial_addr(&self) -> (&str, u16) {
         let Self { host, port } = self;

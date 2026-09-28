@@ -92,7 +92,7 @@ use crate::{
     scheme_cache::{self, SchemeDecision, canonical_authority},
     static_assert,
     transfer_error::{CacheError, DeliveryFailure, DownloadFailure, InternalError, UpstreamError},
-    tunnel_limiter,
+    tunnel_limiter, upstream_dial,
     upstream_head::{
         ContentLength, DownloadPlan, RejectGates, RelayedHeaders, ResumeAnomaly, ResumeState,
         UpstreamHead, plan_download, plan_fresh_download, resolve_body_framing,
@@ -2658,24 +2658,8 @@ async fn tunnel(
     let config = global_config();
 
     /* Connect to remote server */
-    let mut server = match tokio::time::timeout(
-        config.http_timeout,
-        tokio::net::TcpStream::connect(target.dial_addr()),
-    )
-    .await
-    {
-        Ok(result) => result?,
-        Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-            metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!(
-                    "tunnel connect timed out after {}",
-                    HumanFmt::Time(config.http_timeout)
-                ),
-            ));
-        }
-    };
+    let (host, port) = target.dial_addr();
+    let mut server = upstream_dial::connect(host, port, config.http_timeout).await?;
     // Disable Nagle on the tunnel: TLS handshake records and HTTP request
     // headers are interactive, and a tunnel cannot coalesce them on our behalf.
     if config.upstream_tcp_nodelay

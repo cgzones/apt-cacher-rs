@@ -32,7 +32,10 @@ use crate::deb_mirror::Mirror;
 use crate::error::{ErrorReport, is_peer_disconnect, is_tls_certificate_rejection};
 use crate::humanfmt::HumanFmt;
 use crate::limits::UPSTREAM_POOL_MAX_IDLE_PER_HOST;
-use crate::{Scheme, global_config, metrics, scheme_cache, warn_once_or_debug, warn_once_or_info};
+use crate::{
+    Scheme, global_config, metrics, scheme_cache, upstream_dial, warn_once_or_debug,
+    warn_once_or_info,
+};
 
 /// Pre-computed TLS client config for use with `tls_rustls`.
 /// Should only be initialized once from main.
@@ -726,25 +729,15 @@ pub(super) async fn connect_upstream(
     }
 }
 
-/// Establish a TCP connection to the given host and port.
+/// Establish a TCP connection to the given host and port, racing its IPv6
+/// and IPv4 addresses (`upstream_dial`).
 ///
-/// Times out after the configured HTTP timeout.
+/// Times out after the configured HTTP timeout; a timeout counts in
+/// `HTTP_TIMEOUT_UPSTREAM_CONNECT` per attempt, a request whose connect fails
+/// for good once more in `UPSTREAM_CONNECT_FAILED` when its failure concludes.
 pub(super) async fn tcp_connect(host: &ClientHost, port: u16) -> std::io::Result<TcpStream> {
-    let http_timeout = global_config().http_timeout;
-    tokio::time::timeout(http_timeout, TcpStream::connect((host.as_str(), port)))
+    upstream_dial::connect(host.as_str(), port, global_config().http_timeout)
         .await
-        .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
-            // Per attempt; a request whose connect fails for good is counted
-            // once, in `UPSTREAM_CONNECT_FAILED`, when its failure concludes.
-            metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
-            std::io::Error::new(
-                ErrorKind::TimedOut,
-                format!(
-                    "TCP connect timed out after {}",
-                    HumanFmt::Time(http_timeout)
-                ),
-            )
-        })?
         .map_err(|err| {
             std::io::Error::new(
                 err.kind(),

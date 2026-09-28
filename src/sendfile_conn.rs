@@ -99,7 +99,7 @@ use crate::{
     transfer_error::{
         CacheError, ClientError, DeliveryEnd, DeliveryFailure, InternalError, TransferOutcome,
     },
-    tunnel_limiter,
+    tunnel_limiter, upstream_dial,
     upstream_head::ContentLength,
     warn_once, warn_once_or_debug, warn_once_or_info,
     web::{WebResponse, serve_web_interface},
@@ -915,28 +915,24 @@ async fn run_connect_tunnel(
 
     // Connect upstream BEFORE sending `200`: owning the raw socket lets a failed
     // connect surface as a real 502 (see the fn doc-comment).
-    let mut upstream = match tokio::time::timeout(
-        config.http_timeout,
-        TcpStream::connect(target.dial_addr()),
-    )
-    .await
-    {
-        Ok(Ok(upstream)) => upstream,
-        Ok(Err(err)) => {
+    let (host, port) = target.dial_addr();
+    let mut upstream = match upstream_dial::connect(host, port, config.http_timeout).await {
+        Ok(upstream) => upstream,
+        Err(err) if err.kind() == ErrorKind::TimedOut => {
             metrics::TUNNEL_TRANSFER_FAILED.increment();
-            warn_once_or_info!(
-                "Failed to connect the tunnel to {target} for client {client}; returning 502:  {}",
+            info!(
+                "Tunnel connect to {target} for client {client} timed out after {}; returning 502:  {}",
+                HumanFmt::Time(config.http_timeout),
                 ErrorReport(&err)
             );
             write_tunnel_upstream_error(&stream, conn_version, client).await;
             return;
         }
-        Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-            metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
+        Err(err) => {
             metrics::TUNNEL_TRANSFER_FAILED.increment();
-            info!(
-                "Tunnel connect to {target} for client {client} timed out after {}; returning 502",
-                HumanFmt::Time(config.http_timeout)
+            warn_once_or_info!(
+                "Failed to connect the tunnel to {target} for client {client}; returning 502:  {}",
+                ErrorReport(&err)
             );
             write_tunnel_upstream_error(&stream, conn_version, client).await;
             return;

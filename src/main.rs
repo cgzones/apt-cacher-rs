@@ -99,6 +99,7 @@ mod test_support;
 mod transfer_error;
 mod tunnel_limiter;
 mod uncacheables;
+mod upstream_dial;
 mod upstream_head;
 mod upstream_retry;
 mod uri_authority;
@@ -764,6 +765,15 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
         let mut tcp_connector = hyper_util::client::legacy::connect::HttpConnector::new();
         tcp_connector.enforce_http(false);
         tcp_connector.set_nodelay(global_config().upstream_tcp_nodelay);
+        // The connector's own timeout, besides `TimeoutConnector`'s below
+        // (which also covers the TLS handshake): only this one is split
+        // across a host's addresses, so a dead first address cannot use up
+        // the whole budget before the next one is tried.
+        tcp_connector.set_connect_timeout(Some(config_http_timeout));
+        // Race IPv6 and IPv4 like `upstream_dial` does for the splice backend
+        // and the CONNECT relays (the value is hyper-util's default, pinned so
+        // the backends cannot drift apart).
+        tcp_connector.set_happy_eyeballs_timeout(Some(upstream_dial::FALLBACK_DELAY));
 
         #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
         let https_connector = hyper_tls::HttpsConnector::new_with_connector(tcp_connector);
