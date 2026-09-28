@@ -4,9 +4,14 @@
 //!
 //! Per canonical mirror and suite (`dists/<suite>/`), from the newest
 //! `Release`/`InRelease` this process parsed: its `Date:` and `Valid-Until:`
-//! and when the mirror last served or confirmed it. The lag -- confirmed
-//! minus `Date:` -- is judged at confirmation, not now, so an idle proxy
-//! does not make a healthy mirror read stale.
+//! and when the mirror last served or confirmed it. The mirror's lag is
+//! its latest confirmation across suites minus its newest known `Date:`:
+//! how long no newer index was seen. A suite no longer requested cannot
+//! freeze the reading at its old lag, and an idle proxy does not make a
+//! healthy mirror read stale. Only a lag the newest index itself was
+//! re-served at marks the mirror behind; one grown while its suite sat idle
+//! is unconfirmed, as that suite may well have moved on. Expiry is still
+//! judged at each suite's own confirmation: it means served expired.
 //!
 //! Fed by the registry ingest of a structured `Release`/`InRelease`
 //! (`integrity::ingest_release_file`, on commit or on a touch of a cached
@@ -38,10 +43,11 @@ use crate::{
 /// only bounds a client probing made-up suites.
 pub(crate) const MAX_SUITES: usize = 64;
 
-/// A freshest suite older than this at its confirmation marks the mirror as
-/// behind: two weeks is long past any archive's publishing cycle, yet short
-/// of a rarely-publishing vendor repository's quiet spell being mistaken for
-/// a sync failure every week.
+/// A newest index re-served older than this marks the mirror as behind (at
+/// only another suite's later confirmation, as unconfirmed): two weeks is
+/// long past any archive's publishing cycle, yet short of a
+/// rarely-publishing vendor repository's quiet spell being mistaken for a
+/// sync failure every week.
 pub(crate) const BEHIND_AFTER_SECS: u64 = 14 * 24 * 60 * 60;
 
 /// What one parsed `Release`/`InRelease` said about its age.
@@ -62,14 +68,19 @@ pub(crate) struct SuiteIndex {
     pub(crate) confirmed_at: i64,
 }
 
+/// How old an index dated `date` was at `confirmed_at`, in seconds; a date
+/// after the confirmation (clock skew) reads as no lag.
+fn lag_between(date: i64, confirmed_at: i64) -> u64 {
+    u64::try_from(confirmed_at.saturating_sub(date)).unwrap_or(0)
+}
+
 impl SuiteIndex {
     /// How old the index was when the mirror last served it, in seconds;
     /// `None` without a `Date:`. A date after the confirmation (clock skew)
     /// reads as no lag.
     #[must_use]
     pub(crate) fn lag(self) -> Option<u64> {
-        self.date
-            .map(|date| u64::try_from(self.confirmed_at.saturating_sub(date)).unwrap_or(0))
+        self.date.map(|date| lag_between(date, self.confirmed_at))
     }
 
     /// Whether the mirror served the index past its `Valid-Until:`, which
@@ -176,18 +187,23 @@ pub(crate) enum IndexState {
     /// A suite was served past its `Valid-Until:`: apt refuses it. Report
     /// it to the mirror, or switch mirrors.
     Expired,
-    /// Even the freshest suite was more than [`BEHIND_AFTER_SECS`] old when
-    /// served: the mirror has likely stopped syncing.
+    /// Even the newest known index was more than [`BEHIND_AFTER_SECS`] old
+    /// when the mirror last served it: it has likely stopped syncing.
     Behind,
+    /// The newest known index is more than [`BEHIND_AFTER_SECS`] older than
+    /// the mirror's latest confirmation, but its suite was not requested
+    /// since it was fresh: nothing shows whether the mirror still syncs.
+    Unconfirmed,
     Fresh,
 }
 
 /// The dashboard's reading of one mirror's indexes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IndexAge {
-    /// The smallest lag over the dated suites: judged by its freshest suite,
-    /// a mirror whose release pocket keeps its original `Date:` forever (as
-    /// Ubuntu's does) still reads fresh while its `-updates` syncs.
+    /// The newest known `Date:` measured at the latest confirmation across
+    /// suites: how long no newer index was seen. A frozen release pocket
+    /// does not hide syncing `-updates`, and an idle suite does not hide a
+    /// mirror that stopped syncing.
     pub(crate) freshest_lag: Option<u64>,
     pub(crate) state: IndexState,
 }
@@ -195,18 +211,19 @@ pub(crate) struct IndexAge {
 /// Judge a mirror's indexes; `None` without any.
 #[must_use]
 pub(crate) fn assess(indexes: &MirrorIndexes) -> Option<IndexAge> {
-    if indexes.suites.is_empty() {
-        return None;
-    }
-    let freshest_lag = indexes
-        .suites
-        .iter()
-        .filter_map(|(_, index)| index.lag())
-        .min();
-    let state = if indexes.suites.iter().any(|(_, index)| index.expired()) {
+    let suites = || indexes.suites.iter().map(|&(_, index)| index);
+    let confirmed_at = suites().map(|index| index.confirmed_at).max()?;
+    // The newest `Date:`, with the latest confirmation of a suite carrying it.
+    let newest = suites()
+        .filter_map(|index| Some((index.date?, index.confirmed_at)))
+        .max();
+    let freshest_lag = newest.map(|(date, _)| lag_between(date, confirmed_at));
+    let state = if suites().any(SuiteIndex::expired) {
         IndexState::Expired
-    } else if freshest_lag.is_some_and(|lag| lag > BEHIND_AFTER_SECS) {
+    } else if newest.is_some_and(|(date, served)| lag_between(date, served) > BEHIND_AFTER_SECS) {
         IndexState::Behind
+    } else if freshest_lag.is_some_and(|lag| lag > BEHIND_AFTER_SECS) {
+        IndexState::Unconfirmed
     } else {
         IndexState::Fresh
     };
@@ -339,6 +356,82 @@ mod tests {
         assert_eq!(assess(&edge).map(|age| age.state), Some(IndexState::Fresh));
     }
 
+    #[test]
+    fn an_idle_suite_does_not_hide_a_mirror_that_stopped_syncing() {
+        let mut indexes = indexes(&[
+            ("idle", index(Some(NOW), None, NOW)),
+            ("active", index(Some(NOW), None, NOW)),
+        ]);
+        // No activity: the reading stays at the last observation, not today.
+        assert_eq!(assess(&indexes).and_then(|age| age.freshest_lag), Some(0));
+        indexes.confirm("active", NOW + 21 * DAY);
+        assert_eq!(
+            assess(&indexes),
+            Some(IndexAge {
+                freshest_lag: Some((21 * DAY).unsigned_abs()),
+                state: IndexState::Behind,
+            })
+        );
+        // A newly published index makes the mirror fresh again.
+        indexes.record("active", index(Some(NOW + 21 * DAY), None, NOW + 21 * DAY));
+        assert_eq!(
+            assess(&indexes).map(|age| age.state),
+            Some(IndexState::Fresh)
+        );
+    }
+
+    /// A suite carrying the newest index that is no longer requested does
+    /// not make the mirror behind while an older suite keeps being served:
+    /// the lag still grows, but only unconfirmed. Re-serving the newest
+    /// index that old is the evidence.
+    #[test]
+    fn a_lag_grown_while_the_newest_suite_sat_idle_is_unconfirmed() {
+        let mut indexes = indexes(&[
+            ("sid", index(Some(NOW), None, NOW)),
+            ("bookworm", index(Some(NOW - 40 * DAY), None, NOW)),
+        ]);
+        indexes.confirm("bookworm", NOW + 21 * DAY);
+        assert_eq!(
+            assess(&indexes),
+            Some(IndexAge {
+                freshest_lag: Some((21 * DAY).unsigned_abs()),
+                state: IndexState::Unconfirmed,
+            })
+        );
+        indexes.confirm("sid", NOW + 15 * DAY);
+        assert_eq!(
+            assess(&indexes).map(|age| age.state),
+            Some(IndexState::Behind)
+        );
+    }
+
+    #[test]
+    fn another_suites_confirmation_does_not_mean_an_idle_index_was_served_expired() {
+        let indexes = indexes(&[
+            ("idle", index(Some(NOW), Some(NOW + DAY), NOW)),
+            ("active", index(Some(NOW + 21 * DAY), None, NOW + 21 * DAY)),
+        ]);
+        assert_eq!(
+            assess(&indexes).map(|age| age.state),
+            Some(IndexState::Fresh)
+        );
+    }
+
+    #[test]
+    fn an_undated_suite_still_advances_the_mirrors_observation_time() {
+        let indexes = indexes(&[
+            ("dated", index(Some(NOW), None, NOW)),
+            ("undated", index(None, None, NOW + 21 * DAY)),
+        ]);
+        assert_eq!(
+            assess(&indexes),
+            Some(IndexAge {
+                freshest_lag: Some((21 * DAY).unsigned_abs()),
+                state: IndexState::Unconfirmed,
+            })
+        );
+    }
+
     /// Serving an index past its Valid-Until is the worst reading, whatever
     /// the dates; a Valid-Until still ahead at confirmation is fine.
     #[test]
@@ -368,6 +461,8 @@ mod tests {
         );
         // Clock skew: a date after the confirmation is no lag, not a wrap.
         assert_eq!(index(Some(NOW + 60), None, NOW).lag(), Some(0));
+        let future = indexes(&[("sid", index(Some(NOW + 60), None, NOW))]);
+        assert_eq!(assess(&future).and_then(|age| age.freshest_lag), Some(0));
     }
 
     /// Last parsed wins; a 304 only moves the confirmation forward, and

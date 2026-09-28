@@ -445,10 +445,12 @@ mod mirror_cells {
         }
     }
 
-    /// A mirror's index age (`mirror_indexes`): its freshest suite's age
-    /// when last served, notice once past two weeks (the mirror stopped
-    /// syncing), warn once a suite was served past its `Valid-Until:`. The
-    /// title lists every suite.
+    /// A mirror's index age (`mirror_indexes`): its newest known index's
+    /// age at the latest confirmation across suites, notice once that index
+    /// was re-served past two weeks old (the mirror stopped syncing), marked
+    /// unconfirmed when only its idle suite's age grew that far, warn once a
+    /// suite was served past its `Valid-Until:`. The title lists every
+    /// suite.
     pub(super) struct IndexAgeCell<'a> {
         pub indexes: Option<&'a MirrorIndexes>,
         /// `verify_checksums`, whose ingest reads the indexes.
@@ -472,7 +474,7 @@ mod mirror_cells {
             let class = match state {
                 IndexState::Expired => " class=\"warn\"",
                 IndexState::Behind => " class=\"notice\"",
-                IndexState::Fresh => "",
+                IndexState::Unconfirmed | IndexState::Fresh => "",
             };
             write!(f, "<span{class} title=\"")?;
             let mut sep = "";
@@ -499,8 +501,10 @@ mod mirror_cells {
                 Some(lag) => Display::fmt(&Age(lag), f)?,
                 None => f.write_str("undated")?,
             }
-            if state == IndexState::Expired {
-                f.write_str(", expired")?;
+            match state {
+                IndexState::Expired => f.write_str(", expired")?,
+                IndexState::Unconfirmed => f.write_str(", unconfirmed")?,
+                IndexState::Behind | IndexState::Fresh => {}
             }
             f.write_str("</span>")
         }
@@ -592,7 +596,7 @@ const MIRROR_HEALTH_HEADERS: [&str; 4] = [
 ];
 
 /// The Mirrors table's index-age column (`mirror_indexes`).
-const MIRROR_INDEX_HEADER: &str = "<span title=\"Age of this mirror's freshest Release/InRelease when the mirror last served or confirmed it, judged by its freshest suite (a frozen release pocket beside a syncing -updates is fine). Over two weeks is a notice: the mirror has likely stopped syncing; report it to the mirror's operator or switch to another mirror (a vendor repository that rarely publishes reads this way too). A suite served past its Valid-Until warns: apt refuses that index. Hover a cell for every suite. Needs verify_checksums, whose ingest reads the index.\">Newest Index</span> <span class=\"scope\">since start</span>";
+const MIRROR_INDEX_HEADER: &str = "<span title=\"Age of this mirror's newest known Release/InRelease at its latest confirmation across all suites. A frozen release pocket beside a syncing -updates is fine; a suite no longer requested cannot freeze the age, and an idle mirror keeps its last reading. Over two weeks is a notice once the mirror served that newest index this old: it has likely stopped syncing; report it to the mirror's operator or switch to another mirror (a vendor repository that rarely publishes reads this way too). Over two weeks only because the suite carrying the newest index was not requested since reads unconfirmed: that suite may well have moved on. A suite served past its Valid-Until warns: apt refuses that index. Hover a cell for each suite's age when it was served. Needs verify_checksums, whose ingest reads the index.\">Newest Index</span> <span class=\"scope\">since start</span>";
 
 /// The Mirrors table's latency and throughput columns (`mirror_perf`),
 /// in-memory figures since the daemon started like the failure counts.
