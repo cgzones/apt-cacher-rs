@@ -125,7 +125,7 @@ impl Backoff {
     /// The delay to wait before retrying, or `None` once the attempt budget OR
     /// the wall-clock budget is spent and the caller must fail terminally.
     /// Charges the attempt, advances the schedule and bumps `UPSTREAM_RETRIES`
-    /// (unless [`Self::uncounted`]).
+    /// (unless built by `Backoff::uncounted`, which is hyper-only).
     ///
     /// The wall-clock rule is "do not start a sleep that finishes past the
     /// deadline": a delay ending after `now + budget` (measured from the `now`
