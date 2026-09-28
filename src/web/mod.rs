@@ -57,7 +57,8 @@
 //!   inside a row mark it highlighted.
 //! - `div[data-series][data-v]` (`data-unit="B"` for bytes, `data-polled`
 //!   for figures web-interface requests move) on the Metrics counter
-//!   rows, never on the value's `<dd>` (`Entry::figure`), and
+//!   rows, never on the value's `<dd>` (`Entry::figure`); the key is the
+//!   row's unique path, `Group › Total › Label` (`DetailsList::scoped`), and
 //!   `[data-started]` on the Metrics scope note.
 //! - `a[data-carry]`, `a[data-action="refresh-toggle"][data-secs]` and
 //!   `a[data-action="theme-cycle"]` in the nav; `a.pin`, which the script

@@ -8,7 +8,10 @@
  *   reduced motion);
  * - the "Activity since page open" panel under the hero lists every
  *   counter that moved, with a sparkline of its movement per refresh (the
- *   last 40 rounds), so the busy counters can be read in one place.
+ *   last 40 rounds), so the busy counters can be read in one place. Away
+ *   from their group a label like "2xx" or "Other" is ambiguous, so the
+ *   panel names each by its series key: the row's path (group, total,
+ *   label), which the server renders unique.
  *
  * The page's own refreshes are web-interface requests too, and move the
  * rows marked data-polled by one each: those rows count from the first
@@ -65,9 +68,8 @@
       const value = polled ? raw - polls : raw;
       let entry = series.get(key);
       if (!entry) {
-        const dt = row.querySelector("dt");
         entry = {
-          label: dt ? dt.textContent : key,
+          label: key,
           unit: row.getAttribute("data-unit"),
           base: value,
           samples: [],

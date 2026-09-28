@@ -257,7 +257,15 @@ pub(super) struct DetailsList {
     now: i64,
     /// How many of this list's rows are highlighted; see [`Highlights`].
     highlights: Highlights,
+    /// Where this list's rows sit, for their series keys (see
+    /// [`Self::scoped`]): empty, or the Metrics group title followed by the
+    /// labels of the totals a part list is nested in.
+    scope: String,
 }
+
+/// Joins a series key's path segments; U+203A (single right-pointing angle
+/// quotation mark), a separator no label contains.
+const SCOPE_SEPARATOR: &str = " \u{203a} ";
 
 /// Rows painted as alerts or warnings, for the Metrics section's badge.
 ///
@@ -333,6 +341,28 @@ impl DetailsList {
             out,
             now,
             highlights: Highlights::default(),
+            scope: String::new(),
+        }
+    }
+
+    /// Key this list's counter rows under `scope`, the Metrics group they
+    /// render in: a row's series key (`data-series`, see [`Entry::figure`])
+    /// becomes its path, `Upstream › 2xx › 200 OK`, so the
+    /// scripts' activity panel, which lists rows away from their group, can
+    /// tell the upstream "2xx" from the client one, and every key on the page
+    /// is unique by construction rather than by the labels happening to be.
+    #[must_use]
+    pub(super) fn scoped(mut self, scope: &'static str) -> Self {
+        scope.clone_into(&mut self.scope);
+        self
+    }
+
+    /// `label`'s path under this list's scope.
+    fn path(&self, label: &str) -> String {
+        if self.scope.is_empty() {
+            label.to_owned()
+        } else {
+            format!("{}{SCOPE_SEPARATOR}{label}", self.scope)
         }
     }
 
@@ -492,6 +522,7 @@ impl Entry<'_> {
     /// would land beside it, or on the next line under an unrelated cell.
     pub(super) fn parts(mut self, build: impl FnOnce(&mut DetailsList)) -> Self {
         let mut parts = DetailsList::open("parts", self.list.now);
+        parts.scope = self.list.path(self.label);
         build(&mut parts);
         self.parts = Some(parts.finish());
         self
@@ -507,7 +538,8 @@ impl Entry<'_> {
     }
 
     /// The counter this row shows, which only ever grows while the daemon
-    /// runs, as `data-series="{label}" data-v="{value}"` on the row: the
+    /// runs, as `data-series="{path}" data-v="{value}"` on the row (the
+    /// path is the label under the list's scope, [`DetailsList::scoped`]): the
     /// optional scripts sample it across refreshes to show what moved since
     /// the page was opened. On the row's `<div>`, never the value's `<dd>`,
     /// which stays the bare figure. Gauges, peaks and per-run figures carry
@@ -567,10 +599,12 @@ impl Entry<'_> {
             figure,
             polled,
         } = self;
+        let series = figure.map(|(value, unit)| (list.path(label), value, unit));
         let DetailsList {
             out,
             now,
             highlights,
+            scope: _,
         } = list;
         let row_start = out.len();
         out.push_str("<div");
@@ -580,11 +614,11 @@ impl Entry<'_> {
             (false, Some(kind)) => swrite!(out, " class=\"{kind}\""),
             (true, Some(kind)) => swrite!(out, " class=\"whole {kind}\""),
         }
-        if let Some((value, unit)) = figure {
+        if let Some((key, value, unit)) = series {
             swrite!(
                 out,
                 " data-series=\"{}\" data-v=\"{value}\"",
-                HtmlEscape(label)
+                HtmlEscape(&key)
             );
             if unit == Unit::Bytes {
                 out.push_str(" data-unit=\"B\"");
@@ -899,6 +933,24 @@ mod tests {
             html.contains("<div><dt>Never</dt><dd>0</dd></div>"),
             "{html}"
         );
+    }
+
+    /// A scoped list keys its counters by path, a part under its total too;
+    /// the visible label stays bare.
+    #[test]
+    fn scoped_counters_are_keyed_by_their_path() {
+        let mut list = DetailsList::with_now(0).scoped("Upstream");
+        list.entry("2xx")
+            .parts(|p| p.count("200 OK", 1))
+            .figure(1)
+            .value(Count(1));
+        let html = list.finish();
+        for needle in [
+            "<div class=\"whole\" data-series=\"Upstream \u{203a} 2xx\" data-v=\"1\"><dt>2xx</dt>",
+            "<div data-series=\"Upstream \u{203a} 2xx \u{203a} 200 OK\" data-v=\"1\"><dt>200 OK</dt>",
+        ] {
+            assert!(html.contains(needle), "{needle}: {html}");
+        }
     }
 
     #[test]
