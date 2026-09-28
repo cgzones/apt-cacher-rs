@@ -3,7 +3,7 @@
 //!
 //! The global counters say that clients are slow, disconnect, hit a cap or
 //! are refused; these say *which* client, so the operator knows whom to look
-//! at. Four classes, each pointing at one action:
+//! at. Five classes, each pointing at one action:
 //!
 //! - [`Trouble::Slow`]: a delivery aborted because the client read below
 //!   `min_download_rate` or stalled for `http_timeout` (`RATE_LIMIT_CLIENT`,
@@ -15,8 +15,14 @@
 //!   per-IP cap (`CONNECTION_REJECTED_PER_IP_CAP`,
 //!   `TUNNEL_REJECTED_CAPACITY`) -- a noisy client, or a cap sized below a
 //!   NAT gateway's population.
-//! - [`Trouble::Unauthorized`]: a request or connection refused by an ACL
-//!   or allowlist (`AUTHZ_REJECTED_*`, `CONNECTION_REJECTED_ACL`).
+//! - [`Trouble::Unauthorized`]: a connection or request refused because of
+//!   who sent it -- the client ACLs and the web interface's host gate
+//!   (`CONNECTION_REJECTED_ACL`, `AUTHZ_REJECTED_CLIENT`, `_WEBUI`,
+//!   `_WEBUI_HOST`) -- a stray or hostile host, or an ACL set too tight.
+//! - [`Trouble::MirrorRefused`]: an admitted client asked for a mirror this
+//!   proxy does not serve (`AUTHZ_REJECTED_MIRROR`,
+//!   `AUTHZ_REJECTED_TUNNEL_MIRROR`) -- usually a repository in its sources
+//!   the allowlists miss: add the mirror, or fix the client.
 //!
 //! Each class is recorded where its global counter is bumped (for the
 //! delivery classes, where the failure is concluded), once per event, and
@@ -43,6 +49,7 @@ pub(crate) enum Trouble {
     Disconnect,
     CapRefused,
     Unauthorized,
+    MirrorRefused,
 }
 
 /// One tracked client's counts.
@@ -53,6 +60,7 @@ pub(crate) struct ClientTrouble {
     pub(crate) disconnect: u64,
     pub(crate) cap_refused: u64,
     pub(crate) unauthorized: u64,
+    pub(crate) mirror_refused: u64,
     /// The total of the entry this one displaced: an upper bound on the
     /// events this client may have caused before it was tracked. 0 for a
     /// client tracked since its first event.
@@ -74,6 +82,7 @@ impl ClientTrouble {
             disconnect: 0,
             cap_refused: 0,
             unauthorized: 0,
+            mirror_refused: 0,
             inherited,
         }
     }
@@ -82,7 +91,12 @@ impl ClientTrouble {
     /// estimate.
     #[must_use]
     pub(crate) const fn total(&self) -> u64 {
-        self.slow + self.disconnect + self.cap_refused + self.unauthorized + self.inherited
+        self.slow
+            + self.disconnect
+            + self.cap_refused
+            + self.unauthorized
+            + self.mirror_refused
+            + self.inherited
     }
 
     fn bump(&mut self, trouble: Trouble) {
@@ -92,6 +106,7 @@ impl ClientTrouble {
             disconnect,
             cap_refused,
             unauthorized,
+            mirror_refused,
             inherited: _,
         } = self;
         let slot = match trouble {
@@ -99,6 +114,7 @@ impl ClientTrouble {
             Trouble::Disconnect => disconnect,
             Trouble::CapRefused => cap_refused,
             Trouble::Unauthorized => unauthorized,
+            Trouble::MirrorRefused => mirror_refused,
         };
         *slot += 1;
     }
@@ -182,6 +198,7 @@ mod tests {
         table.record(ip(1), Trouble::Slow);
         table.record(ip(1), Trouble::Slow);
         table.record(ip(1), Trouble::Unauthorized);
+        table.record(ip(1), Trouble::MirrorRefused);
         table.record(ip(2), Trouble::Disconnect);
         let first = table.entries.iter().find(|e| e.ip == ip(1)).copied();
         assert_eq!(
@@ -192,6 +209,7 @@ mod tests {
                 disconnect: 0,
                 cap_refused: 0,
                 unauthorized: 1,
+                mirror_refused: 1,
                 inherited: 0,
             })
         );

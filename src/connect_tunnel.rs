@@ -173,7 +173,7 @@ pub(crate) fn validate_connect_target(
             host.format_authority(None)
         );
         metrics::AUTHZ_REJECTED_TUNNEL_MIRROR.increment();
-        client_trouble::record(client, Trouble::Unauthorized);
+        client_trouble::record(client, Trouble::MirrorRefused);
         return Err(ConnectReject {
             status: StatusCode::FORBIDDEN,
             msg: "HTTPS tunnel target not permitted",

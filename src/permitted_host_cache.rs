@@ -131,7 +131,7 @@ fn finalize_host_result(
                 raw_host.escape_debug()
             );
             metrics::AUTHZ_REJECTED_MIRROR.increment();
-            client_trouble::record(client, Trouble::Unauthorized);
+            client_trouble::record(client, Trouble::MirrorRefused);
             Err((StatusCode::FORBIDDEN, "Unauthorized host"))
         }
     }

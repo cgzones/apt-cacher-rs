@@ -971,11 +971,12 @@ pub(super) fn render_origin_table(
 /// The Clients table's trouble columns: in-memory counts since the daemon
 /// started for the heaviest offenders (`client_trouble`), unlike the
 /// persisted columns beside them, hence the scope chip.
-const CLIENT_TROUBLE_HEADERS: [&str; 4] = [
+const CLIENT_TROUBLE_HEADERS: [&str; 5] = [
     "<span title=\"Deliveries aborted because this client read below min_download_rate over rate_check_timeframe, or stalled a body write for http_timeout.\">Slow / Timed Out</span> <span class=\"scope\">since start</span>",
     "<span title=\"Deliveries this client hung up on before the body was complete.\">Disconnects</span> <span class=\"scope\">since start</span>",
     "<span title=\"Connections refused by max_connections_per_client_ip and CONNECT tunnels refused by https_tunnel_max_connections_per_client.\">Cap Refusals</span> <span class=\"scope\">since start</span>",
-    "<span title=\"Connections and requests refused by allowed_proxy_clients, allowed_webif_clients, webif_hostnames, allowed_mirrors or https_tunnel_allowed_mirrors.\">Refused (ACL)</span> <span class=\"scope\">since start</span>",
+    "<span title=\"Connections and requests refused because of who sent them: allowed_proxy_clients, allowed_webif_clients or webif_hostnames. A stray or hostile host, or an ACL set too tight.\">Refused (client ACL)</span> <span class=\"scope\">since start</span>",
+    "<span title=\"Requests and CONNECT tunnels for a mirror outside allowed_mirrors or https_tunnel_allowed_mirrors: usually a repository in this client's sources that this proxy does not serve. Add the mirror, or remove it from the client. Not highlighted: a client with such an entry is refused on every update.\">Refused (mirror)</span> <span class=\"scope\">since start</span>",
 ];
 
 /// See [`render_origin_table`] on why the rows are borrowed. `trouble` is
@@ -1006,8 +1007,9 @@ pub(super) fn render_client_table(
             CLIENT_TROUBLE_HEADERS[1],
             CLIENT_TROUBLE_HEADERS[2],
             CLIENT_TROUBLE_HEADERS[3],
+            CLIENT_TROUBLE_HEADERS[4],
         ],
-        &[2, 3, 4, 5, 6, 7, 8],
+        &[2, 3, 4, 5, 6, 7, 8, 9],
     );
 
     let warn = |value| Nonzero {
@@ -1040,6 +1042,7 @@ pub(super) fn render_client_table(
             Count(counts.disconnect) => Some(counts.disconnect),
             warn(counts.cap_refused) => Some(counts.cap_refused),
             warn(counts.unauthorized) => Some(counts.unauthorized),
+            Count(counts.mirror_refused) => Some(counts.mirror_refused),
         );
     }
     // Heaviest first, as the snapshot came.
@@ -1055,6 +1058,7 @@ pub(super) fn render_client_table(
             Count(counts.disconnect) => Some(counts.disconnect),
             warn(counts.cap_refused) => Some(counts.cap_refused),
             warn(counts.unauthorized) => Some(counts.unauthorized),
+            Count(counts.mirror_refused) => Some(counts.mirror_refused),
         );
     }
 
