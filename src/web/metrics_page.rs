@@ -80,6 +80,29 @@ impl Display for OptReqPerConn {
     }
 }
 
+/// A counter shown with its share of a split, `hits (pct)`: the row keeps
+/// its own figure for the scripts, where a `hits / misses` pair would lose
+/// it.
+fn share_row(
+    t: &mut DetailsList,
+    label: &'static str,
+    tooltip: &'static str,
+    value: u64,
+    rest: u64,
+) {
+    t.entry(label)
+        .tip(tooltip)
+        .figure(value)
+        .value(format_args!(
+            "{}{}",
+            Count(value),
+            OptPctSuffix {
+                num: value,
+                total: value + rest,
+            }
+        ));
+}
+
 /// Backends compiled into this build. A counter only a compiled-out backend
 /// bumps reads 0 forever; its row is not shown.
 ///
@@ -749,9 +772,17 @@ fn build_cache_group(g: &mut Groups) {
     let refetched_uptodate = metrics::VOLATILE_REFETCHED_UPTODATE.get();
     let refetched_outofdate = metrics::VOLATILE_REFETCHED_OUTOFDATE.get();
     let refetched = metrics::VOLATILE_REFETCHED.get();
+    let volatile = HitsMisses {
+        hits: metrics::VOLATILE_HIT.get(),
+        misses: refetched,
+    };
 
     g.group("Cache", |t| {
-        for (label, lookups) in [("Package Lookups", packages), ("By-Hash Lookups", byhash)] {
+        for (label, lookups) in [
+            ("Package Lookups", packages),
+            ("By-Hash Lookups", byhash),
+            ("Volatile Lookups", volatile),
+        ] {
             t.bar(&StackBar {
                 label,
                 segments: &[
@@ -782,10 +813,12 @@ fn build_cache_group(g: &mut Groups) {
                 );
             })
             .value(warn_if(all, parts_exceed));
-        t.count_tip(
+        share_row(
+            t,
             "Volatile Hits",
-            "Index (Release/Packages/Translation/...) lookups served from the cache inside the freshness window.",
-            metrics::VOLATILE_HIT.get(),
+            "Index (Release/Packages/Translation/...) lookups served from the cache inside the freshness window, and their share of all index lookups (hits and the refetches below). A low share with several clients means they update at different times, more than the freshness window apart.",
+            volatile.hits,
+            volatile.misses,
         );
         t.entry("Volatile Refetches")
             .tip("Volatile requests (indexes) that found no fresh cached copy and needed upstream, whether they fetched it or joined an in-flight fetch. The two outcomes beneath cover the stale-but-present case only; it warns only if they exceed it, which is a counting bug.")
@@ -1134,12 +1167,29 @@ fn build_pool_group(g: &mut Groups) {
     let miss_dead = metrics::POOL_MISS_DEAD.get();
     let miss_failed = metrics::POOL_MISS_FAILED.get();
     let miss_no_scheme = metrics::POOL_MISS_NO_SCHEME.get();
+    let reused = metrics::POOL_REUSED.get();
 
     g.group("Upstream Connection Pool", |t| {
-        t.count_tip(
+        t.bar(&StackBar {
+            label: "Upstream Connections",
+            segments: &[
+                Segment {
+                    name: "reused",
+                    value: reused,
+                },
+                Segment {
+                    name: "new",
+                    value: pool_new,
+                },
+            ],
+            unit: Unit::Count,
+        });
+        share_row(
+            t,
             "Pool Reused",
-            "Upstream requests served from an already-open pooled connection.",
-            metrics::POOL_REUSED.get(),
+            "Upstream requests served from an already-open pooled connection, and their share of all upstream connections the splice backend used (reused and new). The misses under Pool New say why a request had to open one.",
+            reused,
+            pool_new,
         );
         t.entry("Pool New")
             .tip("Newly opened upstream connections. Every new connection falls through from exactly one miss arm, but a miss whose connect then fails opens none, so the misses beneath may exceed it; it warns only if it exceeds their sum, which is a counting bug.")
@@ -1340,15 +1390,21 @@ fn build_database_group(g: &mut Groups) {
             .kind(Kind::Live)
             .tip("Process-local mirror-id cache: hydrated at startup, grows on each newly observed mirror, never evicted.")
             .value(Count(metrics::DB_MIRROR_CACHE_ENTRIES.get()));
-        t.count_tip(
-            "Mirror Cache Hits",
-            "Mirror-id lookups served from the process-local cache.",
+        let (mirror_hits, mirror_misses) = (
             metrics::DB_MIRROR_CACHE_HITS.get(),
+            metrics::DB_MIRROR_CACHE_MISSES.get(),
+        );
+        share_row(
+            t,
+            "Mirror Cache Hits",
+            "Mirror-id lookups served from the process-local cache, and their share of all lookups. Near 100% once warm: a miss happens only for a mirror first seen since startup.",
+            mirror_hits,
+            mirror_misses,
         );
         t.count_tip(
             "Mirror Cache Misses",
             "Mirror-id lookups that had to reach the database.",
-            metrics::DB_MIRROR_CACHE_MISSES.get(),
+            mirror_misses,
         );
         t.count_tip(
             "last_seen Rows Flushed",
