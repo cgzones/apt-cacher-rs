@@ -32,7 +32,7 @@
 use std::fmt::{self, Display, Formatter};
 
 use crate::{
-    config::HttpsUpgradeMode,
+    config::{Config, HttpsUpgradeMode},
     global_checksum_registry, global_config, global_verify_throttle,
     humanfmt::HumanFmt,
     metrics::{self, Counter},
@@ -96,18 +96,34 @@ const SENDFILE: bool = cfg!(feature = "sendfile");
 /// [`HYPER`] and [`SENDFILE`]). A counter only a disabled feature reaches
 /// reads 0 forever; showing it suggests a check the operator cannot act on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one independent switch per configuration-gated row set"
+)]
 struct Shown {
     /// `https_upgrade_mode` other than `Never`.
     https_upgrade: bool,
     /// `https_tunnel_enabled`.
     tunnels: bool,
+    /// `verify_checksums`: the Integrity group, the verify throttle and the
+    /// checksum abort cause. Off, an Unverified row reading 0 would claim a
+    /// coverage nothing checks.
+    verify_checksums: bool,
+    /// `min_download_rate` set: the rate-limit cancellations and splice's
+    /// client demotion, which only a rate check triggers.
+    rate_checks: bool,
+    /// `reject_pdiff_requests`.
+    pdiff_rejection: bool,
 }
 
 impl Shown {
-    fn new(https_upgrade_mode: HttpsUpgradeMode, https_tunnel_enabled: bool) -> Self {
+    fn new(config: &Config) -> Self {
         Self {
-            https_upgrade: https_upgrade_mode != HttpsUpgradeMode::Never,
-            tunnels: https_tunnel_enabled,
+            https_upgrade: config.https_upgrade_mode != HttpsUpgradeMode::Never,
+            tunnels: config.https_tunnel_enabled,
+            verify_checksums: config.verify_checksums,
+            rate_checks: config.min_download_rate.is_some(),
+            pdiff_rejection: config.reject_pdiff_requests,
         }
     }
 }
@@ -199,8 +215,7 @@ fn delivery_path(
 /// badge its collapsed header carries. `start_epoch` is when the daemon
 /// started, which every counter here counts from.
 pub(super) fn build_metrics_html(start_epoch: i64) -> (String, Highlights) {
-    let config = global_config();
-    let shown = Shown::new(config.https_upgrade_mode, config.https_tunnel_enabled);
+    let shown = Shown::new(global_config());
     let mut g = Groups::new();
     swrite!(
         g.out,
@@ -214,13 +229,15 @@ pub(super) fn build_metrics_html(start_epoch: i64) -> (String, Highlights) {
     build_requests_group(&mut g);
     build_connections_group(&mut g);
     build_refusals_group(&mut g, shown);
-    build_admission_group(&mut g);
-    build_client_delivery_group(&mut g);
+    build_admission_group(&mut g, shown);
+    build_client_delivery_group(&mut g, shown);
     build_delivery_group(&mut g);
     build_passthrough_group(&mut g);
     build_cache_group(&mut g);
-    build_integrity_group(&mut g);
-    build_upstream_group(&mut g);
+    if shown.verify_checksums {
+        build_integrity_group(&mut g);
+    }
+    build_upstream_group(&mut g, shown);
     if shown.https_upgrade {
         build_https_upgrade_group(&mut g);
     }
@@ -428,11 +445,13 @@ fn build_connections_group(g: &mut Groups) {
 
 fn build_refusals_group(g: &mut Groups, shown: Shown) {
     g.group("Request Refusals", |t| {
-        t.count_tip(
-            "Rejected (pdiff)",
-            "Client requests for pdiff resources, refused because reject_pdiff_requests is set. Not highlighted: apt falls back to the full index.",
-            metrics::PDIFF_REJECTED.get(),
-        );
+        if shown.pdiff_rejection {
+            t.count_tip(
+                "Rejected (pdiff)",
+                "Client requests for pdiff resources, refused with 410 because reject_pdiff_requests is set. Not highlighted: apt falls back to the full index.",
+                metrics::PDIFF_REJECTED.get(),
+            );
+        }
         t.signal(
             "Rejected (unsafe path)",
             "Client requests refused with 400 because their path failed the traversal and encoding checks, a percent-decoded cache-name field included (.., %2F, a control byte): a broken or hostile client.",
@@ -478,7 +497,7 @@ fn build_refusals_group(g: &mut Groups, shown: Shown) {
     });
 }
 
-fn build_admission_group(g: &mut Groups) {
+fn build_admission_group(g: &mut Groups, shown: Shown) {
     g.group("Download Admission", |t| {
         t.signal(
             "Rejected (quota reached)",
@@ -492,12 +511,14 @@ fn build_admission_group(g: &mut Groups) {
             Level::Warn,
             &metrics::DOWNLOAD_REJECTED_OVERSIZE,
         );
-        t.signal(
-            "Rejected (verify-throttled)",
-            "Requests refused with 503 because the resource recently failed checksum verification and is inside its backoff window (verify_checksums_throttle_base, doubling up to verify_checksums_throttle_cap), joiners of a refused download included.",
-            Level::Warn,
-            &metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE,
-        );
+        if shown.verify_checksums {
+            t.signal(
+                "Rejected (verify-throttled)",
+                "Requests refused with 503 because the resource recently failed checksum verification and is inside its backoff window (verify_checksums_throttle_base, doubling up to verify_checksums_throttle_cap), joiners of a refused download included.",
+                Level::Warn,
+                &metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE,
+            );
+        }
         t.signal(
             "Downloads Rejected (cap)",
             "New downloads refused with 503 because max_upstream_downloads were already in flight (late joiners are exempt). The Capacity section shows how long the cap was hit; raise max_upstream_downloads if it is often.",
@@ -510,13 +531,15 @@ fn build_admission_group(g: &mut Groups) {
             Level::Warn,
             &metrics::UPSTREAM_DOWNLOAD_CAP_TRANSITIONS,
         );
-        t.entry("Throttled Resources")
-            .kind(Kind::Live)
-            .tip("Resources currently refused with 503 because a recent download failed checksum verification (backoff from verify_checksums_throttle_base up to verify_checksums_throttle_cap; cleared by a verified download). A live count, not a total.")
-            .value(Nonzero {
-                value: global_verify_throttle().active_len() as u64,
-                level: Level::Warn,
-            });
+        if shown.verify_checksums {
+            t.entry("Throttled Resources")
+                .kind(Kind::Live)
+                .tip("Resources currently refused with 503 because a recent download failed checksum verification (backoff from verify_checksums_throttle_base up to verify_checksums_throttle_cap; cleared by a verified download). A live count, not a total.")
+                .value(Nonzero {
+                    value: global_verify_throttle().active_len() as u64,
+                    level: Level::Warn,
+                });
+        }
         t.count_tip(
             "Downloads Declined",
             "Registered downloads answered without fetching a body, so not aborts: the upstream status was relayed uncached (a 404, say), the answer was refused (oversize, bad framing, an empty index body), or disk_quota, min_disk_free, the checksum verify throttle or max_passthrough_relays refused it. A max_upstream_downloads refusal never registers and counts in Downloads Rejected (cap) instead.",
@@ -525,31 +548,37 @@ fn build_admission_group(g: &mut Groups) {
     });
 }
 
-fn build_client_delivery_group(g: &mut Groups) {
+fn build_client_delivery_group(g: &mut Groups, shown: Shown) {
     g.group("Client Delivery", |t| {
         t.count_tip(
             "Client Disconnected Mid-Body",
             "Clients that hung up before the response body was complete. Not highlighted: apt closes connections it no longer needs. In the hyper backend any peer disconnect during a request counts. The Clients table names the clients.",
             metrics::CLIENT_DISCONNECTED_MID_BODY.get(),
         );
-        t.signal(
-            "Timeouts (client body write)",
-            "Deliveries aborted because the client accepted no body bytes for http_timeout: a stalled client or a dropped link. The Clients table names the client.",
-            Level::Warn,
-            &metrics::HTTP_TIMEOUT_CLIENT_BODY,
-        );
-        t.count_tip(
-            "Timeouts (client header write)",
-            "Response heads or small proxy-generated responses the client did not accept within http_timeout.",
-            metrics::HTTP_TIMEOUT_CLIENT_HEADER_WRITE.get(),
-        );
-        t.signal(
-            "Rate-Limit Cancellations (client)",
-            "Deliveries cancelled because the client read below min_download_rate over rate_check_timeframe. The Clients table names the client; lower min_download_rate if the clients are legitimately slow.",
-            Level::Warn,
-            &metrics::RATE_LIMIT_CLIENT,
-        );
-        if SPLICE {
+        if SENDFILE {
+            // Only the sendfile and splice writers run a timer of their own;
+            // hyper's deliveries time out inside hyper, uncounted.
+            t.signal(
+                "Timeouts (client body write)",
+                "Sendfile and splice deliveries aborted because the client accepted no body bytes for http_timeout: a stalled client or a dropped link. The Clients table names the client.",
+                Level::Warn,
+                &metrics::HTTP_TIMEOUT_CLIENT_BODY,
+            );
+            t.count_tip(
+                "Timeouts (client header write)",
+                "Response heads or small proxy-generated responses the client did not accept within http_timeout (sendfile and splice writes).",
+                metrics::HTTP_TIMEOUT_CLIENT_HEADER_WRITE.get(),
+            );
+        }
+        if shown.rate_checks {
+            t.signal(
+                "Rate-Limit Cancellations (client)",
+                "Deliveries cancelled because the client read below min_download_rate over rate_check_timeframe. The Clients table names the client; lower min_download_rate if the clients are legitimately slow.",
+                Level::Warn,
+                &metrics::RATE_LIMIT_CLIENT,
+            );
+        }
+        if SPLICE && shown.rate_checks {
             t.count_tip(
                 "Clients Demoted (splice \u{2192} file-serve)",
                 "Splice deliveries whose client fell below min_download_rate while the upstream kept pace: instead of cancelling, the client was handed to a task serving the growing cache file, so the download itself goes on at the upstream's speed. A climb points at slow clients (the Clients table) or a min_download_rate set too high.",
@@ -849,7 +878,7 @@ fn build_integrity_group(g: &mut Groups) {
     });
 }
 
-fn build_upstream_group(g: &mut Groups) {
+fn build_upstream_group(g: &mut Groups, shown: Shown) {
     // Subsets before the totals they are compared against (the total is
     // bumped first); see `build_requests_group`.
     let status_200 = metrics::UPSTREAM_STATUS_200.get();
@@ -862,39 +891,46 @@ fn build_upstream_group(g: &mut Groups) {
     let status_2xx = metrics::UPSTREAM_STATUS_2XX.get();
     let status_3xx = metrics::UPSTREAM_STATUS_3XX.get();
 
-    // The causes before their total, which is bumped first.
+    // The causes before their total, which is bumped first. The checksum
+    // cause cannot move without verify_checksums; its row is then not shown.
     let abort_causes = [
         (
             "Aborted (upstream failure)",
             "The mirror failed the transfer: connect, head, body, rate or protocol. The Mirrors table names the mirror.",
             Level::Warn,
             &metrics::DOWNLOADS_ABORTED_UPSTREAM,
+            true,
         ),
         (
             "Aborted (cache I/O failure)",
             "A cache file could not be written, read back or renamed. Check the cache filesystem (space, permissions, errors) and the Storage Errors rows.",
             Level::Alert,
             &metrics::DOWNLOADS_ABORTED_CACHE,
+            true,
         ),
         (
             "Aborted (checksum mismatch)",
             "The whole body arrived but did not match the digest its index promised, so it was discarded: the mirror serves content its own index disagrees with. Same event as Integrity's Mismatch (rejected).",
             Level::Alert,
             &metrics::DOWNLOADS_ABORTED_CHECKSUM,
+            shown.verify_checksums,
         ),
         (
             "Aborted (internal failure)",
             "A transfer broke on this side (a pipe, a task): a bug to report.",
             Level::Alert,
             &metrics::DOWNLOADS_ABORTED_INTERNAL,
+            true,
         ),
     ]
-    .map(|(label, tip, level, signal)| (label, tip, level, signal.get(), signal.last()));
+    .map(|(label, tip, level, signal, visible)| {
+        (label, tip, level, signal.get(), signal.last(), visible)
+    });
     let cancelled = &metrics::DOWNLOADS_ABORTED_CANCELLED;
     let (cancelled_count, cancelled_last) = (cancelled.get(), cancelled.last());
     // The total warns only for a failure: cancellations alone (clients that
     // walked away) are no alarm, like their own row.
-    let failed = abort_causes.iter().any(|(_, _, _, value, _)| *value > 0);
+    let failed = abort_causes.iter().any(|(_, _, _, value, _, _)| *value > 0);
     let aborted = &metrics::DOWNLOADS_ABORTED;
     let (aborted_count, aborted_last) = (aborted.get(), aborted.last());
 
@@ -950,7 +986,10 @@ fn build_upstream_group(g: &mut Groups) {
             .tip("Registered upstream downloads that ended without being cached; the causes beneath split them and sum to this. Warns once a failure cause moved, not for cancellations alone.")
             .last(aborted_last)
             .parts(|p| {
-                for (label, tip, level, value, last) in abort_causes {
+                for (label, tip, level, value, last, visible) in abort_causes {
+                    if !visible {
+                        continue;
+                    }
                     p.entry(label)
                         .tip(tip)
                         .last(last)
@@ -994,12 +1033,14 @@ fn build_upstream_group(g: &mut Groups) {
             Level::Warn,
             &metrics::HTTP_TIMEOUT_UPSTREAM_READ,
         );
-        t.signal(
-            "Rate-Limit Cancellations (upstream)",
-            "Downloads cancelled because the mirror delivered below min_download_rate over rate_check_timeframe. The Mirrors table names the mirror; lower min_download_rate if the mirror is legitimately slow.",
-            Level::Warn,
-            &metrics::RATE_LIMIT_UPSTREAM,
-        );
+        if shown.rate_checks {
+            t.signal(
+                "Rate-Limit Cancellations (upstream)",
+                "Downloads cancelled because the mirror delivered below min_download_rate over rate_check_timeframe (their joiners are answered 504). The Mirrors table names the mirror; lower min_download_rate if the mirror is legitimately slow.",
+                Level::Warn,
+                &metrics::RATE_LIMIT_UPSTREAM,
+            );
+        }
         t.entry("Protocol Violations")
             .tip("Mirror responses that broke the HTTP contract: an unparsable or oversized response head, framing that can be read two ways, a body that over- or under-ran its Content-Length, a Content-Length missing on a package or zero on a cached fetch, or a 206 without a Range request. A mirror bug to report; the Mirrors table names it.")
             .parts(|p| {
@@ -1340,17 +1381,42 @@ fn build_errors_group(g: &mut Groups) {
 
 #[cfg(test)]
 mod tests {
-    use super::{HttpsUpgradeMode, Shown};
+    use super::{Config, HttpsUpgradeMode, Shown};
 
     #[test]
     fn rows_follow_the_build_and_the_config() {
-        let shown = Shown::new(HttpsUpgradeMode::Never, false);
-        assert!(!shown.https_upgrade);
-        assert!(!shown.tunnels);
+        let mut off = Config::default();
+        off.https_upgrade_mode = HttpsUpgradeMode::Never;
+        off.https_tunnel_enabled = false;
+        off.verify_checksums = false;
+        off.min_download_rate = None;
+        off.reject_pdiff_requests = false;
+        assert_eq!(
+            Shown::new(&off),
+            Shown {
+                https_upgrade: false,
+                tunnels: false,
+                verify_checksums: false,
+                rate_checks: false,
+                pdiff_rejection: false,
+            }
+        );
         for mode in [HttpsUpgradeMode::Auto, HttpsUpgradeMode::Always] {
-            let shown = Shown::new(mode, true);
-            assert!(shown.https_upgrade, "{mode:?}");
-            assert!(shown.tunnels);
+            let mut on = Config::default();
+            on.https_upgrade_mode = mode;
+            on.https_tunnel_enabled = true;
+            assert_eq!(
+                Shown::new(&on),
+                Shown {
+                    https_upgrade: true,
+                    tunnels: true,
+                    // The defaults verify, rate-check and refuse pdiffs.
+                    verify_checksums: true,
+                    rate_checks: true,
+                    pdiff_rejection: true,
+                },
+                "{mode:?}"
+            );
         }
     }
 }
