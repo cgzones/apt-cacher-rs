@@ -76,6 +76,8 @@ pub(crate) struct Backoff {
     attempt: u32,
     deadline: Instant,
     budget_spent: sticky::Bool,
+    /// Whether a granted retry bumps `UPSTREAM_RETRIES`.
+    counted: bool,
 }
 
 impl Backoff {
@@ -89,6 +91,18 @@ impl Backoff {
             attempt: 1,
             deadline: now.saturating_add(budget.into()),
             budget_spent: sticky::Bool::new(),
+            counted: true,
+        }
+    }
+
+    /// [`Self::new`] for traffic no metric describes (hyper's scheme-cache
+    /// warm-up, `hyper_conn::Traffic::WarmUp`): the same schedule and
+    /// budgets, without the `UPSTREAM_RETRIES` bumps.
+    #[cfg(any(test, feature = "hyper"))]
+    pub(crate) fn uncounted(budget: Duration, now: Instant) -> Self {
+        Self {
+            counted: false,
+            ..Self::new(budget, now)
         }
     }
 
@@ -110,7 +124,8 @@ impl Backoff {
 
     /// The delay to wait before retrying, or `None` once the attempt budget OR
     /// the wall-clock budget is spent and the caller must fail terminally.
-    /// Charges the attempt, advances the schedule and bumps `UPSTREAM_RETRIES`.
+    /// Charges the attempt, advances the schedule and bumps `UPSTREAM_RETRIES`
+    /// (unless [`Self::uncounted`]).
     ///
     /// The wall-clock rule is "do not start a sleep that finishes past the
     /// deadline": a delay ending after `now + budget` (measured from the `now`
@@ -129,7 +144,9 @@ impl Backoff {
         }
         (self.curr, self.prev) = (self.curr + self.prev, self.curr);
         self.attempt += 1;
-        metrics::UPSTREAM_RETRIES.increment();
+        if self.counted {
+            metrics::UPSTREAM_RETRIES.increment();
+        }
         Some(delay)
     }
 
@@ -171,6 +188,26 @@ mod tests {
 
     fn millis(values: &[u64]) -> Vec<Duration> {
         values.iter().copied().map(Duration::from_millis).collect()
+    }
+
+    /// The warm-up's uncounted backoff keeps the schedule and the budgets;
+    /// only the metric bump differs.
+    #[test]
+    fn uncounted_backoff_keeps_the_schedule() {
+        let now = Instant::now();
+        let (mut counted, mut uncounted) = (
+            Backoff::new(GENEROUS, now),
+            Backoff::uncounted(GENEROUS, now),
+        );
+        assert!(counted.counted && !uncounted.counted);
+        loop {
+            let delay = counted.next_retry(now);
+            assert_eq!(uncounted.next_retry(now), delay);
+            if delay.is_none() {
+                break;
+            }
+        }
+        assert_eq!(uncounted.limit(), counted.limit());
     }
 
     #[test]

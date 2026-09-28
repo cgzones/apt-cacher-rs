@@ -31,7 +31,7 @@ use tracing::{debug, error, info, trace, warn};
 #[cfg(not(feature = "sendfile"))]
 use crate::hyper_conn::handle_hyper_connection;
 #[cfg(feature = "hyper")]
-use crate::hyper_conn::{HttpClient, request_with_retry};
+use crate::hyper_conn::{HttpClient, Traffic, request_with_retry};
 #[cfg(feature = "sendfile")]
 use crate::sendfile_conn;
 use crate::{
@@ -445,7 +445,7 @@ pub(crate) async fn main_loop(
                             .body(Empty::new())
                             .expect("Valid request");
 
-                        match request_with_retry(&client, request).await {
+                        match request_with_retry(&client, request, Traffic::WarmUp).await {
                             Ok((response, _parts, _timing)) => {
                                 if response.status().is_server_error() {
                                     warn!(

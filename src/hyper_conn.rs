@@ -269,14 +269,41 @@ fn is_head_parse_error(err: &hyper_util::client::legacy::Error) -> bool {
     false
 }
 
+/// Whose exchange [`request_with_retry`] runs. Only a proxied request moves
+/// the upstream metrics it touches (status classes, HTTPS upgrades, retries,
+/// timeouts, protocol violations): the startup scheme-cache warm-up's
+/// `HEAD /` probes are no client request, and a hyper-less build sends none,
+/// so counting them would light the upstream 5xx row at every restart for a
+/// mirror that answers `HEAD /` with a 503, with no client traffic at all.
+/// The scheme cache itself still learns from them; that is their purpose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Traffic {
+    /// A request made on a client's behalf, cleanup's index fetches included.
+    Proxied,
+    /// The scheme-cache warm-up at startup (`main_loop`).
+    WarmUp,
+}
+
+impl Traffic {
+    /// Run the metric `bump` for proxied traffic only.
+    fn count(self, bump: impl FnOnce()) {
+        match self {
+            Self::Proxied => bump(),
+            Self::WarmUp => {}
+        }
+    }
+}
+
 /// On success the request `Parts` are handed back alongside the response —
 /// they were consumed by the request anyway, and returning them lets the
 /// rare redirect-follow path rebuild a request without the caller cloning
 /// the whole `HeaderMap` up front — together with the [`HeadTiming`] of the
-/// attempt that answered (`mirror_perf`'s time to first byte).
+/// attempt that answered (`mirror_perf`'s time to first byte). `traffic`
+/// says whether the exchange moves the upstream metrics ([`Traffic`]).
 pub(crate) async fn request_with_retry(
     client: &HttpClient,
     request: Request<Empty<bytes::Bytes>>,
+    traffic: Traffic,
 ) -> Result<(Response<Incoming>, http::request::Parts, HeadTiming), RequestFailure> {
     // Auto-mode's HTTPS-upgrade revert branch only fires once `attempt`
     // has crossed this threshold; below it, transient connect errors
@@ -354,7 +381,7 @@ pub(crate) async fn request_with_retry(
         // Counted only once the upgrade is really attempted, so the
         // ATTEMPTED == SUCCEEDED + REVERTED + FAILED identity holds.
         if upgrade.is_probing() {
-            metrics::HTTPS_UPGRADE_ATTEMPTED.increment();
+            traffic.count(|| metrics::HTTPS_UPGRADE_ATTEMPTED.increment());
         }
         probe = upgrade;
         scheme_decided = true;
@@ -370,11 +397,14 @@ pub(crate) async fn request_with_retry(
         orig_scheme: Option<http::uri::Scheme>,
         mut probe: UpgradeProbe,
         scheme_decided: bool,
+        traffic: Traffic,
     ) -> Result<(Response<Incoming>, http::request::Parts, HeadTiming), RequestFailure> {
-        let mut backoff = upstream_retry::Backoff::new(
-            global_config().upstream_retry_budget,
-            coarsetime::Instant::now(),
-        );
+        let budget = global_config().upstream_retry_budget;
+        let now = coarsetime::Instant::now();
+        let mut backoff = match traffic {
+            Traffic::Proxied => upstream_retry::Backoff::new(budget, now),
+            Traffic::WarmUp => upstream_retry::Backoff::uncounted(budget, now),
+        };
 
         loop {
             let req_clone = Request::from_parts(parts.clone(), Empty::new());
@@ -389,7 +419,7 @@ pub(crate) async fn request_with_retry(
                         head_at: PreciseInstant::now(),
                     };
                     if probe.is_probing() {
-                        metrics::HTTPS_UPGRADE_SUCCEEDED.increment();
+                        traffic.count(|| metrics::HTTPS_UPGRADE_SUCCEEDED.increment());
                     }
                     if scheme_decided && let Some(auth) = parts.uri.authority() {
                         if let Some(scheme) = parts.uri.scheme().and_then(Scheme::from_uri_scheme) {
@@ -414,7 +444,7 @@ pub(crate) async fn request_with_retry(
                         .iter()
                         .map(|(name, value)| (name.as_str(), value.as_bytes()));
                     if let Err(reason) = resolve_body_framing(fields) {
-                        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                        traffic.count(|| metrics::UPSTREAM_PROTOCOL_VIOLATION.increment());
                         return Err(RequestFailure::new(FailedRequest {
                             error: RequestError::Framing(reason),
                             uri: parts.uri,
@@ -422,18 +452,18 @@ pub(crate) async fn request_with_retry(
                             limit: None,
                         }));
                     }
-                    metrics::record_upstream_status(response.status());
+                    traffic.count(|| metrics::record_upstream_status(response.status()));
                     return Ok((response, parts, timing));
                 }
                 Err(err) if !err.is_connect() => {
                     if is_io_timed_out_in_chain(&err) {
-                        metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
+                        traffic.count(|| metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment());
                     }
                     // Counted where detected, like the framing refusal above
                     // and splice's head parser; every other failure here is
                     // counted once its owner concludes it.
                     let error = if is_head_parse_error(&err) {
-                        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                        traffic.count(|| metrics::UPSTREAM_PROTOCOL_VIOLATION.increment());
                         RequestError::MalformedHead(err)
                     } else {
                         err.into()
@@ -444,7 +474,7 @@ pub(crate) async fn request_with_retry(
                         // retry. Count the upgrade attempt as failed so the
                         // ATTEMPTED == SUCCEEDED + REVERTED + FAILED identity
                         // holds.
-                        metrics::HTTPS_UPGRADE_FAILED.increment();
+                        traffic.count(|| metrics::HTTPS_UPGRADE_FAILED.increment());
                     }
                     return Err(RequestFailure::new(FailedRequest {
                         error,
@@ -455,7 +485,7 @@ pub(crate) async fn request_with_retry(
                 }
                 Err(err) => {
                     if is_io_timed_out_in_chain(&err) {
-                        metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
+                        traffic.count(|| metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment());
                     }
                     let attempt = backoff.attempt();
                     // A rejected certificate is repeated identically by every
@@ -493,17 +523,17 @@ pub(crate) async fn request_with_retry(
                         parts.uri = match Uri::from_parts(uri_parts) {
                             Ok(uri) => uri,
                             Err(err) => {
-                                metrics::HTTPS_UPGRADE_FAILED.increment();
+                                traffic.count(|| metrics::HTTPS_UPGRADE_FAILED.increment());
                                 return Err(RequestFailure::invalid_uri(err, parts.uri, attempt));
                             }
                         };
-                        metrics::HTTPS_UPGRADE_REVERTED.increment();
+                        traffic.count(|| metrics::HTTPS_UPGRADE_REVERTED.increment());
                         probe = UpgradeProbe::NotProbing;
                         backoff.reset_delay();
                         // The revert iteration is another upstream attempt
                         // even though the retry budget is not consumed for it.
                         // Match `Backoff::next_retry` in counting it as a retry.
-                        metrics::UPSTREAM_RETRIES.increment();
+                        traffic.count(|| metrics::UPSTREAM_RETRIES.increment());
                         continue;
                     }
 
@@ -520,7 +550,7 @@ pub(crate) async fn request_with_retry(
                             // is failure here. Keep the
                             // ATTEMPTED == SUCCEEDED + REVERTED + FAILED
                             // identity.
-                            metrics::HTTPS_UPGRADE_FAILED.increment();
+                            traffic.count(|| metrics::HTTPS_UPGRADE_FAILED.increment());
                         }
                         if certificate_rejected {
                             // Terminal only where the proxy chose HTTPS (not
@@ -587,7 +617,8 @@ pub(crate) async fn request_with_retry(
         // Spawn a new task such that even if the client disconnects,
         // the task will continue to run and initialize the scheme cache.
         tokio::task::spawn(async move {
-            let result = inner_loop(&client, parts, orig_scheme, probe, scheme_decided).await;
+            let result =
+                inner_loop(&client, parts, orig_scheme, probe, scheme_decided, traffic).await;
             if let Err(ref err) = result {
                 // The caller owns the terminal failure report. This background
                 // task only records scheme initialization context.
@@ -610,6 +641,7 @@ pub(crate) async fn request_with_retry(
             orig_scheme,
             UpgradeProbe::NotProbing,
             scheme_decided,
+            traffic,
         )
         .await
     }
@@ -2092,7 +2124,7 @@ async fn serve_new_file_worker(
     // The timing of the exchange whose answer is used: replaced below with
     // every followed redirect and refetch, like the response.
     let (mut fwd_response, mut head_timing) =
-        match request_with_retry(&appstate.https_client, fwd_request).await {
+        match request_with_retry(&appstate.https_client, fwd_request, Traffic::Proxied).await {
             Ok((r, _parts, timing)) => (r, timing),
             Err(error) => {
                 return Err(error.into_failure("request upstream response"));
@@ -2135,13 +2167,18 @@ async fn serve_new_file_worker(
             trace!("Forwarded redirected request: {redirected_request:?}");
 
             upstream_request_sent = PreciseInstant::now();
-            let (redirected_response, redirected_timing) =
-                match request_with_retry(&appstate.https_client, redirected_request).await {
-                    Ok((r, _parts, timing)) => (r, timing),
-                    Err(error) => {
-                        return Err(error.into_failure("request upstream response"));
-                    }
-                };
+            let (redirected_response, redirected_timing) = match request_with_retry(
+                &appstate.https_client,
+                redirected_request,
+                Traffic::Proxied,
+            )
+            .await
+            {
+                Ok((r, _parts, timing)) => (r, timing),
+                Err(error) => {
+                    return Err(error.into_failure("request upstream response"));
+                }
+            };
 
             trace!("Forwarded redirected response: {redirected_response:?}");
 
@@ -2244,13 +2281,18 @@ async fn serve_new_file_worker(
                 let retry_request = build_fwd_request(&req_uri, &host, None, 0, None);
 
                 upstream_request_sent = PreciseInstant::now();
-                (fwd_response, head_timing) =
-                    match request_with_retry(&appstate.https_client, retry_request).await {
-                        Ok((r, _parts, timing)) => (r, timing),
-                        Err(error) => {
-                            return Err(error.into_failure("request upstream response"));
-                        }
-                    };
+                (fwd_response, head_timing) = match request_with_retry(
+                    &appstate.https_client,
+                    retry_request,
+                    Traffic::Proxied,
+                )
+                .await
+                {
+                    Ok((r, _parts, timing)) => (r, timing),
+                    Err(error) => {
+                        return Err(error.into_failure("request upstream response"));
+                    }
+                };
                 head = UpstreamHead::from_response(&fwd_response);
             }
 
@@ -3140,7 +3182,7 @@ async fn pre_process_client_request(
     // redirect-follow below — no up-front HeaderMap clone per request.
     // A passthrough records no time to first byte (`mirror_perf`).
     let (fwd_response, mut parts) =
-        match request_with_retry(&appstate.https_client, fwd_request).await {
+        match request_with_retry(&appstate.https_client, fwd_request, Traffic::Proxied).await {
             Ok((response, parts, _timing)) => (response, parts),
             Err(err) => return upstream_error_response(err),
         };
@@ -3191,11 +3233,16 @@ async fn pre_process_client_request(
             trace!("Redirected request: {redirected_request:?}");
 
             let redirected_request_sent = PreciseInstant::now();
-            let redirected_response =
-                match request_with_retry(&appstate.https_client, redirected_request).await {
-                    Ok((r, _parts, _timing)) => r,
-                    Err(err) => return upstream_error_response(err),
-                };
+            let redirected_response = match request_with_retry(
+                &appstate.https_client,
+                redirected_request,
+                Traffic::Proxied,
+            )
+            .await
+            {
+                Ok((r, _parts, _timing)) => r,
+                Err(err) => return upstream_error_response(err),
+            };
 
             trace!("Redirected response: {redirected_response:?}");
 

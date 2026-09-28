@@ -3,6 +3,10 @@
 //! All counters are additive and monotonic from process start, except peak
 //! values which track the maximum observed since startup.
 //!
+//! They describe the proxy's own traffic: the hyper backend's startup
+//! scheme-cache warm-up (`HEAD /` to each recent mirror) moves none of the
+//! upstream counters it passes (`hyper_conn::Traffic::WarmUp`).
+//!
 //! A counter the dashboard highlights once non-zero (a bad sign: a failure,
 //! a refusal, a cap hit) is a [`Signal`], which also stamps when it last
 //! moved; everything else is a plain [`Counter`]. Promoting a counter to a
