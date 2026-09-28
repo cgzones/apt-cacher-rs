@@ -309,11 +309,15 @@ impl InitBarrier {
     /// to cache, or this proxy refused to fetch it. Joiners answer from
     /// `why` what the originator answered (`active_downloads::JoinFailure`);
     /// nothing failed, so `DOWNLOADS_ABORTED` stays untouched and
-    /// `DOWNLOADS_DECLINED` counts it instead.
+    /// `DOWNLOADS_DECLINED` counts it instead -- once settled: a future
+    /// cancelled while `settle` waits for the status lock leaves `Drop` to
+    /// count a cancellation, and the download must not count as both.
     pub(crate) async fn decline(&mut self, why: Declined) -> Settled {
+        let settled = self
+            .settle(ActiveDownloadStatus::Aborted(AbortReason::Declined(why)))
+            .await;
         metrics::DOWNLOADS_DECLINED.increment();
-        self.settle(ActiveDownloadStatus::Aborted(AbortReason::Declined(why)))
-            .await
+        settled
     }
 
     /// Publish a final status and retire the entry. `data` is taken only
