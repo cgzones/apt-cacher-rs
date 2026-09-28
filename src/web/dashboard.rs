@@ -6,6 +6,7 @@
 
 use std::{
     fmt::{self, Display, Formatter},
+    net::SocketAddr,
     sync::Arc,
 };
 
@@ -27,6 +28,7 @@ use crate::{
     error::ErrorReport,
     fd_usage, global_cache_quota, global_config,
     humanfmt::HumanFmt,
+    main_loop::LISTEN_ADDR,
     metrics, mirror_health, mirror_indexes, mirror_perf,
     passthrough_limiter::active_relays,
     swrite,
@@ -751,11 +753,18 @@ fn build_configuration_html(rd: &RuntimeDetails) -> String {
         HttpsUpgradeMode::Never => "Never",
     };
 
+    // The address actually bound, which differs from the configured `::`
+    // after the IPv4 fallback; `SocketAddr` brackets an IPv6 address.
+    let configured = SocketAddr::from((rd.config.bind_addr, rd.config.bind_port.get()));
+    let listening = LISTEN_ADDR.get().copied().unwrap_or(configured);
+    let fallback_note = if listening == configured {
+        ""
+    } else {
+        " (IPv4 only: this host has no IPv6)"
+    };
+
     let mut t = DetailsList::new();
-    t.row(
-        "Bind Address + Port",
-        format_args!("{} : {}", rd.config.bind_addr, rd.config.bind_port),
-    );
+    t.row("Listening On", format_args!("{listening}{fallback_note}"));
     t.row(
         "Cache Directory",
         HtmlEscape(&rd.config.cache_directory.to_string_lossy()),

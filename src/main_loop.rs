@@ -10,8 +10,9 @@
 //! empty one.
 
 use std::{
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZero,
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -25,7 +26,11 @@ use http::{
 };
 #[cfg(feature = "hyper")]
 use http_body_util::Empty;
-use tokio::{net::TcpListener, signal::unix::SignalKind};
+use socket2::SockRef;
+use tokio::{
+    net::{TcpListener, TcpSocket},
+    signal::unix::SignalKind,
+};
 use tracing::{debug, error, info, trace, warn};
 
 #[cfg(not(feature = "sendfile"))]
@@ -517,32 +522,10 @@ pub(crate) async fn main_loop(
         active_downloads: ActiveDownloads::new(),
     };
 
-    let mut addr = SocketAddr::from((config.bind_addr, config.bind_port.get()));
-
-    let listener = match TcpListener::bind(addr).await {
-        Ok(x) => x,
-        Err(err) => {
-            if config.bind_addr != Ipv6Addr::UNSPECIFIED {
-                error!(
-                    "Failed to bind the listener to {addr}; aborting startup:  {}",
-                    ErrorReport(&err)
-                );
-                return Err(MainLoopError::Io(err));
-            }
-
-            // Fallback to IPv4 to avoid errors when IPv6 is not available and the default configuration is used.
-            addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.bind_port.get()));
-            TcpListener::bind(addr)
-                .await
-                .inspect_err(|err| {
-                    error!(
-                        "Failed to bind the IPv4 fallback listener to {addr}; aborting startup:  {}",
-                        ErrorReport(err)
-                    );
-                })
-                .map_err(MainLoopError::Io)?
-        }
-    };
+    let (listener, addr) = bind_listener(config.bind_addr, config.bind_port.get())?;
+    LISTEN_ADDR
+        .set(addr)
+        .expect("`main_loop` runs once per process");
     info!("Ready and listening on http://{addr}");
 
     let drain_db_task = async move {
@@ -710,6 +693,89 @@ pub(crate) async fn main_loop(
     }
 }
 
+/// The address the proxy listener is bound to, for the dashboard: the
+/// configured one, or `0.0.0.0` after the IPv4 fallback of
+/// [`bind_listener`]. Unset until the bind succeeded.
+pub(crate) static LISTEN_ADDR: OnceLock<SocketAddr> = OnceLock::new();
+
+/// `listen(2)` backlog of the proxy socket, the value tokio's (mio's and
+/// std's) `TcpListener::bind` uses.
+const LISTEN_BACKLOG: u32 = 128;
+
+/// Bind the proxy listener to `bind_addr`:`port`, returning it with the
+/// address it is bound to.
+///
+/// An IPv6 socket is made dual-stack explicitly (`IPV6_V6ONLY` off): whether
+/// the default `::` also accepts IPv4 clients (as IPv4-mapped peers, which
+/// `ClientInfo::ip` folds back to IPv4) must not hinge on the host's
+/// `net.ipv6.bindv6only` sysctl, under which it would silently refuse them.
+///
+/// Only `::` falls back to `0.0.0.0`, and only on a host without IPv6
+/// ([`is_missing_ipv6`]); any other failure (the port in use, no privilege
+/// for it) is the operator's to fix, and a fallback would leave the daemon
+/// IPv4-only with the cause unlogged.
+fn bind_listener(bind_addr: IpAddr, port: u16) -> Result<(TcpListener, SocketAddr), MainLoopError> {
+    let addr = SocketAddr::from((bind_addr, port));
+    let err = match bind_socket(addr) {
+        Ok(listener) => return Ok((listener, addr)),
+        Err(err) => err,
+    };
+
+    if bind_addr != Ipv6Addr::UNSPECIFIED || !is_missing_ipv6(&err) {
+        // `--bind=::1:3143` is the IPv6 address `::1:3143`, not port 3143.
+        let hint = if bind_addr.is_ipv6() && err.raw_os_error() == Some(nix::libc::EADDRNOTAVAIL) {
+            " (an IPv6 address with a port is written `[ADDR]:PORT`)"
+        } else {
+            ""
+        };
+        error!(
+            "Failed to bind the listener to {addr}{hint}; aborting startup:  {}",
+            ErrorReport(&err)
+        );
+        return Err(MainLoopError::Io(err));
+    }
+
+    let fallback = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+    warn!(
+        "Failed to bind the listener to {addr}, this host has no IPv6; listening on {fallback} for IPv4 clients only:  {}",
+        ErrorReport(&err)
+    );
+    match bind_socket(fallback) {
+        Ok(listener) => Ok((listener, fallback)),
+        Err(err) => {
+            error!(
+                "Failed to bind the IPv4 fallback listener to {fallback}; aborting startup:  {}",
+                ErrorReport(&err)
+            );
+            Err(MainLoopError::Io(err))
+        }
+    }
+}
+
+/// A listening socket on `addr`, dual-stack when IPv6 (see [`bind_listener`]),
+/// with the `SO_REUSEADDR` tokio's `TcpListener::bind` sets.
+fn bind_socket(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let socket = match addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => {
+            let socket = TcpSocket::new_v6()?;
+            SockRef::from(&socket).set_only_v6(false)?;
+            socket
+        }
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(LISTEN_BACKLOG)
+}
+
+/// Whether a failed IPv6 bind means the host has no IPv6 at all: the address
+/// family is compiled out or disabled (`EAFNOSUPPORT`), or no IPv6 address
+/// is available (`EADDRNOTAVAIL`).
+fn is_missing_ipv6(err: &std::io::Error) -> bool {
+    err.raw_os_error()
+        .is_some_and(|errno| errno == nix::libc::EAFNOSUPPORT || errno == nix::libc::EADDRNOTAVAIL)
+}
+
 /// Pause after a transient `accept(2)` failure before retrying.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
@@ -750,5 +816,45 @@ mod accept_error_tests {
         let err = std::io::Error::from_raw_os_error(nix::errno::Errno::EBADF as i32);
         assert!(!is_transient_accept_error(&err));
         assert!(!is_transient_accept_error(&std::io::Error::other("x")));
+    }
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::*;
+
+    /// Only a host without IPv6 lets `::` fall back to IPv4; a port in use or
+    /// a missing privilege is reported instead.
+    #[test]
+    fn only_missing_ipv6_falls_back() {
+        for errno in [nix::libc::EAFNOSUPPORT, nix::libc::EADDRNOTAVAIL] {
+            assert!(is_missing_ipv6(&std::io::Error::from_raw_os_error(errno)));
+        }
+        for errno in [nix::libc::EADDRINUSE, nix::libc::EACCES, nix::libc::EINVAL] {
+            assert!(!is_missing_ipv6(&std::io::Error::from_raw_os_error(errno)));
+        }
+        assert!(!is_missing_ipv6(&std::io::Error::other("x")));
+    }
+
+    /// The `::` listener is dual-stack whatever `net.ipv6.bindv6only` says:
+    /// an IPv4 client reaches it, as an IPv4-mapped peer.
+    #[tokio::test]
+    async fn an_ipv6_listener_accepts_ipv4_clients() {
+        let Ok(listener) = bind_socket(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))) else {
+            return; // no IPv6 on this host
+        };
+        let port = listener.local_addr().unwrap().port();
+        let _client = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let (_stream, peer) = listener.accept().await.unwrap();
+        assert_eq!(
+            peer.ip(),
+            IpAddr::from(Ipv4Addr::LOCALHOST.to_ipv6_mapped())
+        );
+        assert_eq!(
+            ClientInfo::new(peer).ip(),
+            IpAddr::from(Ipv4Addr::LOCALHOST)
+        );
     }
 }

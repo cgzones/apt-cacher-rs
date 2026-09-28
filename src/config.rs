@@ -888,7 +888,9 @@ pub(crate) struct Config {
     /// Can be overridden via program options.
     pub(crate) log_file: LogDestination,
 
-    /// Address to listen on.
+    /// Address to listen on; an IPv6 address may be bracketed (`[::1]`), as
+    /// `--bind` accepts it.
+    #[serde(deserialize_with = "from_bind_addr")]
     pub(crate) bind_addr: IpAddr,
 
     /// Port to listen on.
@@ -1214,6 +1216,20 @@ where
     let s: String = Deserialize::deserialize(deserializer)?;
 
     LevelFilter::from_str(&s).map_err(D::Error::custom)
+}
+
+/// `bind_addr`: an address, an IPv6 one optionally bracketed.
+fn from_bind_addr<'de, D>(deserializer: D) -> Result<IpAddr, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let s: String = Deserialize::deserialize(deserializer)?;
+
+    s.parse::<IpAddr>()
+        .ok()
+        .or_else(|| parse_bracketed_addr(&s))
+        .ok_or_else(|| D::Error::custom(format!("invalid IP address `{s}`")))
 }
 
 fn from_secs_f64<'de, D>(deserializer: D) -> Result<Duration, D::Error>
@@ -1582,6 +1598,13 @@ impl Config {
     fn validate(&mut self) -> Result<Vec<String>, ConfigError> {
         let mut warnings: Vec<String> = Vec::new();
         // TODO: check bind_addr.is_documentation() once stable: https://github.com/rust-lang/rust/issues/27709
+        if let IpAddr::V6(addr) = self.bind_addr
+            && addr.is_unicast_link_local()
+        {
+            invalid!(
+                "Invalid bind_addr `{addr}`: a link-local IPv6 address is bound only together with a zone identifier, which is not supported; listen on `::` or on a global or unique-local address"
+            );
+        }
 
         if let LogDestination::File(ref path) = self.log_file {
             if path.as_os_str().is_empty() {
@@ -2268,6 +2291,44 @@ mod test {
         config.apply_bind(bind("127.0.0.1:3143"));
         assert_eq!(config.bind_addr, IpAddr::from(Ipv4Addr::LOCALHOST));
         assert_eq!(config.bind_port, nonzero!(3143_u16));
+    }
+
+    /// The configuration file takes an IPv6 `bind_addr` bare or bracketed,
+    /// like `--bind` does, and nothing else.
+    #[test]
+    fn bind_addr_accepts_a_bracketed_ipv6_address() {
+        for (input, expected) in [
+            ("::1", IpAddr::from(Ipv6Addr::LOCALHOST)),
+            ("[::1]", IpAddr::from(Ipv6Addr::LOCALHOST)),
+            ("[::]", IpAddr::from(Ipv6Addr::UNSPECIFIED)),
+            ("127.0.0.1", IpAddr::from(Ipv4Addr::LOCALHOST)),
+        ] {
+            let config = Config::from_toml(&format!("bind_addr = '{input}'\n")).unwrap();
+            assert_eq!(config.bind_addr, expected, "input `{input}`");
+        }
+        for input in ["[127.0.0.1]", "[::1]:3142", "::1%eth0", "localhost", ""] {
+            assert!(
+                Config::from_toml(&format!("bind_addr = '{input}'\n")).is_err(),
+                "input `{input}` parsed"
+            );
+        }
+    }
+
+    /// A link-local `bind_addr` would need a zone identifier to bind, so it
+    /// is refused up front, from the file and from `--bind` alike.
+    #[test]
+    fn a_link_local_bind_addr_is_invalid() {
+        let mut config = Config::from_toml("bind_addr = 'fe80::1'\n").expect("config parses");
+        let err = config.validate().expect_err("link-local accepted");
+        assert!(err.to_string().contains("link-local IPv6 address"), "{err}");
+
+        let mut config = Config::default();
+        config.apply_bind(bind("[fe80::1]:3143"));
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.apply_bind(bind("[fd00::1]:3143"));
+        config.validate().expect("a unique-local address is fine");
     }
 
     #[test]

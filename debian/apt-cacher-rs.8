@@ -40,6 +40,12 @@ and/or
 from the configuration file. Accepted forms are
 .IR ADDR " (e.g. " 127.0.0.1 ", " ::1 ", " [::1] "), " ADDR : PORT
 .RI "(e.g. " 127.0.0.1:3143 ", " [::1]:3143 ") and :" PORT " (e.g. " :3143 ).
+An IPv6 address with a port must be bracketed:
+.I ::1:3143
+is the IPv6 address
+.IR ::1:3143 ,
+not port 3143 on
+.IR ::1 .
 An omitted component keeps its configured value.
 .TP
 .BI \-\-log\-file= PATH

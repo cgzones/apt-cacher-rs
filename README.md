@@ -52,6 +52,7 @@ The most relevant flags (see `apt-cacher-rs --help` for the full list):
 - `--database-path=<PATH>`: overrides the `database_path` field from the configuration file (or its default).
 - `--bind=<ADDR[:PORT]>`: overrides the `bind_addr` and/or `bind_port` fields from the configuration file (or their defaults).
   Accepted forms are `ADDR` (e.g. `127.0.0.1`, `::1`, `[::1]`), `ADDR:PORT` (e.g. `127.0.0.1:3143`, `[::1]:3143`) and `:PORT` (e.g. `:3143`).
+  An IPv6 address with a port must be bracketed: `::1:3143` is the IPv6 address `::1:3143`, not port 3143 on `::1`.
   An omitted component keeps its configured value.
 
 ## How to use

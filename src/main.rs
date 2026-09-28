@@ -207,9 +207,10 @@ struct Cli {
     /// file (or the built-in default when no file is loaded)
     #[arg(long, value_name = "PATH")]
     database_path: Option<PathBuf>,
-    /// Listening address and/or port (`ADDR`, `ADDR:PORT` or `:PORT`);
-    /// overrides `bind_addr`/`bind_port` from the configuration file (or the
-    /// built-in defaults when no file is loaded)
+    /// Listening address and/or port (`ADDR`, `ADDR:PORT` or `:PORT`, an IPv6
+    /// address with a port bracketed: `[::1]:3143`); overrides
+    /// `bind_addr`/`bind_port` from the configuration file (or the built-in
+    /// defaults when no file is loaded)
     #[arg(long, value_name = "ADDR[:PORT]")]
     bind: Option<config::BindOverride>,
     /// Skip timestamp in log messages (e.g. under systemd/journald, which
