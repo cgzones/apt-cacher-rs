@@ -981,7 +981,7 @@ pub(crate) static RATE_LIMIT_CLIENT: Signal = Signal::new();
 
 /// `DatabaseCommand` enqueues via `send_db_command` (every send is counted).
 pub(crate) static DB_COMMANDS_SENT: Counter = Counter::new();
-/// Peak observed DB-command channel depth, sampled post-send by the producer.
+/// Peak observed DB-command channel depth at send/receive boundaries.
 pub(crate) static DB_QUEUE_DEPTH_PEAK: Peak = Peak::new();
 /// Sends that observed a fully-saturated channel. The two bump sites differ
 /// in what follows: the async `send_db_command` samples `capacity() == 0`
@@ -994,10 +994,13 @@ pub(crate) static DB_QUEUE_FULL_WAITS: Signal = Signal::new();
 /// (latched until the channel drains fully to empty).
 pub(crate) static DB_QUEUE_FULL_TRANSITIONS: Signal = Signal::new();
 /// Time the DB command channel spent full (`db_channel_capacity`), so that
-/// request paths waited on database writes. Entered when a producer finds
-/// the channel full, left when the DB task finishes a chunk and finds room;
-/// senders parked on the full channel do not re-sample it, so a span can
-/// end at the task's check while they refill it.
+/// request paths waited on database writes. A span starts when a sender finds
+/// the channel full (before an async send, or a `try_send` refused as `Full`);
+/// a send that merely fills the final slot starts none. It ends at the first
+/// later observation that finds room: after a send, a receive, a cancelled
+/// send or closure. Observations and clock transitions are serialized; a
+/// brief drain between observations can be missed. Closure ends the span
+/// even while buffered commands drain.
 pub(crate) static DB_QUEUE_CAP_CLOCK: CapClock = CapClock::new();
 /// Commands dropped because the DB task channel was closed (graceful shutdown
 /// or unexpected receiver death). Bumped instead of panicking so request tasks

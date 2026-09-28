@@ -13,6 +13,11 @@ use crate::{
     sqlite_error::SqlxErrorReport,
 };
 
+mod queue;
+
+static QUEUE_OBSERVER: queue::QueueObserver<'static> =
+    queue::QueueObserver::new(&metrics::DB_QUEUE_CAP_CLOCK);
+
 /// Which per-transfer table a [`DbCmdTransfer`] is recorded in.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum TransferKind {
@@ -78,15 +83,12 @@ pub(crate) async fn send_db_command(cmd: DatabaseCommand) {
     // `capacity() == 0` means every slot is in flight, so this send must wait
     // for the DB task to drain one. Track it so operators can see how often
     // the channel is saturated and whether its configured size needs tuning.
-    if tx.capacity() == 0 {
+    if QUEUE_OBSERVER.admit(tx) {
         metrics::DB_QUEUE_FULL_WAITS.increment();
-        metrics::DB_QUEUE_CAP_CLOCK.enter();
     }
-    if tx.send(cmd).await.is_err() {
+    if QUEUE_OBSERVER.send(tx, cmd).await.is_err() {
         metrics::DB_COMMANDS_DROPPED_SHUTDOWN.increment();
-        return;
     }
-    record_queue_depth(tx);
 }
 
 /// Delete mirror rows by id, with every row referencing them.
@@ -108,15 +110,6 @@ pub(crate) async fn delete_mirrors(ids: Vec<i64>) -> Result<Vec<i64>, sqlx::Erro
     received.await.unwrap_or(Err(sqlx::Error::PoolClosed))
 }
 
-/// Sample the channel depth into `DB_QUEUE_DEPTH_PEAK`.
-///
-/// Depth peaks are reached the instant a send completes — the consumer can
-/// only decrease depth, never increase it — so one post-send sample here
-/// captures every spike without needing a consumer-side sample.
-fn record_queue_depth(tx: &tokio::sync::mpsc::Sender<DatabaseCommand>) {
-    metrics::DB_QUEUE_DEPTH_PEAK.update(tx.max_capacity().saturating_sub(tx.capacity()) as u64);
-}
-
 /// Synchronous variant of [`send_db_command`] for `Drop` impls and
 /// pre-response paths that must not stall on a saturated queue:
 /// `try_send` inline (the channel is rarely full) and fall back to a
@@ -129,14 +122,13 @@ pub(crate) fn send_db_command_nonblocking(cmd: DatabaseCommand) {
         .get()
         .expect("Sender initialized in main_loop()");
     metrics::DB_COMMANDS_SENT.increment();
-    match tx.try_send(cmd) {
-        Ok(()) => record_queue_depth(tx),
+    match QUEUE_OBSERVER.try_send(tx, cmd) {
+        Ok(()) => {}
         Err(TrySendError::Full(cmd)) => {
             metrics::DB_QUEUE_FULL_WAITS.increment();
-            metrics::DB_QUEUE_CAP_CLOCK.enter();
             let tx = tx.clone();
             tokio::task::spawn(async move {
-                if tx.send(cmd).await.is_err() {
+                if QUEUE_OBSERVER.send(&tx, cmd).await.is_err() {
                     metrics::DB_COMMANDS_DROPPED_SHUTDOWN.increment();
                 }
             });
@@ -472,11 +464,12 @@ async fn flush_last_seen(db: &Database, cache: &mut HashMap<Mirror, CachedMirror
 
 pub(crate) async fn db_loop(
     database: Database,
-    mut db_thread_rx: tokio::sync::mpsc::Receiver<DatabaseCommand>,
+    db_thread_rx: tokio::sync::mpsc::Receiver<DatabaseCommand>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     flush_max_count: usize,
     flush_interval: StdDuration,
 ) {
+    let mut db_thread_rx = QUEUE_OBSERVER.receiver(db_thread_rx);
     debug!("Database task started");
 
     let mut cache: HashMap<Mirror, CachedMirror> = HashMap::new();
@@ -565,14 +558,9 @@ pub(crate) async fn db_loop(
                 // chunk frees go to parked senders first, so `capacity()`
                 // only reads zero again once a whole chunk's worth of them
                 // was waiting. Sampled once per chunk; the producer-side
-                // full-wait/depth counters remain per send.
+                // full-wait counter remains per send.
                 let was_full = count.saturating_add(db_thread_rx.len()) >= max_capacity;
                 stage_received(&database, &mut cache, &mut buf, &mut received, flush_max_count).await;
-                // Room again once this chunk is staged, unless parked senders
-                // refilled it meanwhile: the time-at-cap span ends here.
-                if db_thread_rx.len() < max_capacity {
-                    metrics::DB_QUEUE_CAP_CLOCK.leave();
-                }
 
                 if was_full && !at_cap {
                     // `send_db_command` awaits on a full queue, so request

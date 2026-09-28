@@ -701,7 +701,7 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
     let channel_max = database_tx.max_capacity();
     t.entry("DB Command Queue")
         .kind(Kind::Live)
-        .tip("Commands queued for the database task, against db_channel_capacity. While it is full, request paths wait on database writes: raise db_channel_capacity, or flush sooner with db_batch_flush_max_count / db_batch_flush_interval_secs.")
+        .tip("Commands and reserved slots against db_channel_capacity. Time at cap is sampled at send and receive boundaries; brief transitions between samples can be missed. While it is full, request paths wait on database writes: raise db_channel_capacity, or flush sooner with db_batch_flush_max_count / db_batch_flush_interval_secs.")
         .note(Saturation {
             at_cap: metrics::DB_QUEUE_CAP_CLOCK.total(),
             refused: metrics::DB_QUEUE_FULL_WAITS.get(),
