@@ -42,7 +42,10 @@ use crate::{
 };
 
 use super::{
-    fmt::{Count, Level, Nonzero, RelTime, Segment, StackBar, Unit, alert_if, now_epoch, warn_if},
+    fmt::{
+        Count, Gauge, Level, Nonzero, RelTime, Segment, StackBar, Unit, alert_if, now_epoch,
+        warn_if,
+    },
     table::{DetailsList, Highlights, Kind},
 };
 
@@ -899,8 +902,12 @@ fn build_integrity_group(g: &mut Groups) {
         );
         t.entry("Registry Entries")
             .kind(Kind::Live)
-            .tip("In-memory checksum-registry entries (expected digests parsed from Packages/Release indices; lost on restart), capped by verify_checksums_max_entries.")
-            .value(Count::len(global_checksum_registry().len()));
+            .tip("In-memory checksum-registry entries (expected digests parsed from Packages/Release indices; lost on restart), against verify_checksums_max_entries. At the cap the oldest digests are dropped, and Re-ingests (touch) climbs: raise the cap to hold the live working set.")
+            .value(Gauge {
+                current: global_checksum_registry().len() as u64,
+                cap: Some(global_config().verify_checksums_max_entries.get() as u64),
+                peak: None,
+            });
         t.count_tip(
             "Re-ingests (touch)",
             "Cached indexes re-ingested because a request answered from cache found their digests missing (restart, eviction, an earlier skip). Climbing on every apt update means verify_checksums_max_entries is below the live working set.",
@@ -1384,8 +1391,12 @@ fn build_database_group(g: &mut Groups) {
         );
         t.entry("Peak Batch Size")
             .kind(Kind::Peak)
-            .tip("Most commands coalesced into a single flush since startup, against db_batch_flush_max_count.")
-            .value(Count(metrics::DB_BATCH_SIZE_PEAK.get()));
+            .tip("Most commands coalesced into a single flush since startup, against db_batch_flush_max_count, which flushes a batch once it is reached.")
+            .value(Gauge {
+                current: metrics::DB_BATCH_SIZE_PEAK.get(),
+                cap: Some(global_config().db_batch_flush_max_count.get() as u64),
+                peak: None,
+            });
         t.entry("Mirror Cache Entries")
             .kind(Kind::Live)
             .tip("Process-local mirror-id cache: hydrated at startup, grows on each newly observed mirror, never evicted.")

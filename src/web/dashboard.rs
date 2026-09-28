@@ -538,7 +538,7 @@ fn build_daemon_status_html(
     t.entry("Active Client Downloads")
         .kind(Kind::Live)
         .value(format_args!(
-            "{} (peak {})",
+            "{} <span class=\"peak\">peak {}</span>",
             Count::len(active_client_downloads()),
             Count(metrics::ACTIVE_CLIENT_DOWNLOADS_PEAK.get()),
         ));
@@ -898,7 +898,12 @@ fn build_cache_stats_html(
         .value(Window(bandwidth_week));
     t.entry("Uncacheable Resources")
         .kind(Kind::Live)
-        .value(Count::len(uncacheable_count));
+        .tip("Recently seen uncacheable (host, path) resources the Uncacheables section lists, against the fixed number it keeps; the oldest makes room for the newest.")
+        .value(Gauge {
+            current: uncacheable_count as u64,
+            cap: Some(UNCACHEABLES_MAX.get() as u64),
+            peak: None,
+        });
     t.entry("Cached Files")
         .kind(Kind::Live)
         .tip("From a walk of the mirror directories, cached for up to a minute.")
