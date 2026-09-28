@@ -24,7 +24,7 @@ use http::{
         IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, LOCATION, RANGE, USER_AGENT,
         VIA,
     },
-    uri::{Authority, PathAndQuery},
+    uri::PathAndQuery,
 };
 use http_body::{Body, Frame};
 use http_body_util::{BodyExt as _, Empty, combinators::BoxBody};
@@ -89,7 +89,7 @@ use crate::{
         dispatch_request, preflight_method, preflight_target, preflight_via,
     },
     response_head::{ResponseHead, ResponseKind, retry_after_secs},
-    scheme_cache::{self, SchemeDecision, canonical_authority},
+    scheme_cache::{self, SchemeDecision, canonical_upstream_authority},
     static_assert,
     transfer_error::{CacheError, DeliveryFailure, DownloadFailure, InternalError, UpstreamError},
     tunnel_limiter, upstream_dial,
@@ -332,9 +332,12 @@ pub(crate) async fn request_with_retry(
     // the proxy uses (`ClientHost`), as the splice backend's `Mirror` key
     // already is: a DNS name lowercased, an IPv6 literal in its one text
     // form. The raw spelling of a client URI or a redirect `Location` would
-    // miss an http-only entry and grow one cache entry per spelling. This is
-    // the single choke point every hyper upstream request passes.
-    if let Some(canonical) = parts.uri.authority().and_then(canonical_authority) {
+    // miss an http-only entry and grow one cache entry per spelling. An
+    // explicit `:80` on an `http` URI goes too, as dispatch drops it from the
+    // mirror: kept, it would be a scheme-cache key of its own and the HTTPS
+    // upgrade below would dial TLS on port 80. This is the single choke point
+    // every hyper upstream request passes.
+    if let Some(canonical) = canonical_upstream_authority(&parts.uri) {
         let mut uri_parts = parts.uri.into_parts();
         uri_parts.authority = Some(canonical);
         parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
@@ -2153,7 +2156,7 @@ async fn serve_new_file_worker(
         {
             // Derive the Host header from the redirect target so it matches
             // the URI we're actually sending the request to.
-            host = host_header_from_uri(moved_auth);
+            host = host_header_from_uri(&moved_uri);
             req_uri = Cow::Owned(moved_uri);
 
             let redirected_request = build_fwd_request(
@@ -3151,8 +3154,8 @@ async fn pre_process_client_request(
         .header(USER_AGENT, APP_USER_AGENT)
         .header(VIA, APP_VIA)
         .header(ACCEPT_ENCODING, "identity");
-    if let Some(authority) = parts.uri.authority() {
-        fwd_request = fwd_request.header(HOST, host_header_from_uri(authority));
+    if parts.uri.authority().is_some() {
+        fwd_request = fwd_request.header(HOST, host_header_from_uri(&parts.uri));
     }
     let fwd_request = fwd_request
         .uri(parts.uri)
@@ -3209,7 +3212,7 @@ async fn pre_process_client_request(
             // Update the Host header so it matches the redirect target,
             // otherwise the header from the original request would be
             // sent to a different mirror.
-            let redirected_host = host_header_from_uri(moved_auth);
+            let redirected_host = host_header_from_uri(&moved_uri);
             parts.headers.insert(HOST, redirected_host);
             parts.uri = moved_uri;
             let redirected_request = Request::from_parts(parts, Empty::new());
@@ -3259,14 +3262,17 @@ async fn pre_process_client_request(
     )
 }
 
-/// Build a `Host` header value matching the given authority, in its
-/// canonical spelling (`scheme_cache::canonical_authority`), the one
-/// `request_with_retry` dials and the splice backend sends.
+/// Build a `Host` header value matching the authority of the absolute `uri`,
+/// in its canonical spelling (`scheme_cache::canonical_upstream_authority`),
+/// the one `request_with_retry` dials and the splice backend sends.
 ///
 /// IPv6 hosts are kept bracketed per RFC 3986 §3.2.2, and any explicit
-/// port is appended.
-fn host_header_from_uri(auth: &Authority) -> HeaderValue {
-    let canonical = canonical_authority(auth);
+/// port but an `http` URI's `:80` is appended.
+fn host_header_from_uri(uri: &Uri) -> HeaderValue {
+    let auth = uri
+        .authority()
+        .expect("an upstream URI names its authority");
+    let canonical = canonical_upstream_authority(uri);
     let auth = canonical.as_ref().unwrap_or(auth);
     let host = auth.host();
     let value = match uri_authority::port(auth).expect("validated upstream authority") {
@@ -3598,10 +3604,7 @@ mod tests {
             .expect("redirect response");
         let target = super::parse_redirect_location(&response, "mirror.example", "package.deb")
             .expect("valid redirect port");
-        assert_eq!(
-            host_header_from_uri(target.authority().expect("absolute URI")),
-            "[::1]:80"
-        );
+        assert_eq!(host_header_from_uri(&target), "[::1]");
     }
 
     /// Feed actual wire bytes through Hyper, with the same transport marker
@@ -3877,36 +3880,36 @@ mod tests {
     #[test]
     fn host_header_from_uri_plain_host() {
         let uri: Uri = "http://deb.debian.org/foo".parse().unwrap();
-        assert_eq!(
-            host_header_from_uri(uri.authority().unwrap()),
-            "deb.debian.org"
-        );
+        assert_eq!(host_header_from_uri(&uri), "deb.debian.org");
     }
 
     #[test]
     fn host_header_from_uri_with_port() {
         let uri: Uri = "http://mirror.example.com:8080/foo".parse().unwrap();
-        assert_eq!(
-            host_header_from_uri(uri.authority().unwrap()),
-            "mirror.example.com:8080"
-        );
+        assert_eq!(host_header_from_uri(&uri), "mirror.example.com:8080");
     }
 
     #[test]
     fn host_header_from_uri_ipv6_bracketed() {
         let uri: Uri = "http://[2001:db8::1]/foo".parse().unwrap();
-        assert_eq!(
-            host_header_from_uri(uri.authority().unwrap()),
-            "[2001:db8::1]"
-        );
+        assert_eq!(host_header_from_uri(&uri), "[2001:db8::1]");
+    }
+
+    #[test]
+    fn host_header_from_uri_drops_the_http_default_port() {
+        for (uri, host) in [
+            ("http://deb.debian.org:80/foo", "deb.debian.org"),
+            ("http://[2001:db8::1]:80/foo", "[2001:db8::1]"),
+            ("https://deb.debian.org:80/foo", "deb.debian.org:80"),
+        ] {
+            let uri: Uri = uri.parse().unwrap();
+            assert_eq!(host_header_from_uri(&uri), host, "{uri}");
+        }
     }
 
     #[test]
     fn host_header_from_uri_ipv6_with_port() {
         let uri: Uri = "http://[2001:db8::1]:8080/foo".parse().unwrap();
-        assert_eq!(
-            host_header_from_uri(uri.authority().unwrap()),
-            "[2001:db8::1]:8080"
-        );
+        assert_eq!(host_header_from_uri(&uri), "[2001:db8::1]:8080");
     }
 }

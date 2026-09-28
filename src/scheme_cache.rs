@@ -129,15 +129,35 @@ impl<'a> From<&'a Authority> for SchemeKeyRef<'a> {
 /// `http_only_mirrors`, under a name no `Mirror` carries.
 #[must_use]
 pub(crate) fn canonical_authority(auth: &Authority) -> Option<Authority> {
+    canonicalize(auth, None)
+}
+
+/// The canonical authority of the upstream `uri`, or `None` when it has none
+/// or it already is canonical: [`canonical_authority`], and for an `http` URI
+/// an explicit `:80` dropped too, as `request_dispatch::preflight_target`
+/// drops it from a proxied request. The default port names the same resource
+/// as none (RFC 3986 §6.2.3); kept, it would key the scheme cache apart from
+/// the port-less mirror and survive an HTTPS upgrade as TLS on port 80.
+#[cfg(feature = "hyper")]
+#[must_use]
+pub(crate) fn canonical_upstream_authority(uri: &http::Uri) -> Option<Authority> {
+    let default_port = (uri.scheme() == Some(&http::uri::Scheme::HTTP))
+        .then_some(uri_authority::HTTP_DEFAULT_PORT);
+    canonicalize(uri.authority()?, default_port)
+}
+
+/// [`canonical_authority`], dropping an explicit port equal to `default_port`.
+fn canonicalize(auth: &Authority, default_port: Option<u16>) -> Option<Authority> {
     let port = uri_authority::port(auth).ok()?;
+    let default_named = port.is_some_and(|port| Some(port.get()) == default_port);
     let host = auth.host();
     // Fast path, no allocation: a lowercase DNS name or an IPv4 address
     // (whose parser admits only the canonical dotted quad) is canonical.
-    if !host.starts_with('[') && !host.bytes().any(|b| b.is_ascii_uppercase()) {
+    if !default_named && !host.starts_with('[') && !host.bytes().any(|b| b.is_ascii_uppercase()) {
         return None;
     }
     let canonical = DomainName::new(host).ok()?;
-    let rendered = canonical.format_authority(port);
+    let rendered = canonical.format_authority(port.filter(|_| !default_named));
     if rendered == auth.as_str() {
         return None;
     }
@@ -548,6 +568,35 @@ mod tests {
         ] {
             let auth = Authority::try_from(already).expect("valid authority");
             assert_eq!(canonical_authority(&auth), None, "{already}");
+        }
+    }
+
+    /// An `http` URI's explicit `:80` is no port, as in a proxied request;
+    /// any other scheme's `:80`, and any other port, stays.
+    #[cfg(feature = "hyper")]
+    #[test]
+    fn canonical_upstream_authority_drops_the_http_default_port() {
+        for (uri, canonical) in [
+            ("http://deb.debian.org:80/debian/", Some("deb.debian.org")),
+            ("http://DEB.debian.org:080/debian/", Some("deb.debian.org")),
+            ("http://[2001:db8:0::1]:80/debian/", Some("[2001:db8::1]")),
+            ("http://192.0.2.1:80/debian/", Some("192.0.2.1")),
+            ("http://Deb.debian.org/debian/", Some("deb.debian.org")),
+            ("http://deb.debian.org/debian/", None),
+            ("http://deb.debian.org:443/debian/", None),
+            ("http://deb.debian.org:8080/debian/", None),
+            ("https://deb.debian.org:80/debian/", None),
+            ("https://deb.debian.org:443/debian/", None),
+            ("/debian/", None),
+        ] {
+            let uri: http::Uri = uri.parse().expect("valid URI");
+            assert_eq!(
+                canonical_upstream_authority(&uri)
+                    .as_ref()
+                    .map(Authority::as_str),
+                canonical,
+                "{uri}"
+            );
         }
     }
 

@@ -390,7 +390,11 @@ pub(crate) fn preflight_target<'a, 'h>(
     };
 
     let port = match uri_authority::port(authority) {
-        Ok(port) => port,
+        // The scheme is `http` (checked above), whose default port names the
+        // same resource as none (RFC 3986 §6.2.3): `host:80` and `host` are
+        // one mirror, with one cache tree and one database row, and an
+        // HTTPS upgrade dials 443 instead of TLS on port 80.
+        Ok(port) => port.filter(|port| port.get() != uri_authority::HTTP_DEFAULT_PORT),
         Err(err) => {
             warn_once_or_info!(
                 "Unsupported request port in `{authority}` from client {client} ({err}); returning 400"
@@ -997,6 +1001,33 @@ mod tests {
             expect_proxy(&preflight_target(&uri, true, || None, &client, &OPEN_ACLS));
         assert_eq!(host, "deb.example.com");
         assert_eq!(port, NonZero::new(8080));
+
+        // An explicit default port is no port: one mirror, not two.
+        for (target, expected_host) in [
+            (
+                "http://deb.example.com:80/debian/dists/sid/Release",
+                "deb.example.com",
+            ),
+            (
+                "http://[2001:db8::1]:80/debian/dists/sid/Release",
+                "[2001:db8::1]",
+            ),
+        ] {
+            let uri: Uri = target.parse().unwrap();
+            let (host, port) =
+                expect_proxy(&preflight_target(&uri, true, || None, &client, &OPEN_ACLS));
+            assert_eq!(host, expected_host, "{target}");
+            assert_eq!(port, None, "{target}");
+        }
+        let uri: Uri = "http://deb.example.com:443/debian/dists/sid/Release"
+            .parse()
+            .unwrap();
+        let (_, port) = expect_proxy(&preflight_target(&uri, true, || None, &client, &OPEN_ACLS));
+        assert_eq!(port, NonZero::new(443), "only the http default folds");
+
+        let uri: Uri = "http://deb.example.com:8080/debian/dists/sid/Release"
+            .parse()
+            .unwrap();
 
         // Absolute-form requests need no Host header even on HTTP/1.1, and
         // the ACLs are left to authorize_cache_access.

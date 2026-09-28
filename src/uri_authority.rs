@@ -4,6 +4,10 @@ use std::num::NonZero;
 
 use http::uri::Authority;
 
+/// The default port of the `http` scheme, which names the same resource as
+/// no port (RFC 3986 §6.2.3).
+pub(crate) const HTTP_DEFAULT_PORT: u16 = 80;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("port must be a decimal number between 1 and 65535")]
 pub(crate) struct InvalidPort;
