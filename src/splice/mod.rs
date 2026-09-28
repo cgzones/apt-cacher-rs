@@ -729,7 +729,7 @@ async fn reject_if_verify_throttled(
         return Ok(false);
     };
     warn_once_or_info!(
-        "splice proxy: rejecting request for {} from client {}: recently failed checksum verification ({} consecutive failures), retry in {}",
+        "splice proxy: rejecting request for {} from client {} since it recently failed checksum verification ({} consecutive failures), retry in {}",
         conn_details.debname,
         conn_details.client,
         throttled.failures,

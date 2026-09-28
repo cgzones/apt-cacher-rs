@@ -2047,7 +2047,7 @@ async fn serve_new_file_worker(
         && let Some(throttled) = global_verify_throttle().check(conn_details.key())
     {
         warn_once_or_info!(
-            "Rejecting request for {} from client {}: recently failed checksum verification ({} consecutive failures), retry in {}",
+            "Rejecting request for {} from client {} since it recently failed checksum verification ({} consecutive failures), retry in {}",
             conn_details.debname,
             conn_details.client,
             throttled.failures,
@@ -2800,7 +2800,7 @@ fn connect_response(
     let tunnel_guard = if let Some(max) = config.https_tunnel_max_connections_per_client {
         let Some(guard) = tunnel_limiter::try_acquire(client.ip(), max) else {
             info!(
-                "Rejecting https tunnel request for client {client}: \
+                "Rejecting https tunnel request for client {client}, \
                      concurrent connection limit ({max}) reached"
             );
             metrics::TUNNEL_REJECTED_CAPACITY.increment();

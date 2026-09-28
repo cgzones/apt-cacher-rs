@@ -13,12 +13,16 @@ use crate::{error::ErrorReport, static_assert, warn_once_or_debug};
 /// One end of a socket as the log lines below render it: the address, or
 /// `<unknown>` when `getsockname`/`getpeername` failed. Formats straight into
 /// the `Formatter` instead of allocating a `String` per log site.
+///
+/// The IP is canonicalized as `ClientInfo` renders it, so an IPv4 client of
+/// the dual-stack listener reads `192.0.2.1:40000` here too, not
+/// `[::ffff:192.0.2.1]:40000`.
 struct Endpoint(std::io::Result<SocketAddr>);
 
 impl Display for Endpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0 {
-            Ok(addr) => Display::fmt(addr, f),
+            Ok(addr) => Display::fmt(&SocketAddr::new(addr.ip().to_canonical(), addr.port()), f),
             Err(_err) => f.write_str("<unknown>"),
         }
     }
@@ -109,5 +113,26 @@ impl Drop for CorkGuard<'_> {
                 ErrorReport(&err)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use super::*;
+
+    /// An IPv4 peer of the dual-stack listener renders as IPv4, like every
+    /// other log line names that client; a real IPv6 peer stays bracketed.
+    #[test]
+    fn endpoint_renders_a_mapped_peer_as_ipv4() {
+        let mapped = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped(), 40000));
+        assert_eq!(Endpoint(Ok(mapped)).to_string(), "192.0.2.1:40000");
+
+        let v6 = SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 80));
+        assert_eq!(Endpoint(Ok(v6)).to_string(), "[2001:db8::1]:80");
+
+        let failed = Endpoint(Err(std::io::Error::other("getpeername")));
+        assert_eq!(failed.to_string(), "<unknown>");
     }
 }

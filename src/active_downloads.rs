@@ -515,7 +515,7 @@ fn discarded_join(checksum_mismatch: bool, conn_details: &ConnectionDetails) -> 
         && let Some(throttled) = global_verify_throttle().check(conn_details.key())
     {
         warn_once_or_info!(
-            "Rejecting request for {} from client {}: recently failed checksum verification ({} consecutive failures), retry in {}",
+            "Rejecting request for {} from client {} since it recently failed checksum verification ({} consecutive failures), retry in {}",
             conn_details.debname,
             conn_details.client,
             throttled.failures,

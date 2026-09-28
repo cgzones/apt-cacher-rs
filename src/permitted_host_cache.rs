@@ -101,7 +101,7 @@ pub(crate) fn authorize_cache_access(
 
     if !client_permitted(&config.allowed_proxy_clients, client) {
         warn_once_or_info!(
-            "Unauthorized proxy client {client}: not permitted by `allowed_proxy_clients`; rejecting with 403"
+            "Unauthorized proxy client {client} (not permitted by `allowed_proxy_clients`); rejecting with 403"
         );
         metrics::AUTHZ_REJECTED_CLIENT.increment();
         client_trouble::record(client, Trouble::Unauthorized);

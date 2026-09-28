@@ -600,7 +600,7 @@ fn decide_request(
     request_received_at: PreciseInstant,
 ) -> Decision {
     let (uri_path, query) = split_query(path_and_query);
-    trace!("Dispatching request from client {client}: host=`{requested_host}` path=`{uri_path}`");
+    trace!("Dispatching request from client {client} (host=`{requested_host}` path=`{uri_path}`)");
 
     // pdiff URLs have a known shape (`/Packages.diff/T-...`, `/Sources.diff/T-...`,
     // `/Translation-XX.diff/T-...`) that `parse_request_path` deliberately does

@@ -60,6 +60,11 @@ impl PerIpCounter {
     /// Admit one more concurrent user of `ip` while fewer than `max` are
     /// held, or return `None` at the cap.
     ///
+    /// `ip` is canonicalized here rather than trusted to arrive that way
+    /// (`ClientInfo::ip` already is): a dual-stack listener reports an IPv4
+    /// client as `::ffff:a.b.c.d`, and keyed raw that client would hold a
+    /// second set of slots beside its plain IPv4 form.
+    ///
     /// Takes `&'static self` because the permit outlives the call and must
     /// name the counter to release into; every counter is a `static`.
     #[must_use]
@@ -68,6 +73,7 @@ impl PerIpCounter {
         ip: IpAddr,
         max: NonZero<usize>,
     ) -> Option<PerIpPermit> {
+        let ip = ip.to_canonical();
         let mut held = self.held.lock();
         let Held { per_ip, at_cap } = &mut *held;
         let count = per_ip.entry(ip).or_insert(0);
@@ -98,7 +104,7 @@ impl PerIpCounter {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn tracks(&self, ip: IpAddr) -> bool {
-        self.held.lock().per_ip.contains_key(&ip)
+        self.held.lock().per_ip.contains_key(&ip.to_canonical())
     }
 }
 
@@ -204,6 +210,36 @@ mod tests {
             .expect("a different IP is unaffected");
 
         drop(held);
+        drop(unrelated);
+    }
+
+    /// An IPv4 client reported by a dual-stack listener as an IPv4-mapped
+    /// IPv6 address shares its slots with the plain IPv4 form, and an IPv6
+    /// client stays apart from both.
+    #[test]
+    fn a_mapped_ipv4_client_shares_its_slots_with_the_plain_form() {
+        let plain: IpAddr = "192.0.2.34".parse().expect("test address");
+        let mapped: IpAddr = "::ffff:192.0.2.34".parse().expect("test address");
+        let native: IpAddr = "2001:db8::34".parse().expect("test address");
+
+        let held = COUNTER
+            .try_acquire(mapped, nonzero!(1))
+            .expect("first slot");
+        assert!(
+            COUNTER.try_acquire(plain, nonzero!(1)).is_none(),
+            "the plain form must count against the mapped one's slot"
+        );
+        assert!(COUNTER.tracks(plain));
+        let unrelated = COUNTER
+            .try_acquire(native, nonzero!(1))
+            .expect("an IPv6 client is a different client");
+
+        drop(held);
+        assert!(!COUNTER.tracks(mapped), "released under the canonical key");
+        let again = COUNTER
+            .try_acquire(plain, nonzero!(1))
+            .expect("the released slot is free for the plain form");
+        drop(again);
         drop(unrelated);
     }
 }

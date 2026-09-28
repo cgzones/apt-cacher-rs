@@ -654,8 +654,8 @@ pub(crate) async fn main_loop(
             // flood would be one info line per connection, and the counter
             // above already carries every repeat.
             warn_once_or_debug!(
-                "Unauthorized client {client}: permitted by neither `allowed_proxy_clients` nor \
-                 `allowed_webif_clients`; closing the socket without a response"
+                "Unauthorized client {client} (permitted by neither `allowed_proxy_clients` nor \
+                 `allowed_webif_clients`); closing the socket without a response"
             );
             drop(stream);
             continue;
@@ -671,12 +671,12 @@ pub(crate) async fn main_loop(
                 // Per rejected connection, on exactly the path a flood exercises.
                 match cap {
                     client_counter::ConnectionCap::PerIp(max) => warn_once_or_debug!(
-                        "Rejecting connection from client {client}: \
-                         `max_connections_per_client_ip` ({max}) reached, closing the socket without a response"
+                        "Rejecting connection from client {client}, \
+                         `max_connections_per_client_ip` ({max}) reached; closing the socket without a response"
                     ),
                     client_counter::ConnectionCap::Global(max) => warn_once_or_debug!(
-                        "Rejecting connection from client {client}: \
-                         `max_connections` ({max}) reached, closing the socket without a response"
+                        "Rejecting connection from client {client}, \
+                         `max_connections` ({max}) reached; closing the socket without a response"
                     ),
                 }
                 // Drop the stream; closing the socket is the cheapest available
