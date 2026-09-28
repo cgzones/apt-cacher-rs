@@ -257,7 +257,10 @@ impl StateU64 {
 }
 
 /// Total client requests handled, including web-interface requests.
-/// Subtract `WEBUI_REQUESTS` to get proxy-only requests.
+/// Subtract `WEBUI_REQUESTS` to get proxy-only requests. Counted when the
+/// request starts. A request hyper itself refuses while parsing (a hyper-only
+/// build, or a connection the sendfile backend handed to hyper for good)
+/// never reaches the proxy and counts nowhere, nor in `CLIENT_STATUS_*`.
 pub(crate) static REQUESTS_TOTAL: Counter = Counter::new();
 /// Requests for which a response body was fully delivered to the client
 /// (subset of `REQUESTS_TOTAL`; sum of per-delivery-path `SERVED_*` plus

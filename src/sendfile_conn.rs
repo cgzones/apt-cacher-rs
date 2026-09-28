@@ -308,14 +308,15 @@ pub(crate) async fn handle_sendfile_connection(
             }
         };
 
+        // Proxy entry for every request this backend parsed, including the
+        // ones handed to hyper (which skips its own bump for a handoff).
+        // Counted before the request runs, so REQUESTS_TOTAL >= SERVED_TOTAL
+        // and >= CLIENT_STATUS_* hold at every instant, as on the parse-error
+        // path above, and a long download is a request while it runs.
+        metrics::REQUESTS_TOTAL.increment();
+
         let result =
             try_sendfile_request(&buf, &stream, client, &appstate, &mut conn_version).await;
-
-        // Proxy entry for every request this backend parsed, including the
-        // ones handed to hyper (which skips its own bump for a handoff), so
-        // REQUESTS_TOTAL >= CLIENT_STATUS_* holds as on the parse-error path
-        // above.
-        metrics::REQUESTS_TOTAL.increment();
 
         let _: Never = match result {
             ZeroCopyResult::Served(ConnectionAction::KeepAlive) => {
