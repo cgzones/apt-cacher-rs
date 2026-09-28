@@ -92,10 +92,6 @@ The cleanup can also be manually triggered by sending the signal `USR2` to the `
 - `webpki-roots`: bundle Mozilla's CA root set with `rustls` instead of relying on the system trust store.
 - `splice`: proxy upstream responses to clients using `splice(2)` (implies `sendfile`).
 - At least one HTTP backend must be enabled: `hyper` or `splice`. A `splice`-only build stays operational and routes requests through the splice/sendfile path.
-  Requires Linux >= 4.17 (kernel TLS receive offload) with the `tls` kernel module available
-  (auto-loaded on first use; `modprobe tls` if module loading is restricted). TLS 1.3 and
-  AES-256-GCM need >= 5.1, ChaCha20-Poly1305 >= 5.11. Recommended: >= 6.0 (reworked RX path
-  and the `TLS_RX_EXPECT_NO_PAD` optimization, used when available).
 
 ## Security
 
