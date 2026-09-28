@@ -30,6 +30,7 @@ hyper = [
     "dep:hyper",
     "dep:hyper-util",
     "dep:hyper-timeout",
+    "dep:tower-service",
 ]
 webpki-roots = ["tls_rustls", "dep:webpki-roots"]
 sendfile = ["dep:httparse", "nix/zerocopy", "nix/socket"]
@@ -83,6 +84,7 @@ time = { version = "0.3.47", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1.37.0", features = ["fs", "io-util", "macros", "net", "parking_lot", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.10", features = ["io-util"] }
 toml = "1.0.3"
+tower-service = { version = "0.3.3", optional = true }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-log = "0.2"

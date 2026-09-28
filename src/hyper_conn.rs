@@ -70,6 +70,7 @@ use crate::{
     global_cache_quota, global_config, global_verify_throttle, global_webif_hosts,
     guards::{Consequence, DownloadBarrier, InitBarrier, Settled},
     humanfmt::HumanFmt,
+    hyper_transport::{TransportConnector, is_transport_error},
     integrity::{note_cached_index_touch, note_release_revalidated},
     limits::VOLATILE_CACHE_MAX_AGE,
     log_once, metrics,
@@ -105,7 +106,7 @@ use hyper_rustls::HttpsConnector;
 use hyper_tls::HttpsConnector;
 
 pub(crate) type HttpClient = hyper_util::client::legacy::Client<
-    hyper_timeout::TimeoutConnector<HttpsConnector<HttpConnector>>,
+    TransportConnector<hyper_timeout::TimeoutConnector<HttpsConnector<HttpConnector>>>,
     Empty<bytes::Bytes>,
 >;
 
@@ -780,11 +781,21 @@ impl Body for CachedFileBody {
 /// Hyper is the only source of these erased transport errors. Restore upstream
 /// provenance here; library error-chain inspection never reaches a delivery logger.
 fn upstream_body_error(error: hyper::Error) -> UpstreamError {
-    // Hyper's body decoder wraps a short read in an UnexpectedEof I/O
-    // source; is_incomplete_message() only covers the response head here.
+    // Hyper's body decoder reports short reads and malformed chunk framing
+    // as I/O errors; is_parse()/is_incomplete_message() cover the head.
+    // TLS may also report InvalidData, so only an untagged error with a
+    // decoder kind is a protocol violation. Keep the existing EOF policy:
+    // an upstream EOF before the promised body is complete is a short body.
     if std::error::Error::source(&error)
         .and_then(|source| source.downcast_ref::<std::io::Error>())
-        .is_some_and(|source| source.kind() == std::io::ErrorKind::UnexpectedEof)
+        .is_some_and(|source| {
+            use std::io::ErrorKind;
+            source.kind() == ErrorKind::UnexpectedEof
+                || (matches!(
+                    source.kind(),
+                    ErrorKind::InvalidInput | ErrorKind::InvalidData
+                ) && !is_transport_error(source))
+        })
     {
         return UpstreamError::protocol(ErrorReport(&error).to_string());
     }
@@ -3512,19 +3523,54 @@ fn log_client_connection_error(client: ClientInfo, err: &hyper::Error) {
 mod tests {
     use super::{SchemeDecision, UpgradeProbe, Uri, host_header_from_uri};
 
-    /// Exercise real hyper body errors: a decoder-detected short body and
-    /// an EOF from the transport are protocol failures, while a reset,
-    /// timeout or TLS-style `InvalidData` error keeps its transport accounting.
-    #[tokio::test]
-    async fn upstream_body_errors_distinguish_eof_from_transport_failures() {
-        use std::io::ErrorKind;
-
+    /// Feed actual wire bytes through Hyper, with the same transport marker
+    /// as the production connector. A transport failure follows the bytes.
+    async fn read_body_error(response: Vec<u8>, kind: Option<std::io::ErrorKind>) -> hyper::Error {
         use bytes::Bytes;
         use futures_util::StreamExt as _;
         use http_body_util::{BodyExt as _, Empty};
         use hyper_util::rt::TokioIo;
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         use tokio_util::io::{ReaderStream, StreamReader};
+
+        let (client, mut upstream) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let mut request = [0; 4096];
+            assert!(upstream.read(&mut request).await.expect("request") > 0);
+            upstream.write_all(&response).await.expect("response");
+        });
+        let (reader, writer) = tokio::io::split(client);
+        let chunks = ReaderStream::new(reader).chain(futures_util::stream::iter(
+            kind.map(|kind| Err(std::io::Error::from(kind))),
+        ));
+        let io = crate::hyper_transport::TransportIo::new(TokioIo::new(tokio::io::join(
+            StreamReader::new(chunks),
+            writer,
+        )));
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(io)
+            .await
+            .expect("client handshake");
+        let driver = tokio::spawn(connection);
+        let response = sender
+            .send_request(http::Request::new(Empty::<Bytes>::new()))
+            .await
+            .expect("response head");
+        let error = response
+            .into_body()
+            .collect()
+            .await
+            .expect_err("failed body");
+        drop(driver.await.expect("connection task"));
+        server.await.expect("upstream task");
+        error
+    }
+
+    /// Exercise real hyper body errors: a decoder-detected short body and
+    /// an EOF from the transport are protocol failures, while a reset,
+    /// timeout or TLS-style `InvalidData` error keeps its transport accounting.
+    #[tokio::test]
+    async fn upstream_body_errors_distinguish_eof_from_transport_failures() {
+        use std::io::ErrorKind;
 
         use super::{metrics, upstream_body_error};
         use crate::mirror_health::MirrorFault;
@@ -3545,36 +3591,13 @@ mod tests {
                 true,
             ),
             (Some(ErrorKind::InvalidData), None, true, false),
+            (Some(ErrorKind::InvalidInput), None, true, false),
         ] {
-            let (client, mut upstream) = tokio::io::duplex(4096);
-            let server = tokio::spawn(async move {
-                let mut request = [0; 4096];
-                assert!(upstream.read(&mut request).await.expect("request") > 0);
-                upstream
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort")
-                    .await
-                    .expect("response");
-            });
-            let (reader, writer) = tokio::io::split(client);
-            let chunks = ReaderStream::new(reader).chain(futures_util::stream::iter(
-                kind.map(|kind| Err(std::io::Error::from(kind))),
-            ));
-            let io = TokioIo::new(tokio::io::join(StreamReader::new(chunks), writer));
-            let (mut sender, connection) = hyper::client::conn::http1::handshake(io)
-                .await
-                .expect("client handshake");
-            let driver = tokio::spawn(connection);
-            let response = sender
-                .send_request(http::Request::new(Empty::<Bytes>::new()))
-                .await
-                .expect("response head");
-            let error = response
-                .into_body()
-                .collect()
-                .await
-                .expect_err("short or failed body");
-            drop(driver.await.expect("connection task"));
-            server.await.expect("upstream task");
+            let error = read_body_error(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort".to_vec(),
+                kind,
+            )
+            .await;
 
             let body_errors = metrics::UPSTREAM_HYPER_BODY_ERR.get();
             let timeouts = metrics::HTTP_TIMEOUT_UPSTREAM_READ.get();
@@ -3589,6 +3612,56 @@ mod tests {
                 metrics::HTTP_TIMEOUT_UPSTREAM_READ.get() - timeouts,
                 u64::from(timeout),
                 "{kind:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_chunk_framing_counts_one_protocol_fault_per_download() {
+        use super::{metrics, upstream_body_error};
+        use crate::{log_once::Logged, mirror_health, mirror_health::MirrorFault};
+
+        let bodies: &[&[u8]] = &[
+            b"g\r\n",                    // invalid size digit
+            b"10000000000000000\r\n",    // size overflow (InvalidData)
+            b"1\rX",                     // size delimiter
+            b"1\r\naX",                  // body delimiter
+            b"1;extension\n",            // invalid extension (InvalidData)
+            b"0\r\nbad trailer\r\n\r\n", // malformed trailers
+            b"5\r\nabc",                 // truncated chunk
+        ];
+        for (case, body) in bodies.iter().enumerate() {
+            let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+            response.extend_from_slice(body);
+            let error = read_body_error(response, None).await;
+            let transport_before = metrics::UPSTREAM_HYPER_BODY_ERR.get();
+            let failure = upstream_body_error(error);
+            assert_eq!(
+                failure.mirror_fault(),
+                Some(MirrorFault::Protocol),
+                "case {case}"
+            );
+            assert_eq!(metrics::UPSTREAM_HYPER_BODY_ERR.get(), transport_before);
+            let mirror = crate::test_support::structured_mirror(
+                &format!("chunk-framing-{case}.example"),
+                "repo",
+            );
+            let protocol_before = metrics::UPSTREAM_PROTOCOL_VIOLATION.get();
+            let _reported = failure.conclude(Some(&mirror), |_| {
+                Logged::at(
+                    crate::transfer_error::Severity::Info,
+                    format_args!("test malformed chunk framing"),
+                )
+            });
+            assert_eq!(
+                metrics::UPSTREAM_PROTOCOL_VIOLATION.get(),
+                protocol_before + 1
+            );
+            assert_eq!(
+                mirror_health::snapshot()
+                    .get(mirror.to_string().as_str())
+                    .map(|h| h.protocol),
+                Some(1)
             );
         }
     }

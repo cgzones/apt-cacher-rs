@@ -53,6 +53,8 @@ mod http_range;
 mod humanfmt;
 #[cfg(feature = "hyper")]
 mod hyper_conn;
+#[cfg(feature = "hyper")]
+mod hyper_transport;
 mod index_parser;
 mod ingest_ledger;
 mod integrity;
@@ -791,7 +793,7 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
             .http1_max_headers(limits::MAX_UPSTREAM_HEADERS)
             .pool_max_idle_per_host(limits::UPSTREAM_POOL_MAX_IDLE_PER_HOST)
             .http1_max_buf_size(limits::MAX_UPSTREAM_READ_BUFFER)
-            .build(timeout_connector)
+            .build(hyper_transport::TransportConnector::new(timeout_connector))
     };
 
     let runtime = Builder::new_multi_thread()
