@@ -3,7 +3,7 @@
 //!
 //! Sockets, cache files, splice pipes, the database: everything the daemon
 //! opens draws on one budget, and at its end `accept(2)` fails with `EMFILE`
-//! (the Accept Failures row). `max_connections` defaults to three quarters
+//! (Descriptor Exhaustion, under Accept Failures). `max_connections` defaults to three quarters
 //! of the soft limit (`client_counter::default_max_connections`); the
 //! gauge shows how much of the rest the other descriptors take.
 //!

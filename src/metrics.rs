@@ -288,6 +288,11 @@ pub(crate) static CONNECTIONS_ACCEPTED: Counter = Counter::new();
 /// ECONNABORTED.  Climbing values mean the process is at its fd budget --
 /// check `max_connections` against `LimitNOFILE`.
 pub(crate) static ACCEPT_TRANSIENT_FAILURES: Signal = Signal::new();
+/// Part of `ACCEPT_TRANSIENT_FAILURES` (bumped after it): the EMFILE/ENFILE
+/// failures, the process or the system out of file descriptors. Every new
+/// connection, cache file and upstream socket fails meanwhile, so unlike a
+/// client aborting its handshake (ECONNABORTED) this is an outage.
+pub(crate) static ACCEPT_FD_EXHAUSTED: Signal = Signal::new();
 
 /// Upstream response class buckets (2xx/3xx/4xx/5xx/other).
 pub(crate) static UPSTREAM_STATUS_2XX: Counter = Counter::new();

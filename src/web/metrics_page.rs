@@ -439,12 +439,17 @@ fn build_connections_group(g: &mut Groups) {
             Level::Warn,
             &metrics::CONNECTION_REJECTED_ACL,
         );
-        t.signal(
-            "Accept Failures (retried)",
-            "accept(2) failures retried after a short pause instead of stopping the daemon: descriptor exhaustion (EMFILE/ENFILE), ENOBUFS/ENOMEM, ECONNABORTED. The process is at its file-descriptor budget (Capacity: Open File Descriptors): raise LimitNOFILE, or lower max_connections below it.",
-            Level::Warn,
-            &metrics::ACCEPT_TRANSIENT_FAILURES,
-        );
+        t.entry("Accept Failures (retried)")
+            .tip("accept(2) failures retried after a short pause instead of stopping the daemon: descriptor exhaustion (EMFILE/ENFILE, beneath), kernel memory (ENOBUFS/ENOMEM), or a client that aborted its handshake (ECONNABORTED).")
+            .parts(|p| {
+                p.signal(
+                    "Descriptor Exhaustion",
+                    "EMFILE/ENFILE: the process (or the system) ran out of file descriptors, so new connections, cache files and upstream sockets all failed meanwhile. Raise LimitNOFILE, or lower max_connections below it; Capacity: Open File Descriptors shows the peak.",
+                    Level::Alert,
+                    &metrics::ACCEPT_FD_EXHAUSTED,
+                );
+            })
+            .signal(Level::Warn, &metrics::ACCEPT_TRANSIENT_FAILURES);
     });
 }
 

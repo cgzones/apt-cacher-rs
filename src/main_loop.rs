@@ -616,7 +616,11 @@ pub(crate) async fn main_loop(
             // Back off briefly so a saturated loop does not spin.
             Err(err) if is_transient_accept_error(&err) => {
                 metrics::ACCEPT_TRANSIENT_FAILURES.increment();
-                if err.raw_os_error() == Some(nix::libc::EMFILE) {
+                let errno = err.raw_os_error();
+                if errno == Some(nix::libc::EMFILE) || errno == Some(nix::libc::ENFILE) {
+                    metrics::ACCEPT_FD_EXHAUSTED.increment();
+                }
+                if errno == Some(nix::libc::EMFILE) {
                     fd_usage::note_exhausted();
                 }
                 warn_once_or_info!(

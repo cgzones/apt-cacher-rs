@@ -574,7 +574,7 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
     let open_fds = t
         .entry("Open File Descriptors")
         .kind(Kind::Live)
-        .tip("Sockets, cache files, splice pipes and the database this process holds, against its soft RLIMIT_NOFILE. At the cap accept(2) fails with EMFILE (Metrics: Accept Failures) and new downloads cannot open their files. Raise LimitNOFILE= in the service unit, or lower max_connections, which by default takes three quarters of the limit.");
+        .tip("Sockets, cache files, splice pipes and the database this process holds, against its soft RLIMIT_NOFILE. At the cap accept(2) fails with EMFILE (Metrics: Descriptor Exhaustion) and new downloads cannot open their files. Raise LimitNOFILE= in the service unit, or lower max_connections, which by default takes three quarters of the limit.");
     // Sampled now too, so the peak is never below the figure beside it.
     match fd_usage::sample() {
         Some(current) => {
