@@ -1281,6 +1281,25 @@ fn build_tunnels_group(g: &mut Groups) {
     });
 }
 
+/// When the last cleanup run finished, labelled when it failed: an aborted
+/// run alerts (the cache could not shrink at all), failed steps warn.
+struct LastRun {
+    finished: RelTime,
+    failures: u64,
+}
+impl Display for LastRun {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self { finished, failures } = self;
+        write!(f, "{finished}")?;
+        match *failures {
+            0 => Ok(()),
+            metrics::CLEANUP_ABORTED => write!(f, " {}", alert_if("aborted", true)),
+            1 => write!(f, " {}", warn_if("1 step failed", true)),
+            n => write!(f, " {}", warn_if(format_args!("{n} steps failed"), true)),
+        }
+    }
+}
+
 fn build_cleanup_group(g: &mut Groups) {
     g.group("Cleanup", |t| {
         // The part before its total, which is bumped first.
@@ -1313,8 +1332,8 @@ fn build_cleanup_group(g: &mut Groups) {
             "Digest verifications skipped because the file was already verified in an earlier cleanup cycle and is unchanged (same inode, size and expected digest).",
             metrics::CLEANUP_CHECKSUM_SKIPS.get(),
         );
-        // Loaded first: it is set after the trio, so finding it set means
-        // the trio is this run's.
+        // Loaded first: it is set after the figures, so finding it set means
+        // they are this run's.
         let finished_at = metrics::LAST_CLEANUP_FINISHED_AT.get();
         if finished_at == 0 {
             t.row_tip(
@@ -1324,10 +1343,13 @@ fn build_cleanup_group(g: &mut Groups) {
             );
         } else {
             t.entry("Last Run")
-                .tip("When this process's most recent cleanup run finished. Maintenance shows the same from the database.")
-                .value(RelTime {
-                    epoch: i64::try_from(finished_at).unwrap_or(i64::MAX),
-                    now: now_epoch(),
+                .tip("When this process's most recent cleanup run finished, and whether it failed: aborted (the mirror list could not be read, so nothing was reclaimed) or some steps failed (a mirror task that panicked, a directory that could not be read, an index that could not be fetched or parsed so a mirror's sweep was skipped, the rescan after it). The log names each. Maintenance shows the last run from the database.")
+                .value(LastRun {
+                    finished: RelTime {
+                        epoch: i64::try_from(finished_at).unwrap_or(i64::MAX),
+                        now: now_epoch(),
+                    },
+                    failures: metrics::LAST_CLEANUP_FAILURES.get(),
                 });
             t.row_tip(
                 "Last Run Duration",
@@ -1462,7 +1484,37 @@ fn build_errors_group(g: &mut Groups) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, HttpsUpgradeMode, Shown};
+    use super::{Config, HttpsUpgradeMode, LastRun, RelTime, Shown, metrics};
+
+    #[test]
+    fn a_failed_cleanup_run_is_labelled() {
+        let run = |failures| {
+            LastRun {
+                finished: RelTime {
+                    epoch: 1_000,
+                    now: 1_060,
+                },
+                failures,
+            }
+            .to_string()
+        };
+        assert!(!run(0).contains("class="), "{}", run(0));
+        assert!(
+            run(metrics::CLEANUP_ABORTED).ends_with(" <span class=\"alert\">aborted</span>"),
+            "{}",
+            run(metrics::CLEANUP_ABORTED)
+        );
+        assert!(
+            run(1).ends_with(" <span class=\"warn\">1 step failed</span>"),
+            "{}",
+            run(1)
+        );
+        assert!(
+            run(3).ends_with(" <span class=\"warn\">3 steps failed</span>"),
+            "{}",
+            run(3)
+        );
+    }
 
     #[test]
     fn rows_follow_the_build_and_the_config() {

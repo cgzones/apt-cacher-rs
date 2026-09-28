@@ -1086,7 +1086,7 @@ pub(crate) static CLEANUP_CHECKSUM_MISMATCHES: Signal = Signal::new();
 pub(crate) static CLEANUP_CHECKSUM_SKIPS: Counter = Counter::new();
 
 /// Last cleanup run of this process: when it finished (Unix seconds; 0
-/// before the first run since start). Set last, after the trio below, so a
+/// before the first run since start). Set last, after the figures below, so a
 /// reader that finds it set finds them set too. The persisted counterpart
 /// is the mirrors' `last_cleanup` column, which survives restarts.
 pub(crate) static LAST_CLEANUP_FINISHED_AT: StateU64 = StateU64::new();
@@ -1097,6 +1097,16 @@ pub(crate) static LAST_CLEANUP_DURATION_SECS: StateU64 = StateU64::new();
 pub(crate) static LAST_CLEANUP_FILES_REMOVED: StateU64 = StateU64::new();
 /// Last cleanup run: bytes reclaimed (in `cache_quota::accounted_size` units).
 pub(crate) static LAST_CLEANUP_BYTES_RECLAIMED: StateU64 = StateU64::new();
+/// Last cleanup run: the steps that failed, each logged where it failed --
+/// a mirror task that panicked, a cleanup unit abandoned on a directory it
+/// could not read, a sweep bailed on an incomplete reference set (an index
+/// that could not be fetched or parsed), the post-cleanup rescan -- or
+/// [`CLEANUP_ABORTED`] for a run that stopped before any mirror. Set before
+/// `LAST_CLEANUP_FINISHED_AT`, like the rest.
+pub(crate) static LAST_CLEANUP_FAILURES: StateU64 = StateU64::new();
+/// [`LAST_CLEANUP_FAILURES`] of a run aborted before any mirror (the mirror
+/// list could not be read), so no cache file could be reclaimed.
+pub(crate) const CLEANUP_ABORTED: u64 = u64::MAX;
 
 /// Record a client response status code into the matching class counter plus the
 /// fine-grained bucket for statuses we track individually. The class is

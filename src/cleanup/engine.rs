@@ -87,19 +87,24 @@ pub(super) struct CleanupDone {
     pub(super) removed_unreferenced: u64,
     /// See [`UnitStats::tmp_bytes_removed`].
     pub(super) tmp_bytes_removed: u64,
+    /// Units of this mirror that did not do their job, each logged where it
+    /// stopped: abandoned on a directory they could not read, or a sweep
+    /// bailed on an incomplete reference set ([`UnitStats::bailed`]).
+    pub(super) failed_units: u64,
 }
 
 impl CleanupDone {
     /// Close out a mirror from the sum of its units' [`UnitStats`]:
     /// `files_retained` is derived (scanned minus removed) rather than tallied,
     /// so the two can never disagree.
-    fn tally(mirror: Mirror, stats: UnitStats) -> Self {
+    fn tally(mirror: Mirror, stats: UnitStats, abandoned: u64) -> Self {
         let UnitStats {
             scanned,
             removed,
             bytes_removed,
             removed_unreferenced,
             tmp_bytes_removed,
+            bailed,
         } = stats;
         Self {
             mirror,
@@ -108,6 +113,7 @@ impl CleanupDone {
             bytes_removed,
             removed_unreferenced,
             tmp_bytes_removed,
+            failed_units: abandoned + bailed,
         }
     }
 }
@@ -133,6 +139,10 @@ pub(super) struct UnitStats {
     /// reconcile subtracts them, but they are not cache evictions: kept out
     /// of `removed`/`bytes_removed` and the metrics fed from those.
     pub tmp_bytes_removed: u64,
+    /// Reconcile sweeps bailed for an incomplete reference set (an index that
+    /// could not be fetched, parsed or looked up): nothing of that tree is
+    /// reclaimed this cycle, which the dashboard labels as a failed step.
+    pub bailed: u64,
 }
 
 impl UnitStats {
@@ -156,12 +166,14 @@ impl UnitStats {
             bytes_removed,
             removed_unreferenced,
             tmp_bytes_removed,
+            bailed,
         } = unit;
         self.scanned += scanned;
         self.removed += removed;
         self.bytes_removed += bytes_removed;
         self.removed_unreferenced += removed_unreferenced;
         self.tmp_bytes_removed += tmp_bytes_removed;
+        self.bailed += bailed;
     }
 
     /// Account one checksum-mismatch eviction performed during a reduce.
@@ -366,11 +378,13 @@ pub(super) async fn run_mirror_units(
     };
 
     let mut totals = UnitStats::default();
+    let mut abandoned = 0;
 
     for unit in &units {
         match run_unit(unit, &ctx).await {
             Ok(unit_stats) => totals.accumulate(unit_stats),
             Err(CleanupUnitError(_logged @ Logged { .. })) => {
+                abandoned += 1;
                 debug!(
                     "Abandoned a cleanup unit for mirror {mirror}; continuing with the mirror's remaining units"
                 );
@@ -378,7 +392,7 @@ pub(super) async fn run_mirror_units(
         }
     }
 
-    CleanupDone::tally(mirror, totals)
+    CleanupDone::tally(mirror, totals, abandoned)
 }
 
 /// Everything a unit needs that is fixed for the whole mirror: its identity, the
@@ -535,6 +549,7 @@ async fn run_metadata_unit(unit: &MetadataUnit, ctx: &MirrorCtx<'_>) -> UnitStat
         bytes_removed: swept.bytes_removed,
         removed_unreferenced: 0,
         tmp_bytes_removed: 0,
+        bailed: 0,
     }
 }
 
@@ -623,6 +638,7 @@ async fn run_byhash_unit(
         bytes_removed: outcome.bytes_removed,
         removed_unreferenced: outcome.removed_unreferenced,
         tmp_bytes_removed: 0,
+        bailed: 0,
     })
 }
 
@@ -764,6 +780,7 @@ async fn run_reconcile_unit(
         bytes_removed: 0,
         removed_unreferenced: 0,
         tmp_bytes_removed: 0,
+        bailed: 0,
     };
 
     let ctx = ReconcileCtx {
@@ -826,7 +843,10 @@ async fn run_reconcile_unit(
         SweepAction::Sweep { spans, reason } => (spans, reason),
         // Conservative bail: no sweep this cycle. The resolver
         // already emitted the per-origin warn with the failing host/path/status.
-        SweepAction::Bail => return Ok(tally),
+        SweepAction::Bail => {
+            tally.bailed += 1;
+            return Ok(tally);
+        }
     };
 
     // The age fallback announces itself before sweeping: every index source

@@ -253,6 +253,7 @@ async fn task_cleanup_impl(appstate: &AppState) {
             metrics::LAST_CLEANUP_DURATION_SECS.set(elapsed.as_secs());
             metrics::LAST_CLEANUP_FILES_REMOVED.set(0);
             metrics::LAST_CLEANUP_BYTES_RECLAIMED.set(0);
+            metrics::LAST_CLEANUP_FAILURES.set(metrics::CLEANUP_ABORTED);
             metrics::LAST_CLEANUP_FINISHED_AT.set(coarsetime::Clock::now_since_epoch().as_secs());
             return;
         }
@@ -325,6 +326,8 @@ async fn task_cleanup_impl(appstate: &AppState) {
     let mut bytes_removed = 0;
     let mut removed_unreferenced = 0;
     let mut tmp_bytes_removed = 0;
+    // Steps that failed (`LAST_CLEANUP_FAILURES`), each logged where it failed.
+    let mut failures = 0;
 
     for res in results {
         // A unit's hard error is logged and swallowed inside `run_mirror_units`,
@@ -332,6 +335,7 @@ async fn task_cleanup_impl(appstate: &AppState) {
         let cleanup_result = match res {
             Ok(cr) => cr,
             Err(join_err) => {
+                failures += 1;
                 error!(
                     "Failed to join a mirror cleanup task; skipping that mirror's tally and cleanup timestamp:  {}",
                     ErrorReport(&join_err)
@@ -358,6 +362,7 @@ async fn task_cleanup_impl(appstate: &AppState) {
         bytes_removed += cleanup_result.bytes_removed;
         removed_unreferenced += cleanup_result.removed_unreferenced;
         tmp_bytes_removed += cleanup_result.tmp_bytes_removed;
+        failures += cleanup_result.failed_units;
     }
 
     // The window snapshot must precede the scan: commits landing while the
@@ -401,6 +406,7 @@ async fn task_cleanup_impl(appstate: &AppState) {
             }
         }
         Err(err) => {
+            failures += 1;
             error!(
                 "Failed to rescan the cache directory after cleanup; skipping the cache-size reconciliation:  {}",
                 ErrorReport(&err)
@@ -415,6 +421,7 @@ async fn task_cleanup_impl(appstate: &AppState) {
     metrics::LAST_CLEANUP_DURATION_SECS.set(elapsed.as_secs());
     metrics::LAST_CLEANUP_FILES_REMOVED.set(files_removed);
     metrics::LAST_CLEANUP_BYTES_RECLAIMED.set(bytes_removed);
+    metrics::LAST_CLEANUP_FAILURES.set(failures);
     metrics::LAST_CLEANUP_FINISHED_AT.set(coarsetime::Clock::now_since_epoch().as_secs());
 
     // Second invalidation: the per-mirror units above removed rows of their
