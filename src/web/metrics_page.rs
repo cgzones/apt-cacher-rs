@@ -1,8 +1,9 @@
 //! The collapsed Metrics section of the dashboard: every counter in
 //! `metrics.rs` except the limiter gauges and their peaks, time-at-cap
 //! clocks, admission counters and `LOGSTORE_EVICTIONS` (the Capacity
-//! section, `dashboard.rs`), `ACTIVE_CLIENT_DOWNLOADS_PEAK` (Daemon Status)
-//! and `CACHE_QUOTA_UTIL_PEAK_BPS` (the disk-usage cell), split into titled
+//! section, `dashboard.rs`), `ACTIVE_CLIENT_DOWNLOADS_PEAK` (Daemon Status),
+//! `ORPHANED_PARTIAL_*` (Cache Statistics) and `CACHE_QUOTA_UTIL_PEAK_BPS`
+//! (the disk-usage cell), split into titled
 //! subsections with the alert/warn policy applied per row.
 //!
 //! Every row should send the operator somewhere: to a config option (the
@@ -329,7 +330,11 @@ fn build_requests_group(g: &mut Groups) {
         t.entry("Client 4xx")
             .tip("Client-error responses. Not highlighted: pdiff rejections, missing packages relayed from a mirror and web-interface 404 probes land here routinely.")
             .parts(|p| {
-                p.count("Client 410 Gone", metrics::CLIENT_STATUS_410.get());
+                p.count_tip(
+                    "Client 410 Gone",
+                    "Mostly pdiff requests refused by reject_pdiff_requests (Rejected (pdiff)); a mirror's own 410 is relayed too.",
+                    metrics::CLIENT_STATUS_410.get(),
+                );
                 p.count(
                     "Client 416 Range Not Satisfiable",
                     metrics::CLIENT_STATUS_416.get(),
@@ -1061,7 +1066,7 @@ fn build_upstream_group(g: &mut Groups, shown: Shown) {
         if HYPER {
             t.signal(
                 "hyper Failures (body)",
-                "Hyper-backend upstream errors after the response head arrived, while streaming the body (a reset, a read or TLS failure, a framing error). A body that ended before its announced length counts as a Protocol Violation instead, as in splice.",
+                "Hyper-backend upstream errors after the response head arrived, while streaming the body (a reset, a read or TLS failure, a read timeout). A body that ended before its announced length, or broke its chunked framing, counts as a Protocol Violation instead, as in splice.",
                 Level::Warn,
                 &metrics::UPSTREAM_HYPER_BODY_ERR,
             );
@@ -1105,7 +1110,7 @@ fn build_https_upgrade_group(g: &mut Groups) {
                 );
                 p.count_tip(
                     "HTTPS Upgrade Failed",
-                    "Terminal upgrade failures: Always-mode exhaustion, or a non-connect transport error in any mode.",
+                    "Terminal upgrade failures: Always-mode exhaustion, or a non-connect transport error in any mode. The splice backend also counts an Auto-mode host where both schemes failed here, not as a revert.",
                     upgrade_failed,
                 );
             })
@@ -1216,20 +1221,24 @@ fn build_tunnels_group(g: &mut Groups) {
 
 fn build_cleanup_group(g: &mut Groups) {
     g.group("Cleanup", |t| {
-        t.count_tip(
-            "Evictions (total)",
-            "Cache files removed by the background cleanup across all runs since the daemon started.",
-            metrics::CLEANUP_EVICTIONS.get(),
-        );
+        // The part before its total, which is bumped first.
+        let byhash_unreferenced = metrics::CLEANUP_BYHASH_UNREFERENCED.get();
+        let evictions = metrics::CLEANUP_EVICTIONS.get();
+        t.entry("Evictions (total)")
+            .tip("Cache files removed by the background cleanup across all runs since the daemon started, checksum mismatches included.")
+            .parts(|p| {
+                p.count_tip(
+                    "By-Hash Unreferenced",
+                    "By-hash index files reclaimed because their digest was absent from the mirror's current Release set. The other by-hash evictions age out via byhash_retention_days: no current Release could be read, or it does not cover the file's hash algorithm.",
+                    byhash_unreferenced,
+                );
+            })
+            .figure(evictions)
+            .value(warn_if(Count(evictions), byhash_unreferenced > evictions));
         t.bytes_tip(
             "Bytes Reclaimed (total)",
             "Disk space reclaimed by the background cleanup across all runs since the daemon started.",
             metrics::CLEANUP_BYTES_RECLAIMED.get(),
-        );
-        t.count_tip(
-            "By-Hash Unreferenced (total)",
-            "By-hash index files reclaimed because their digest was absent from the mirror's current Release set (a subset of total evictions). The rest age out via byhash_retention_days when no current Release can be read.",
-            metrics::CLEANUP_BYHASH_UNREFERENCED.get(),
         );
         t.signal(
             "Checksum Mismatches",
@@ -1287,7 +1296,7 @@ fn build_database_group(g: &mut Groups) {
             metrics::DB_COMMANDS_SENT.get(),
         );
         t.signal(
-            "Queue Full-Waits",
+            "Queue Found Full",
             "Sends that found the command channel full: observations of saturation, not waits (an async send may not have to park). Raise db_channel_capacity, or flush sooner with db_batch_flush_max_count / db_batch_flush_interval_secs.",
             Level::Warn,
             &metrics::DB_QUEUE_FULL_WAITS,
