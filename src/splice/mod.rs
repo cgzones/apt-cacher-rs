@@ -233,7 +233,10 @@ pub(crate) async fn splice_proxy(
 /// a cache file is replaced -- from renaming a newer copy in meanwhile. The
 /// per-path bits (status recording, upstream-connection pooling, `debug!`
 /// wording) stay at the call site, and `invalid_tag` carries the call-site
-/// location tag for `SpliceProxyError::Client`.
+/// location tag for `SpliceProxyError::Client`. A failed delivery (already
+/// logged by the sendfile serve) is [`SpliceProxyOutcome::ClientLost`], so the
+/// connection closes instead of waiting for a next request the client, still
+/// owed the rest of this body, will never send.
 async fn serve_volatile_304_via_sendfile(
     client: ClientConn<'_>,
     conn_details: &ConnectionDetails,
@@ -241,7 +244,7 @@ async fn serve_volatile_304_via_sendfile(
     client_range: RangeRequestHeaders<'_>,
     mut ibarrier: InitBarrier,
     invalid_tag: &'static str,
-) -> Result<(), SpliceProxyError> {
+) -> Result<SpliceProxyOutcome, SpliceProxyError> {
     if !conn_details.client.is_cleanup_synthetic() {
         metrics::VOLATILE_REFETCHED_UPTODATE.increment();
     }
@@ -268,12 +271,14 @@ async fn serve_volatile_304_via_sendfile(
     )
     .await
     {
-        SendfileResult::Served(_)
-        | SendfileResult::ClientError
-        | SendfileResult::AfterHeaderError => Ok(()),
-        SendfileResult::Invalid { status, msg } => {
-            client.write_invalid(status, msg, None, invalid_tag).await
+        SendfileResult::Served(_) => Ok(SpliceProxyOutcome::Served),
+        SendfileResult::ClientError | SendfileResult::AfterHeaderError => {
+            Ok(SpliceProxyOutcome::ClientLost)
         }
+        SendfileResult::Invalid { status, msg } => client
+            .write_invalid(status, msg, None, invalid_tag)
+            .await
+            .map(|()| SpliceProxyOutcome::Served),
     }
 }
 
@@ -1607,8 +1612,7 @@ async fn splice_proxy_drive(
                 ibarrier,
                 "post-304 invalid response",
             )
-            .await
-            .map(|()| SpliceProxyOutcome::Served);
+            .await;
         }
         DownloadPlan::Passthrough => {
             // `decline` gives back the upstream-download slot before the body
@@ -1935,8 +1939,9 @@ pub(crate) enum SpliceProxyOutcome {
     ServedClosing,
     /// The download ran to completion (cached or not), but the client's
     /// delivery failed after the response headers went out -- the body
-    /// prefix write, the splice loop, or the demoted file-serve task -- and
-    /// that source logged it. The caller closes the connection without a new
+    /// prefix write, the splice loop, or the demoted file-serve task -- or
+    /// the sendfile serve of a 304-revalidated copy failed at its head or
+    /// body, and that source logged it. The caller closes the connection without a new
     /// status and without logging again.
     ClientLost,
     Concurrent {
