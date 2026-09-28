@@ -266,6 +266,7 @@ pub(crate) async fn touch_volatile_mtime_with(
     let now = std::time::SystemTime::now();
     let result = tokio::task::block_in_place(|| std_file.set_modified(now));
     if let Err(err) = result {
+        metrics::CACHE_IO_FAILURE.increment();
         error!(
             "Failed to update the modification time of `{}`; its volatile freshness window is not reset:  {}",
             display_path.display(),

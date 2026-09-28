@@ -32,7 +32,7 @@ use crate::{
     cache_quota::{CacheQuota, ReservedPartial, partial_len},
     deb_mirror,
     error::ErrorReport,
-    fs_open::tokio_nofollow_options,
+    fs_open::{count_cache_failure, tokio_nofollow_options},
     global_cache_quota,
     guards::InitBarrier,
     http_etag::ETag,
@@ -521,6 +521,7 @@ fn remove_and_release(path: &Path, quota: Option<&CacheQuota>) {
                 ErrorReport(&err)
             );
         } else {
+            count_cache_failure(&err);
             error!(
                 "Failed to remove partial file `{}`; it stays on disk:  {}",
                 path.display(),
@@ -557,6 +558,11 @@ impl Drop for TempPath {
             }
             tokio::task::spawn_blocking(move || {
                 if let Err(err) = std::fs::remove_file(&path) {
+                    // A scratch file gone already is a concurrent removal,
+                    // which counts nowhere.
+                    if err.kind() != std::io::ErrorKind::NotFound {
+                        count_cache_failure(&err);
+                    }
                     error!(
                         "Failed to remove temporary file `{}`; it stays on disk:  {}",
                         path.display(),
