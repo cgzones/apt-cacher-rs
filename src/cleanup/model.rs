@@ -88,6 +88,21 @@ pub(super) enum CleanupUnit {
     Partials(PartialsUnit),
 }
 
+impl CleanupUnit {
+    /// Whether running the unit fetches index files from the mirror: only a
+    /// reconcile's [`SourceGroup`]s do. Cleanup drops these units for a
+    /// mirror the allow-lists no longer permit, which leaves its package
+    /// trees as they are rather than sweeping them against an index it did
+    /// not fetch.
+    #[must_use]
+    pub(super) const fn fetches_indexes(&self) -> bool {
+        match self {
+            Self::Reconcile(_) => true,
+            Self::ByHash(_) | Self::Metadata(_) | Self::Partials(_) => false,
+        }
+    }
+}
+
 /// A [`CleanupUnit::Reconcile`] unit: the tree to scan, the ordered index
 /// sources that reduce its candidate map, and how leftovers are retained.
 #[derive(Debug, PartialEq, Eq)]

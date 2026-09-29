@@ -37,6 +37,7 @@ use crate::{
     humanfmt::HumanFmt,
     limits::RETENTION_TIME,
     metrics,
+    permitted_host_cache::mirror_permitted,
     task_cache_scan::task_cache_scan,
     warn_once_or_debug, xattr_helpers,
 };
@@ -312,7 +313,14 @@ async fn task_cleanup_impl(appstate: &AppState) {
             // runs on the engine as one ordered per-mirror unit list, in the
             // order `classify_mirror` documents and emits; `nested` becomes the
             // FlatTree unit's walk boundaries.
-            let units = classify_mirror(&mirror, nested, config);
+            let mut units = classify_mirror(&mirror, nested, config);
+            if !mirror_permitted(config, &mirror.host, mirror.port()) {
+                info!(
+                    "Mirror {} is no longer permitted by `allowed_mirrors`/`allowed_mirror_ports`; not fetching its indexes and keeping its package files",
+                    mirror.site()
+                );
+                units.retain(|unit| !unit.fetches_indexes());
+            }
             tokio::task::spawn(run_mirror_units(mirror, units, appstate.clone(), config))
         });
 

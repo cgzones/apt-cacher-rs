@@ -6,22 +6,38 @@ use http::StatusCode;
 use crate::{
     client_info::ClientInfo,
     client_trouble::{self, Trouble},
-    config::{ClientHost, DomainName, HostError},
+    config::{ClientHost, Config, DomainName, HostError},
     global_config, metrics,
     request_dispatch::client_permitted,
     uri_authority::HTTP_DEFAULT_PORT,
     warn_once_or_info,
 };
 
-/// Whether `allowed_mirrors` permits `requested_host`, uncached: for the
-/// few hosts the daemon contacts on its own (the scheme-cache warm-up), where
-/// the host comes from the database, not a request.
 #[must_use]
-pub(crate) fn is_host_allowed(requested_host: &DomainName) -> bool {
-    global_config()
+fn is_host_allowed(requested_host: &DomainName) -> bool {
+    host_allowed(global_config(), requested_host)
+}
+
+#[must_use]
+fn host_allowed(config: &Config, host: &DomainName) -> bool {
+    config
         .allowed_mirrors
         .iter()
-        .any(|host| host.permits(requested_host))
+        .any(|allowed| allowed.permits(host))
+}
+
+/// Whether the allow-lists in `config` still permit a mirror the daemon
+/// contacts on its own -- the scheme-cache warm-up, cleanup's index fetches
+/// -- whose `host` and `port` (`None`: the `http` default) come from the
+/// database, not a request: a row outlives the operator's removal of its
+/// host or port by up to its retention.
+#[must_use]
+pub(crate) fn mirror_permitted(
+    config: &Config,
+    host: &DomainName,
+    port: Option<NonZero<u16>>,
+) -> bool {
+    host_allowed(config, host) && port_permitted(&config.allowed_mirror_ports, port, false)
 }
 
 /// Soft cap on the [`PermittedHostCache`] entry count.  Realistic apt
@@ -182,6 +198,27 @@ fn finalize_host_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_database_mirror_needs_both_its_host_and_its_port_permitted() {
+        let mut config = Config::default();
+        config.allowed_mirrors =
+            vec![crate::config::ConfigDomainName::new("deb.debian.org").expect("valid host")];
+        config.allowed_mirror_ports = vec![NonZero::new(80).unwrap(), NonZero::new(443).unwrap()];
+        let host = |name: &str| DomainName::new(name).expect("valid host");
+        assert!(mirror_permitted(&config, &host("deb.debian.org"), None));
+        assert!(mirror_permitted(
+            &config,
+            &host("deb.debian.org"),
+            NonZero::new(443)
+        ));
+        assert!(!mirror_permitted(
+            &config,
+            &host("deb.debian.org"),
+            NonZero::new(8080)
+        ));
+        assert!(!mirror_permitted(&config, &host("evil.example"), None));
+    }
 
     #[test]
     fn a_port_is_judged_with_its_schemes_default() {
