@@ -11,6 +11,13 @@
 //! passthrough path.  This module owns the in-memory set of blocked
 //! `(host, port)` pairs.
 //!
+//! Dispatch no longer lets such a structured mirror come into being: a
+//! structured request under `flat` is relayed uncached
+//! (`PassthroughReason::FlatAnchoredMirror`) and mints no origin, since the
+//! blocklist only reacted once the row was written -- after the colliding
+//! structured file had already landed in the flat tree.  The blocklist
+//! stays for rows recorded before that rule.
+//!
 //! The blocklist is a flat set that records "this host has a colliding
 //! structured mirror" — no longest-prefix index, no per-request URL
 //! rewriting, since the host-anchored layout means the URL path is the

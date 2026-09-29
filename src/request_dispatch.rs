@@ -55,7 +55,8 @@ use crate::{
         normalize_uri_path, parse_request_path,
     },
     error::ErrorReport,
-    flat_blocklist, global_config, info_once, metrics,
+    flat_blocklist::{self, path_collides_with_flat_layout},
+    global_config, info_once, metrics,
     precise_instant::PreciseInstant,
     uncacheables::record_uncacheable,
     uri_authority, warn_once_or_debug, warn_once_or_info,
@@ -426,6 +427,12 @@ pub(crate) enum PassthroughReason {
     /// anchor.  Flat caching is disabled for the host
     /// (see [`crate::flat_blocklist`]).
     FlatBlocked,
+    /// A structured request whose mirror path is `flat` or starts with
+    /// `flat/`: its cache files would land in the host's flat-repository
+    /// tree (`<host>/flat/...`), sharing names with a flat repository's.
+    /// The reactive [`Self::FlatBlocked`] only fires once the colliding
+    /// mirror row is in the database, after its first file was cached.
+    FlatAnchoredMirror,
     /// An otherwise cacheable request carries a query string.  The query is
     /// forwarded upstream but no part of the cache name, so caching the
     /// answer would serve the query variant to every later plain request.
@@ -452,6 +459,7 @@ impl PassthroughReason {
             Self::Unrecognized => "unrecognized resource path",
             Self::NonDebPool => "unsupported pool filename",
             Self::FlatBlocked => "flat host blocked by structured collision",
+            Self::FlatAnchoredMirror => "structured mirror path under the flat-repository tree",
             Self::QueryString => "query string on a cacheable path",
             Self::JoinedFieldUnderscore => "`_` in a distribution, component or architecture",
             Self::PackagesOutsideArchitecture => "Packages index outside an architecture directory",
@@ -667,6 +675,11 @@ fn decide_request(
                         class.debname.len()
                     );
                     PassthroughReason::NameTooLong
+                } else if !layout.is_flat() && path_collides_with_flat_layout(&class.mirror_path) {
+                    warn_once_or_info!(
+                        "Uncacheable path {uri_path} from client {client} (a structured mirror path under `flat` would share the host's flat-repository cache tree); forwarding it upstream uncached"
+                    );
+                    PassthroughReason::FlatAnchoredMirror
                 } else if layout.is_flat() && is_flat_blocked(cache_id, requested_port) {
                     warn_once_or_info!(
                         "Flat caching disabled for host `{requested_host}` due to colliding structured mirror; passing {uri_path} through uncached for client {client}"
@@ -1483,6 +1496,52 @@ mod tests {
                 }
             ),
             "expected NonDebPool passthrough, got {decision:?}"
+        );
+    }
+
+    /// A structured mirror path under `flat` maps onto the host's flat
+    /// tree: `/flat/x/pool/main/f/foo/foo_1_amd64.deb` would be cached as
+    /// the flat entry `/x/foo_1_amd64.deb`.
+    #[test]
+    fn passthrough_structured_mirror_path_under_flat() {
+        for path in [
+            "/flat/x/pool/main/f/foo/foo_1.0_amd64.deb",
+            "/flat/dists/sid/InRelease",
+        ] {
+            let decision = decide_request(
+                path,
+                fake_host(),
+                None,
+                &local_client(),
+                &[],
+                true,
+                never_flat_blocked,
+                PreciseInstant::now(),
+            );
+            assert!(
+                matches!(
+                    decision,
+                    Decision::Passthrough {
+                        reason: PassthroughReason::FlatAnchoredMirror,
+                        ..
+                    }
+                ),
+                "{path}: expected FlatAnchoredMirror passthrough, got {decision:?}"
+            );
+        }
+        let decision = decide_request(
+            "/flatter/pool/main/f/foo/foo_1.0_amd64.deb",
+            fake_host(),
+            None,
+            &local_client(),
+            &[],
+            true,
+            never_flat_blocked,
+            PreciseInstant::now(),
+        );
+        assert!(
+            matches!(decision, Decision::Cache { .. }),
+            "only the `flat` segment itself is reserved, got {decision:?}"
         );
     }
 

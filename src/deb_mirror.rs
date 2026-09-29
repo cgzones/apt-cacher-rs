@@ -7,6 +7,7 @@ use crate::{
     client_info::ClientInfo,
     config::ClientHost,
     database,
+    flat_blocklist::path_collides_with_flat_layout,
     index_parser::HashAlgo,
 };
 
@@ -276,8 +277,9 @@ impl Origin {
     /// declined: an origin row names a mirror, feeds cleanup's index fetches
     /// and can disable flat caching for a whole host
     /// ([`crate::flat_blocklist`]), so it must never come from a shape - a
-    /// trailing slash, a reserved or undecoded segment, a `_`-joined field -
-    /// the cache itself refuses.  `client` only labels trace lines.
+    /// trailing slash, a reserved or undecoded segment, a `_`-joined field,
+    /// a structured mirror path under `flat` - the cache itself refuses.
+    /// `client` only labels trace lines.
     #[must_use]
     pub(crate) fn from_path(
         path: &str,
@@ -288,17 +290,17 @@ impl Origin {
         let normalized = normalize_uri_path(path);
         let resource = parse_request_path(&normalized)?;
         let class = classify_request(&resource, client).ok()?;
-        if is_unsafe_cache_path(&normalized) || class.debname.len() > MAX_DEBNAME_LEN {
+        let kind = class.resource_kind.layout().mirror_kind();
+        if is_unsafe_cache_path(&normalized)
+            || class.debname.len() > MAX_DEBNAME_LEN
+            || (kind == MirrorKind::Structured
+                && path_collides_with_flat_layout(&class.mirror_path))
+        {
             return None;
         }
         let fields = class.origin_fields?;
         Some(Self {
-            mirror: Mirror::new(
-                host,
-                port,
-                class.mirror_path,
-                class.resource_kind.layout().mirror_kind(),
-            ),
+            mirror: Mirror::new(host, port, class.mirror_path, kind),
             fields,
         })
     }
@@ -1172,10 +1174,11 @@ const MAX_SEGMENT_LEN: usize = 128;
 /// A mirror path containing any of these as a `/`-separated segment would
 /// collide with cache plumbing — `tmp/` is the partial-download scratch
 /// dir, `by-hash/` is the content-addressed subtree under each mirror.
-/// The host-level `flat/` anchor is *not* reserved here: structured
-/// mirrors named `flat` are handled by the per-host collision blocklist
-/// (`flat_blocklist`) so that "structured wins" without permanently
-/// banning such mirror paths.
+/// The host-level `flat/` anchor is *not* reserved here: a structured
+/// request under `flat` is relayed uncached instead of refused
+/// (`PassthroughReason::FlatAnchoredMirror`), and such a mirror row from
+/// before that rule still disables flat caching for its host through the
+/// per-host collision blocklist (`flat_blocklist`: "structured wins").
 ///
 /// Shared with the startup migration scan in `main.rs`, which warns about
 /// pre-existing `mirrors_v2` rows that would now fail validation.
@@ -1460,6 +1463,27 @@ mod tests {
         assert_eq!(origin.fields.distribution, "sid");
         assert_eq!(origin.fields.component, "main");
         assert_eq!(origin.fields.architecture, "binary-amd64");
+    }
+
+    /// A relayed answer must not mint the structured mirror row the cache
+    /// refuses: under `flat` it would disable flat caching for the host.
+    #[test]
+    fn a_structured_mirror_path_under_flat_mints_no_origin() {
+        for path in [
+            "/flat/dists/sid/main/binary-amd64/Packages",
+            "/flat/x/dists/sid/main/binary-amd64/Packages",
+        ] {
+            assert!(
+                Origin::from_path(
+                    path,
+                    ClientHost::new("deb.debian.org").unwrap(),
+                    None,
+                    &local_client(),
+                )
+                .is_none(),
+                "{path}"
+            );
+        }
     }
 
     #[test]
