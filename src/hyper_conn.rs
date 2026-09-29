@@ -1996,10 +1996,10 @@ async fn serve_new_file_worker(
         let mut request = Request::builder()
             .method(Method::GET)
             .uri(uri)
-            .header(USER_AGENT, APP_USER_AGENT)
+            .header(USER_AGENT, HeaderValue::from_static(APP_USER_AGENT))
             .header(HOST, host)
-            .header(VIA, APP_VIA)
-            .header(ACCEPT_ENCODING, "identity")
+            .header(VIA, HeaderValue::from_static(APP_VIA))
+            .header(ACCEPT_ENCODING, HeaderValue::from_static("identity"))
             .body(Empty::new())
             .expect("request should be valid");
 
@@ -3220,9 +3220,9 @@ async fn pre_process_client_request(
     let (parts, _body) = req.into_parts();
     let mut fwd_request = Request::builder()
         .method(Method::GET)
-        .header(USER_AGENT, APP_USER_AGENT)
-        .header(VIA, APP_VIA)
-        .header(ACCEPT_ENCODING, "identity");
+        .header(USER_AGENT, HeaderValue::from_static(APP_USER_AGENT))
+        .header(VIA, HeaderValue::from_static(APP_VIA))
+        .header(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
     if parts.uri.authority().is_some() {
         fwd_request = fwd_request.header(HOST, host_header_from_uri(&parts.uri));
     }

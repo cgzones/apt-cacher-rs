@@ -250,16 +250,16 @@ impl ResponseHead<'_> {
 
         let mut builder = http::Response::builder().status(status);
         if emits_server {
-            builder = builder.header(SERVER, APP_NAME);
+            builder = builder.header(SERVER, HeaderValue::from_static(APP_NAME));
         }
         builder = builder
-            .header(VIA, APP_VIA)
+            .header(VIA, HeaderValue::from_static(APP_VIA))
             .header(DATE, &*format_http_date());
         if emits_connection {
-            builder = builder.header(CONNECTION, "keep-alive");
+            builder = builder.header(CONNECTION, HeaderValue::from_static("keep-alive"));
         }
         if let Some(content_type) = content_type {
-            builder = builder.header(CONTENT_TYPE, content_type);
+            builder = builder.header(CONTENT_TYPE, HeaderValue::from_static(content_type));
         }
         if let Some(content_length) = content_length {
             builder = builder.header(CONTENT_LENGTH, HeaderValue::from(content_length));
@@ -283,7 +283,7 @@ impl ResponseHead<'_> {
             );
         }
         if accept_ranges {
-            builder = builder.header(ACCEPT_RANGES, "bytes");
+            builder = builder.header(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
         }
         if let Some(age) = age {
             builder = builder.header(AGE, HeaderValue::from(age));
@@ -292,7 +292,7 @@ impl ResponseHead<'_> {
             builder = builder.header(RETRY_AFTER, HeaderValue::from(retry_after));
         }
         if emits_allow {
-            builder = builder.header(ALLOW, "GET");
+            builder = builder.header(ALLOW, HeaderValue::from_static("GET"));
         }
 
         builder.body(body).expect("HTTP response is valid")
