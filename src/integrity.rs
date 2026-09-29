@@ -361,10 +361,11 @@ pub(crate) struct RenamePlan {
     /// the basename used directly as the registry-lookup key; for other
     /// kinds it is kept only for log context.
     pub(crate) debname: String,
-    /// The canonical mirror. Its host and repo-prefix path
-    /// (`Mirror::path()`) are the registry key, so two distinct mirrors
-    /// served from the same host (e.g. `host/m1/pool/...` vs
-    /// `host/m2/pool/...`) cannot poison each other's expected digests via
+    /// The canonical mirror. Its authority (host and port,
+    /// `Mirror::format_authority()`) and repo-prefix path (`Mirror::path()`)
+    /// are the registry key, so two distinct mirrors served from the same
+    /// host (e.g. `host/m1/pool/...` vs `host/m2/pool/...`, or one repository
+    /// per port) cannot poison each other's expected digests via
     /// same-named packages; the whole mirror names it in the
     /// `mirror_indexes` a committed `Release` records.
     pub(crate) mirror: Mirror,
@@ -374,18 +375,22 @@ pub(crate) struct RenamePlan {
     pub(crate) raw_uri_path: String,
 }
 
-/// Owned `(host, mirror_path, relpath)` registry key. `relpath` is the
+/// Owned `(authority, mirror_path, relpath)` registry key, `authority` being
+/// the mirror's `host[:port]` ([`Mirror::format_authority`]). `relpath` is the
 /// resource's agreed lookup key, NOT uniformly "repo-relative": for a pool
 /// `.deb` (layer B) it is the bare basename, for an index file (layer C) it is
 /// the full host-relative URI path (e.g.
 /// `debian/dists/sid/main/binary-amd64/Packages.xz`). `mirror_path`
 /// discriminates same-`relpath` entries that two mirrors on the same host can
-/// otherwise overwrite — see `RenamePlan::mirror_path`. (For layer-C keys
+/// otherwise overwrite — see `RenamePlan::mirror`.  The port is part of the
+/// scope because `allowed_mirrors` permits a host on every port: without it,
+/// a client fetching an index from `host:8080` would replace the digests the
+/// default port's downloads are checked against. (For layer-C keys
 /// `mirror_path` is a redundant prefix of `relpath`; for layer-B basenames it
 /// is the sole discriminator.)
 #[derive(Debug, Eq, Hash, PartialEq)]
 struct RegistryScope {
-    host: String,
+    authority: String,
     mirror_path: String,
 }
 
@@ -394,18 +399,21 @@ struct RegistryScope {
 /// the pattern of `cache_layout::CacheEntryKeyRef`.
 #[derive(Hash)]
 struct RegistryScopeRef<'a> {
-    host: &'a str,
+    authority: &'a str,
     mirror_path: &'a str,
 }
 
 impl Equivalent<RegistryScope> for RegistryScopeRef<'_> {
     fn equivalent(&self, key: &RegistryScope) -> bool {
-        let &Self { host, mirror_path } = self;
+        let &Self {
+            authority,
+            mirror_path,
+        } = self;
         let RegistryScope {
-            host: khost,
+            authority: kauthority,
             mirror_path: kmpath,
         } = key;
-        host == khost && mirror_path == kmpath
+        authority == kauthority && mirror_path == kmpath
     }
 }
 
@@ -421,7 +429,7 @@ impl Equivalent<Arc<RegistryScope>> for RegistryScopeRef<'_> {
     }
 }
 
-/// Bounded in-memory map from `(host, mirror_path)` scope and per-scope
+/// Bounded in-memory map from `(authority, mirror_path)` scope and per-scope
 /// resource lookup key to an expected SHA256 digest, populated by parsing
 /// `Packages` / `Release` index files as they flow through. In-memory only
 /// (lost on restart; an index answered from cache is re-ingested when its
@@ -429,7 +437,7 @@ impl Equivalent<Arc<RegistryScope>> for RegistryScopeRef<'_> {
 /// configured cap.
 ///
 /// Two-level layout: essentially all entries of one mirror share the same
-/// `(host, mirror_path)` pair, so a flat per-entry key would store those
+/// `(authority, mirror_path)` pair, so a flat per-entry key would store those
 /// strings ~100k times per Debian-main `Packages` ingest (tens of MB at the
 /// default 500k cap). The scope is allocated once per mirror; entries only
 /// own their relpath.
@@ -455,7 +463,7 @@ pub(crate) struct ChecksumRegistry {
 /// `RegistryInner::next_gen`).
 type ScopeEntries = HashMap<Arc<str>, ([u8; 32], u64)>;
 
-/// One `(host, mirror_path)` scope: its entries and their insertion order.
+/// One `(authority, mirror_path)` scope: its entries and their insertion order.
 #[derive(Debug, Default)]
 struct ScopeState {
     entries: ScopeEntries,
@@ -482,7 +490,7 @@ impl ScopeState {
 
 #[derive(Debug)]
 struct RegistryInner {
-    /// `(host, mirror_path)` scope to its entries and eviction order. The
+    /// `(authority, mirror_path)` scope to its entries and eviction order. The
     /// scope `Arc` and relpath `Arc<str>` are shared between the map and the
     /// order log, so `insert` allocates each string once.
     map: HashMap<Arc<RegistryScope>, ScopeState>,
@@ -529,9 +537,12 @@ impl EvictionEpochs {
         }
     }
 
-    fn get(&self, host: &str, mirror_path: &str) -> u64 {
+    fn get(&self, authority: &str, mirror_path: &str) -> u64 {
         self.by_scope
-            .get(&RegistryScopeRef { host, mirror_path })
+            .get(&RegistryScopeRef {
+                authority,
+                mirror_path,
+            })
             .copied()
             .unwrap_or(self.floor)
     }
@@ -565,9 +576,9 @@ impl ChecksumRegistry {
     /// one oversized (or hostile) index cannot drain the digests of every
     /// other mirror. Re-inserting an existing key refreshes its
     /// eviction-order position to most-recent.
-    fn insert(&self, host: &str, mirror_path: &str, relpath: &str, digest: [u8; 32]) {
+    fn insert(&self, authority: &str, mirror_path: &str, relpath: &str, digest: [u8; 32]) {
         let mut inner = self.inner.lock();
-        self.insert_locked(&mut inner, host, mirror_path, relpath, digest);
+        self.insert_locked(&mut inner, authority, mirror_path, relpath, digest);
     }
 
     /// Register a `Release`/`InRelease`'s `Packages` entries unless a newer
@@ -584,7 +595,7 @@ impl ChecksumRegistry {
     /// that was not implausibly far in the future when ingested.
     fn insert_release(
         &self,
-        host: &str,
+        authority: &str,
         mirror_path: &str,
         release_dir: &str,
         date: Option<i64>,
@@ -593,7 +604,10 @@ impl ChecksumRegistry {
         let mut inner = self.inner.lock();
         let recorded = inner
             .map
-            .get(&RegistryScopeRef { host, mirror_path })
+            .get(&RegistryScopeRef {
+                authority,
+                mirror_path,
+            })
             .and_then(|state| state.release_dates.get(release_dir).copied());
         let supersedes = match (recorded, date) {
             (None | Some(None), _) => true,
@@ -604,25 +618,31 @@ impl ChecksumRegistry {
             return false;
         }
         for (key, digest) in entries {
-            self.insert_locked(&mut inner, host, mirror_path, key, *digest);
+            self.insert_locked(&mut inner, authority, mirror_path, key, *digest);
         }
         // Eviction may have drained this scope; record the date only if it
         // still exists (a drained scope rebuilds its dates on re-ingest).
-        if let Some(state) = inner.map.get_mut(&RegistryScopeRef { host, mirror_path }) {
+        if let Some(state) = inner.map.get_mut(&RegistryScopeRef {
+            authority,
+            mirror_path,
+        }) {
             state.release_dates.insert(release_dir.into(), date);
         }
         drop(inner);
         true
     }
 
-    /// Look up an expected digest by `(host, mirror_path, relpath)`.
+    /// Look up an expected digest by `(authority, mirror_path, relpath)`.
     /// Allocation-free via `hashbrown::Equivalent` and `Arc<str>:
     /// Borrow<str>`.
-    fn lookup(&self, host: &str, mirror_path: &str, relpath: &str) -> Option<[u8; 32]> {
+    fn lookup(&self, authority: &str, mirror_path: &str, relpath: &str) -> Option<[u8; 32]> {
         let inner = self.inner.lock();
         inner
             .map
-            .get(&RegistryScopeRef { host, mirror_path })
+            .get(&RegistryScopeRef {
+                authority,
+                mirror_path,
+            })
             .and_then(|state| state.entries.get(relpath))
             .map(|&(digest, _)| digest)
     }
@@ -635,11 +655,14 @@ impl ChecksumRegistry {
     /// `(entries, entry capacity, order length, order capacity)` of one
     /// scope.
     #[cfg(test)]
-    fn scope_footprint(&self, host: &str, mirror_path: &str) -> (usize, usize, usize, usize) {
+    fn scope_footprint(&self, authority: &str, mirror_path: &str) -> (usize, usize, usize, usize) {
         self.inner
             .lock()
             .map
-            .get(&RegistryScopeRef { host, mirror_path })
+            .get(&RegistryScopeRef {
+                authority,
+                mirror_path,
+            })
             .map(|state| {
                 (
                     state.entries.len(),
@@ -656,11 +679,11 @@ impl ChecksumRegistry {
         self.inner.lock().map.values().map(|s| s.order.len()).sum()
     }
 
-    /// The eviction epoch of `(host, mirror_path)`: bumped by every
+    /// The eviction epoch of `(authority, mirror_path)`: bumped by every
     /// eviction that takes entries from the scope, so an ingest ledger mark
     /// taken under an older epoch knows its digests may be gone.
-    fn scope_epoch(&self, host: &str, mirror_path: &str) -> u64 {
-        self.epochs.lock().get(host, mirror_path)
+    fn scope_epoch(&self, authority: &str, mirror_path: &str) -> u64 {
+        self.epochs.lock().get(authority, mirror_path)
     }
 
     /// Insert (or refresh) one expected digest under an already-locked
@@ -671,7 +694,7 @@ impl ChecksumRegistry {
     fn insert_locked(
         &self,
         inner: &mut RegistryInner,
-        host: &str,
+        authority: &str,
         mirror_path: &str,
         relpath: &str,
         digest: [u8; 32],
@@ -680,12 +703,15 @@ impl ChecksumRegistry {
         let generation = inner.next_gen;
         inner.next_gen += 1;
 
-        let scope_ref = RegistryScopeRef { host, mirror_path };
+        let scope_ref = RegistryScopeRef {
+            authority,
+            mirror_path,
+        };
         let scope = if let Some((scope, _)) = inner.map.get_key_value(&scope_ref) {
             Arc::clone(scope)
         } else {
             let scope = Arc::new(RegistryScope {
-                host: host.to_owned(),
+                authority: authority.to_owned(),
                 mirror_path: mirror_path.to_owned(),
             });
             inner.map.insert(Arc::clone(&scope), ScopeState::default());
@@ -836,7 +862,7 @@ fn log_registry_miss(plan: &RenamePlan, key: &str) {
 /// no digest for `key`.
 fn registry_verify_kind(plan: &RenamePlan, key: &str) -> VerifyKind {
     global_checksum_registry()
-        .lookup(plan.mirror.host().as_str(), plan.mirror.path(), key)
+        .lookup(plan.mirror.format_authority(), plan.mirror.path(), key)
         .map_or_else(
             || {
                 log_registry_miss(plan, key);
@@ -1235,16 +1261,15 @@ fn schedule_ingest(file: &IndexFile<'_>, trigger: IngestTrigger) {
         return;
     };
     let registry = global_checksum_registry();
-    let (host, mirror_path) = (file.mirror.host().as_str(), file.mirror.path());
-    let epoch = registry.scope_epoch(host, mirror_path);
+    let (authority, mirror_path) = (file.mirror.format_authority(), file.mirror.path());
+    let epoch = registry.scope_epoch(authority, mirror_path);
     let (claim, slot) = match admit(&INGEST_LEDGER, ingest_pool(&kind), file.path, epoch) {
         Admission::Nothing => return,
         Admission::Refused => {
             metrics::INGEST_SKIPPED_QUEUE_FULL.increment();
             warn_once_or_debug!(
-                "Skipping registry ingest of index `{}` for host {host} mirror {mirror_path} (ingest queue full); retrying on its next request",
+                "Skipping registry ingest of index `{}` for host {authority} mirror {mirror_path} (ingest queue full); retrying on its next request",
                 file.path.display(),
-                host = HostText(host),
             );
             return;
         }
@@ -1315,12 +1340,12 @@ async fn run_ingest_job(
     buffer_size: usize,
 ) {
     let registry = global_checksum_registry();
-    let (host, mirror_path) = (mirror.host().as_str(), mirror.path());
+    let (authority, mirror_path) = (mirror.format_authority(), mirror.path());
     loop {
         let result = ingest_once(registry, &kind, &mirror, &dest, buffer_size).await;
         let outcome = result.outcome();
-        log_ingest_result(&result, outcome, host, mirror_path, &dest);
-        if !claim.finish(outcome, registry.scope_epoch(host, mirror_path)) {
+        log_ingest_result(&result, outcome, authority, mirror_path, &dest);
+        if !claim.finish(outcome, registry.scope_epoch(authority, mirror_path)) {
             return;
         }
     }
@@ -1336,7 +1361,7 @@ async fn ingest_once(
     dest: &Path,
     buffer_size: usize,
 ) -> IngestResult {
-    let (host, mirror_path) = (mirror.host().as_str(), mirror.path());
+    let (authority, mirror_path) = (mirror.format_authority(), mirror.path());
     let result = match kind {
         IngestKind::Packages {
             compression,
@@ -1344,7 +1369,7 @@ async fn ingest_once(
         } => {
             with_decode_permit(ingest_packages_file(
                 registry,
-                host,
+                authority,
                 mirror_path,
                 dest,
                 *compression,
@@ -1358,7 +1383,7 @@ async fn ingest_once(
                 let compression = sniff_packages_compression(dest).await?;
                 ingest_packages_file(
                     registry,
-                    host,
+                    authority,
                     mirror_path,
                     dest,
                     compression,
@@ -1370,7 +1395,7 @@ async fn ingest_once(
             .await
         }
         IngestKind::Release { release_dir } => {
-            ingest_release_file(registry, host, mirror_path, dest, release_dir)
+            ingest_release_file(registry, authority, mirror_path, dest, release_dir)
                 .await
                 .map(|seen| {
                     // Whether or not the registry took its entries: an older
@@ -1389,7 +1414,7 @@ async fn ingest_once(
 fn log_ingest_result(
     result: &IngestResult,
     outcome: Outcome,
-    host: &str,
+    authority: &str,
     mirror_path: &str,
     dest: &Path,
 ) {
@@ -1397,17 +1422,15 @@ fn log_ingest_result(
         (IngestResult::Failed(err), Outcome::Failed) => {
             metrics::INGEST_FAILED_MARKED.increment();
             warn_once_or_debug!(
-                "Failed to ingest index `{}` for host {host} mirror {mirror_path}; not retried until the file changes:  {}",
+                "Failed to ingest index `{}` for host {authority} mirror {mirror_path}; not retried until the file changes:  {}",
                 dest.display(),
                 ErrorReport(err),
-                host = HostText(host),
             );
         }
         (IngestResult::Failed(err), Outcome::Ingested | Outcome::Retry) => warn_once_or_debug!(
-            "Failed to ingest index `{}` for host {host} mirror {mirror_path}; retrying on its next request:  {}",
+            "Failed to ingest index `{}` for host {authority} mirror {mirror_path}; retrying on its next request:  {}",
             dest.display(),
             ErrorReport(err),
-            host = HostText(host),
         ),
         // Sync point for `wait_for_log("Index ingestion completed")`; keep the wording stable.
         (IngestResult::Done, _) => debug!("Index ingestion completed for `{}`", dest.display()),
@@ -1675,13 +1698,13 @@ pub(crate) fn stream_hash_algo_for_download(
     resource_kind: ResourceKind,
     raw_uri_path: &str,
     debname: &str,
-    host: &str,
+    authority: &str,
     mirror_path: &str,
 ) -> Option<HashAlgo> {
     let registry_hit =
         registry_lookup_key(resource_kind, debname, raw_uri_path).is_some_and(|key| {
             global_checksum_registry()
-                .lookup(host, mirror_path, &key)
+                .lookup(authority, mirror_path, &key)
                 .is_some()
         });
     stream_hash_algo(
@@ -1734,7 +1757,7 @@ async fn sniff_packages_compression(path: &Path) -> std::io::Result<PackagesComp
 /// less-populated).
 async fn ingest_packages_file(
     registry: &ChecksumRegistry,
-    host: &str,
+    authority: &str,
     mirror_path: &str,
     path: &Path,
     compression: PackagesCompression,
@@ -1770,15 +1793,14 @@ async fn ingest_packages_file(
     let mut stanzas = StanzaStream::new(
         reader,
         index_parser::Stanza::new_sha256_only().with_source(format!(
-            "{host}/{mirror_path} index `{}`",
+            "{authority}/{mirror_path} index `{}`",
             path.display(),
-            host = HostText(host)
         )),
     );
     loop {
         match stanzas.next().await {
             Ok(Some(stanza)) => {
-                ingest_stanza_into_registry(stanza, registry, host, mirror_path, format);
+                ingest_stanza_into_registry(stanza, registry, authority, mirror_path, format);
             }
             Ok(None) => return Ok(()),
             Err(err) => {
@@ -1866,7 +1888,7 @@ fn clamp_future_release_date(date: Option<i64>) -> Option<i64> {
 /// commit writes the file, an upstream 304 touches it).
 async fn ingest_release_file(
     registry: &ChecksumRegistry,
-    host: &str,
+    authority: &str,
     mirror_path: &str,
     path: &Path,
     release_dir: &str,
@@ -1890,11 +1912,10 @@ async fn ingest_release_file(
         (key, digest)
     })
     .collect();
-    if !registry.insert_release(host, mirror_path, release_dir, date, &entries) {
+    if !registry.insert_release(authority, mirror_path, release_dir, date, &entries) {
         debug!(
-            "Not registering index `{}` for host {host} mirror {mirror_path}; a newer Release/InRelease of `{release_dir}` is already registered",
+            "Not registering index `{}` for host {authority} mirror {mirror_path}; a newer Release/InRelease of `{release_dir}` is already registered",
             path.display(),
-            host = HostText(host),
         );
     }
     Ok(ReleaseSeen {
@@ -1913,7 +1934,7 @@ async fn ingest_release_file(
 fn ingest_stanza_into_registry(
     stanza: &index_parser::Stanza,
     registry: &ChecksumRegistry,
-    host: &str,
+    authority: &str,
     mirror_path: &str,
     format: IndexFormat,
 ) {
@@ -1924,13 +1945,12 @@ fn ingest_stanza_into_registry(
         // `Stanza` already rejected (and logged) unsafe values, so this is
         // the length gate: a name no cache file can have.
         warn_once_or_debug!(
-            "Not registering the digest of a {} byte Filename value from host {host} mirror {mirror_path}; no cache file can have that name",
+            "Not registering the digest of a {} byte Filename value from host {authority} mirror {mirror_path}; no cache file can have that name",
             filename.len(),
-            host = HostText(host),
         );
         return;
     };
-    registry.insert(host, mirror_path, key, sha256);
+    registry.insert(authority, mirror_path, key, sha256);
 }
 
 #[cfg(test)]
@@ -2447,7 +2467,7 @@ mod tests {
     fn a_full_epoch_map_forgets_every_scope_and_stales_every_mark() {
         let scope = |host: &str| {
             Arc::new(RegistryScope {
-                host: host.to_owned(),
+                authority: host.to_owned(),
                 mirror_path: "m".to_owned(),
             })
         };
@@ -2934,6 +2954,49 @@ mod tests {
         assert_eq!(
             reg.lookup("deb.debian.org", "debian", "b_2_amd64.deb"),
             Some(sha_b)
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_scopes_digests_by_port() {
+        use std::io::Write as _;
+        use std::num::NonZero;
+
+        use crate::{
+            config::ClientHost,
+            deb_mirror::{Mirror, MirrorKind},
+        };
+
+        let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
+        let sha = [0xaau8; 32];
+        let packages = format!(
+            "Package: a\nFilename: pool/main/a/a/a_1_amd64.deb\nSHA256: {}\n",
+            index_parser::hex_encode(&sha),
+        );
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(packages.as_bytes()).expect("write");
+        f.flush().expect("flush");
+        let mirror = Mirror::new(
+            ClientHost::new("deb.debian.org").expect("valid host"),
+            NonZero::new(8080),
+            "debian".to_owned(),
+            MirrorKind::Structured,
+        );
+        let kind = IngestKind::Packages {
+            compression: PackagesCompression::Raw,
+            format: IndexFormat::Structured,
+        };
+
+        let result = ingest_once(&reg, &kind, &mirror, f.path(), 64 * 1024).await;
+        assert!(matches!(result, IngestResult::Done), "ingest ok");
+        assert_eq!(
+            reg.lookup("deb.debian.org:8080", "debian", "a_1_amd64.deb"),
+            Some(sha)
+        );
+        assert_eq!(
+            reg.lookup("deb.debian.org", "debian", "a_1_amd64.deb"),
+            None,
+            "the default port's downloads are not checked against another port's index"
         );
     }
 

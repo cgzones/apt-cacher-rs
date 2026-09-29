@@ -1723,7 +1723,7 @@ async fn splice_proxy_drive(
             conn_details.resource_kind,
             ibarrier.raw_uri_path(),
             &conn_details.debname,
-            conn_details.mirror.host().as_str(),
+            conn_details.mirror.format_authority(),
             conn_details.mirror.path(),
         ))
     };
