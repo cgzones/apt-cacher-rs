@@ -55,7 +55,7 @@ use crate::{
     cache_quota::QuotaReservation,
     deb_mirror::{Mirror, normalize_uri_path},
     guards::DownloadWriteLease,
-    index_parser::{self, HashAlgo, IndexFormat, ReleaseHeader, StanzaStream, StreamedDigest},
+    index_parser::{self, HashAlgo, ReleaseHeader, StanzaStream, StreamedDigest},
     metrics,
     mirror_indexes::{self, ReleaseSeen},
     partial_file::TempPath,
@@ -1193,7 +1193,7 @@ static RELEASE_INGEST_SLOTS: Semaphore = Semaphore::const_new(RELEASE_INGEST_QUE
 fn ingest_pool(kind: &IngestKind) -> &'static Semaphore {
     match kind {
         IngestKind::Release { release_dir: _ } => &RELEASE_INGEST_SLOTS,
-        IngestKind::Packages { .. } | IngestKind::PackagesSniff { .. } => &INGEST_SLOTS,
+        IngestKind::Packages { .. } | IngestKind::PackagesSniff => &INGEST_SLOTS,
     }
 }
 
@@ -1363,22 +1363,18 @@ async fn ingest_once(
 ) -> IngestResult {
     let (authority, mirror_path) = (mirror.format_authority(), mirror.path());
     let result = match kind {
-        IngestKind::Packages {
-            compression,
-            format,
-        } => {
+        IngestKind::Packages { compression } => {
             with_decode_permit(ingest_packages_file(
                 registry,
                 authority,
                 mirror_path,
                 dest,
                 *compression,
-                *format,
                 buffer_size,
             ))
             .await
         }
-        IngestKind::PackagesSniff { format } => {
+        IngestKind::PackagesSniff => {
             with_decode_permit(async {
                 let compression = sniff_packages_compression(dest).await?;
                 ingest_packages_file(
@@ -1387,7 +1383,6 @@ async fn ingest_once(
                     mirror_path,
                     dest,
                     compression,
-                    *format,
                     buffer_size,
                 )
                 .await
@@ -1442,16 +1437,13 @@ fn log_ingest_result(
 enum IngestKind {
     Packages {
         compression: PackagesCompression,
-        format: IndexFormat,
     },
     /// Compression unknown (by-hash URL leaf is a hex digest); the spawned
     /// task sniffs magic bytes before parsing. Required because modern APT
     /// with `Acquire::By-Hash: yes` fetches `Packages.xz` (typically) via
     /// `/by-hash/SHA256/<hex>` URLs that carry no extension, so the
     /// filename-based detection used elsewhere fails.
-    PackagesSniff {
-        format: IndexFormat,
-    },
+    PackagesSniff,
     Release {
         release_dir: String,
     },
@@ -1495,35 +1487,31 @@ impl<'a> From<&'a RenamePlan> for IndexFile<'a> {
 /// How `file` is ingested, or `None` for a resource that feeds no registry
 /// entries. One table for the commit and the touch path.
 fn ingest_kind(file: &IndexFile<'_>) -> Option<IngestKind> {
-    // For Packages/FlatMetadata, `file.debname` is `_`-joined for structured
-    // resources; extract the leaf filename (the part after the last `_`).
+    // For Packages, `file.debname` is `_`-joined; extract the leaf filename
+    // (the part after the last `_`).
     let leaf = file
         .debname
         .rsplit('_')
         .next()
         .expect("rsplit yields at least one element");
 
-    // The structured and flat `Packages` arms are the same ingest, differing
-    // only in how a `Filename:` field maps onto a registry key.
-    let packages_kind = |format: IndexFormat| {
+    let packages_kind = || {
         let compression = PackagesCompression::from_filename(leaf);
         if compression.is_none() {
             log_unsupported_packages_compression(leaf, file.mirror.host().as_str());
         }
-        compression.map(|compression| IngestKind::Packages {
-            compression,
-            format,
-        })
+        compression.map(|compression| IngestKind::Packages { compression })
     };
 
     #[expect(clippy::match_same_arms, reason = "prefer clarity")]
     let kind = match file.resource_kind {
-        ResourceKind::Packages => packages_kind(IndexFormat::Structured),
-        // Flat Packages files are ingested into the registry (layer-B deb
-        // verification).  Flat-layer-C (verifying a flat Packages file against
-        // a flat Release) is not implemented - consistent with flat-pool layer-B
-        // also being deferred.
-        ResourceKind::FlatMetadata => packages_kind(IndexFormat::Flat),
+        ResourceKind::Packages => packages_kind(),
+        // A flat repository's indexes feed nothing: its pool downloads are
+        // `VerifyKind::Unverifiable` and its `Packages` files are not
+        // verified against a flat `Release` either, so their digests would
+        // only take decode permits and ingest slots from the structured
+        // mirrors (and share their registry scope on the same host and path).
+        ResourceKind::FlatMetadata => None,
         ResourceKind::Release => release_dir_from_uri_path(file.raw_uri_path)
             .map(|d| IngestKind::Release { release_dir: d }),
         // A per-component Release (`binary-<arch>/Release`) carries no SHA256:
@@ -1534,19 +1522,10 @@ fn ingest_kind(file: &IndexFile<'_>) -> Option<IngestKind> {
         // validated `by-hash/` hangs in, judged once by the classifier,
         // distinguishes a binary Packages index from Contents/dep11/i18n
         // by-hash content.
-        ResourceKind::ByHash(_, ByHashContent::MaybePackages) => Some(IngestKind::PackagesSniff {
-            format: IndexFormat::Structured,
-        }),
-        // Only a flat repository whose base directory is itself named
-        // `binary-*` or `source` gets here.  Flat layer-C ingestion is
-        // deferred (see `verify_and_rename`).
-        ResourceKind::FlatByHash(_, ByHashContent::MaybePackages) => {
-            Some(IngestKind::PackagesSniff {
-                format: IndexFormat::Flat,
-            })
-        }
-        ResourceKind::ByHash(_, ByHashContent::Other)
-        | ResourceKind::FlatByHash(_, ByHashContent::Other) => None,
+        ResourceKind::ByHash(_, ByHashContent::MaybePackages) => Some(IngestKind::PackagesSniff),
+        // Like `FlatMetadata`: nothing reads a flat repository's digests.
+        ResourceKind::FlatByHash(_, ByHashContent::MaybePackages | ByHashContent::Other)
+        | ResourceKind::ByHash(_, ByHashContent::Other) => None,
         ResourceKind::Pool
         | ResourceKind::Sources
         | ResourceKind::Translation
@@ -1761,7 +1740,6 @@ async fn ingest_packages_file(
     mirror_path: &str,
     path: &Path,
     compression: PackagesCompression,
-    format: IndexFormat,
     buffer_size: usize,
 ) -> std::io::Result<()> {
     let file = tokio_nofollow_options().read(true).open(path).await?;
@@ -1800,7 +1778,7 @@ async fn ingest_packages_file(
     loop {
         match stanzas.next().await {
             Ok(Some(stanza)) => {
-                ingest_stanza_into_registry(stanza, registry, authority, mirror_path, format);
+                ingest_stanza_into_registry(stanza, registry, authority, mirror_path);
             }
             Ok(None) => return Ok(()),
             Err(err) => {
@@ -1936,12 +1914,11 @@ fn ingest_stanza_into_registry(
     registry: &ChecksumRegistry,
     authority: &str,
     mirror_path: &str,
-    format: IndexFormat,
 ) {
     let (Some(filename), Some(sha256)) = (stanza.filename(), stanza.sha256) else {
         return;
     };
-    let Some(key) = index_parser::registry_key_from_filename_field(filename, format) else {
+    let Some(key) = index_parser::registry_key_from_filename_field(filename) else {
         // `Stanza` already rejected (and logged) unsafe values, so this is
         // the length gate: a name no cache file can have.
         warn_once_or_debug!(
@@ -2581,31 +2558,20 @@ mod tests {
         };
 
         for (path, expected) in [
-            (
-                "debian/dists/sid/main/binary-amd64",
-                Some(IndexFormat::Structured),
-            ),
-            (
-                "debian/dists/sid/main/source",
-                Some(IndexFormat::Structured),
-            ),
+            ("debian/dists/sid/main/binary-amd64", true),
+            ("debian/dists/sid/main/source", true),
             // Deeper than the origin scope, still a `Packages` directory.
-            (
-                "debian/dists/sid/main/debian-installer/binary-amd64",
-                Some(IndexFormat::Structured),
-            ),
-            ("debian/dists/sid/main/dep11", None),
-            ("debian/dists/sid/main", None),
-            ("debian/dists", None),
-            ("debian/dists/sid/main/binary-amd64/Packages.diff", None),
+            ("debian/dists/sid/main/debian-installer/binary-amd64", true),
+            ("debian/dists/sid/main/dep11", false),
+            ("debian/dists/sid/main", false),
+            ("debian/dists", false),
+            ("debian/dists/sid/main/binary-amd64/Packages.diff", false),
             // Decoys: the directory before the first `by-hash` said otherwise.
-            ("debian/dists/sid/main/binary-amd64/by-hash/MD5Sum", None),
-            (
-                "debian/dists/sid/main/i18n/by-hash/X/binary-amd64",
-                Some(IndexFormat::Structured),
-            ),
-            ("apt/binary-amd64", Some(IndexFormat::Flat)),
-            ("apt", None),
+            ("debian/dists/sid/main/binary-amd64/by-hash/MD5Sum", false),
+            ("debian/dists/sid/main/i18n/by-hash/X/binary-amd64", true),
+            // A flat repository feeds no registry.
+            ("apt/binary-amd64", false),
+            ("apt", false),
         ] {
             let path = format!("{path}/by-hash/SHA256/{HELLO_SHA256}");
             let resource = parse_request_path(&path).expect("parses as a by-hash object");
@@ -2618,13 +2584,9 @@ mod tests {
                 mirror: &structured_mirror("h", &class.mirror_path),
                 path: Path::new("/cache/x"),
             });
-            let format = if let Some(IngestKind::PackagesSniff { format }) = kind {
-                Some(format)
-            } else {
-                assert!(kind.is_none(), "{path}: unexpected ingest kind");
-                None
-            };
-            assert_eq!(format, expected, "{path}");
+            let sniffed = matches!(kind, Some(IngestKind::PackagesSniff));
+            assert!(sniffed || kind.is_none(), "{path}: unexpected ingest kind");
+            assert_eq!(sniffed, expected, "{path}");
         }
     }
 
@@ -2941,7 +2903,6 @@ mod tests {
             "debian",
             f.path(),
             PackagesCompression::Raw,
-            IndexFormat::Structured,
             64 * 1024,
         )
         .await
@@ -2984,7 +2945,6 @@ mod tests {
         );
         let kind = IngestKind::Packages {
             compression: PackagesCompression::Raw,
-            format: IndexFormat::Structured,
         };
 
         let result = ingest_once(&reg, &kind, &mirror, f.path(), 64 * 1024).await;
@@ -3024,7 +2984,6 @@ mod tests {
             "debian",
             f.path(),
             PackagesCompression::Raw,
-            IndexFormat::Structured,
             64 * 1024,
         )
         .await
@@ -3054,7 +3013,6 @@ mod tests {
             "debian",
             f.path(),
             PackagesCompression::Xz,
-            IndexFormat::Structured,
             64 * 1024,
         )
         .await
@@ -3094,7 +3052,6 @@ mod tests {
             "debian",
             f.path(),
             PackagesCompression::Gz,
-            IndexFormat::Structured,
             64 * 1024,
         )
         .await
@@ -3335,11 +3292,8 @@ mod tests {
         };
         let packages = IngestKind::Packages {
             compression: PackagesCompression::Xz,
-            format: IndexFormat::Structured,
         };
-        let sniff = IngestKind::PackagesSniff {
-            format: IndexFormat::Structured,
-        };
+        let sniff = IngestKind::PackagesSniff;
         assert!(std::ptr::eq(
             ingest_pool(&release),
             &raw const RELEASE_INGEST_SLOTS
@@ -3378,8 +3332,25 @@ mod tests {
                 "abcd",
                 "/debian/dists/sid/main/binary-amd64/by-hash/SHA256/abcd"
             )),
-            Some(IngestKind::PackagesSniff { .. })
+            Some(IngestKind::PackagesSniff)
         ));
+        // A flat repository's indexes feed no registry.
+        assert!(
+            ingest_kind(&file(
+                ResourceKind::FlatMetadata,
+                "Packages.xz",
+                "/apt/Packages.xz"
+            ))
+            .is_none()
+        );
+        assert!(
+            ingest_kind(&file(
+                ResourceKind::FlatByHash(HashAlgo::Sha256, ByHashContent::MaybePackages),
+                "abcd",
+                "/apt/binary-amd64/by-hash/SHA256/abcd"
+            ))
+            .is_none()
+        );
         assert!(
             ingest_kind(&file(
                 ResourceKind::ByHash(HashAlgo::Sha256, ByHashContent::Other),

@@ -498,60 +498,31 @@ pub(crate) fn byhash_digest_for_algo(algo: HashAlgo, filename: &str) -> Option<V
     }
 }
 
-/// Discriminator for `Packages`/`Filename` parsing rules: structured
-/// (pool-based) repositories versus flat-repo layouts. Replaces the
-/// previous `is_flat: bool` parameter so the call sites self-document and
-/// no impossible "neither" state can be constructed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum IndexFormat {
-    Structured,
-    Flat,
-}
-
-/// Longest path component a registry key may carry: Linux's `NAME_MAX`. A
-/// key names a cache file (a structured key is the file's name, a flat key
-/// its path below the mirror root), and no longer component can exist on
-/// disk, so no download could ever look such a key up.
+/// Longest name a registry key may be: Linux's `NAME_MAX`. A key names a
+/// cache file, and no longer name can exist on disk, so no download could
+/// ever look such a key up.
 const MAX_REGISTRY_KEY_COMPONENT_LEN: usize = 255;
 
-/// Longest flat-repo relpath a registry key may be. Real flat archives nest
-/// a directory or two; the cap only has to stop an index from parking
-/// line-cap-sized keys ([`MAX_METADATA_LINE_LEN`]) in the registry.
-const MAX_REGISTRY_FLAT_KEY_LEN: usize = 1024;
-
-/// Map a `Packages` stanza `Filename:` value to the registry key used to look
-/// it up at `.deb` download time.
-///
-/// - structured repos: the cache flattens `pool/.../<deb>` to the basename, so
-///   the key is the basename (`structured_lookup_key`).
-/// - flat repos: the URL path is the on-disk path verbatim, so the key is the
-///   validated relpath itself.
+/// Map a structured repository's `Packages` stanza `Filename:` value to the
+/// registry key used to look it up at `.deb` download time: the cache
+/// flattens `pool/.../<deb>` to the basename, so the key is the basename
+/// (`structured_lookup_key`). Flat repositories feed no registry: their pool
+/// downloads are not verified against it.
 ///
 /// Returns `None` when the relpath fails `is_safe_filename_relpath` (after
 /// [`strip_leading_dot_segments`]; a `Stanza`'s value is already stripped,
 /// this repeats it so the function gates a raw field the same way), and when
-/// the key could not name a cache file: a component longer than
-/// [`MAX_REGISTRY_KEY_COMPONENT_LEN`], or a flat relpath longer than
-/// [`MAX_REGISTRY_FLAT_KEY_LEN`]. The registry caps entries, not bytes, so
-/// without the length gate a hostile index could retain up to the line cap
-/// per entry -- gigabytes at the default entry cap.
-pub(crate) fn registry_key_from_filename_field(
-    filename_field: &str,
-    format: IndexFormat,
-) -> Option<&str> {
+/// the key could not name a cache file: longer than
+/// [`MAX_REGISTRY_KEY_COMPONENT_LEN`]. The registry caps entries, not bytes,
+/// so without the length gate a hostile index could retain up to the line
+/// cap per entry -- gigabytes at the default entry cap.
+pub(crate) fn registry_key_from_filename_field(filename_field: &str) -> Option<&str> {
     let filename_field = strip_leading_dot_segments(filename_field);
     if !is_safe_filename_relpath(filename_field) {
         return None;
     }
-    let key = match format {
-        IndexFormat::Flat => {
-            (filename_field.len() <= MAX_REGISTRY_FLAT_KEY_LEN).then_some(filename_field)
-        }
-        IndexFormat::Structured => Some(structured_lookup_key(filename_field)),
-    }?;
-    key.split('/')
-        .all(|component| component.len() <= MAX_REGISTRY_KEY_COMPONENT_LEN)
-        .then_some(key)
+    let key = structured_lookup_key(filename_field);
+    (key.len() <= MAX_REGISTRY_KEY_COMPONENT_LEN).then_some(key)
 }
 
 /// A `SHA256:` / `SHA512:` section of a Debian `Release`/`InRelease` file.
@@ -1301,45 +1272,23 @@ mod tests {
     #[test]
     fn registry_key_for_structured_pool_uses_basename() {
         assert_eq!(
-            registry_key_from_filename_field(
-                "pool/main/f/foo/foo_1.0_amd64.deb",
-                IndexFormat::Structured,
-            ),
+            registry_key_from_filename_field("pool/main/f/foo/foo_1.0_amd64.deb"),
             Some("foo_1.0_amd64.deb")
-        );
-    }
-
-    #[test]
-    fn registry_key_for_flat_uses_relpath_verbatim() {
-        assert_eq!(
-            registry_key_from_filename_field("amd64/foo_1.0_amd64.deb", IndexFormat::Flat),
-            Some("amd64/foo_1.0_amd64.deb")
         );
     }
 
     #[test]
     fn registry_key_strips_leading_dot_slash() {
         assert_eq!(
-            registry_key_from_filename_field("./foo_1.0_amd64.deb", IndexFormat::Flat),
-            Some("foo_1.0_amd64.deb"),
-            "the flat key must match the cache path relative to the mirror root"
-        );
-        assert_eq!(
-            registry_key_from_filename_field("./foo_1.0_amd64.deb", IndexFormat::Structured),
+            registry_key_from_filename_field("./foo_1.0_amd64.deb"),
             Some("foo_1.0_amd64.deb")
         );
     }
 
     #[test]
     fn registry_key_rejects_unsafe_relpath() {
-        assert_eq!(
-            registry_key_from_filename_field("../etc/passwd", IndexFormat::Structured),
-            None
-        );
-        assert_eq!(
-            registry_key_from_filename_field("", IndexFormat::Flat),
-            None
-        );
+        assert_eq!(registry_key_from_filename_field("../etc/passwd"), None);
+        assert_eq!(registry_key_from_filename_field(""), None);
     }
 
     #[test]
@@ -1350,44 +1299,21 @@ mod tests {
         // part does not matter...
         let long_dir = format!("pool/{}{at_cap}", "d/".repeat(1000));
         assert_eq!(
-            registry_key_from_filename_field(&long_dir, IndexFormat::Structured),
+            registry_key_from_filename_field(&long_dir),
             Some(at_cap.as_str())
         );
         // ... but a basename past NAME_MAX, up to the 8 KiB line cap, does.
         for name in [
-            over_cap.clone(),
+            over_cap,
             "a".repeat(MAX_METADATA_LINE_LEN - "Filename: pool/".len()),
         ] {
             assert_eq!(
-                registry_key_from_filename_field(&format!("pool/{name}"), IndexFormat::Structured),
+                registry_key_from_filename_field(&format!("pool/{name}")),
                 None,
                 "{} byte basename",
                 name.len()
             );
         }
-
-        assert_eq!(
-            registry_key_from_filename_field(&format!("sub/{at_cap}"), IndexFormat::Flat),
-            Some(format!("sub/{at_cap}").as_str())
-        );
-        assert_eq!(
-            registry_key_from_filename_field(&format!("sub/{over_cap}"), IndexFormat::Flat),
-            None,
-            "a flat component past NAME_MAX"
-        );
-        let deep = format!("{}x.deb", "d/".repeat(MAX_REGISTRY_FLAT_KEY_LEN / 2));
-        assert_eq!(
-            registry_key_from_filename_field(&deep, IndexFormat::Flat),
-            None,
-            "a {} byte flat relpath",
-            deep.len()
-        );
-        let at_flat_cap = format!("{}.deb", "d/".repeat((MAX_REGISTRY_FLAT_KEY_LEN - 5) / 2));
-        assert!(at_flat_cap.len() <= MAX_REGISTRY_FLAT_KEY_LEN);
-        assert_eq!(
-            registry_key_from_filename_field(&at_flat_cap, IndexFormat::Flat),
-            Some(at_flat_cap.as_str())
-        );
     }
 
     #[test]
