@@ -187,7 +187,10 @@ impl WebResponse {
                 ("X-Content-Type-Options", "nosniff"),
                 ("Cross-Origin-Resource-Policy", "same-origin"),
             ],
-            WebResponseKind::Error => &[],
+            WebResponseKind::Error => &[
+                ("X-Content-Type-Options", "nosniff"),
+                ("Cross-Origin-Resource-Policy", "same-origin"),
+            ],
         }
     }
 
@@ -361,7 +364,13 @@ mod tests {
         assert_eq!(r.status, StatusCode::NOT_FOUND);
         assert_eq!(&r.body[..], b"nope");
         assert_eq!(r.content_type(), "text/plain; charset=utf-8");
-        assert_eq!(r.extra_headers(), []);
+        assert_eq!(
+            r.extra_headers(),
+            [
+                ("X-Content-Type-Options", "nosniff"),
+                ("Cross-Origin-Resource-Policy", "same-origin"),
+            ]
+        );
     }
 
     #[cfg(feature = "hyper")]
