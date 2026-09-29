@@ -735,6 +735,15 @@ pub(crate) enum IpNetOrAddr {
 }
 
 impl IpNetOrAddr {
+    /// Whether every address the entry covers is a loopback address.
+    #[must_use]
+    fn is_loopback(&self) -> bool {
+        match self {
+            Self::Addr(ip) => ip.is_loopback(),
+            Self::Net(net) => net.network().is_loopback() && net.broadcast().is_loopback(),
+        }
+    }
+
     #[must_use]
     pub(crate) fn contains(&self, ip: &IpAddr) -> bool {
         match self {
@@ -1876,6 +1885,36 @@ impl Config {
                     ));
                 }
             }
+        }
+
+        // Both client lists fail open when empty. The proxy one is empty as
+        // shipped, so an operator who only fills in `allowed_mirrors` serves
+        // every host that can reach the listener. Until `allowed_mirrors` is
+        // filled in the proxy serves nothing and `main` warns about that
+        // instead, so neither warning below fires for the shipped defaults.
+        let configured = !self.allowed_mirrors.is_empty();
+        if configured && self.allowed_proxy_clients.is_empty() {
+            warnings.push(
+                "allowed_proxy_clients is empty, so every host that can reach the listener may use the proxy; list the client networks it should serve"
+                    .to_string(),
+            );
+        }
+
+        // The web interface shows the logs, every client's address and
+        // traffic, and the mirror URLs (a private repository's token
+        // included); inheriting the proxy list hands that to every client.
+        if configured
+            && self.allowed_webif_clients.is_none()
+            && (self.allowed_proxy_clients.is_empty()
+                || !self
+                    .allowed_proxy_clients
+                    .iter()
+                    .all(IpNetOrAddr::is_loopback))
+        {
+            warnings.push(
+                "allowed_webif_clients is unset, so the web interface admits every proxy client, and shows each of them the logs, the other clients' addresses and traffic, and the mirror URLs; set allowed_webif_clients to the administrators' addresses (e.g. ['127.0.0.1', '::1'])"
+                    .to_string(),
+            );
         }
 
         // Tunneling is off by default, so reaching here means the operator
@@ -3027,6 +3066,47 @@ mod test {
         // Only the mapped block folds: the deprecated IPv4-compatible form
         // stays an IPv6 address.
         assert!(dn("::192.0.2.1").is_ipv6());
+    }
+
+    #[test]
+    fn an_open_client_list_warns() {
+        let open = |w: &String| w.starts_with("allowed_proxy_clients is empty");
+        let webif = |w: &String| w.starts_with("allowed_webif_clients is unset");
+
+        // As shipped: no mirror, so the proxy serves nobody yet and the
+        // `allowed_mirrors` warning is the one to act on.
+        let warnings = warnings_for("");
+        assert!(!warnings.iter().any(open), "{warnings:?}");
+        assert!(!warnings.iter().any(webif), "{warnings:?}");
+
+        let warnings = warnings_for("allowed_mirrors = ['deb.debian.org']\n");
+        assert!(warnings.iter().any(open), "{warnings:?}");
+        assert!(warnings.iter().any(webif), "{warnings:?}");
+
+        let warnings = warnings_for(
+            "allowed_mirrors = ['deb.debian.org']\nallowed_proxy_clients = ['192.168.0.0/16', '::1']\n",
+        );
+        assert!(!warnings.iter().any(open), "{warnings:?}");
+        assert!(
+            warnings.iter().any(webif),
+            "a LAN list is inherited: {warnings:?}"
+        );
+
+        for quiet in [
+            "allowed_proxy_clients = ['127.0.0.1', '::1', '127.0.0.0/8']\n",
+            "allowed_proxy_clients = ['192.168.0.0/16']\nallowed_webif_clients = ['::1']\n",
+            "allowed_proxy_clients = ['192.168.0.0/16']\nallowed_webif_clients = []\n",
+        ] {
+            let warnings = warnings_for(&format!("allowed_mirrors = ['deb.debian.org']\n{quiet}"));
+            assert!(!warnings.iter().any(webif), "{quiet}: {warnings:?}");
+        }
+        let warnings = warnings_for(
+            "allowed_mirrors = ['deb.debian.org']\nallowed_proxy_clients = ['127.0.0.0/7']\n",
+        );
+        assert!(
+            warnings.iter().any(webif),
+            "a net reaching past loopback: {warnings:?}"
+        );
     }
 
     /// The two tunnel ACLs have opposite empty-list semantics: an empty
