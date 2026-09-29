@@ -971,7 +971,7 @@ pub(super) fn render_origin_table(
 /// The Clients table's address column. A row is one address, which an IPv6
 /// host using temporary (privacy) addresses changes daily or so: the tooltip
 /// says why one machine can fill several rows.
-const CLIENT_IP_HEADER: &str = "<span title=\"One row per client address; an IPv4 client of the dual-stack listener shows as IPv4. An IPv6 host using temporary (privacy) addresses gets a row for every address it used, and each address has its own max_connections_per_client_ip.\">IP</span>";
+const CLIENT_IP_HEADER: &str = "<span title=\"One row per client address; an IPv4 client of the dual-stack listener shows as IPv4. An IPv6 host using temporary (privacy) addresses gets a row for every address it used, and the per-client caps count each address on its own unless client_ipv6_prefix_len groups them by network.\">IP</span>";
 
 /// The Clients table's trouble columns: in-memory counts since the daemon
 /// started for the heaviest offenders (`client_trouble`), unlike the

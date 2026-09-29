@@ -655,7 +655,7 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
     if let Some(cap) = config.max_connections_per_client_ip {
         t.entry("Connections per Client IP")
         .kind(Kind::Live)
-            .tip("Connections held by the busiest single source IP, against max_connections_per_client_ip; its next connection is closed at accept time. The peak is the most any IP held since start: deploy generously, watch it settle, then lower the cap to a margin above it. The Clients table names refused clients.")
+            .tip("Connections held by the busiest single source IP (IPv6 by client_ipv6_prefix_len network when below 128), against max_connections_per_client_ip; its next connection is closed at accept time. The peak is the most any IP held since start: deploy generously, watch it settle, then lower the cap to a margin above it. The Clients table names refused clients.")
             .note(Saturation {
                 at_cap: metrics::CONNECTION_PER_IP_CAP_CLOCK.total(),
                 refused: metrics::CONNECTION_REJECTED_PER_IP_CAP.get(),

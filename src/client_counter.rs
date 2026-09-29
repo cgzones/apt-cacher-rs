@@ -87,6 +87,7 @@ impl ClientCounter {
         client_ip: IpAddr,
         max_per_ip: Option<NonZero<usize>>,
         max_global: Option<NonZero<usize>>,
+        ipv6_prefix_len: u8,
     ) -> Result<Self, ConnectionCap> {
         // Reserve the global slot atomically: bump, and back out when that
         // pushed the count past the cap.
@@ -101,7 +102,8 @@ impl ClientCounter {
 
         let per_ip = match max_per_ip {
             Some(max) => {
-                let Some(permit) = CONNECTIONS_PER_IP.try_acquire(client_ip, max) else {
+                let Some(permit) = CONNECTIONS_PER_IP.try_acquire(client_ip, max, ipv6_prefix_len)
+                else {
                     CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
                     metrics::CONNECTION_REJECTED_PER_IP_CAP.increment();
                     client_trouble::record_ip(client_ip, Trouble::CapRefused);
@@ -168,10 +170,11 @@ mod tests {
         let ip: IpAddr = "192.0.2.21".parse().expect("test address");
         let before = connected_clients();
 
-        let admitted = ClientCounter::try_new(ip, Some(nonzero!(1)), None).expect("first admitted");
+        let admitted =
+            ClientCounter::try_new(ip, Some(nonzero!(1)), None, 128).expect("first admitted");
         assert_eq!(connected_clients(), before + 1);
         assert_eq!(
-            ClientCounter::try_new(ip, Some(nonzero!(1)), None).err(),
+            ClientCounter::try_new(ip, Some(nonzero!(1)), None, 128).err(),
             Some(ConnectionCap::PerIp(nonzero!(1))),
         );
         assert_eq!(
@@ -186,7 +189,8 @@ mod tests {
         );
 
         drop(admitted);
-        let again = ClientCounter::try_new(ip, Some(nonzero!(1)), None).expect("slot released");
+        let again =
+            ClientCounter::try_new(ip, Some(nonzero!(1)), None, 128).expect("slot released");
         drop(again);
         assert_eq!(connected_clients(), before);
     }
@@ -196,10 +200,11 @@ mod tests {
     #[test]
     fn per_ip_refusal_does_not_raise_the_connected_peak() {
         let ip: IpAddr = "192.0.2.25".parse().expect("test address");
-        let admitted = ClientCounter::try_new(ip, Some(nonzero!(1)), None).expect("first admitted");
+        let admitted =
+            ClientCounter::try_new(ip, Some(nonzero!(1)), None, 128).expect("first admitted");
         let peak = metrics::CONNECTED_CLIENTS_PEAK.get();
         assert!(peak >= connected_clients() as u64);
-        assert!(ClientCounter::try_new(ip, Some(nonzero!(1)), None).is_err());
+        assert!(ClientCounter::try_new(ip, Some(nonzero!(1)), None, 128).is_err());
         assert_eq!(
             metrics::CONNECTED_CLIENTS_PEAK.get(),
             peak,
@@ -216,10 +221,10 @@ mod tests {
         let ip: IpAddr = "192.0.2.24".parse().expect("test address");
         let before = connected_clients();
 
-        let admitted = ClientCounter::try_new(ip, None, None).expect("admitted");
+        let admitted = ClientCounter::try_new(ip, None, None, 128).expect("admitted");
         assert_eq!(connected_clients(), before + 1);
         assert!(
-            !CONNECTIONS_PER_IP.tracks(ip),
+            !CONNECTIONS_PER_IP.tracks(ip, 128),
             "an unconfigured per-IP cap must not populate the map"
         );
 
@@ -233,9 +238,9 @@ mod tests {
         let before = connected_clients();
         let max = NonZero::new(before + 1).expect("at least one slot");
 
-        let admitted = ClientCounter::try_new(ip, None, Some(max)).expect("under the cap");
+        let admitted = ClientCounter::try_new(ip, None, Some(max), 128).expect("under the cap");
         assert_eq!(
-            ClientCounter::try_new(ip, None, Some(max)).err(),
+            ClientCounter::try_new(ip, None, Some(max), 128).err(),
             Some(ConnectionCap::Global(max)),
         );
 

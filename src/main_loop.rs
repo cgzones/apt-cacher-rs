@@ -653,6 +653,7 @@ pub(crate) async fn main_loop(
             client.ip(),
             config.max_connections_per_client_ip,
             config.max_connections,
+            config.client_ipv6_prefix_len,
         ) {
             Ok(counter) => counter,
             Err(cap) => {

@@ -66,8 +66,12 @@ impl Drop for ActiveTunnelGuard {
 /// Returns `Some(TunnelGuard)` if under the limit, `None` if at capacity.
 /// Does *not* update the active-tunnel counter — that's
 /// [`ActiveTunnelGuard`]'s job, and the caller composes both guards.
-pub(crate) fn try_acquire(client_ip: IpAddr, max: NonZero<usize>) -> Option<TunnelGuard> {
-    TUNNEL_CONNECTIONS.try_acquire(client_ip, max)
+pub(crate) fn try_acquire(
+    client_ip: IpAddr,
+    max: NonZero<usize>,
+    ipv6_prefix_len: u8,
+) -> Option<TunnelGuard> {
+    TUNNEL_CONNECTIONS.try_acquire(client_ip, max, ipv6_prefix_len)
 }
 
 /// A held per-IP tunnel slot; released on drop.
@@ -85,20 +89,20 @@ mod tests {
     fn slots_are_capped_per_ip_and_released_on_drop() {
         let ip: IpAddr = "192.0.2.11".parse().expect("test address");
 
-        let first = try_acquire(ip, nonzero!(2)).expect("first slot");
-        let second = try_acquire(ip, nonzero!(2)).expect("second slot");
+        let first = try_acquire(ip, nonzero!(2), 128).expect("first slot");
+        let second = try_acquire(ip, nonzero!(2), 128).expect("second slot");
         assert!(
-            try_acquire(ip, nonzero!(2)).is_none(),
+            try_acquire(ip, nonzero!(2), 128).is_none(),
             "the cap must refuse a third tunnel"
         );
 
         drop(second);
-        let third = try_acquire(ip, nonzero!(2)).expect("a released slot is handed out again");
+        let third = try_acquire(ip, nonzero!(2), 128).expect("a released slot is handed out again");
 
         drop(first);
         drop(third);
         assert!(
-            !TUNNEL_CONNECTIONS.tracks(ip),
+            !TUNNEL_CONNECTIONS.tracks(ip, 128),
             "the last guard's drop must remove the map entry"
         );
     }
@@ -108,9 +112,9 @@ mod tests {
         let busy: IpAddr = "192.0.2.12".parse().expect("test address");
         let other: IpAddr = "192.0.2.13".parse().expect("test address");
 
-        let held = try_acquire(busy, nonzero!(1)).expect("first slot");
-        assert!(try_acquire(busy, nonzero!(1)).is_none(), "cap reached");
-        let unrelated = try_acquire(other, nonzero!(1)).expect("a different IP is unaffected");
+        let held = try_acquire(busy, nonzero!(1), 128).expect("first slot");
+        assert!(try_acquire(busy, nonzero!(1), 128).is_none(), "cap reached");
+        let unrelated = try_acquire(other, nonzero!(1), 128).expect("a different IP is unaffected");
 
         drop(held);
         drop(unrelated);

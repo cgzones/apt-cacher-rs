@@ -833,7 +833,9 @@ fn handle_connect(client: ClientInfo, target: &str) -> ZeroCopyResult {
     };
 
     let tunnel_guard = if let Some(max) = config.https_tunnel_max_connections_per_client {
-        let Some(guard) = tunnel_limiter::try_acquire(client.ip(), max) else {
+        let Some(guard) =
+            tunnel_limiter::try_acquire(client.ip(), max, config.client_ipv6_prefix_len)
+        else {
             info!(
                 "Rejecting https tunnel request for client {client}, \
                  concurrent connection limit ({max}) reached"

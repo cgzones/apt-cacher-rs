@@ -9,7 +9,10 @@
 //! release decrement and drop the entry at zero so an idle map does not grow
 //! one entry per IP ever seen.
 
-use std::{net::IpAddr, num::NonZero};
+use std::{
+    net::{IpAddr, Ipv6Addr},
+    num::NonZero,
+};
 
 use hashbrown::HashMap;
 
@@ -63,7 +66,9 @@ impl PerIpCounter {
     /// `ip` is canonicalized here rather than trusted to arrive that way
     /// (`ClientInfo::ip` already is): a dual-stack listener reports an IPv4
     /// client as `::ffff:a.b.c.d`, and keyed raw that client would hold a
-    /// second set of slots beside its plain IPv4 form.
+    /// second set of slots beside its plain IPv4 form. An IPv6 address then
+    /// counts as its first `ipv6_prefix_len` bits (`client_ipv6_prefix_len`,
+    /// see [`counter_key`]).
     ///
     /// Takes `&'static self` because the permit outlives the call and must
     /// name the counter to release into; every counter is a `static`.
@@ -72,8 +77,9 @@ impl PerIpCounter {
         &'static self,
         ip: IpAddr,
         max: NonZero<usize>,
+        ipv6_prefix_len: u8,
     ) -> Option<PerIpPermit> {
-        let ip = ip.to_canonical();
+        let ip = counter_key(ip, ipv6_prefix_len);
         let mut held = self.held.lock();
         let Held { per_ip, at_cap } = &mut *held;
         let count = per_ip.entry(ip).or_insert(0);
@@ -99,12 +105,32 @@ impl PerIpCounter {
         })
     }
 
-    /// Whether `ip` currently holds a permit. Only the tests need it; the
-    /// production paths hold a permit or they do not.
+    /// Whether `ip`, keyed as [`Self::try_acquire`] keys it with
+    /// `ipv6_prefix_len`, currently holds a permit. Only the tests need it;
+    /// the production paths hold a permit or they do not.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn tracks(&self, ip: IpAddr) -> bool {
-        self.held.lock().per_ip.contains_key(&ip.to_canonical())
+    pub(crate) fn tracks(&self, ip: IpAddr, ipv6_prefix_len: u8) -> bool {
+        self.held
+            .lock()
+            .per_ip
+            .contains_key(&counter_key(ip, ipv6_prefix_len))
+    }
+}
+
+/// The address `ip` is counted under: its canonical form, and for IPv6 only
+/// its first `ipv6_prefix_len` bits (1..=128), so one host cannot multiply
+/// its cap by using more addresses of its network (a /64 holds 2^64).
+#[must_use]
+fn counter_key(ip: IpAddr, ipv6_prefix_len: u8) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let mask = u128::MAX
+                .checked_shl(128 - u32::from(ipv6_prefix_len.min(128)))
+                .unwrap_or(0);
+            IpAddr::V6(Ipv6Addr::from(u128::from(v6) & mask))
+        }
+        v4 @ IpAddr::V4(_) => v4,
     }
 }
 
@@ -157,11 +183,11 @@ mod tests {
         let a: IpAddr = "192.0.2.41".parse().expect("test address");
         let b: IpAddr = "192.0.2.42".parse().expect("test address");
 
-        let a1 = COUNTER.try_acquire(a, nonzero!(2)).expect("slot");
+        let a1 = COUNTER.try_acquire(a, nonzero!(2), 128).expect("slot");
         assert!(!CLOCK.is_at_cap(), "one of two is not the cap");
-        let a2 = COUNTER.try_acquire(a, nonzero!(2)).expect("slot");
+        let a2 = COUNTER.try_acquire(a, nonzero!(2), 128).expect("slot");
         assert!(CLOCK.is_at_cap());
-        let b1 = COUNTER.try_acquire(b, nonzero!(1)).expect("slot");
+        let b1 = COUNTER.try_acquire(b, nonzero!(1), 128).expect("slot");
         assert_eq!(COUNTER.busiest(), 2);
         drop(a2);
         assert!(CLOCK.is_at_cap(), "b still holds its cap");
@@ -172,25 +198,68 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_clients_count_by_prefix() {
+        let key = |ip: &str, prefix| counter_key(ip.parse().expect("test address"), prefix);
+        assert_eq!(
+            key("2001:db8:1:2:aaaa::1", 64),
+            key("2001:db8:1:2:bbbb::2", 64)
+        );
+        assert_ne!(key("2001:db8:1:2::1", 64), key("2001:db8:1:3::1", 64));
+        assert_ne!(key("2001:db8::1", 128), key("2001:db8::2", 128));
+        assert_eq!(key("2001:db8::1", 128), key("2001:db8::1", 128));
+        assert_eq!(key("2001:db8::1", 1), key("3fff::1", 1));
+        assert_eq!(
+            key("::ffff:192.0.2.1", 64),
+            key("192.0.2.1", 64),
+            "IPv4 is canonical and unmasked"
+        );
+        assert_ne!(key("192.0.2.1", 64), key("192.0.2.2", 64));
+    }
+
+    /// Grouped by `/64`, two addresses of one network share a cap and the
+    /// permit releases under the same key it was admitted under.
+    #[test]
+    fn a_prefix_groups_ipv6_addresses_under_one_cap() {
+        let a: IpAddr = "2001:db8:41::a".parse().expect("test address");
+        let b: IpAddr = "2001:db8:41::b".parse().expect("test address");
+        let held = COUNTER.try_acquire(a, nonzero!(1), 64).expect("slot");
+        assert!(
+            COUNTER.try_acquire(b, nonzero!(1), 64).is_none(),
+            "the network's cap is taken"
+        );
+        let own = COUNTER
+            .try_acquire(b, nonzero!(1), 128)
+            .expect("per address, b has its own cap");
+        assert!(COUNTER.tracks(b, 64));
+        drop(held);
+        drop(own);
+        assert!(!COUNTER.tracks(a, 64) && !COUNTER.tracks(b, 128));
+    }
+
+    #[test]
     fn permits_are_capped_per_ip_and_released_on_drop() {
         let ip: IpAddr = "192.0.2.31".parse().expect("test address");
 
-        let first = COUNTER.try_acquire(ip, nonzero!(2)).expect("first slot");
-        let second = COUNTER.try_acquire(ip, nonzero!(2)).expect("second slot");
+        let first = COUNTER
+            .try_acquire(ip, nonzero!(2), 128)
+            .expect("first slot");
+        let second = COUNTER
+            .try_acquire(ip, nonzero!(2), 128)
+            .expect("second slot");
         assert!(
-            COUNTER.try_acquire(ip, nonzero!(2)).is_none(),
+            COUNTER.try_acquire(ip, nonzero!(2), 128).is_none(),
             "the cap must refuse a third"
         );
 
         drop(second);
         let third = COUNTER
-            .try_acquire(ip, nonzero!(2))
+            .try_acquire(ip, nonzero!(2), 128)
             .expect("a released slot is handed out again");
 
         drop(first);
         drop(third);
         assert!(
-            !COUNTER.tracks(ip),
+            !COUNTER.tracks(ip, 128),
             "the last permit's drop must remove the map entry"
         );
     }
@@ -200,13 +269,15 @@ mod tests {
         let busy: IpAddr = "192.0.2.32".parse().expect("test address");
         let other: IpAddr = "192.0.2.33".parse().expect("test address");
 
-        let held = COUNTER.try_acquire(busy, nonzero!(1)).expect("first slot");
+        let held = COUNTER
+            .try_acquire(busy, nonzero!(1), 128)
+            .expect("first slot");
         assert!(
-            COUNTER.try_acquire(busy, nonzero!(1)).is_none(),
+            COUNTER.try_acquire(busy, nonzero!(1), 128).is_none(),
             "cap reached"
         );
         let unrelated = COUNTER
-            .try_acquire(other, nonzero!(1))
+            .try_acquire(other, nonzero!(1), 128)
             .expect("a different IP is unaffected");
 
         drop(held);
@@ -223,21 +294,24 @@ mod tests {
         let native: IpAddr = "2001:db8::34".parse().expect("test address");
 
         let held = COUNTER
-            .try_acquire(mapped, nonzero!(1))
+            .try_acquire(mapped, nonzero!(1), 128)
             .expect("first slot");
         assert!(
-            COUNTER.try_acquire(plain, nonzero!(1)).is_none(),
+            COUNTER.try_acquire(plain, nonzero!(1), 128).is_none(),
             "the plain form must count against the mapped one's slot"
         );
-        assert!(COUNTER.tracks(plain));
+        assert!(COUNTER.tracks(plain, 128));
         let unrelated = COUNTER
-            .try_acquire(native, nonzero!(1))
+            .try_acquire(native, nonzero!(1), 128)
             .expect("an IPv6 client is a different client");
 
         drop(held);
-        assert!(!COUNTER.tracks(mapped), "released under the canonical key");
+        assert!(
+            !COUNTER.tracks(mapped, 128),
+            "released under the canonical key"
+        );
         let again = COUNTER
-            .try_acquire(plain, nonzero!(1))
+            .try_acquire(plain, nonzero!(1), 128)
             .expect("the released slot is free for the plain form");
         drop(again);
         drop(unrelated);

@@ -1050,6 +1050,16 @@ pub(crate) struct Config {
     #[serde(deserialize_with = "from_nonzero_usize")]
     pub(crate) max_connections_per_client_ip: Option<NonZero<usize>>,
 
+    /// How many leading bits of a client's IPv6 address the per-IP caps
+    /// (`max_connections_per_client_ip`,
+    /// `https_tunnel_max_connections_per_client`) count it by, 1..=128.
+    /// Defaults to 128, every address on its own, like an IPv4 client. A host
+    /// picks its addresses from its /64 at will (temporary addresses, or on
+    /// purpose), multiplying its cap; 64 closes that, at the price of one
+    /// cap for every host of the network -- a LAN's IPv6 clients usually
+    /// share one /64 -- which is why it is opt-in.
+    pub(crate) client_ipv6_prefix_len: u8,
+
     /// Maximum number of concurrent accepted connections across all clients
     /// (plain HTTP and CONNECT tunnels alike); excess connections are closed
     /// at accept time.  `None` means unlimited.  Defaults to three quarters
@@ -1201,6 +1211,7 @@ impl Default for Config {
             https_tunnel_allowed_mirrors: Vec::new(),
             https_tunnel_max_connections_per_client: Some(nonzero!(10)),
             max_connections_per_client_ip: Some(nonzero!(128)),
+            client_ipv6_prefix_len: 128,
             max_connections: Some(client_counter::default_max_connections()),
             min_download_rate: Some(nonzero!(10000)), // 10 kB/s
             rate_check_timeframe: DEFAULT_RATE_CHECK_TIMEFRAME,
@@ -1691,6 +1702,13 @@ impl Config {
             ));
         }
 
+        if !(1..=128).contains(&self.client_ipv6_prefix_len) {
+            invalid!(
+                "Invalid client_ipv6_prefix_len value of {}: must be between 1 and 128",
+                self.client_ipv6_prefix_len
+            );
+        }
+
         if self.buffer_size < 1024 || self.buffer_size > 1024 * 1024 * 1024 {
             invalid!(
                 "Invalid buffer_size value of {}: must be between 1KiB and 1GiB",
@@ -2001,6 +2019,17 @@ impl Config {
             invalid!(
                 "rate_check_timeframe is set to {}s but min_download_rate is disabled",
                 self.rate_check_timeframe
+            );
+        }
+
+        if self.is_set("client_ipv6_prefix_len")
+            && self.max_connections_per_client_ip.is_none()
+            && (!self.https_tunnel_enabled
+                || self.https_tunnel_max_connections_per_client.is_none())
+        {
+            warnings.push(
+                "client_ipv6_prefix_len is set but has no effect while no per-client cap (max_connections_per_client_ip, https_tunnel_max_connections_per_client) is active"
+                    .to_string(),
             );
         }
 
@@ -3172,6 +3201,26 @@ mod test {
                 .iter()
                 .any(|w| w.contains("https_tunnel_allowed")),
             "a fully specified tunnel config must not warn: {restricted:?}"
+        );
+    }
+
+    #[test]
+    fn client_ipv6_prefix_len_is_bounded_and_warns_without_a_cap() {
+        for invalid in ["client_ipv6_prefix_len = 0", "client_ipv6_prefix_len = 129"] {
+            let mut cfg = Config::from_toml(invalid).expect("parses");
+            assert!(cfg.validate().is_err(), "{invalid}");
+        }
+        let no_effect =
+            |w: &String| w.starts_with("client_ipv6_prefix_len is set but has no effect");
+        assert!(
+            !warnings_for("client_ipv6_prefix_len = 48")
+                .iter()
+                .any(no_effect)
+        );
+        assert!(
+            warnings_for("client_ipv6_prefix_len = 48\nmax_connections_per_client_ip = 0")
+                .iter()
+                .any(no_effect)
         );
     }
 
