@@ -48,9 +48,9 @@ use tracing::{debug, error, warn};
 
 use crate::config::HostText;
 use crate::error::ErrorReport;
-use crate::fs_open::{hint_sequential_read, tokio_nofollow_options};
+use crate::fs_open::{hint_sequential_read, nofollow_options, tokio_nofollow_options};
 use crate::ingest_ledger::{Claim, IngestLedger, Outcome};
-use crate::limits::{self, LimitedReader, PackagesCompression};
+use crate::limits::{self, PackagesCompression};
 use crate::{
     cache_layout::{ByHashContent, ConnectionDetails, ResourceKind},
     cache_quota::QuotaReservation,
@@ -1913,9 +1913,9 @@ async fn ingest_packages_file(
 
 /// Read a cached `Release` / `InRelease` file to a string with the cache's
 /// standard hardening: `O_NOFOLLOW` (reject a symlinked final component) and a
-/// `LimitedReader` capped at `MAX_RELEASE_SIZE`, so a hostile or buggy mirror
-/// serving a multi-GB `Release` (which passes the `max_object_size` admission
-/// check) cannot balloon memory unbounded. An over-cap file fails with
+/// read capped at `MAX_RELEASE_SIZE`, so a hostile or buggy mirror serving a
+/// multi-GB `Release` (which passes the `max_object_size` admission check)
+/// cannot balloon memory unbounded. An over-cap file fails with
 /// `io::ErrorKind::InvalidData` rather than truncating silently.
 ///
 /// Shared by registry ingest ([`ingest_release_file`]) and the by-hash cleanup
@@ -1926,16 +1926,39 @@ pub(crate) async fn read_release_to_string(path: &Path) -> std::io::Result<Strin
 
 /// [`read_release_to_string`], with the modification time of the file read
 /// (its `fstat`, so the pair describes one inode).
+///
+/// One blocking-pool hop for the whole read. Through `tokio::fs` the open,
+/// the `fstat` and every read were a hop each, and `read_to_string` grows an
+/// empty buffer by doubling from 32 bytes: about fifteen hops for the
+/// 50-200 KiB `InRelease` a commit ingests after every index download.
 async fn read_release(path: &Path) -> std::io::Result<(String, std::time::SystemTime)> {
-    let file = tokio_nofollow_options().read(true).open(path).await?;
-    let mtime = file
-        .metadata()
-        .await?
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || read_release_sync(&path))
+        .await
+        .unwrap_or_else(|err| Err(std::io::Error::other(err)))
+}
+
+fn read_release_sync(path: &Path) -> std::io::Result<(String, std::time::SystemTime)> {
+    use std::io::Read as _;
+
+    let file = nofollow_options().read(true).open(path)?;
+    let metadata = file.metadata()?;
+    let mtime = metadata
         .modified()
         .expect("Platform should support modification timestamps via setup check");
-    let mut limited = LimitedReader::new(file, limits::MAX_RELEASE_SIZE);
-    let mut buf = String::new();
-    tokio::io::AsyncReadExt::read_to_string(&mut limited, &mut buf).await?;
+    let limit = limits::MAX_RELEASE_SIZE.get();
+    // Sized from the fstat so the read takes one call plus the EOF probe; a
+    // file grown since is still bounded by the `take` below.
+    let capacity = usize::try_from(metadata.len().min(limit)).unwrap_or(0);
+    let mut buf = String::with_capacity(capacity);
+    // One byte past the cap tells an over-cap file from one exactly at it.
+    let read = (&file).take(limit + 1).read_to_string(&mut buf)?;
+    if read as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Release file exceeds the size limit",
+        ));
+    }
     Ok((buf, mtime))
 }
 
@@ -2371,7 +2394,7 @@ mod tests {
     #[test]
     fn unreadable_temp_file_returns_reject_verifyio() {
         let f = temp_file_with(b"hello world");
-        let write_only = crate::fs_open::nofollow_options()
+        let write_only = nofollow_options()
             .write(true)
             .open(f.path())
             .expect("open write-only");
@@ -3048,6 +3071,28 @@ mod tests {
         );
     }
 
+    /// A `Release` exactly at `MAX_RELEASE_SIZE` reads whole; one byte more
+    /// fails as `InvalidData` (cleanup's by-hash reconcile counts no cache
+    /// I/O failure for it) rather than being truncated at the cap.
+    #[tokio::test]
+    async fn read_release_refuses_a_file_over_the_cap() {
+        let cap = usize::try_from(limits::MAX_RELEASE_SIZE.get()).expect("cap fits usize");
+        let mut content = vec![b'a'; cap];
+        let at_cap = temp_file_with(&content);
+        let read = read_release_to_string(at_cap.path())
+            .await
+            .expect("a file at the cap reads");
+        assert_eq!(read.len(), cap);
+
+        content.push(b'a');
+        let over_cap = temp_file_with(&content);
+        let err = read_release_to_string(over_cap.path())
+            .await
+            .expect_err("a file over the cap fails");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.raw_os_error(), None);
+    }
+
     #[tokio::test]
     async fn a_future_dated_release_is_treated_as_undated() {
         use std::num::NonZero;
@@ -3311,7 +3356,7 @@ mod tests {
         let payload = b"a small deb body";
         // Read + write, like a download's temp file; the cursor is left at
         // the end, so verification has to rewind before hashing.
-        let mut temp_file = crate::fs_open::nofollow_options()
+        let mut temp_file = nofollow_options()
             .read(true)
             .write(true)
             .create_new(true)
