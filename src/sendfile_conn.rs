@@ -223,13 +223,10 @@ impl From<SendfileResult> for ZeroCopyResult {
 /// - Web-interface and splice-proxy-eligible requests are handled in place
 /// - Otherwise, fall back to the standard hyper-based handler
 pub(crate) async fn handle_sendfile_connection(
-    stream: TcpStream,
+    mut stream: TcpStream,
     client: ClientInfo,
     appstate: AppState,
 ) {
-    // A single-request handoff to hyper hands the stream back.
-    #[cfg(feature = "hyper")]
-    let mut stream = stream;
     let mut buf = BytesMut::with_capacity(INITIAL_HEADER_SIZE);
 
     trace!("Using sendfile(2) backend to handle request from client {client}...");
@@ -238,7 +235,7 @@ pub(crate) async fn handle_sendfile_connection(
     let mut conn_version = ConnectionVersion::Http11; // assume more recent version 1.1 if not yet parsed from any request
 
     loop {
-        let next_header_index = match read_request_headers(&stream, &mut buf).await {
+        let next_header_index = match read_request_headers(&mut stream, &mut buf).await {
             Ok(None) if req_num == 0 => {
                 info!("Connection from client {client} closed before receiving any request");
                 return;
@@ -500,10 +497,18 @@ async fn write_request_error_response(
 /// the byte count httparse consumes for it (see [`find_header_end`]): the
 /// caller's `advance` by that index then moves past the request exactly
 /// once.
+///
+/// The read goes through `AsyncRead`, not `readable()` + `try_read_buf`:
+/// `try_io` clears the socket's readiness only on `EAGAIN`, so that pair
+/// pays one `recvfrom` returning `EAGAIN` before every park, i.e. once per
+/// request. tokio's `poll_read` also clears it after a short read, which on
+/// epoll proves the receive queue drained.
 async fn read_request_headers(
-    stream: &TcpStream,
+    stream: &mut TcpStream,
     buf: &mut BytesMut,
 ) -> std::io::Result<Option<usize>> {
+    use tokio::io::AsyncReadExt as _;
+
     let mut scanned = 0;
     if let Some(next_index) = resume_header_end(buf, &mut scanned) {
         return Ok(Some(next_index));
@@ -516,10 +521,11 @@ async fn read_request_headers(
     loop {
         tokio::select! {
             biased;
-            ready = stream.readable() => {
-                ready?;
+            read = {
                 buf.reserve(MIN_HEADER_READ_ROOM);
-                match stream.try_read_buf(buf) {
+                stream.read_buf(buf)
+            } => {
+                match read {
                     Ok(0) => {
                         if buf.is_empty() {
                             // Clean close between requests.
@@ -546,12 +552,6 @@ async fn read_request_headers(
                             ));
                         }
                         trace!("Read {n} bytes from client, did not find header end");
-                    }
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                        // Race: readable() returned ready but try_read_buf got
-                        // WouldBlock.  Looping iterates select! which will
-                        // re-poll readable() and naturally pend if the socket
-                        // really isn't ready.
                     }
                     Err(err) if err.kind() == ErrorKind::Interrupted => {}
                     Err(err) => return Err(err),
