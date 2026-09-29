@@ -746,8 +746,21 @@ struct CachedFileBody {
     terminal: bool,
 }
 
+/// A cached body up to this size is read as one frame instead of in
+/// `buffer_size` chunks.
+const SINGLE_FRAME_MAX: usize = 256 * 1024;
+
 impl CachedFileBody {
     fn new(file: tokio::fs::File, length: u64, capacity: usize, path: PathBuf) -> Self {
+        // Every read of a `tokio::fs::File` is a blocking-pool round trip:
+        // seven for a 200 KiB `InRelease` at the default 32 KiB. A body that
+        // fits one frame has no later read for the write of the first to
+        // overlap (what `client_max_buf_size` keeps for bigger ones), so read
+        // it whole.
+        let capacity = match usize::try_from(length) {
+            Ok(length) if length <= SINGLE_FRAME_MAX => capacity.max(length),
+            Ok(_) | Err(_) => capacity,
+        };
         Self {
             reader: tokio_util::io::ReaderStream::with_capacity(file.take(length), capacity),
             path,
@@ -3936,6 +3949,43 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    /// A body up to `SINGLE_FRAME_MAX` goes out as one frame (one read);
+    /// a bigger one in `buffer_size` frames, so its reads overlap the writes.
+    #[tokio::test]
+    async fn cached_file_body_frames_small_files_whole() {
+        use super::{Body as _, CachedFileBody, SINGLE_FRAME_MAX};
+        use std::io::Write as _;
+        use std::pin::Pin;
+
+        async fn frame_lengths(len: usize, buffer_size: usize) -> Vec<usize> {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&vec![b'x'; len]).unwrap();
+            std::io::Seek::rewind(&mut file).unwrap();
+            let mut body = CachedFileBody::new(
+                tokio::fs::File::from_std(file),
+                len as u64,
+                buffer_size,
+                "cached-file".into(),
+            );
+            let mut lengths = Vec::new();
+            while let Some(frame) =
+                std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+            {
+                lengths.push(frame.unwrap().into_data().unwrap().len());
+            }
+            lengths
+        }
+
+        assert_eq!(frame_lengths(1000, 4096).await, [1000]);
+        assert_eq!(
+            frame_lengths(SINGLE_FRAME_MAX, 4096).await,
+            [SINGLE_FRAME_MAX]
+        );
+        let big = frame_lengths(SINGLE_FRAME_MAX + 1, 4096).await;
+        assert_eq!(big.iter().sum::<usize>(), SINGLE_FRAME_MAX + 1);
+        assert!(big.iter().all(|&len| len <= 4096), "{big:?}");
     }
 
     /// Only an uncached `Auto` decision may fall back to the original
