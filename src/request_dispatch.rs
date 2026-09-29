@@ -713,6 +713,14 @@ fn decide_request(
                 metrics::UNSAFE_PATH_REJECTED.increment();
                 return Decision::Reject(RejectReason::InvalidValue);
             }
+            Err(ClassifyError::EncodedSeparator { kind, raw }) => {
+                warn_once_or_info!(
+                    "Unsupported {kind} `{}` from client {client} (an encoded `/` would split it into other segments); rejecting with 400",
+                    raw.escape_debug()
+                );
+                metrics::UNSAFE_PATH_REJECTED.increment();
+                return Decision::Reject(RejectReason::InvalidValue);
+            }
             Err(ClassifyError::JoinedFieldUnderscore { kind, decoded }) => {
                 warn_once_or_info!(
                     "Uncacheable {kind} `{}` from client {client} (`_` separates cache-name fields); forwarding it upstream uncached",
@@ -1654,6 +1662,28 @@ mod tests {
             unsafe_before + 1,
             "a field the safety validator refuses is an unsafe-path rejection"
         );
+    }
+
+    #[test]
+    fn reject_encoded_separator_in_mirror_path() {
+        // Decoded, `public%2Fubuntu` would name the same cache file as
+        // `public/ubuntu` while the upstream is asked for the `%2F` form.
+        let unsafe_before = metrics::UNSAFE_PATH_REJECTED.get();
+        let decision = decide_request(
+            "/public%2Fubuntu/dists/noble/InRelease",
+            fake_host(),
+            None,
+            &local_client(),
+            &[],
+            true,
+            never_flat_blocked,
+            PreciseInstant::now(),
+        );
+        assert!(
+            matches!(decision, Decision::Reject(RejectReason::InvalidValue)),
+            "expected InvalidValue reject, got {decision:?}"
+        );
+        assert_eq!(metrics::UNSAFE_PATH_REJECTED.get(), unsafe_before + 1);
     }
 
     #[test]

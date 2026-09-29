@@ -398,7 +398,8 @@ pub(crate) static CLIENT_DISCONNECTED_MID_BODY: Counter = Counter::new();
 /// traversal or control bytes in the whole path (`is_unsafe_cache_path`,
 /// `is_unsafe_proxy_path`), or a cached route's field whose percent-decoded
 /// value its validator refuses (`ClassifyError::InvalidValue`: a `..`, a
-/// `/` smuggled as `%2F`, a control byte).
+/// `/` smuggled as `%2F`, a control byte) or a mirror path holding a `%2F`
+/// (`ClassifyError::EncodedSeparator`).
 pub(crate) static UNSAFE_PATH_REJECTED: Signal = Signal::new();
 /// Requests rejected because they targeted a `pdiff` resource.
 pub(crate) static PDIFF_REJECTED: Counter = Counter::new();

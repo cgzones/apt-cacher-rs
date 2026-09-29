@@ -669,6 +669,21 @@ impl ValidateKind {
             Self::MirrorPath | Self::FlatMirrorPath | Self::Directory | Self::Filename => false,
         }
     }
+
+    /// Whether the field is a `/`-joined run of segments, split only after
+    /// decoding (the mirror paths); every other field is one segment, whose
+    /// validator refuses a `/`.
+    #[must_use]
+    const fn spans_segments(self) -> bool {
+        match self {
+            Self::MirrorPath | Self::FlatMirrorPath => true,
+            Self::Distribution
+            | Self::Component
+            | Self::Architecture
+            | Self::Directory
+            | Self::Filename => false,
+        }
+    }
 }
 
 impl std::fmt::Display for ValidateKind {
@@ -743,6 +758,11 @@ pub(crate) enum ClassifyError<'a> {
         kind: ValidateKind,
         decoded: Cow<'a, str>,
     },
+    /// A multi-segment field ([`ValidateKind::spans_segments`]) holding an
+    /// encoded `/` (`%2F`).  Decoding turns it into a separator, so
+    /// `public%2Fubuntu` and `public/ubuntu` -- distinct upstream URLs (RFC
+    /// 3986 §2.2) -- would share one cache name.  `raw` is the value as sent.
+    EncodedSeparator { kind: ValidateKind, raw: &'a str },
     /// A structured `Pool` request had a filename whose extension is not
     /// `.deb` / `.udeb` / `.ddeb`.  Both dispatchers treat this as a
     /// non-cacheable request and fall through to the simple proxy.
@@ -1116,6 +1136,10 @@ fn decode_validate(raw: &str, kind: ValidateKind) -> Result<Cow<'_, str>, Classi
             return Err(ClassifyError::BadEncoding { kind, raw, source });
         }
     };
+
+    if kind.spans_segments() && decoded.matches('/').count() != raw.matches('/').count() {
+        return Err(ClassifyError::EncodedSeparator { kind, raw });
+    }
 
     if !kind.accepts(&decoded) {
         return Err(ClassifyError::InvalidValue { kind, decoded });
@@ -1538,6 +1562,47 @@ mod tests {
                 decoded,
             }) if decoded == "_foo.deb"
         ));
+    }
+
+    #[test]
+    fn classify_mirror_path_rejects_an_encoded_separator() {
+        for mirror_path in ["public%2Fubuntu", "public%2fubuntu"] {
+            let res = ResourceFile::Pool {
+                mirror_path,
+                dirs: "main/f/foo",
+                filename: "foo_1.0_amd64.deb",
+            };
+            assert!(
+                matches!(
+                    classify_request(&res, &local_client()),
+                    Err(ClassifyError::EncodedSeparator {
+                        kind: ValidateKind::MirrorPath,
+                        raw,
+                    }) if raw == mirror_path
+                ),
+                "{mirror_path}"
+            );
+        }
+        let res = ResourceFile::Flat {
+            kind: FlatKind::Metadata,
+            mirror_path: "a%2Fb",
+            filename: "Packages.gz",
+        };
+        assert!(matches!(
+            classify_request(&res, &local_client()),
+            Err(ClassifyError::EncodedSeparator {
+                kind: ValidateKind::FlatMirrorPath,
+                raw: "a%2Fb",
+            })
+        ));
+        // Other escapes still decode inside a segment.
+        let res = ResourceFile::Pool {
+            mirror_path: "public%2Dubuntu/x",
+            dirs: "main/f/foo",
+            filename: "foo_1.0_amd64.deb",
+        };
+        let class = classify_request(&res, &local_client()).expect("classifies");
+        assert_eq!(class.mirror_path, "public-ubuntu/x");
     }
 
     #[test]
