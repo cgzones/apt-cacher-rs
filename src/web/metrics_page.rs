@@ -136,8 +136,8 @@ struct Shown {
     /// checksum abort cause. Off, an Unverified row reading 0 would claim a
     /// coverage nothing checks.
     verify_checksums: bool,
-    /// `min_download_rate` set: the rate-limit cancellations and splice's
-    /// client demotion, which only a rate check triggers.
+    /// `min_download_rate` set: the rate-limit cancellations, which only a
+    /// rate check triggers.
     rate_checks: bool,
     /// `reject_pdiff_requests`.
     pdiff_rejection: bool,
@@ -614,10 +614,12 @@ fn build_client_delivery_group(g: &mut Groups, shown: Shown) {
                 &metrics::RATE_LIMIT_CLIENT,
             );
         }
-        if SPLICE && shown.rate_checks {
+        if SPLICE {
+            // Not gated on `rate_checks`: the demotion floor fires without
+            // `min_download_rate`.
             t.count_tip(
                 "Clients Demoted (splice \u{2192} file-serve)",
-                "Splice deliveries whose client fell below min_download_rate while the upstream kept pace: instead of cancelling, the client was handed to a task serving the growing cache file, so the download itself goes on at the upstream's speed. A climb points at slow clients (the Clients table) or a min_download_rate set too high.",
+                "Splice deliveries whose client read, over rate_check_timeframe, below min_download_rate while the upstream kept pace, or below 1/8 of the fastest download the mirror has delivered since start: instead of cancelling, or pacing the download to the client, the client was handed to a task serving the growing cache file, so the download itself goes on at the upstream's speed and frees its max_upstream_downloads slot. The floor makes demotions routine on a fast mirror (a client well below the mirror's best speed on any download longer than rate_check_timeframe); a climb with few floor lines in the log points at slow clients (the Clients table) or a min_download_rate set too high.",
                 metrics::CLIENTS_DEMOTED.get(),
             );
         }

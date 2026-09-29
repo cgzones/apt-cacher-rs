@@ -4,7 +4,9 @@
 //! read and deliver steps while every shared piece lives on [`BodyTransfer`]
 //! and comes back as [`BodyOutcome`]. Also owns client demotion to file
 //! serving ([`write_client_or_demote`], [`prepare_file_serve`],
-//! [`ClientEnd::Demoted`]), the [`SpliceRangeFilter`] applied to the client
+//! [`ClientEnd::Demoted`]) on either trigger, `min_download_rate` or the
+//! [`DemotionFloor`] that frees a slow client's upstream slot, the
+//! [`SpliceRangeFilter`] applied to the client
 //! stream, [`DownloadFailure`]/[`DeliveryFailure`] attribution, and the
 //! pipe and `/dev/null` helpers ([`create_pipe`], [`SplicePipes::discard_duplicate`],
 //! [`drain_pipe_to_file`], [`range_slice`]). [`CacheBatch`] is both loops'
@@ -24,6 +26,7 @@
 use std::{
     future::Future as _,
     io::ErrorKind,
+    num::NonZero,
     ops::Range,
     os::fd::{AsFd as _, OwnedFd},
     path::{Path, PathBuf},
@@ -45,7 +48,7 @@ use crate::guards::{DownloadBarrier, DownloadWriteLease};
 use crate::humanfmt::HumanFmt;
 use crate::index_parser::{HashAlgo, StreamHasher, StreamedDigest};
 use crate::log_once::Logged;
-use crate::rate_checker::RateChecker;
+use crate::rate_checker::{InsufficientRate, RateChecker};
 use crate::sendfile_conn::{
     async_sendfile_unfinished, clear_tcp_readable_cache, clear_tcp_writable_cache,
     wait_readable_rated, wait_writable_rated,
@@ -590,18 +593,133 @@ impl CacheWriter {
     }
 }
 
+/// The demotion floor: an attached client reading far below what its mirror
+/// has delivered is demoted even while it stays above `min_download_rate`.
+///
+/// A client paces the whole download until it is demoted (the loops pull
+/// from upstream only as fast as they push to the client), and the download
+/// holds one global `max_upstream_downloads` slot until `begin_rename`. A
+/// client reading just above `min_download_rate` therefore pinned a slot for
+/// its whole slow transfer: a handful of them starved every other client's
+/// cache miss into a 503. The `min_download_rate` demotion cannot catch it,
+/// since that client passes the check, and the upstream checker measures
+/// the same paced rate. Demoted, the client keeps reading the growing cache
+/// file from its own task, and the download finishes at the mirror's pace.
+///
+/// The reference is the mirror's peak throughput (`mirror_perf`), which
+/// neither this transfer nor any other slow client's paced download can
+/// drag down. Without one (no download of 1 MiB or more from the mirror has
+/// committed since start) there is no floor. The window is
+/// `rate_check_timeframe`, so a body the client finishes within it is never
+/// floor-demoted; `min_download_rate` being disabled does not disarm it.
+/// A demotion costs the client little (the same bytes, from the page
+/// cache), so the divisor only has to keep clients near the mirror's pace
+/// out of it, while a client a whole order of magnitude below the peak
+/// is demoted.
+struct DemotionFloor {
+    /// Checks the client against `peak / PEAK_DIVISOR`.
+    checker: RateChecker,
+    peak: NonZero<u64>,
+    /// When one full `rate_check_timeframe` has passed since the transfer
+    /// started. The checker counts its window full once it holds that many
+    /// per-second samples, the newest still filling -- with a one-second
+    /// window, after the very first write -- so the floor judges nothing
+    /// before this instant.
+    window_ends: coarsetime::Instant,
+}
+
+impl DemotionFloor {
+    /// How far below the mirror's peak throughput a client must read.
+    const PEAK_DIVISOR: u64 = 8;
+
+    /// The floor for a client of a mirror whose peak throughput is
+    /// `mirror_peak`; `None` without a peak, or when the floor would not sit
+    /// above `min_download_rate` (that checker trips first anyway).
+    fn new(mirror_peak: Option<NonZero<u64>>, config: &crate::config::Config) -> Option<Self> {
+        let peak = mirror_peak?;
+        let floor =
+            NonZero::new(usize::try_from(peak.get() / Self::PEAK_DIVISOR).unwrap_or(usize::MAX))?;
+        if config.min_download_rate.is_some_and(|min| floor <= min) {
+            return None;
+        }
+        let window = coarsetime::Duration::from_secs(config.rate_check_timeframe.get() as u64);
+        Some(Self {
+            checker: RateChecker::with_timeframe(floor, config.rate_check_timeframe),
+            peak,
+            window_ends: coarsetime::Instant::now() + window,
+        })
+    }
+
+    /// Feed `sent` client bytes; the trigger once a full window, elapsed
+    /// since the transfer started, read below the floor.
+    fn note(&mut self, sent: usize) -> Option<DemoteTrigger> {
+        self.checker.add(sent);
+        if coarsetime::Instant::now() < self.window_ends {
+            return None;
+        }
+        self.checker.check_fail().map(|rate| DemoteTrigger::Floor {
+            rate,
+            peak: self.peak,
+        })
+    }
+}
+
+/// Which client checker asked for a demotion; renders the reason clause of
+/// the demotion line.
+#[derive(Clone, Copy, Debug)]
+enum DemoteTrigger {
+    /// The client read below `min_download_rate`.
+    MinRate(InsufficientRate),
+    /// The client read below the [`DemotionFloor`] (`rate.min_rate`)
+    /// derived from the mirror's `peak` throughput.
+    Floor {
+        rate: InsufficientRate,
+        peak: NonZero<u64>,
+    },
+}
+
+impl std::fmt::Display for DemoteTrigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::MinRate(rate) | Self::Floor { rate, peak: _ }) = self;
+        let window = Duration::from_secs(rate.timeframe.get() as u64);
+        let second = Duration::from_secs(1);
+        write!(
+            f,
+            "the client read {} over the last {}, below ",
+            HumanFmt::Rate(rate.transferred as u64, window),
+            HumanFmt::Time(window),
+        )?;
+        match self {
+            Self::MinRate(_) => write!(
+                f,
+                "`min_download_rate` ({})",
+                HumanFmt::Rate(rate.min_rate.get() as u64, second)
+            ),
+            Self::Floor { rate: _, peak } => write!(
+                f,
+                "the demotion floor of {} (1/{} of the mirror's peak throughput of {})",
+                HumanFmt::Rate(rate.min_rate.get() as u64, second),
+                DemotionFloor::PEAK_DIVISOR,
+                HumanFmt::Rate(peak.get(), second),
+            ),
+        }
+    }
+}
+
 /// Per-body bookkeeping shared by the two body loops.
 ///
 /// [`splice_proxy_body`] (zero-copy splice/tee) and [`splice_proxy_body_tls`]
 /// (userspace reads into its batch buffer) differ only in how they pull a chunk
 /// from upstream and how they hand it to the cache file and the client.
-/// Everything around that -- the client-download accounting, the two rate
-/// checkers, the upstream-rate gate, the byte cursors, the client state
-/// machine and the demotion hand-off -- lives here so it exists once.
+/// Everything around that -- the client-download accounting, the rate
+/// checkers (upstream, client, [`DemotionFloor`]), the upstream-rate gate,
+/// the byte cursors, the client state machine and the demotion hand-off --
+/// lives here so it exists once.
 ///
 /// A client-less transfer ([`BodyClient::Absent`], [`BodyClient::Aborted`])
 /// starts the state machine in the matching [`ClientStatus`] with the
-/// client-side accounting (`counter`, `client_rate_checker`) unarmed; the
+/// client-side accounting (`counter`, `client_rate_checker`,
+/// `demotion_floor`) unarmed; the
 /// socket itself is reachable only through [`ClientStatus::client_to_write`],
 /// so the client-less form needs no arms of its own.
 ///
@@ -620,6 +738,11 @@ pub(super) struct BodyTransfer<'a> {
     barrier: &'a mut DownloadBarrier,
     rate_checker: Option<RateChecker>,
     client_rate_checker: Option<RateChecker>,
+    /// The second client checker, against the mirror's peak throughput
+    /// rather than `min_download_rate`; `None` without an attached client or
+    /// a known peak, or when the floor would not reach above
+    /// `min_download_rate`.
+    demotion_floor: Option<DemotionFloor>,
     /// Body bytes still to be pulled from upstream.
     remaining: u64,
     client_status: ClientStatus<'a>,
@@ -652,6 +775,12 @@ pub(super) struct BodyOutcome {
 impl<'a> BodyTransfer<'a> {
     /// `content_length` is the byte count the loop has to pull from
     /// upstream; the cache writer supplies its starting file offset.
+    /// `mirror_peak` is the mirror's peak throughput, the reference of the
+    /// [`DemotionFloor`] an attached client gets.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the body geometry, its borrowed owners and the rate references; a parameter struct would only be unpacked here"
+    )]
     pub(super) fn new(
         client: BodyClient<'a>,
         cache: &'a mut CacheWriter,
@@ -659,6 +788,7 @@ impl<'a> BodyTransfer<'a> {
         range_filter: &'a SpliceRangeFilter,
         cache_path: &'a Path,
         content_length: u64,
+        mirror_peak: Option<NonZero<u64>>,
         config: &crate::config::Config,
     ) -> Self {
         let file_start_offset = cache.position();
@@ -669,15 +799,18 @@ impl<'a> BodyTransfer<'a> {
         // body prefix and we still need to count it. A transfer that ships
         // no bytes to any client has nothing to account for and must not
         // bump `ACTIVE_CLIENT_DOWNLOADS`.
-        let (counter, client_rate_checker, client_status, peer) = match client {
+        let (counter, client_rate_checker, demotion_floor, client_status, peer) = match client {
             BodyClient::Attached(stream, peer) => (
                 Some(client_counter::ClientDownload::new()),
                 RateChecker::from_config(config),
+                DemotionFloor::new(mirror_peak, config),
                 ClientStatus::Active(stream),
                 Some(peer),
             ),
-            BodyClient::Absent => (None, None, ClientStatus::Absent, None),
-            BodyClient::Aborted(failure) => (None, None, ClientStatus::Aborted(failure), None),
+            BodyClient::Absent => (None, None, None, ClientStatus::Absent, None),
+            BodyClient::Aborted(failure) => {
+                (None, None, None, ClientStatus::Aborted(failure), None)
+            }
         };
 
         Self {
@@ -686,6 +819,7 @@ impl<'a> BodyTransfer<'a> {
             barrier,
             rate_checker,
             client_rate_checker,
+            demotion_floor,
             remaining: content_length,
             client_status,
             bytes_done: 0,
@@ -769,23 +903,43 @@ impl<'a> BodyTransfer<'a> {
         start..end
     }
 
-    /// Record bytes just delivered to the client.
-    fn note_client_bytes(&mut self, sent: usize) {
+    /// Record bytes just delivered to the client and feed them to both
+    /// client checkers. Returns why the client is to be demoted when one of
+    /// them tripped, `min_download_rate` first; the caller lands the batch
+    /// and hands the trigger to [`Self::request_demote`].
+    ///
+    /// Only a successful write feeds the floor. A parked write ticks the
+    /// `min_download_rate` checker alone (`wait_writable_rated`), whose
+    /// breach there aborts the delivery; the floor never aborts anything,
+    /// and its next `add` back-fills the parked seconds with zeros.
+    #[must_use]
+    fn note_client_bytes(&mut self, sent: usize) -> Option<DemoteTrigger> {
         metrics::BYTES_SERVED_SPLICE.increment_by(sent as u64);
         self.client_file_pos += sent as u64;
         self.client_remaining = self
             .client_remaining
             .checked_sub(sent as u64)
             .expect("client_remaining tracks bytes still owed to the client");
+
+        let below_min = self.client_rate_checker.as_mut().and_then(|rc| {
+            rc.add(sent);
+            rc.check_fail()
+        });
+        let below_floor = self
+            .demotion_floor
+            .as_mut()
+            .and_then(|floor| floor.note(sent));
+        below_min.map(DemoteTrigger::MinRate).or(below_floor)
     }
 
-    /// The client RC tripped after progress: the cache already has the
+    /// A client checker tripped after progress: the cache already has the
     /// bytes, so hand off to [`Self::maybe_demote`] for adjudication.
-    fn request_demote(&mut self, client: &'a TcpStream) {
+    fn request_demote(&mut self, client: &'a TcpStream, trigger: DemoteTrigger) {
         self.client_status = ClientStatus::DemoteRequested {
             client,
             client_file_pos: self.client_file_pos,
             client_remaining: self.client_remaining,
+            trigger,
         };
     }
 
@@ -805,6 +959,7 @@ impl<'a> BodyTransfer<'a> {
             client,
             client_file_pos: _,
             client_remaining: _,
+            trigger: _,
         } = self.client_status
         {
             shutdown_client_write(client);
@@ -831,12 +986,16 @@ impl<'a> BodyTransfer<'a> {
     /// file-serve task. Only when the upstream is healthy is the client
     /// really the bottleneck: accounting is handed to the spawned task (its
     /// `async_sendfile_unfinished` creates its own `ClientDownload`, so net
-    /// `ACTIVE_CLIENT_DOWNLOADS` stays at 1 across the transition).
+    /// `ACTIVE_CLIENT_DOWNLOADS` stays at 1 across the transition). A
+    /// [`DemotionFloor`] trigger passes through the same check, which the
+    /// loop's next iteration would run anyway: the floor never ends a
+    /// download the upstream checker would have let go on.
     fn maybe_demote(&mut self) -> Result<(), DownloadFailure> {
         let ClientStatus::DemoteRequested {
             client,
             client_file_pos: demote_pos,
             client_remaining: demote_remaining,
+            trigger,
         } = self.client_status
         else {
             return Ok(());
@@ -848,7 +1007,7 @@ impl<'a> BodyTransfer<'a> {
         #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
         let demote_remaining_percent = 100.0 * demote_remaining as f32 / client_total as f32;
         info!(
-            "splice proxy: demoting slow client to file-serve of `{}` at cache offset {} with {} remaining out of {} ({:.1}%)",
+            "splice proxy: demoting slow client to file-serve of `{}` at cache offset {} with {} remaining out of {} ({:.1}%): {trigger}",
             self.cache_path.display(),
             HumanFmt::Size(demote_pos),
             HumanFmt::Size(demote_remaining),
@@ -887,6 +1046,7 @@ impl<'a> BodyTransfer<'a> {
                 client,
                 client_file_pos: _,
                 client_remaining: _,
+                trigger: _,
             } => {
                 shutdown_client_write(client);
                 ClientEnd::Aborted(
@@ -907,6 +1067,7 @@ impl<'a> BodyTransfer<'a> {
             barrier: _,
             rate_checker: _,
             client_rate_checker: _,
+            demotion_floor: _,
             remaining,
             client_status: _,
             bytes_done: _,
@@ -1510,14 +1671,10 @@ async fn write_client_or_demote<'a>(
             }
             Ok(n) => {
                 written += n;
-                xfer.note_client_bytes(n);
-                if let Some(rc) = &mut xfer.client_rate_checker {
-                    rc.add(n);
-                    if rc.check_fail().is_some() {
-                        xfer.flush_cache().await?;
-                        xfer.request_demote(client);
-                        return Ok(());
-                    }
+                if let Some(trigger) = xfer.note_client_bytes(n) {
+                    xfer.flush_cache().await?;
+                    xfer.request_demote(client, trigger);
+                    return Ok(());
                 }
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
@@ -1683,7 +1840,7 @@ async fn serve_remaining_from_file(
 /// callers cannot forget to account a tee or a partial client splice.
 enum PipeHead {
     Unique,
-    Duplicated(std::num::NonZero<usize>),
+    Duplicated(NonZero<usize>),
     /// A boundary read moved the head into a userspace buffer. Until the
     /// next accumulation, a leftover tail cannot be salvaged on its own.
     Extracted,
@@ -1744,7 +1901,7 @@ impl SplicePipes {
             count,
             SpliceFFlags::empty(),
         )?;
-        if let Some(count) = std::num::NonZero::new(teed) {
+        if let Some(count) = NonZero::new(teed) {
             self.head = PipeHead::Duplicated(count);
             self.cache.queue(teed);
         }
@@ -1771,8 +1928,8 @@ impl SplicePipes {
             remaining.get().min(limit),
             SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_MORE,
         )?;
-        self.head = std::num::NonZero::new(remaining.get() - sent)
-            .map_or(PipeHead::Unique, PipeHead::Duplicated);
+        self.head =
+            NonZero::new(remaining.get() - sent).map_or(PipeHead::Unique, PipeHead::Duplicated);
         Ok(sent)
     }
 
@@ -2012,9 +2169,9 @@ enum ClientStatus<'a> {
     Absent,
     /// The delivery ended mid-transfer; its failure is concluded.
     Aborted(ReportedDelivery),
-    /// Client send rate dropped below the minimum threshold during the
-    /// inner tee+splice loop and the teed bytes still in `pipe_A` have
-    /// been drained. The caller adjudicates whether to actually demote
+    /// Client send rate dropped below `min_download_rate` or the
+    /// [`DemotionFloor`] (`trigger`) and the teed bytes still in `pipe_A`
+    /// have been drained. The caller adjudicates whether to actually demote
     /// (transitioning to [`ClientStatus::Demoted`]) or to abort the
     /// whole splice with an upstream-rate timeout: when the upstream
     /// rate has also fallen below threshold the client RC is observing
@@ -2028,6 +2185,8 @@ enum ClientStatus<'a> {
         /// Bytes still owed to the client (matches the response Content-Length
         /// minus what was already written before/during the splice loop).
         client_remaining: u64,
+        /// Which client checker asked for the demotion, for its log line.
+        trigger: DemoteTrigger,
     },
     /// Caller has accepted the demote: a file-serve task has been spawned
     /// and is now responsible for the client. Subsequent iterations of the
@@ -2060,9 +2219,9 @@ impl<'a> ClientStatus<'a> {
 /// If the client disconnects mid-transfer, the function continues to drain `pipe_A` and
 /// write to the cache file so concurrent hyper clients can still complete.
 ///
-/// If the client send rate drops below the configured minimum, remaining bytes are
-/// drained and the client is left in `ClientStatus::DemoteRequested` so the
-/// caller ([`BodyTransfer::maybe_demote`]) can either promote it to
+/// If the client send rate drops below the configured minimum or the
+/// [`DemotionFloor`], remaining bytes are drained and the client is left in
+/// `ClientStatus::DemoteRequested` so the caller ([`BodyTransfer::maybe_demote`]) can either promote it to
 /// `ClientStatus::Demoted` (spawn a file-serve task) or abort the splice with
 /// an upstream-rate timeout when the upstream is the actual bottleneck.
 async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), DownloadFailure> {
@@ -2143,32 +2302,28 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), D
                         break;
                     }
                     Ok(n) => {
-                        xfer.note_client_bytes(n);
-                        if let Some(rc) = &mut xfer.client_rate_checker {
-                            rc.add(n);
-                            if rc.check_fail().is_some() {
-                                // Client RC tripped — drain remaining teed bytes
-                                // (cache already has them) and hand off to the
-                                // caller. The outer loop decides whether to
-                                // actually demote or to abort the splice on
-                                // upstream-rate failure (slow upstream is the
-                                // most common reason the client RC also trips).
-                                // The pipe owner already accounted the successful client splice,
-                                // so it discards only the remaining duplicated head.
-                                xfer.cache
-                                    .pipes_mut()
-                                    .discard_duplicate()
-                                    .await
-                                    .map_err(internal_io)?;
+                        if let Some(trigger) = xfer.note_client_bytes(n) {
+                            // A client checker tripped — drain remaining teed
+                            // bytes (cache already has them) and hand off to
+                            // the caller. The outer loop decides whether to
+                            // actually demote or to abort the splice on
+                            // upstream-rate failure (slow upstream is the
+                            // most common reason the client RC also trips).
+                            // The pipe owner already accounted the successful client splice,
+                            // so it discards only the remaining duplicated head.
+                            xfer.cache
+                                .pipes_mut()
+                                .discard_duplicate()
+                                .await
+                                .map_err(internal_io)?;
 
-                                // The file-serve task the caller may spawn
-                                // takes over from `client_file_pos` by reading
-                                // the partial file, so every byte delivered so
-                                // far has to be on disk first.
-                                xfer.flush_cache().await?;
-                                xfer.request_demote(client);
-                                break;
-                            }
+                            // The file-serve task the caller may spawn
+                            // takes over from `client_file_pos` by reading
+                            // the partial file, so every byte delivered so
+                            // far has to be on disk first.
+                            xfer.flush_cache().await?;
+                            xfer.request_demote(client, trigger);
+                            break;
                         }
 
                         continue;
@@ -2735,7 +2890,7 @@ mod tests {
             origin_fields: None,
         };
         let origination = active.originate_uncapped(details.key());
-        let length = ContentLength::Exact(std::num::NonZero::new(1024 * 1024).unwrap());
+        let length = ContentLength::Exact(NonZero::new(1024 * 1024).unwrap());
         let quota = CacheQuota::new(0, None)
             .try_acquire(length, 0, None, "writer.deb")
             .ok()
@@ -2869,13 +3024,17 @@ mod tests {
             &filter,
             &scratch.path,
             1,
+            None,
             &config,
         );
         assert!(matches!(xfer.client_status, ClientStatus::Active(_)));
         assert_eq!(xfer.note_chunk(1), 0..1);
         assert!(xfer.check_upstream_rate().is_err(), "the window is armed");
 
-        xfer.request_demote(&client);
+        let mut starved = RateChecker::with_timeframe(nonzero!(1_000_000), nonzero!(1));
+        starved.add(0);
+        let trigger = DemoteTrigger::MinRate(starved.check_fail().expect("0 B in a 1 s window"));
+        xfer.request_demote(&client, trigger);
         let err = xfer
             .maybe_demote()
             .expect_err("a starved upstream must win over the demote");
@@ -2890,6 +3049,7 @@ mod tests {
                     client: _,
                     client_file_pos: 0,
                     client_remaining: 1,
+                    trigger: DemoteTrigger::MinRate(_),
                 }
             ),
             "no file-serve task may have been spawned"
@@ -2909,6 +3069,117 @@ mod tests {
             "an unadjudicated demote is a short response"
         );
         assert_eq!(outcome.client_bytes, 0);
+    }
+
+    /// The floor exists only with a known peak, and only where it sits above
+    /// `min_download_rate`; a disabled `min_download_rate` leaves it armed.
+    #[test]
+    fn demotion_floor_needs_a_peak_above_the_minimum_rate() {
+        use crate::nonzero;
+
+        let mut config = crate::config::Config::default();
+        config.min_download_rate = Some(nonzero!(10_000));
+        let peak = |rate: u64| NonZero::new(rate);
+        assert!(DemotionFloor::new(None, &config).is_none(), "no reference");
+        assert!(
+            DemotionFloor::new(peak(7), &config).is_none(),
+            "a peak below the divisor makes no floor"
+        );
+        assert!(
+            DemotionFloor::new(peak(80_000), &config).is_none(),
+            "a floor at min_download_rate adds nothing"
+        );
+        assert!(DemotionFloor::new(peak(80_008), &config).is_some());
+        config.min_download_rate = None;
+        assert!(DemotionFloor::new(peak(8), &config).is_some());
+    }
+
+    /// Both client checkers see every delivered byte; the floor asks for a
+    /// demotion on its own, and `min_download_rate` names the trigger when
+    /// both trip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_bytes_feed_the_demotion_floor() {
+        use crate::nonzero;
+
+        let scratch = ScratchFile::new();
+        let mut barrier = cache_barrier(&scratch.path).await;
+        let mut writer = CacheWriter::new(
+            scratch.file,
+            0,
+            CacheWriteMode::Kernel,
+            &barrier,
+            &scratch.path,
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (client, _) = listener.accept().await.unwrap();
+
+        // One-second windows.
+        let mut config = crate::config::Config::default();
+        config.min_download_rate = Some(nonzero!(1_000));
+        config.rate_check_timeframe = nonzero!(1);
+        let filter = SpliceRangeFilter {
+            skip: 0,
+            send: 4_000,
+        };
+        let mut xfer = BodyTransfer::new(
+            BodyClient::Attached(&client, local_client()),
+            &mut writer,
+            &mut barrier,
+            &filter,
+            &scratch.path,
+            4_000,
+            NonZero::new(8 * 1_000_000),
+            &config,
+        );
+        assert!(
+            xfer.note_client_bytes(2_000).is_none(),
+            "no floor verdict before a full window has elapsed"
+        );
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let trigger = xfer
+            .note_client_bytes(2_000)
+            .expect("2 kB/s is below the 1 MB/s floor");
+        assert!(
+            matches!(trigger, DemoteTrigger::Floor { rate, peak }
+                if rate.transferred == 2_000
+                    && rate.min_rate.get() == 1_000_000
+                    && peak.get() == 8_000_000),
+            "the floor alone trips: {trigger:?}"
+        );
+        assert_eq!(
+            trigger.to_string(),
+            "the client read 2.00kB/s over the last 1.00s, below the demotion floor of 1.00MB/s (1/8 of the mirror's peak throughput of 8.00MB/s)"
+        );
+        drop(xfer);
+
+        let mut xfer = BodyTransfer::new(
+            BodyClient::Attached(&client, local_client()),
+            &mut writer,
+            &mut barrier,
+            &filter,
+            &scratch.path,
+            4_000,
+            NonZero::new(8 * 1_000_000),
+            &config,
+        );
+        let trigger = xfer
+            .note_client_bytes(500)
+            .expect("500 B/s is below both checkers");
+        assert!(
+            matches!(trigger, DemoteTrigger::MinRate(rate) if rate.transferred == 500),
+            "min_download_rate wins: {trigger:?}"
+        );
+        assert!(
+            xfer.demotion_floor
+                .as_ref()
+                .is_some_and(|floor| floor.checker.check_fail().is_some()),
+            "the floor saw the same bytes"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2934,6 +3205,7 @@ mod tests {
             &filter,
             &scratch.path,
             1,
+            None,
             &crate::config::Config::default(),
         );
         xfer.cache.pipes = Some(SplicePipes::new().unwrap());

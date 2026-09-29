@@ -1383,12 +1383,19 @@ struct BodyTransferred {
 /// which also passes a zero-length `range_plan` so the loops run cache-only,
 /// and [`BodyClient::Aborted`] when the prefix write already failed;
 /// `consequence` follows the same split, ending the reported failure's line.
+/// `mirror_peak` is the mirror's peak throughput, the reference of an
+/// attached client's demotion floor (`body::DemotionFloor`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the drive's per-download state, each owned elsewhere"
+)]
 async fn transfer_body(
     upstream: &mut ResponseBody,
     client: BodyClient<'_>,
     target: CacheTarget,
     splice_count: u64,
     range_plan: &ServeParams,
+    mirror_peak: Option<NonZero<u64>>,
     rates: &mut RateTimestamps,
     consequence: Consequence,
 ) -> Result<BodyTransferred, ReportedDownloadFailure> {
@@ -1441,6 +1448,7 @@ async fn transfer_body(
                 &range_filter,
                 &temppath,
                 splice_count,
+                mirror_peak,
                 global_config(),
             );
             if let Some(tcp) = upstream.zero_copy() {
@@ -1861,6 +1869,7 @@ async fn splice_proxy_drive(
         target,
         splice_count,
         &range_plan,
+        mirror_perf::peak_throughput(&conn_details.mirror),
         &mut rates,
         Consequence::CloseConnection,
     )

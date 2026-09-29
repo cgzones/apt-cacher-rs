@@ -62,6 +62,14 @@ impl<T: Default + Clone + Twin> MirrorRegistry<T> {
         }
     }
 
+    /// `mirror`'s own state (its twin not merged in), `None` while it is
+    /// untracked.
+    #[cfg(feature = "splice")]
+    #[must_use]
+    pub(crate) fn get(&self, mirror: &Mirror) -> Option<T> {
+        self.map.lock().get(mirror).cloned()
+    }
+
     /// Every tracked mirror's state keyed by its `host[:port]/path`
     /// rendering, twins merged, for one dashboard render.
     #[must_use]
@@ -123,6 +131,20 @@ mod tests {
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.get("a.example/debian"), Some(&Tally(2)));
         assert_eq!(snapshot.get("b.example/ubuntu"), Some(&Tally(5)));
+    }
+
+    /// A lookup reads one exact identity: the twin stays out of it.
+    #[cfg(feature = "splice")]
+    #[test]
+    fn get_reads_one_identity() {
+        let registry = MirrorRegistry::<Tally>::new(8);
+        let structured = mirror("a.example", "repo", MirrorKind::Structured);
+        let flat = mirror("a.example", "repo", MirrorKind::Flat);
+        assert_eq!(registry.get(&structured), None);
+        registry.update(&structured, |t| t.0 += 1);
+        registry.update(&flat, |t| t.0 += 2);
+        assert_eq!(registry.get(&structured), Some(Tally(1)));
+        assert_eq!(registry.get(&flat), Some(Tally(2)));
     }
 
     /// A mirror's flat and structured requests are two keys but one row.

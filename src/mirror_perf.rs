@@ -25,6 +25,13 @@
 //! to the client until demotion, and hyper's figure includes its buffered
 //! cache writes.
 //!
+//! The peak throughput is also splice's demotion-floor reference
+//! ([`peak_throughput`], read by `splice/body.rs`'s `DemotionFloor`): what
+//! the mirror has shown it can deliver, independent of the transfer a slow
+//! client paces. Only the peak serves there, never the latest sample: a
+//! slow client's own paced download records a low latest figure, while no
+//! download can lower the peak.
+//!
 //! Stored in a [`MirrorRegistry`] keyed by the canonical mirror: one short
 //! lock per answered fetch, no allocation after a mirror's first sighting.
 
@@ -150,6 +157,16 @@ pub(crate) fn record_throughput(mirror: &Mirror, wire_bytes: u64, window: Durati
         let at = now_ticks();
         PERF.update(mirror, |perf| perf.record_rate(rate, at));
     }
+}
+
+/// The fastest download recorded from `mirror` (canonical, its twin not
+/// merged in), bytes per second; `None` before its first recorded
+/// throughput.
+#[cfg(feature = "splice")]
+#[must_use]
+pub(crate) fn peak_throughput(mirror: &Mirror) -> Option<std::num::NonZero<u64>> {
+    PERF.get(mirror)
+        .and_then(|perf| std::num::NonZero::new(perf.rate_peak))
 }
 
 /// Every tracked mirror's figures, keyed by its `host[:port]/path`, for one

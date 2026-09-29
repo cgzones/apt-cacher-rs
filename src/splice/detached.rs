@@ -125,6 +125,7 @@ impl DetachedDownload {
             target,
             splice_count,
             &NO_CLIENT_RANGE,
+            None,
             &mut rates,
             Consequence::Abandon,
         )
