@@ -55,6 +55,20 @@ fn duration_as_secs_i64(d: Duration) -> Result<i64, Error> {
         .map_err(|err: TryFromIntError| Error::InvalidArgument(err.to_string()))
 }
 
+/// Whether a stored path field is `/`-joined segments none of which is
+/// empty, `.`, `..` or holds a control byte: what every row written through
+/// the request validators satisfies, and what a path joined below the cache
+/// root must.
+#[must_use]
+fn is_plain_relative_path(path: &str) -> bool {
+    path.split('/').all(|segment| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && !segment.bytes().any(|b| b.is_ascii_control())
+    })
+}
+
 /// Conservative upper bound on the number of bind parameters allowed in a
 /// single `SQLite` statement.
 ///
@@ -1213,8 +1227,13 @@ impl Database {
     }
 
     /// Remove mirrors whose `host` no longer parses through
-    /// `DomainName::new` or whose `kind` is outside the [`MirrorKind`]
-    /// invariant.  Cascade to origins/downloads/deliveries.
+    /// `DomainName::new`, whose `kind` is outside the [`MirrorKind`]
+    /// invariant or whose `path` is not a plain relative path
+    /// ([`is_plain_relative_path`]).  Cascade to origins/downloads/deliveries.
+    /// Origins whose distribution, component or architecture is not one
+    /// either go too: those fields and the mirror path become directories
+    /// below the cache root that cleanup walks and sweeps, so a `..` in a
+    /// corrupted or hand-edited row would point it outside the cache.
     ///
     /// The host check uses `DomainName::new` (not `ConfigDomainName::new`) so
     /// the row set this function purges is exactly the set of rows
@@ -1231,7 +1250,15 @@ impl Database {
         struct MirrorRow {
             id: i64,
             host: String,
+            path: String,
             kind: i64,
+        }
+
+        struct OriginRow {
+            id: i64,
+            distribution: String,
+            component: String,
+            architecture: String,
         }
 
         let mut tx = self.conn.begin().await?;
@@ -1253,9 +1280,40 @@ impl Database {
             );
         }
 
+        // Origin fields become cache paths and cleanup's index URLs; only a
+        // corrupted or hand-edited database holds a traversal segment in one.
+        let origins = query_as!(
+            OriginRow,
+            r#"SELECT id AS "id!: i64", distribution, component, architecture FROM origins;"#
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        for origin in origins {
+            if [
+                &origin.distribution,
+                &origin.component,
+                &origin.architecture,
+            ]
+            .into_iter()
+            .all(|field| is_plain_relative_path(field))
+            {
+                continue;
+            }
+            warn!(
+                "Removing origin id={} with a path-unsafe field (distribution `{}`, component `{}`, architecture `{}`)",
+                origin.id,
+                origin.distribution.escape_debug(),
+                origin.component.escape_debug(),
+                origin.architecture.escape_debug()
+            );
+            query!(r"DELETE FROM origins WHERE id = ?;", origin.id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
         let mirrors = query_as!(
             MirrorRow,
-            r#"SELECT id AS "id!: i64", host, kind AS "kind!: i64" FROM mirrors_v2;"#
+            r#"SELECT id AS "id!: i64", host, path, kind AS "kind!: i64" FROM mirrors_v2;"#
         )
         .fetch_all(&mut *tx)
         .await?;
@@ -1263,8 +1321,11 @@ impl Database {
         for mirror in mirrors {
             let bad_host = DomainName::new(&mirror.host).is_err();
             let bad_kind = MirrorKind::from_db_int(mirror.kind).is_none();
+            // The path becomes directories below the cache root that cleanup
+            // walks and sweeps.
+            let bad_path = !is_plain_relative_path(&mirror.path);
 
-            if !bad_host && !bad_kind {
+            if !bad_host && !bad_kind && !bad_path {
                 continue;
             }
 
@@ -1281,6 +1342,14 @@ impl Database {
                     mirror.id,
                     mirror.host.escape_debug(),
                     mirror.kind
+                );
+            }
+            if bad_path {
+                warn!(
+                    "Removing mirror id={} (host `{}`) with the path-unsafe path `{}`",
+                    mirror.id,
+                    mirror.host.escape_debug(),
+                    mirror.path.escape_debug()
                 );
             }
 
@@ -1528,6 +1597,28 @@ impl Database {
         .await
         .expect("insert mirror");
         sqlx::Row::get(&row, 0)
+    }
+}
+
+#[cfg(test)]
+mod path_check_tests {
+    use super::is_plain_relative_path;
+
+    #[test]
+    fn only_plain_relative_paths_pass() {
+        for ok in [
+            "debian",
+            "private/debian",
+            "bookworm/updates",
+            "binary-amd64",
+        ] {
+            assert!(is_plain_relative_path(ok), "{ok}");
+        }
+        for bad in [
+            "", "/debian", "debian/", "a//b", ".", "..", "../x", "a/../b", "a/.", "a\nb",
+        ] {
+            assert!(!is_plain_relative_path(bad), "{bad:?}");
+        }
     }
 }
 

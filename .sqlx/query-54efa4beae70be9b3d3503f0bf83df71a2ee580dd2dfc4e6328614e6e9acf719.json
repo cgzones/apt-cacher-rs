@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id AS \"id!: i64\", host, kind AS \"kind!: i64\" FROM mirrors_v2;",
+  "query": "SELECT id AS \"id!: i64\", host, path, kind AS \"kind!: i64\" FROM mirrors_v2;",
   "describe": {
     "columns": [
       {
@@ -26,8 +26,19 @@
         }
       },
       {
-        "name": "kind!: i64",
+        "name": "path",
         "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mirrors_v2",
+            "name": "path"
+          }
+        }
+      },
+      {
+        "name": "kind!: i64",
+        "ordinal": 3,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -43,8 +54,9 @@
     "nullable": [
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "065ed29beeda22c4f962b818fbf4fb6c8ee29e408404f0c78968d110298c7c37"
+  "hash": "54efa4beae70be9b3d3503f0bf83df71a2ee580dd2dfc4e6328614e6e9acf719"
 }

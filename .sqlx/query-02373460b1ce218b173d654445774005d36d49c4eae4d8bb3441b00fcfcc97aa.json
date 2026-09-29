@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id AS \"id!: i64\", distribution, component, architecture FROM origins;",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: i64",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "origins",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "distribution",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "origins",
+            "name": "distribution"
+          }
+        }
+      },
+      {
+        "name": "component",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "origins",
+            "name": "component"
+          }
+        }
+      },
+      {
+        "name": "architecture",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "origins",
+            "name": "architecture"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "02373460b1ce218b173d654445774005d36d49c4eae4d8bb3441b00fcfcc97aa"
+}

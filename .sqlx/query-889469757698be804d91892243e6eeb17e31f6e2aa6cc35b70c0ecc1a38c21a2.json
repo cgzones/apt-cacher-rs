@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM origins WHERE id = ?;",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "889469757698be804d91892243e6eeb17e31f6e2aa6cc35b70c0ecc1a38c21a2"
+}
