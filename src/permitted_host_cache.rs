@@ -12,8 +12,11 @@ use crate::{
     warn_once_or_info,
 };
 
+/// Whether `allowed_mirrors` permits `requested_host`, uncached: for the
+/// few hosts the daemon contacts on its own (the scheme-cache warm-up), where
+/// the host comes from the database, not a request.
 #[must_use]
-fn is_host_allowed(requested_host: &DomainName) -> bool {
+pub(crate) fn is_host_allowed(requested_host: &DomainName) -> bool {
     global_config()
         .allowed_mirrors
         .iter()
