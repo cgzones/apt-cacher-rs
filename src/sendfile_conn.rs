@@ -476,13 +476,8 @@ async fn read_request_headers(
     stream: &TcpStream,
     buf: &mut BytesMut,
 ) -> std::io::Result<Option<usize>> {
-    /// Drop the leading empty lines, then look for the end of the head.
-    fn header_end(buf: &mut BytesMut) -> Option<usize> {
-        buf.advance(leading_empty_lines(buf));
-        find_header_end(buf)
-    }
-
-    if let Some(next_index) = header_end(buf) {
+    let mut scanned = 0;
+    if let Some(next_index) = resume_header_end(buf, &mut scanned) {
         return Ok(Some(next_index));
     }
 
@@ -512,7 +507,7 @@ async fn read_request_headers(
                         ));
                     }
                     Ok(n) => {
-                        if let Some(next_index) = header_end(buf) {
+                        if let Some(next_index) = resume_header_end(buf, &mut scanned) {
                             trace!("Read {n} bytes from client, found header end at {next_index}");
                             return Ok(Some(next_index));
                         }
@@ -546,6 +541,22 @@ async fn read_request_headers(
             }
         }
     }
+}
+
+/// Drop the leading empty lines from `buf`, then look for the end of the
+/// head, resuming where the previous call on the same head stopped:
+/// `scanned` is the length of `buf` that call found no terminator in (`0`
+/// for the first). Rescanning from the start on every read would make a
+/// client that dribbles its head one byte per segment cost time quadratic in
+/// the head size.
+fn resume_header_end(buf: &mut BytesMut, scanned: &mut usize) -> Option<usize> {
+    let skipped = leading_empty_lines(buf);
+    buf.advance(skipped);
+    // A terminator is up to three bytes (`LF CR LF`), so one starting in the
+    // last two bytes scanned may have been cut short then.
+    let from = scanned.saturating_sub(skipped).saturating_sub(2);
+    *scanned = buf.len();
+    find_header_end(&buf[from..]).map(|end| from + end)
 }
 
 /// Log a failed write of a proxy-generated response to the client, taking the
@@ -2884,6 +2895,52 @@ mod transfer_tests {
             "retain the partial delivery progress: {transferred}"
         );
         assert!(!failure.is_peer_disconnect());
+    }
+}
+
+/// The resumed head scan finds the terminator the one-shot scan over the
+/// whole (empty-line-stripped) buffer does, however the bytes arrive.
+#[cfg(test)]
+mod header_end_tests {
+    use bytes::BytesMut;
+
+    use super::resume_header_end;
+    use crate::http_helpers::{find_header_end, leading_empty_lines};
+
+    #[test]
+    fn a_resumed_scan_matches_a_full_scan_for_every_split() {
+        let heads: [&[u8]; 6] = [
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET /next",
+            b"GET / HTTP/1.1\nHost: a\n\nrest",
+            b"GET / HTTP/1.1\nHost: a\n\r\n",
+            b"\r\n\nGET / HTTP/1.1\r\n\r\n",
+            b"\r\r\nGET / HTTP/1.1\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a\r\n",
+        ];
+        for head in heads {
+            let mut whole = BytesMut::from(head);
+            let skipped = leading_empty_lines(&whole);
+            bytes::Buf::advance(&mut whole, skipped);
+            let expected = find_header_end(&whole);
+            for chunk in 1..=head.len() {
+                let mut buf = BytesMut::new();
+                let mut scanned = 0;
+                let mut found = None;
+                for piece in head.chunks(chunk) {
+                    buf.extend_from_slice(piece);
+                    found = resume_header_end(&mut buf, &mut scanned);
+                    if found.is_some() {
+                        break;
+                    }
+                }
+                assert_eq!(found, expected, "{head:?} in chunks of {chunk}");
+                assert_eq!(
+                    &buf[..],
+                    &whole[..buf.len()],
+                    "{head:?} in chunks of {chunk}"
+                );
+            }
+        }
     }
 }
 
