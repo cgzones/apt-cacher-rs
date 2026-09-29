@@ -823,9 +823,11 @@ pub(crate) static HTTP_TIMEOUT_CLIENT_HEADER: Counter = Counter::new();
 ///
 /// Scope: response-body writes via `write_all_to_stream(.., WritePhase::Body)`,
 /// every rated-write helper (`write_all_to_stream_rated{,_counted}`,
-/// `wait_socket_rated`), and the sendfile chunk loop. Hyper's internal-timer
-/// body delivery is not routed through these helpers and is not counted
-/// here. Header-write timeouts are tracked separately in
+/// `wait_socket_rated`), the sendfile chunk loop, and a hyper-served
+/// connection or a CONNECT tunnel ended by `write_stall::WriteStallTimeout`
+/// (which cannot tell a stalled head write from a body write, so counts both
+/// here). The other
+/// header-write timeouts are tracked separately in
 /// `HTTP_TIMEOUT_CLIENT_HEADER_WRITE`.
 pub(crate) static HTTP_TIMEOUT_CLIENT_BODY: Signal = Signal::new();
 /// HTTP timeout firings: client failed to drain a response-header (or other

@@ -591,15 +591,15 @@ fn build_client_delivery_group(g: &mut Groups, shown: Shown) {
             "Clients that hung up before the response body was complete. Not highlighted: apt closes connections it no longer needs. In the hyper backend any peer disconnect during a request counts. The Clients table names the clients.",
             metrics::CLIENT_DISCONNECTED_MID_BODY.get(),
         );
+        t.signal(
+            "Timeouts (client body write)",
+            "Deliveries aborted because the client accepted no body bytes for http_timeout: a stalled client or a dropped link. The Clients table names the client.",
+            Level::Warn,
+            &metrics::HTTP_TIMEOUT_CLIENT_BODY,
+        );
         if SENDFILE {
-            // Only the sendfile and splice writers run a timer of their own;
-            // hyper's deliveries time out inside hyper, uncounted.
-            t.signal(
-                "Timeouts (client body write)",
-                "Sendfile and splice deliveries aborted because the client accepted no body bytes for http_timeout: a stalled client or a dropped link. The Clients table names the client.",
-                Level::Warn,
-                &metrics::HTTP_TIMEOUT_CLIENT_BODY,
-            );
+            // Only the sendfile and splice writers tell a head write from a
+            // body write; hyper's stalls count as body writes.
             t.count_tip(
                 "Timeouts (client header write)",
                 "Response heads or small proxy-generated responses the client did not accept within http_timeout (sendfile and splice writes).",

@@ -106,6 +106,7 @@ mod uri_authority;
 mod verified_marker;
 mod verify_throttle;
 mod web;
+mod write_stall;
 mod xattr_helpers;
 mod xz_stream;
 

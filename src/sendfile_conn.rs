@@ -103,6 +103,7 @@ use crate::{
     upstream_head::ContentLength,
     warn_once, warn_once_or_debug, warn_once_or_info,
     web::{WebResponse, serve_web_interface},
+    write_stall::WriteStallTimeout,
 };
 
 /// Maximum size for HTTP request headers buffer (matches hyper's default of 8192).
@@ -991,8 +992,10 @@ async fn run_connect_tunnel(
     }
 
     let start = PreciseInstant::now();
+    // Bounded like a hyper-run tunnel: a client that keeps sending but stops
+    // reading never looks idle to the relay's watchdog.
     let mut outcome = copy_bidirectional_idle(
-        stream,
+        WriteStallTimeout::new(stream, config.http_timeout),
         &mut upstream,
         config.buffer_size,
         config.client_idle_timeout,

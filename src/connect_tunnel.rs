@@ -43,6 +43,7 @@ use crate::{
     error::{ErrorReport, is_peer_disconnect},
     humanfmt::HumanFmt,
     limits, metrics, uri_authority, warn_once_or_info,
+    write_stall::is_client_write_stall,
 };
 
 /// A CONNECT target that passed [`validate_connect_target`]: a permitted
@@ -291,9 +292,18 @@ pub(crate) fn report_tunnel_outcome(
         }
         Err(TunnelCopyError::Io(err)) => {
             metrics::TUNNEL_TRANSFER_FAILED.increment();
-            // OS-level `ETIMEDOUT` (TCP keepalive / `TCP_USER_TIMEOUT`) is a
-            // network condition, not a code error; log at info.
-            if err.kind() == ErrorKind::TimedOut {
+            if is_client_write_stall(err) {
+                // The client stopped reading (`WriteStallTimeout`): counted
+                // like a stalled body write of either backend.
+                metrics::HTTP_TIMEOUT_CLIENT_BODY.increment();
+                client_trouble::record(client, Trouble::Slow);
+                info!(
+                    "Tunnel for client {client} to {target} stalled; closing the tunnel:  {}",
+                    ErrorReport(err)
+                );
+            } else if err.kind() == ErrorKind::TimedOut {
+                // OS-level `ETIMEDOUT` (TCP keepalive / `TCP_USER_TIMEOUT`)
+                // is a network condition, not a code error; log at info.
                 info!(
                     "Tunnel for client {client} to {target} timed out:  {}",
                     ErrorReport(err)

@@ -33,6 +33,8 @@ use hyper_util::{client::legacy::connect::HttpConnector, rt::tokio::TokioIo};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tracing::{debug, error, info, trace, warn};
 
+use crate::write_stall::WriteStallTimeout;
+
 use crate::{
     AppState, Never, Scheme,
     accounted_body::{AccountedBody, Subject},
@@ -2712,7 +2714,10 @@ async fn tunnel(
     let upgraded = TokioIo::new(upgraded);
 
     /* Proxying data */
-    // not rate-checked; idle-bounded by `client_idle_timeout`
+    // Not rate-checked; ended by `client_idle_timeout` without traffic
+    // either way, and -- `upgraded` still being the connection's
+    // `WriteStallTimeout` stream -- by a client that accepts no byte for
+    // `http_timeout` (`report_tunnel_outcome` counts it).
     let outcome = copy_bidirectional_idle(
         upgraded,
         &mut server,
@@ -3409,7 +3414,7 @@ pub(crate) async fn handle_hyper_connection<T>(
 
     if let Err(err) = client_http1_builder()
         .serve_connection(
-            TokioIo::new(stream),
+            TokioIo::new(WriteStallTimeout::new(stream, global_config().http_timeout)),
             service_fn(move |req| {
                 pre_process_client_request_wrapper(
                     client,
@@ -3495,7 +3500,10 @@ where
         })
     };
 
-    let mut conn = client_http1_builder().serve_connection(TokioIo::new(stream), service);
+    let mut conn = client_http1_builder().serve_connection(
+        TokioIo::new(WriteStallTimeout::new(stream, global_config().http_timeout)),
+        service,
+    );
     // Every response gets the shutdown, not only one handed back: hyper takes
     // keep-alive from the HTTP/1.1 request, so after a response the handoff
     // will not hand back (an HTTP/1.0 one with a length) it can go idle on
@@ -3520,7 +3528,7 @@ where
     }
     let parts = conn.into_parts();
     let read_buf = parts.read_buf;
-    let mut stream = parts.io.into_inner();
+    let mut stream = parts.io.into_inner().into_inner();
     if shutting_down && keep_alive.get() == Some(&true) {
         return Some((stream, read_buf));
     }
@@ -3565,15 +3573,8 @@ fn response_keeps_alive(response: &Response<ProxyCacheBody>) -> bool {
 /// Log how a hyper-served client connection ended in error.
 fn log_client_connection_error(client: ClientInfo, err: &hyper::Error) {
     #[must_use]
-    fn hyper_is_peer_disconnect(err: &hyper::Error) -> bool {
-        if let Some(err) = std::error::Error::source(&err)
-            && let Some(ioerr) = err.downcast_ref::<std::io::Error>()
-            && is_peer_disconnect(ioerr)
-        {
-            return true;
-        }
-
-        false
+    fn hyper_io_error(err: &hyper::Error) -> Option<&std::io::Error> {
+        std::error::Error::source(err).and_then(|err| err.downcast_ref::<std::io::Error>())
     }
 
     if let Some(failure) = accounted_body_failure(err) {
@@ -3581,7 +3582,7 @@ fn log_client_connection_error(client: ClientInfo, err: &hyper::Error) {
             "Closing connection to client {client} after accounted body failure:  {}",
             ErrorReport(failure)
         );
-    } else if err.is_incomplete_message() || hyper_is_peer_disconnect(err) {
+    } else if err.is_incomplete_message() || hyper_io_error(err).is_some_and(is_peer_disconnect) {
         // Hyper does not expose per-frame write errors, so we cannot
         // tell whether the disconnect happened mid-body, between
         // pipelined requests, or before any response was started. Bump
@@ -3594,6 +3595,17 @@ fn log_client_connection_error(client: ClientInfo, err: &hyper::Error) {
         client_trouble::record(&client, Trouble::Disconnect);
         info!(
             "Connection to client {client} disconnected:  {}",
+            ErrorReport(err)
+        );
+    } else if hyper_io_error(err).is_some_and(|ioerr| ioerr.kind() == std::io::ErrorKind::TimedOut)
+    {
+        // `WriteStallTimeout`: the client stopped reading. Counted like the
+        // sendfile backend's stalled body write, though a stalled head
+        // write lands here too: hyper does not say which it was writing.
+        metrics::HTTP_TIMEOUT_CLIENT_BODY.increment();
+        client_trouble::record(&client, Trouble::Slow);
+        info!(
+            "Connection to client {client} timed out; closing the connection:  {}",
             ErrorReport(err)
         );
     } else if err.is_timeout() {
