@@ -502,7 +502,7 @@ fn build_refusals_group(g: &mut Groups, shown: Shown) {
         );
         t.count_tip(
             "Authorization Rejected (mirror)",
-            "Requests refused because the requested mirror is outside allowed_mirrors. The Clients table names the client; add the mirror, or fix the client's sources.",
+            "Requests refused because the requested mirror is outside allowed_mirrors, or its port outside allowed_mirror_ports. The Clients table names the client; add the mirror, or fix the client's sources.",
             metrics::AUTHZ_REJECTED_MIRROR.get(),
         );
         t.count_tip(

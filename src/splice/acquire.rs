@@ -26,7 +26,7 @@ use crate::upstream_retry::RetryStop;
 use crate::uri_authority;
 use crate::{
     Scheme, global_config, log_once, metrics,
-    permitted_host_cache::{HostReject, permitted_host},
+    permitted_host_cache::{HostReject, permitted_host, permitted_port},
     scheme_cache, upstream_retry, warn_once_or_info,
 };
 
@@ -490,6 +490,13 @@ pub(super) async fn follow_redirect(
             return Ok((exchange, None));
         }
     };
+
+    if !permitted_port(moved_port, redirect_scheme == Scheme::Https) {
+        debug!(
+            "splice proxy: {status} redirect target `{moved_uri}` names a port outside allowed_mirror_ports, not following"
+        );
+        return Ok((exchange, None));
+    }
 
     // Reject self-redirects: if the target (host, port, path) matches the request
     // we just made, following it would just repeat the same request and create

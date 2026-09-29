@@ -991,6 +991,14 @@ pub(crate) struct Config {
     /// List of allowed mirrors.
     pub(crate) allowed_mirrors: Vec<ConfigDomainName>,
 
+    /// Ports a proxied request or a followed redirect may name on an
+    /// allowed mirror; an absent port is its scheme's default. Like
+    /// [`Self::https_tunnel_allowed_ports`] and for the same reason this
+    /// list is **fail-open** (empty permits every port), which `validate`
+    /// warns about. Without it, listing a host would expose every HTTP
+    /// service on it (`http://localhost:9200/`) to the proxy's clients.
+    pub(crate) allowed_mirror_ports: Vec<NonZero<u16>>,
+
     /// List of mirrors supporting only http.
     pub(crate) http_only_mirrors: Vec<ConfigDomainName>,
 
@@ -1183,6 +1191,7 @@ impl Default for Config {
             usage_retention_days: Some(nonzero!(30)),
             aliases: Vec::new(),
             allowed_mirrors: Vec::new(),
+            allowed_mirror_ports: vec![nonzero!(80), nonzero!(443)],
             http_only_mirrors: Vec::new(),
             allowed_proxy_clients: Vec::new(),
             allowed_webif_clients: None,
@@ -1803,6 +1812,7 @@ impl Config {
             }
         }
 
+        self.allowed_mirror_ports.sort_unstable();
         self.https_tunnel_allowed_ports.sort_unstable();
         self.https_tunnel_allowed_mirrors.sort_unstable();
 
@@ -1884,6 +1894,29 @@ impl Config {
                         "{key} is set but has no effect while https_tunnel_enabled is false"
                     ));
                 }
+            }
+        }
+
+        if self.allowed_mirror_ports.is_empty() {
+            warnings.push(
+                "allowed_mirror_ports is empty, which permits requests to every port on an allowed mirror (unlike allowed_mirrors, where empty permits nothing); list the ports to restrict them"
+                    .to_string(),
+            );
+        } else if self
+            .allowed_mirror_ports
+            .binary_search(&nonzero!(443))
+            .is_err()
+        {
+            // An https upgrade of a mirror named without a port dials 443.
+            match self.https_upgrade_mode {
+                HttpsUpgradeMode::Always => invalid!(
+                    "Invalid allowed_mirror_ports: https_upgrade_mode is Always, which fetches a mirror named without a port over https on port 443, but 443 is not listed"
+                ),
+                HttpsUpgradeMode::Auto => warnings.push(
+                    "allowed_mirror_ports does not list 443, so mirrors named without a port are fetched over plain http although https_upgrade_mode is Auto; list 443 or set https_upgrade_mode to Never"
+                        .to_string(),
+                ),
+                HttpsUpgradeMode::Never => {}
             }
         }
 
@@ -3139,6 +3172,30 @@ mod test {
                 .iter()
                 .any(|w| w.contains("https_tunnel_allowed")),
             "a fully specified tunnel config must not warn: {restricted:?}"
+        );
+    }
+
+    #[test]
+    fn allowed_mirror_ports_without_443_conflicts_with_https_upgrade() {
+        let mut always =
+            Config::from_toml("allowed_mirror_ports = [80]\nhttps_upgrade_mode = 'Always'")
+                .expect("parses");
+        assert!(always.validate().is_err());
+        let no_443 = |w: &String| w.starts_with("allowed_mirror_ports does not list 443");
+        assert!(
+            warnings_for("allowed_mirror_ports = [80]")
+                .iter()
+                .any(no_443)
+        );
+        assert!(
+            !warnings_for("allowed_mirror_ports = [80]\nhttps_upgrade_mode = 'Never'")
+                .iter()
+                .any(no_443)
+        );
+        assert!(
+            !warnings_for("allowed_mirror_ports = [80, 443]")
+                .iter()
+                .any(no_443)
         );
     }
 

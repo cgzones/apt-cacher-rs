@@ -813,6 +813,7 @@ fn build_configuration_html(rd: &RuntimeDetails) -> String {
     );
     t.row("Log Buffer Capacity", rd.config.logstore_capacity);
     t.row("Allowed Mirrors", rd.config.allowed_mirrors.len());
+    t.row("Allowed Mirror Ports", rd.config.allowed_mirror_ports.len());
     t.row("HTTP-Only Mirrors", rd.config.http_only_mirrors.len());
     t.row(
         "Allowed Tunnel Ports",

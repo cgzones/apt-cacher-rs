@@ -991,7 +991,8 @@ pub(crate) static RECONCILE_BYTES_REPAIRED: Accumulator = Accumulator::new();
 /// subtract") — any non-zero is a bug signal.
 pub(crate) static CACHE_SIZE_CORRUPTION: Signal = Signal::new();
 
-/// Authorization rejection: client request denied by the mirror allowlist.
+/// Authorization rejection: client request denied by the mirror allowlist
+/// (`allowed_mirrors`, or `allowed_mirror_ports` for its port).
 pub(crate) static AUTHZ_REJECTED_MIRROR: Counter = Counter::new();
 /// Authorization rejection: client request denied by the client allowlist.
 pub(crate) static AUTHZ_REJECTED_CLIENT: Counter = Counter::new();

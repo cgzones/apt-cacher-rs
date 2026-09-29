@@ -26,6 +26,7 @@ use parking_lot::RwLock;
 use crate::config::{Config, DomainName, HttpsUpgradeMode};
 use crate::deb_mirror::Mirror;
 use crate::metrics;
+use crate::permitted_host_cache::port_permitted;
 use crate::uri_authority;
 
 /// Upstream URI scheme we support proxying.
@@ -255,8 +256,18 @@ impl SchemeDecision {
 
 /// The single scheme-decision truth table. Pure — no globals — so it is fully
 /// unit-testable (both backends' inline resolvers call `global_config()` and are
-/// not).
-fn decide(cached: Option<Scheme>, is_http_only: bool, mode: HttpsUpgradeMode) -> SchemeDecision {
+/// not). `https_permitted` is whether `allowed_mirror_ports` lets the mirror
+/// be dialled over https at all (see [`resolve`]); without it the mirror
+/// stays on http whatever was cached.
+fn decide(
+    cached: Option<Scheme>,
+    is_http_only: bool,
+    https_permitted: bool,
+    mode: HttpsUpgradeMode,
+) -> SchemeDecision {
+    if !https_permitted {
+        return SchemeDecision::Http;
+    }
     if let Some(cached) = cached {
         return match cached {
             Scheme::Http => SchemeDecision::Http,
@@ -309,11 +320,22 @@ pub(crate) const fn no_fallback_reason(mode: HttpsUpgradeMode) -> &'static str {
 /// Resolve the upstream scheme for `key` from the cache and config — the single
 /// entry point both backends use to decide HTTP vs HTTPS.
 pub(crate) fn resolve(key: SchemeKeyRef<'_>, config: &Config) -> SchemeDecision {
+    // An upgrade keeps an explicit port and dials 443 for a mirror named
+    // without one, which `allowed_mirror_ports` may refuse: such a mirror
+    // stays on http (`Config::validate` refuses `Always` in that case and
+    // warns under `Auto`). An explicit port was checked with the request.
+    let https_permitted =
+        key.port.is_some() || port_permitted(&config.allowed_mirror_ports, None, true);
     let cached = cached_scheme_at(key, Instant::now());
     // `decide` returns on `cached` before reading `is_http_only`; skip the
     // `http_only_mirrors` scan on a cache hit.
     let is_http_only = cached.is_none() && is_http_only(key, config);
-    decide(cached, is_http_only, config.https_upgrade_mode)
+    decide(
+        cached,
+        is_http_only,
+        https_permitted,
+        config.https_upgrade_mode,
+    )
 }
 
 /// A live cache entry, as the dashboard reads it: the scheme and, for a
@@ -666,6 +688,7 @@ mod tests {
             decide(
                 cached_scheme_at(host, expired),
                 false,
+                true,
                 HttpsUpgradeMode::Auto
             ),
             SchemeDecision::AutoUpgrade,
@@ -826,11 +849,11 @@ mod tests {
         ] {
             for http_only in [false, true] {
                 assert_eq!(
-                    decide(Some(Scheme::Http), http_only, mode),
+                    decide(Some(Scheme::Http), http_only, true, mode),
                     SchemeDecision::Http
                 );
                 assert_eq!(
-                    decide(Some(Scheme::Https), http_only, mode),
+                    decide(Some(Scheme::Https), http_only, true, mode),
                     SchemeDecision::Https
                 );
             }
@@ -844,14 +867,14 @@ mod tests {
             HttpsUpgradeMode::Auto,
             HttpsUpgradeMode::Always,
         ] {
-            assert_eq!(decide(None, true, mode), SchemeDecision::Http);
+            assert_eq!(decide(None, true, true, mode), SchemeDecision::Http);
         }
     }
 
     #[test]
     fn uncached_never_is_http() {
         assert_eq!(
-            decide(None, false, HttpsUpgradeMode::Never),
+            decide(None, false, true, HttpsUpgradeMode::Never),
             SchemeDecision::Http
         );
     }
@@ -859,7 +882,7 @@ mod tests {
     #[test]
     fn uncached_always_is_always_upgrade() {
         assert_eq!(
-            decide(None, false, HttpsUpgradeMode::Always),
+            decide(None, false, true, HttpsUpgradeMode::Always),
             SchemeDecision::AlwaysUpgrade
         );
     }
@@ -867,9 +890,24 @@ mod tests {
     #[test]
     fn uncached_auto_is_auto_upgrade() {
         assert_eq!(
-            decide(None, false, HttpsUpgradeMode::Auto),
+            decide(None, false, true, HttpsUpgradeMode::Auto),
             SchemeDecision::AutoUpgrade
         );
+    }
+
+    /// Without https permitted (443 outside `allowed_mirror_ports` for a
+    /// port-less mirror) the mirror stays on http, even with https cached.
+    #[test]
+    fn a_refused_https_port_keeps_the_mirror_on_http() {
+        for mode in [HttpsUpgradeMode::Auto, HttpsUpgradeMode::Always] {
+            for cached in [None, Some(Scheme::Https), Some(Scheme::Http)] {
+                assert_eq!(
+                    decide(cached, false, false, mode),
+                    SchemeDecision::Http,
+                    "{mode:?} {cached:?}"
+                );
+            }
+        }
     }
 
     #[test]

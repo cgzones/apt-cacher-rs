@@ -1143,7 +1143,7 @@ async fn try_sendfile_request(
         }
     };
 
-    let requested_host = match authorize_cache_access(&client, requested_host) {
+    let requested_host = match authorize_cache_access(&client, requested_host, requested_port) {
         Ok(rh) => rh,
         Err((status, msg)) => return ZeroCopyResult::Invalid { status, msg },
     };

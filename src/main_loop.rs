@@ -65,7 +65,7 @@ use crate::{
 #[cfg(feature = "hyper")]
 use crate::{
     build_info::{APP_USER_AGENT, APP_VIA},
-    permitted_host_cache::is_host_allowed,
+    permitted_host_cache::{is_host_allowed, permitted_port},
     scheme_cache,
 };
 
@@ -426,9 +426,12 @@ pub(crate) async fn main_loop(
                 }
             };
 
-            // A row outlives its host's removal from `allowed_mirrors` by up
-            // to the stale threshold; the daemon must not keep dialing it.
-            mirrors.retain(|mirror| is_host_allowed(&mirror.host));
+            // A row outlives its host's (or port's) removal from the
+            // allow-lists by up to the stale threshold; the daemon must not
+            // keep dialing it.
+            mirrors.retain(|mirror| {
+                is_host_allowed(&mirror.host) && permitted_port(mirror.port(), false)
+            });
             mirrors
                 .sort_unstable_by(|a, b| a.host.cmp(&b.host).then_with(|| a.port().cmp(&b.port())));
             mirrors.dedup_by(|a, b| a.host == b.host && a.port() == b.port());

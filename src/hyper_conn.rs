@@ -81,7 +81,7 @@ use crate::{
     parallel_hack::{NUDGE_BODY, log_nudge, nudge_head, should_nudge},
     partial_file::{self, TempPath},
     passthrough_limiter,
-    permitted_host_cache::{HostReject, authorize_cache_access, permitted_host},
+    permitted_host_cache::{HostReject, authorize_cache_access, permitted_host, permitted_port},
     precise_instant::PreciseInstant,
     proxy_body::{ProxyCacheBody, full_body, quick_response, quick_response_closing},
     rate_checked_body::{ClientBody, MaybeRated, RateCheckedBodyErr},
@@ -1772,10 +1772,19 @@ fn parse_redirect_location<B>(response: &Response<B>, source: &str, what: &str) 
     parsed
 }
 
+/// Whether `allowed_mirror_ports` permits the port of a redirect target
+/// that [`parse_redirect_location`] already validated.
+fn redirect_port_permitted(moved_uri: &Uri, moved_auth: &http::uri::Authority) -> bool {
+    uri_authority::port(moved_auth).is_ok_and(|port| {
+        permitted_port(port, moved_uri.scheme() == Some(&http::uri::Scheme::HTTPS))
+    })
+}
+
 /// Log why an upstream redirect was not followed, at the point where the
-/// follow conditions (absolute `http(s)` target naming a permitted host) have
-/// already failed.  Shared by the cache-fetch and the simple-proxy redirect
-/// handling so both name the same reason for the same `Location`.
+/// follow conditions (absolute `http(s)` target naming a permitted host and
+/// port) have already failed.  Shared by the cache-fetch and the
+/// simple-proxy redirect handling so both name the same reason for the same
+/// `Location`.
 fn log_unfollowed_redirect(moved_uri: &Uri) {
     if moved_uri.scheme().is_none() {
         // A relative Location (`/pool/...`) is legal per RFC 9110, but this
@@ -1796,7 +1805,10 @@ fn log_unfollowed_redirect(moved_uri: &Uri) {
                     moved_host.escape_debug()
                 );
             }
-            Ok(_) | Err(HostReject::Forbidden) => {
+            Ok(_) => {
+                debug!("Port of moved URI `{moved_uri}` not permitted by `allowed_mirror_ports`");
+            }
+            Err(HostReject::Forbidden) => {
                 debug!("Host `{moved_host}` of moved URI not permitted");
             }
         }
@@ -2191,6 +2203,7 @@ async fn serve_new_file_worker(
             *scheme == http::uri::Scheme::HTTP || *scheme == http::uri::Scheme::HTTPS
         }) && let Some(moved_auth) = moved_uri.authority()
             && permitted_host(moved_auth.host()).is_ok()
+            && redirect_port_permitted(&moved_uri, moved_auth)
         {
             // Derive the Host header from the redirect target so it matches
             // the URI we're actually sending the request to.
@@ -3113,7 +3126,7 @@ async fn pre_process_client_request(
 
         // Closing, like the sendfile backend: a refused proxy client must
         // not keep its connection slot by asking again.
-        let requested_host = match authorize_cache_access(&client, requested_host) {
+        let requested_host = match authorize_cache_access(&client, requested_host, requested_port) {
             Ok(rh) => rh,
             Err((status, msg)) => return quick_response_closing(status, msg),
         };
@@ -3249,6 +3262,7 @@ async fn pre_process_client_request(
             *scheme == http::uri::Scheme::HTTP || *scheme == http::uri::Scheme::HTTPS
         }) && let Some(moved_auth) = moved_uri.authority()
             && permitted_host(moved_auth.host()).is_ok()
+            && redirect_port_permitted(&moved_uri, moved_auth)
         {
             // Update the Host header so it matches the redirect target,
             // otherwise the header from the original request would be

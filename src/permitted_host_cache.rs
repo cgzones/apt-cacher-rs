@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+use std::{num::NonZero, sync::LazyLock};
 
 use hashbrown::HashMap;
 use http::StatusCode;
@@ -9,6 +9,7 @@ use crate::{
     config::{ClientHost, DomainName, HostError},
     global_config, metrics,
     request_dispatch::client_permitted,
+    uri_authority::HTTP_DEFAULT_PORT,
     warn_once_or_info,
 };
 
@@ -96,9 +97,34 @@ pub(crate) fn permitted_host(raw_host: &str) -> Result<ClientHost, HostReject> {
     result
 }
 
+/// Whether `allowed_mirror_ports` permits `port` (`None`: the scheme's
+/// default, 443 for `https` and 80 otherwise). The gate for every port the
+/// proxy fetches from, like [`permitted_host`] for hosts: a request's own
+/// ([`authorize_cache_access`]), a redirect `Location`'s, and the mirrors
+/// the daemon contacts on its own.
+#[must_use]
+pub(crate) fn permitted_port(port: Option<NonZero<u16>>, https: bool) -> bool {
+    port_permitted(&global_config().allowed_mirror_ports, port, https)
+}
+
+/// [`permitted_port`] against an explicit (sorted) list.
+#[must_use]
+pub(crate) fn port_permitted(
+    allowed: &[NonZero<u16>],
+    port: Option<NonZero<u16>>,
+    https: bool,
+) -> bool {
+    let port = port.map_or(if https { 443 } else { HTTP_DEFAULT_PORT }, NonZero::get);
+    allowed.is_empty() || allowed.binary_search_by_key(&port, |p| p.get()).is_ok()
+}
+
+/// `requested_port` is the request target's (`None` for the `http`
+/// default), checked after the client and the host so a refused client
+/// learns nothing about the mirror policy.
 pub(crate) fn authorize_cache_access(
     client: &ClientInfo,
     requested_host: &str,
+    requested_port: Option<NonZero<u16>>,
 ) -> Result<ClientHost, (StatusCode, &'static str)> {
     let config = global_config();
 
@@ -111,7 +137,20 @@ pub(crate) fn authorize_cache_access(
         return Err((StatusCode::FORBIDDEN, "Unauthorized client"));
     }
 
-    finalize_host_result(permitted_host(requested_host), requested_host, client)
+    let host = finalize_host_result(permitted_host(requested_host), requested_host, client)?;
+
+    if !port_permitted(&config.allowed_mirror_ports, requested_port, false) {
+        let port = requested_port.map_or(HTTP_DEFAULT_PORT, NonZero::get);
+        warn_once_or_info!(
+            "Unauthorized port {port} of host `{}`: not permitted by `allowed_mirror_ports`; rejecting with 403",
+            requested_host.escape_debug()
+        );
+        metrics::AUTHZ_REJECTED_MIRROR.increment();
+        client_trouble::record(client, Trouble::MirrorRefused);
+        return Err((StatusCode::FORBIDDEN, "Unauthorized port"));
+    }
+
+    Ok(host)
 }
 
 fn finalize_host_result(
@@ -143,6 +182,31 @@ fn finalize_host_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_port_is_judged_with_its_schemes_default() {
+        let allowed = [NonZero::new(80).unwrap(), NonZero::new(443).unwrap()];
+        for (port, https, expected) in [
+            (None, false, true),
+            (None, true, true),
+            (NonZero::new(443), false, true),
+            (NonZero::new(80), true, true),
+            (NonZero::new(8080), false, false),
+            (NonZero::new(9200), true, false),
+        ] {
+            assert_eq!(
+                port_permitted(&allowed, port, https),
+                expected,
+                "{port:?} https={https}"
+            );
+        }
+        assert!(!port_permitted(&[NonZero::new(8080).unwrap()], None, false));
+        assert!(!port_permitted(&[NonZero::new(80).unwrap()], None, true));
+        assert!(
+            port_permitted(&[], NonZero::new(9200), false),
+            "empty permits every port"
+        );
+    }
 
     /// The soft cap is enforced by clearing, and only a *new* key past the
     /// cap trips it: re-recording a host already in the map must not throw
