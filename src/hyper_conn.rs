@@ -1824,6 +1824,41 @@ fn upstream_cap_rejection(
     )
 }
 
+/// A client request header's value for a log line, withheld for the headers
+/// that carry credentials: apt sends `Authorization` from `auth.conf` for an
+/// `http://` repository and `Proxy-Authorization` for a proxy URL with
+/// userinfo, repository clients send their own (`X-Api-Key`,
+/// `Private-Token`, `X-JFrog-Art-Api`), and a WARN line reaches the `/logs`
+/// page every web-interface client can read. Matched by name fragment, so
+/// an unknown credential header is withheld too; a harmless header that
+/// happens to match loses only its value.
+struct LoggedHeaderValue<'a> {
+    name: &'a HeaderName,
+    value: &'a HeaderValue,
+}
+
+impl fmt::Display for LoggedHeaderValue<'_> {
+    #[expect(
+        clippy::use_debug,
+        reason = "a header value may not be UTF-8; its `Debug` escapes the bytes"
+    )]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Header names are lowercase.
+        const CREDENTIAL_FRAGMENTS: [&str; 8] = [
+            "auth", "token", "key", "cookie", "secret", "passw", "session", "-api",
+        ];
+        let &Self { name, value } = self;
+        if CREDENTIAL_FRAGMENTS
+            .iter()
+            .any(|fragment| name.as_str().contains(fragment))
+        {
+            f.write_str("<redacted>")
+        } else {
+            write!(f, "{value:?}")
+        }
+    }
+}
+
 /// The registered-download owner retains every terminal setup failure before
 /// returning its response. Successful transitions disarm the initial guard.
 #[must_use]
@@ -2027,7 +2062,8 @@ async fn serve_new_file_worker(
             _ => {
                 metrics::UNHANDLED_REQUEST_HEADERS.increment();
                 warn_once_or_info!(
-                    "Unhandled HTTP header `{name}` with value `{value:?}` in request from client {}; not forwarding it upstream",
+                    "Unhandled HTTP header `{name}` with value `{}` in request from client {}; not forwarding it upstream",
+                    LoggedHeaderValue { name, value },
                     conn_details.client
                 );
             }
@@ -3577,7 +3613,32 @@ fn log_client_connection_error(client: ClientInfo, err: &hyper::Error) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SchemeDecision, UpgradeProbe, Uri, host_header_from_uri};
+    use super::{LoggedHeaderValue, SchemeDecision, UpgradeProbe, Uri, host_header_from_uri};
+
+    #[test]
+    fn logged_header_values_withhold_credentials() {
+        let logged = |name: &str, value: &str| {
+            LoggedHeaderValue {
+                name: &http::HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                value: &http::HeaderValue::from_str(value).expect("header value"),
+            }
+            .to_string()
+        };
+        for name in [
+            "Authorization",
+            "proxy-authorization",
+            "COOKIE",
+            "X-Api-Key",
+            "Private-Token",
+            "X-JFrog-Art-Api",
+            "X-Session-Id",
+        ] {
+            assert_eq!(logged(name, "Basic dXNlcjpwYXNz"), "<redacted>", "{name}");
+        }
+        for name in ["x-trace", "Keep-Alive", "Pragma", "TE"] {
+            assert_eq!(logged(name, "abc"), r#""abc""#, "{name}");
+        }
+    }
 
     #[test]
     fn redirects_with_invalid_ports_are_left_for_the_client() {
