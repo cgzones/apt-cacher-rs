@@ -241,11 +241,17 @@ pub(super) async fn standard_upstream_connect(
                         );
                     }
                     Err(HeadError::Protocol(reason)) => {
-                        // The upstream's answer is broken, not the socket: a
-                        // fresh connection would fetch the same bytes.
-                        return Err(HeadError::Protocol(reason)
-                            .into_upstream()
-                            .with_target(format!("{scheme}://{host_authority}{upstream_path}")));
+                        // Broken bytes on a *reused* connection may be the
+                        // previous exchange's: stray body bytes past a
+                        // 304/204 or a chunked terminator that arrived after
+                        // the liveness probe looked. A fresh connection tells
+                        // a broken answer from a poisoned socket; one that
+                        // fails the same way ends the request there.
+                        metrics::POOL_MISS_FAILED.increment();
+                        debug!(
+                            "splice proxy: pooled connection to {host_authority} answered \
+                             unparsably, opening fresh:  {reason}"
+                        );
                     }
                 }
             }
