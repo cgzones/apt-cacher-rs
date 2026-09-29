@@ -7,8 +7,11 @@ on:
 
 jobs:
   build-deb:
+    # Read-only: this job runs every dependency's build script, so it never
+    # holds a token that can write to the repository; `release` below does
+    # the writing with nothing but the finished package.
     permissions:
-      contents: write
+      contents: read
 
     name: Generate Debian Package
     runs-on: ubuntu-latest
@@ -20,11 +23,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Nothing below pushes; keep the token out of `.git/config`, where
+          # every dependency's build script could read it.
+          persist-credentials: false
 
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
         with:
           toolchain: stable
+          # A release is built from scratch, never from a cache another
+          # workflow run could have written.
+          cache: false
 
       - name: Install cargo-deb
         uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
@@ -59,9 +69,32 @@ jobs:
           lintian --display-experimental --info --display-info --pedantic \
                   --tag-display-limit 0 --color auto target/debian/*.deb
 
+      - name: Upload package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: debian-package
+          path: target/debian/*.deb
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: build-deb
+    permissions:
+      contents: write
+
+    name: Draft Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: debian-package
+          path: dist
+
       - name: Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           draft: true
-          files: target/debian/*.deb
+          files: dist/*.deb
           fail_on_unmatched_files: true
