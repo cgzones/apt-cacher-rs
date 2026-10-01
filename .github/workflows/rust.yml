@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: taiki-e/install-action@cargo-hack
       - uses: taiki-e/install-action@nextest
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           components: clippy
 
@@ -67,7 +67,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           components: rustfmt
           cache: false
