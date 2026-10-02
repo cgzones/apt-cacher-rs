@@ -60,37 +60,29 @@ impl<T: Connection> Connection for TransportIo<T> {
 
 impl<T: Read + Unpin> Read for TransportIo<T> {
     fn poll_read(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: ReadBufCursor<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner)
-            .poll_read(cx, buf)
-            .map_err(tag)
+        Pin::new(&mut self.inner).poll_read(cx, buf).map_err(tag)
     }
 }
 
 impl<T: Write + Unpin> Write for TransportIo<T> {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner)
-            .poll_write(cx, buf)
-            .map_err(tag)
+        Pin::new(&mut self.inner).poll_write(cx, buf).map_err(tag)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner)
-            .poll_flush(cx)
-            .map_err(tag)
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx).map_err(tag)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner)
-            .poll_shutdown(cx)
-            .map_err(tag)
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx).map_err(tag)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -98,11 +90,11 @@ impl<T: Write + Unpin> Write for TransportIo<T> {
     }
 
     fn poll_write_vectored(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner)
+        Pin::new(&mut self.inner)
             .poll_write_vectored(cx, bufs)
             .map_err(tag)
     }
