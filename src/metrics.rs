@@ -142,7 +142,6 @@ impl CapClock {
     }
 
     /// Whether a span at the cap is running.
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn is_at_cap(&self) -> bool {
         self.since.load(Ordering::Relaxed) != 0
