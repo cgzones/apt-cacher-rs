@@ -7,6 +7,14 @@
 //! an older sample. Channel operations remain asynchronous and unlocked.
 //! These are observations, not a replacement for Tokio's channel: a brief
 //! full-to-drained transition between observations can still be missed.
+//!
+//! The common observation (room, no span running) skips the lock: it would
+//! only record the depth peak, an order-free maximum, and leave an idle
+//! clock. It changes no clock state, so it cannot start or stop a span from
+//! an older sample either; what it can miss is a span a sender starts
+//! (under the lock, from its own full sample) just after the unlocked check
+//! found the clock idle. That span ends at the next observation finding
+//! room, at the latest that sender's own once its send completes.
 
 use std::ops::Deref;
 
@@ -48,7 +56,19 @@ impl<'a> QueueObserver<'a> {
 
     /// Sample inside the lock: passing an already-read capacity would let
     /// an old full sample race a newer empty sample and restart the clock.
-    fn observe(&self, kind: Observation, read: impl FnOnce() -> Snapshot) -> bool {
+    /// Room with no span running needs no lock (see the module docs).
+    fn observe(&self, kind: Observation, read: impl Fn() -> Snapshot) -> bool {
+        if !self.clock.is_at_cap() {
+            let Snapshot {
+                capacity,
+                max_capacity,
+                closed,
+            } = read();
+            if capacity != 0 || closed {
+                metrics::DB_QUEUE_DEPTH_PEAK.update(max_capacity.saturating_sub(capacity) as u64);
+                return false;
+            }
+        }
         let sampling = self.sampling.lock();
         let Snapshot {
             capacity,
