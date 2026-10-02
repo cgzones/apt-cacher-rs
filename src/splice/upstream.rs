@@ -58,10 +58,9 @@ pub(super) const TLS_READ_BUF_SIZE: usize = 256 * 1024;
         reason = "tokio_rustls::client::TlsStream is the biggest variant, but also the one most likely to be used"
     )
 )]
-#[pin_project::pin_project(project = UpstreamConnProj)]
 pub(super) enum UpstreamConn {
-    Tcp(#[pin] TcpStream),
-    Tls(#[pin] TlsStream),
+    Tcp(TcpStream),
+    Tls(TlsStream),
 }
 
 /// Log suffix naming an exchange's connection flavour -- TLS or plain, plus
@@ -99,9 +98,9 @@ impl AsyncRead for UpstreamConn {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        match self.project() {
-            UpstreamConnProj::Tcp(s) => s.poll_read(cx, buf),
-            UpstreamConnProj::Tls(s) => s.poll_read(cx, buf),
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Tls(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -113,25 +112,25 @@ impl AsyncWrite for UpstreamConn {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        match self.project() {
-            UpstreamConnProj::Tcp(s) => s.poll_write(cx, buf),
-            UpstreamConnProj::Tls(s) => s.poll_write(cx, buf),
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Tls(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
     #[inline]
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.project() {
-            UpstreamConnProj::Tcp(s) => s.poll_flush(cx),
-            UpstreamConnProj::Tls(s) => s.poll_flush(cx),
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_flush(cx),
+            Self::Tls(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
     #[inline]
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.project() {
-            UpstreamConnProj::Tcp(s) => s.poll_shutdown(cx),
-            UpstreamConnProj::Tls(s) => s.poll_shutdown(cx),
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Tls(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }

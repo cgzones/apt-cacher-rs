@@ -41,10 +41,8 @@ impl<C: Service<http::Uri>> Service<http::Uri> for TransportConnector<C> {
     }
 }
 
-#[pin_project::pin_project]
 #[derive(Debug)]
 pub(crate) struct TransportIo<T> {
-    #[pin]
     inner: T,
 }
 
@@ -60,31 +58,39 @@ impl<T: Connection> Connection for TransportIo<T> {
     }
 }
 
-impl<T: Read> Read for TransportIo<T> {
+impl<T: Read + Unpin> Read for TransportIo<T> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: ReadBufCursor<'_>,
     ) -> Poll<io::Result<()>> {
-        self.project().inner.poll_read(cx, buf).map_err(tag)
+        Pin::new(&mut self.get_mut().inner)
+            .poll_read(cx, buf)
+            .map_err(tag)
     }
 }
 
-impl<T: Write> Write for TransportIo<T> {
+impl<T: Write + Unpin> Write for TransportIo<T> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.project().inner.poll_write(cx, buf).map_err(tag)
+        Pin::new(&mut self.get_mut().inner)
+            .poll_write(cx, buf)
+            .map_err(tag)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_flush(cx).map_err(tag)
+        Pin::new(&mut self.get_mut().inner)
+            .poll_flush(cx)
+            .map_err(tag)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_shutdown(cx).map_err(tag)
+        Pin::new(&mut self.get_mut().inner)
+            .poll_shutdown(cx)
+            .map_err(tag)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -96,8 +102,7 @@ impl<T: Write> Write for TransportIo<T> {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.project()
-            .inner
+        Pin::new(&mut self.get_mut().inner)
             .poll_write_vectored(cx, bufs)
             .map_err(tag)
     }

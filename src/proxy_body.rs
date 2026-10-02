@@ -8,7 +8,6 @@ use std::{fmt::Debug, pin::Pin};
 use http::{Response, StatusCode};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
-use pin_project::pin_project;
 
 #[cfg(feature = "hyper")]
 use crate::response_head::ResponseHead;
@@ -41,9 +40,8 @@ pub(crate) fn full_body<T: Into<bytes::Bytes>>(content: T) -> ProxyCacheBody {
     ProxyCacheBody::Boxed(BoxBody::new(body))
 }
 
-#[pin_project(project = EnumProj)]
 pub(crate) enum ProxyCacheBody {
-    Boxed(#[pin] BoxBody<bytes::Bytes, DeliveryFailure>),
+    Boxed(BoxBody<bytes::Bytes, DeliveryFailure>),
 }
 
 impl Debug for ProxyCacheBody {
@@ -64,8 +62,8 @@ impl Body for ProxyCacheBody {
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        match self.project() {
-            EnumProj::Boxed(bytes) => bytes
+        match self.get_mut() {
+            Self::Boxed(box_body) => Pin::new(box_body)
                 .poll_frame(cx)
                 .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Bytes)),
         }
