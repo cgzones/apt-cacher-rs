@@ -27,7 +27,7 @@ use http::{
     uri::PathAndQuery,
 };
 use http_body::{Body, Frame};
-use http_body_util::{BodyExt as _, Empty, combinators::BoxBody};
+use http_body_util::{BodyExt as _, Empty};
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::{client::legacy::connect::HttpConnector, rt::tokio::TokioIo};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
@@ -113,10 +113,10 @@ pub(crate) type HttpClient = hyper_util::client::legacy::Client<
     Empty<bytes::Bytes>,
 >;
 
-/// Box `Empty` into [`ProxyCacheBody::Boxed`].
+/// Box `Empty` into a [`ProxyCacheBody`].
 fn empty_body() -> ProxyCacheBody {
     let body = Empty::new().map_err(|never| match never {});
-    ProxyCacheBody::Boxed(BoxBody::new(body))
+    ProxyCacheBody::new(body)
 }
 
 /// The canonical `500` for a cache-file access failure.  The failure itself
@@ -734,7 +734,7 @@ where
 {
     let config = global_config();
     let rated = ClientBody::new(body, config.min_download_rate, config.rate_check_timeframe);
-    ProxyCacheBody::Boxed(BoxBody::new(AccountedBody::new(rated, subject)))
+    ProxyCacheBody::new(AccountedBody::new(rated, subject))
 }
 
 /// Cache reading establishes both the I/O source and the promised-length

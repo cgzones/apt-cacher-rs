@@ -18,7 +18,7 @@ use http::{
 #[cfg(feature = "hyper")]
 use http_body::{Body, Frame, SizeHint};
 #[cfg(feature = "hyper")]
-use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
+use http_body_util::{BodyExt as _, Full};
 
 #[cfg(feature = "hyper")]
 use crate::{
@@ -211,9 +211,7 @@ impl WebResponse {
             delivered: sticky::Bool::new(),
         };
         builder
-            .body(ProxyCacheBody::Boxed(BoxBody::new(
-                body.map_err(|never| match never {}),
-            )))
+            .body(ProxyCacheBody::new(body.map_err(|never| match never {})))
             .expect("HTTP response is valid")
     }
 }
