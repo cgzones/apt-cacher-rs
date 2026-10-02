@@ -26,7 +26,7 @@
 //! cache writes.
 //!
 //! The peak throughput is also splice's demotion-floor reference
-//! ([`peak_throughput`], read by `splice/body.rs`'s `DemotionFloor`): what
+//! (`peak_throughput`, read by `splice/body.rs`'s `DemotionFloor`): what
 //! the mirror has shown it can deliver, independent of the transfer a slow
 //! client paces. Only the peak serves there, never the latest sample: a
 //! slow client's own paced download records a low latest figure, while no
