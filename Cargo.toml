@@ -30,6 +30,7 @@ hyper = [
     "dep:hyper",
     "dep:hyper-util",
     "dep:hyper-timeout",
+    "dep:pin-project",
     "dep:tower-service",
 ]
 webpki-roots = ["tls_rustls", "dep:webpki-roots"]
@@ -65,7 +66,7 @@ memory-stats = { version = "1.2.0", features = ["always_use_statm"] }
 nix = { version = "0.31", features = ["fs", "hostname", "resource", "user"] }
 openssl = { version = "0.10", optional = true }
 parking_lot = "0.12.5"
-pin-project = "1.1.11"
+pin-project = { version = "1.1.11", optional = true }
 rand = "0.10.1"
 rustls = { version = "0.23", optional = true }
 rustls-native-certs = { version = "0.8.4", optional = true }
