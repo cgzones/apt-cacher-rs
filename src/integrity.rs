@@ -34,6 +34,7 @@
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::fmt;
 use std::fs::Metadata;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
@@ -62,7 +63,8 @@ use crate::{
     verified_marker,
 };
 use crate::{
-    global_checksum_registry, global_config, info_once, warn_once_or_debug, warn_once_or_info,
+    global_checksum_registry, global_config, info_once, warn_once_or_debug,
+    warn_once_or_debug_gated, warn_once_or_info,
 };
 
 /// Why a download could not be committed to the cache. Every variant retires
@@ -479,6 +481,70 @@ struct ScopeState {
     /// an older one ingested later must not overwrite the newer digests.
     /// Dropped with the scope when eviction drains it.
     release_dates: HashMap<Box<str>, Option<i64>>,
+    /// How many of `entries` are [`KeyKind::Package`] keys; the rest are
+    /// [`KeyKind::Index`] ones. Read only to explain a miss
+    /// ([`RegistryMiss`]).
+    packages: usize,
+}
+
+/// Which of the two digest families a registry key belongs to. One scope
+/// holds both, and the key alone tells them apart: a package's key is its
+/// bare basename (`index_parser::structured_lookup_key`), an index's the
+/// host-relative path `ingest_release_file` builds (`<release_dir>/<rel>`,
+/// so it always holds a `/`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyKind {
+    /// A `.deb`, registered by a `Packages` index.
+    Package,
+    /// A `Packages` index, registered by a `Release`/`InRelease`.
+    Index,
+}
+
+impl KeyKind {
+    fn of(key: &str) -> Self {
+        if key.contains('/') {
+            Self::Index
+        } else {
+            Self::Package
+        }
+    }
+}
+
+/// Why a lookup came up empty: what the scope holds of the missed key's
+/// family. A cold registry (nothing ingested since startup, or not yet) and
+/// a populated one that does not list the key call for different reactions,
+/// and the miss line is the only place either is visible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RegistryMiss {
+    kind: KeyKind,
+    /// Digests of `kind` the scope holds.
+    held: usize,
+    /// Whether an eviction took entries from the scope, so `held` is not
+    /// everything its indexes registered.
+    evicted: bool,
+}
+
+impl fmt::Display for RegistryMiss {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            kind,
+            held,
+            evicted,
+        } = *self;
+        let source = match kind {
+            KeyKind::Package => "Packages indexes",
+            KeyKind::Index => "Release files",
+        };
+        if held == 0 {
+            write!(f, "none held from this mirror's {source}")?;
+        } else {
+            write!(f, "not among the {held} held from this mirror's {source}")?;
+        }
+        if evicted {
+            f.write_str(", after evictions")?;
+        }
+        Ok(())
+    }
 }
 
 impl ScopeState {
@@ -545,6 +611,15 @@ impl EvictionEpochs {
             })
             .copied()
             .unwrap_or(self.floor)
+    }
+
+    /// Whether an eviction took entries from the scope since the map was
+    /// last cleared (a cleared map under-reports, it never invents one).
+    fn evicted(&self, authority: &str, mirror_path: &str) -> bool {
+        self.by_scope.contains_key(&RegistryScopeRef {
+            authority,
+            mirror_path,
+        })
     }
 
     fn bump(&mut self, scope: &Arc<RegistryScope>) {
@@ -647,6 +722,32 @@ impl ChecksumRegistry {
             .map(|&(digest, _)| digest)
     }
 
+    /// What the scope holds of `relpath`'s family, for the line reporting
+    /// that [`Self::lookup`] missed it. A second lock round trip, taken on
+    /// the miss path only; an ingest landing in between makes the figure
+    /// newer than the miss, never wrong about the scope.
+    fn explain_miss(&self, authority: &str, mirror_path: &str, relpath: &str) -> RegistryMiss {
+        let kind = KeyKind::of(relpath);
+        let held = self
+            .inner
+            .lock()
+            .map
+            .get(&RegistryScopeRef {
+                authority,
+                mirror_path,
+            })
+            .map_or(0, |state| match kind {
+                KeyKind::Package => state.packages,
+                KeyKind::Index => state.entries.len() - state.packages,
+            });
+        let evicted = self.epochs.lock().evicted(authority, mirror_path);
+        RegistryMiss {
+            kind,
+            held,
+            evicted,
+        }
+    }
+
     /// Current entry count (for the web dashboard).
     pub(crate) fn len(&self) -> usize {
         self.inner.lock().len
@@ -737,6 +838,9 @@ impl ChecksumRegistry {
             compact_order(state);
         }
         if inserted {
+            if KeyKind::of(relpath) == KeyKind::Package {
+                state.packages += 1;
+            }
             inner.len += 1;
         }
 
@@ -777,6 +881,9 @@ fn evict(inner: &mut RegistryInner, cap: usize, epochs: &Mutex<EvictionEpochs>) 
             match state.entries.get(&rel) {
                 Some(&(_, current_gen)) if current_gen == generation => {
                     state.entries.remove(&rel);
+                    if KeyKind::of(&rel) == KeyKind::Package {
+                        state.packages -= 1;
+                    }
                     inner.len -= 1;
                     live += 1;
                 }
@@ -847,9 +954,17 @@ fn compact_order(state: &mut ScopeState) {
 /// `apt install` after startup), but a *persistent* miss means the key
 /// derived here disagrees with the key ingest inserted, and the only symptom
 /// otherwise is `CHECKSUM_UNVERIFIED` climbing with no identity attached.
-fn log_registry_miss(plan: &RenamePlan, key: &str) {
-    warn_once_or_debug!(
-        "No expected digest in the checksum registry for host {} mirror {} key `{}`; caching {} unverified",
+///
+/// `miss` says which of the two it is, and each has its own once-gate: the
+/// cold miss nearly every start produces must not spend the one WARN of the
+/// miss worth looking into, a key a populated registry does not list.
+fn log_registry_miss(plan: &RenamePlan, key: &str, miss: RegistryMiss) {
+    static COLD: AtomicBool = AtomicBool::new(false);
+    static UNLISTED: AtomicBool = AtomicBool::new(false);
+
+    warn_once_or_debug_gated!(
+        if miss.held == 0 { &COLD } else { &UNLISTED },
+        "No expected digest in the checksum registry for host {} mirror {} key `{}` ({miss}); caching {} unverified",
         plan.mirror.host(),
         plan.mirror.path(),
         key.escape_debug(),
@@ -861,18 +976,19 @@ fn log_registry_miss(plan: &RenamePlan, key: &str) {
 /// degrading to [`VerifyKind::Unknown`] (and logging the miss) when it holds
 /// no digest for `key`.
 fn registry_verify_kind(plan: &RenamePlan, key: &str) -> VerifyKind {
-    global_checksum_registry()
-        .lookup(plan.mirror.format_authority(), plan.mirror.path(), key)
-        .map_or_else(
-            || {
-                log_registry_miss(plan, key);
-                VerifyKind::Unknown
-            },
-            |digest| VerifyKind::Expected {
-                algo: HashAlgo::Sha256,
-                digest: digest.to_vec(),
-            },
-        )
+    let registry = global_checksum_registry();
+    let (authority, mirror_path) = (plan.mirror.format_authority(), plan.mirror.path());
+    registry.lookup(authority, mirror_path, key).map_or_else(
+        || {
+            let miss = registry.explain_miss(authority, mirror_path, key);
+            log_registry_miss(plan, key, miss);
+            VerifyKind::Unknown
+        },
+        |digest| VerifyKind::Expected {
+            algo: HashAlgo::Sha256,
+            digest: digest.to_vec(),
+        },
+    )
 }
 
 /// A `Packages` index cached in a compression the ingest ladder does not
@@ -2370,6 +2486,124 @@ mod tests {
         assert_eq!(reg.lookup("host", "m1", "foo_1_amd64.deb"), Some([1u8; 32]));
         assert_eq!(reg.lookup("host", "m2", "foo_1_amd64.deb"), Some([2u8; 32]));
         assert_eq!(reg.len(), 2);
+    }
+
+    /// The miss line's explanation: what the scope holds of the missed key's
+    /// family, which is what tells a cold registry from an unlisted key.
+    #[test]
+    fn registry_explains_a_miss_by_what_the_scope_holds() {
+        use std::num::NonZero;
+        const INDEX: &str = "dists/sid/main/binary-arm64/Packages.xz";
+        let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
+        let miss = |kind, held| RegistryMiss {
+            kind,
+            held,
+            evicted: false,
+        };
+
+        // Nothing ingested for the mirror at all.
+        assert_eq!(
+            reg.explain_miss("h", "debian", "a_1_arm64.deb"),
+            miss(KeyKind::Package, 0)
+        );
+
+        // Only its `Release` so far (a restart, then an `InRelease` touch):
+        // the scope exists, but a deb lookup is as cold as before.
+        assert!(reg.insert_release(
+            "h",
+            "debian",
+            "dists/sid",
+            None,
+            &[(INDEX.to_owned(), [0; 32])]
+        ));
+        assert_eq!(
+            reg.explain_miss("h", "debian", "a_1_arm64.deb"),
+            miss(KeyKind::Package, 0)
+        );
+        assert_eq!(
+            reg.explain_miss("h", "debian", "dists/sid/main/binary-amd64/Packages.xz"),
+            miss(KeyKind::Index, 1)
+        );
+
+        // A `Packages` ingest; a refreshed key is not counted twice.
+        reg.insert("h", "debian", "b_1_arm64.deb", [1; 32]);
+        reg.insert("h", "debian", "c_1_arm64.deb", [2; 32]);
+        reg.insert("h", "debian", "c_1_arm64.deb", [3; 32]);
+        assert_eq!(
+            reg.explain_miss("h", "debian", "a_1_arm64.deb"),
+            miss(KeyKind::Package, 2)
+        );
+        // Another mirror of the same host stays cold.
+        assert_eq!(
+            reg.explain_miss("h", "debian-security", "a_1_arm64.deb"),
+            miss(KeyKind::Package, 0)
+        );
+    }
+
+    #[test]
+    fn registry_miss_counts_survive_eviction() {
+        use std::num::NonZero;
+        let reg = ChecksumRegistry::new(NonZero::new(8).unwrap());
+        assert!(reg.insert_release(
+            "h",
+            "m",
+            "dists/sid",
+            None,
+            &[(
+                "dists/sid/main/binary-arm64/Packages.xz".to_owned(),
+                [0; 32]
+            )]
+        ));
+        for i in 0..8u8 {
+            reg.insert("h", "m", &format!("p{i}_1_arm64.deb"), [i; 32]);
+        }
+        // Nine entries at a cap of eight: the two oldest went, the index
+        // digest and the first package.
+        assert_eq!(reg.len(), 7);
+        assert_eq!(
+            reg.explain_miss("h", "m", "p0_1_arm64.deb"),
+            RegistryMiss {
+                kind: KeyKind::Package,
+                held: 7,
+                evicted: true,
+            }
+        );
+        assert_eq!(
+            reg.explain_miss("h", "m", "dists/sid/main/binary-arm64/Packages.xz"),
+            RegistryMiss {
+                kind: KeyKind::Index,
+                held: 0,
+                evicted: true,
+            }
+        );
+    }
+
+    #[test]
+    fn registry_miss_display() {
+        let miss = |kind, held, evicted| {
+            RegistryMiss {
+                kind,
+                held,
+                evicted,
+            }
+            .to_string()
+        };
+        assert_eq!(
+            miss(KeyKind::Package, 0, false),
+            "none held from this mirror's Packages indexes"
+        );
+        assert_eq!(
+            miss(KeyKind::Package, 68_412, false),
+            "not among the 68412 held from this mirror's Packages indexes"
+        );
+        assert_eq!(
+            miss(KeyKind::Package, 68_412, true),
+            "not among the 68412 held from this mirror's Packages indexes, after evictions"
+        );
+        assert_eq!(
+            miss(KeyKind::Index, 0, true),
+            "none held from this mirror's Release files, after evictions"
+        );
     }
 
     #[test]

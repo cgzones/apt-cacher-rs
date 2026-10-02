@@ -130,7 +130,19 @@ macro_rules! warn_once_or_debug {
     ($($t:tt)*) => {{
         static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-        if $crate::log_once::first_fire(&FIRED) {
+        $crate::warn_once_or_debug_gated!(&FIRED, $($t)*)
+    }};
+}
+
+/// [`warn_once_or_debug!`] with a caller-owned gate, for a site whose one
+/// line reports one of several facts: each fact gets a gate, so the first
+/// occurrence of one does not demote the first occurrence of another (see
+/// `integrity::log_registry_miss`). A macro rather than a function, so the
+/// line keeps the caller's module as its `target`.
+#[macro_export]
+macro_rules! warn_once_or_debug_gated {
+    ($fired:expr, $($t:tt)*) => {{
+        if $crate::log_once::first_fire($fired) {
             tracing::warn!($($t)*);
         } else {
             tracing::debug!($($t)*);
@@ -356,6 +368,27 @@ mod tests {
             }
         });
         assert_eq!(levels, [tracing::Level::WARN, tracing::Level::WARN]);
+    }
+
+    #[test]
+    fn warn_once_or_debug_gated_warns_once_per_handed_in_gate() {
+        static A: AtomicBool = AtomicBool::new(false);
+        static B: AtomicBool = AtomicBool::new(false);
+        // One call site, two facts: each gate warns once, then demotes.
+        let levels = levels_during(|| {
+            for gate in [&A, &A, &B, &B] {
+                crate::warn_once_or_debug_gated!(gate, "one site");
+            }
+        });
+        assert_eq!(
+            levels,
+            [
+                tracing::Level::WARN,
+                tracing::Level::DEBUG,
+                tracing::Level::WARN,
+                tracing::Level::DEBUG
+            ]
+        );
     }
 
     #[test]
