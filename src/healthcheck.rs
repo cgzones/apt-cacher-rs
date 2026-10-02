@@ -113,7 +113,7 @@ pub(crate) async fn filesystem_space(path: &Path) -> Option<FsSpace> {
 
 /// Outcome of a single readiness check.
 #[derive(Clone)]
-#[cfg_attr(test, derive(Debug, PartialEq))]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 enum CheckResult {
     Pass,
     Fail(String),

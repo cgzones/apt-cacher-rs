@@ -44,6 +44,7 @@ use super::verify::{Verdict, verify_cache_file};
 
 /// How a `Filename:` value from a Packages stanza maps to a key in the
 /// scanned candidate map.
+#[derive(Clone, Copy)]
 pub(super) enum KeyMapper<'a> {
     /// Structured pool: the cache flattens to basename.
     Basename,
@@ -184,7 +185,7 @@ pub(super) struct ReduceContext<'a> {
     /// failure are never lost.
     pub(super) tally: &'a mut UnitStats,
     /// Derives the lookup key from a `Filename:` relpath.
-    pub(super) keymap: &'a KeyMapper<'a>,
+    pub(super) keymap: KeyMapper<'a>,
 }
 
 /// Process one stanza: if its `Filename:` value resolves to a candidate
@@ -972,13 +973,12 @@ mod tests {
         // Sibling subtree: `arm64/sibling.deb` does not start with the
         // `amd64/` prefix — must be a no-op on file_list.
         {
-            let km = KeyMapper::RelpathUnderPrefix { prefix: "amd64/" };
             let mut ctx = ReduceContext {
                 root: Path::new("/tmp/cache"),
                 mirror: &mirror,
                 layout: CacheLayout::Flat,
                 tally: &mut tally,
-                keymap: &km,
+                keymap: KeyMapper::RelpathUnderPrefix { prefix: "amd64/" },
             };
             let mut stanza = Stanza::new();
             stanza.ingest("Filename: arm64/sibling.deb\n");
@@ -991,13 +991,12 @@ mod tests {
         // In-subtree: `amd64/pkg.deb` strips to `pkg.deb`; with no SHA
         // advertised, the stanza warn-retains and removes the lookup key.
         {
-            let km = KeyMapper::RelpathUnderPrefix { prefix: "amd64/" };
             let mut ctx = ReduceContext {
                 root: Path::new("/tmp/cache"),
                 mirror: &mirror,
                 layout: CacheLayout::Flat,
                 tally: &mut tally,
-                keymap: &km,
+                keymap: KeyMapper::RelpathUnderPrefix { prefix: "amd64/" },
             };
             let mut stanza = Stanza::new();
             stanza.ingest("Filename: amd64/pkg.deb\n");
@@ -1042,13 +1041,12 @@ mod tests {
         // streams the whole (bomb) input instead of early-returning.
         let mut file_list = cands(&["never-matched.deb"]);
         let mut tally = UnitStats::default();
-        let km = KeyMapper::RelpathUnderPrefix { prefix: "amd64/" };
         let mut ctx = ReduceContext {
             root: Path::new("/tmp"),
             mirror: &mirror,
             layout: CacheLayout::Flat,
             tally: &mut tally,
-            keymap: &km,
+            keymap: KeyMapper::RelpathUnderPrefix { prefix: "amd64/" },
         };
 
         let result = reduce_file_list(
@@ -1092,13 +1090,12 @@ mod tests {
         );
         let mut file_list = cands(&["never-matched.deb"]);
         let mut tally = UnitStats::default();
-        let km = KeyMapper::RelpathUnderPrefix { prefix: "amd64/" };
         let mut ctx = ReduceContext {
             root: Path::new("/tmp"),
             mirror: &mirror,
             layout: CacheLayout::Flat,
             tally: &mut tally,
-            keymap: &km,
+            keymap: KeyMapper::RelpathUnderPrefix { prefix: "amd64/" },
         };
 
         let err = reduce_file_list(
@@ -1139,13 +1136,12 @@ mod tests {
         );
         let mut file_list = cands(&["keep-me.deb"]);
         let mut tally = UnitStats::default();
-        let km = KeyMapper::Basename;
         let mut ctx = ReduceContext {
             root: Path::new("/tmp"),
             mirror: &mirror,
             layout: CacheLayout::StructuredPool,
             tally: &mut tally,
-            keymap: &km,
+            keymap: KeyMapper::Basename,
         };
 
         let err = reduce_file_list(
@@ -1218,13 +1214,12 @@ mod tests {
             .expect("write deb");
         let mut file_list = cands(&["dummy_1.0_amd64.deb", "keep-me.deb"]);
         let mut tally = UnitStats::default();
-        let km = KeyMapper::Basename;
         let mut ctx = ReduceContext {
             root: dir.path(),
             mirror: &mirror,
             layout: CacheLayout::StructuredPool,
             tally: &mut tally,
-            keymap: &km,
+            keymap: KeyMapper::Basename,
         };
 
         reduce_file_list(
@@ -1269,13 +1264,12 @@ mod tests {
         );
         let mut file_list = cands(&["keep-me.deb"]);
         let mut tally = UnitStats::default();
-        let km = KeyMapper::Basename;
         let mut ctx = ReduceContext {
             root: Path::new("/tmp"),
             mirror: &mirror,
             layout: CacheLayout::StructuredPool,
             tally: &mut tally,
-            keymap: &km,
+            keymap: KeyMapper::Basename,
         };
 
         reduce_file_list(

@@ -315,7 +315,7 @@ async fn reduce_against(
         mirror: &plan.owner_mirror,
         layout: plan.cache_layout,
         tally,
-        keymap: &plan.keymap,
+        keymap: plan.keymap,
     };
     reduce_file_list(
         pkgfmt,
@@ -1217,16 +1217,11 @@ async fn resolve_origin_packages_archive_root(
         MirrorKind::Structured,
     );
 
+    let keymap = keymapper_for(keymap);
     for origin in &active_origins {
         // The debs live under the original flat sub-path `mirror`, not the
         // archive root, so metadata invalidation must key by `mirror`.
-        let plan = origin_fetch_plan(
-            &archive_mirror,
-            mirror,
-            origin,
-            cache_layout,
-            keymapper_for(keymap),
-        );
+        let plan = origin_fetch_plan(&archive_mirror, mirror, origin, cache_layout, keymap);
         let step = map_reduce(
             reduce_against(&plan, ctx, cached_files, tally).await,
             mirror,

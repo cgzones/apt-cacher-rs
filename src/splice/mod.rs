@@ -1445,7 +1445,7 @@ async fn transfer_body(
                 client,
                 &mut writer,
                 barrier,
-                &range_filter,
+                range_filter,
                 &temppath,
                 splice_count,
                 mirror_peak,

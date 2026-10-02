@@ -28,7 +28,7 @@ use crate::warn_once;
 /// the cap purely bounds memory if an upstream serves endless garbage.
 const MAX_THROTTLE_ENTRIES: usize = 256;
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct ThrottleEntry {
     /// Consecutive verification failures for this resource (>= 1).
     failures: u32,
@@ -80,11 +80,7 @@ impl VerifyThrottle {
         // lookup below would miss anyway; this short-circuit keeps the
         // per-request gate free of a lock acquisition and a hash.
         self.base?;
-        let (failures, until) = self
-            .map
-            .read()
-            .get(&key)
-            .map(|entry| (entry.failures, entry.until))?;
+        let ThrottleEntry { failures, until } = self.map.read().get(&key).copied()?;
         (now < until).then(|| Throttled {
             remaining: until.duration_since(now).into(),
             failures,
@@ -109,11 +105,13 @@ impl VerifyThrottle {
         let base = self.base?;
         let mut map = self.map.write();
 
-        let previous = map.get(&key).map(|entry| (entry.failures, entry.until));
+        let previous = map.get(&key).copied();
         let failures = match previous {
             // A failure within the streak-reset TTL of the previous
             // window continues the streak; a later one starts over.
-            Some((failures, until)) if now <= until + self.cap => failures.saturating_add(1),
+            Some(ThrottleEntry { failures, until }) if now <= until + self.cap => {
+                failures.saturating_add(1)
+            }
             _ => 1,
         };
         if previous.is_none() && map.len() >= MAX_THROTTLE_ENTRIES {

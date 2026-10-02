@@ -700,7 +700,7 @@ impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for ClientHost {
     }
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Alias {
     pub(crate) main: CacheHost,
@@ -728,7 +728,7 @@ pub(crate) fn resolve_alias<'a>(aliases: &'a [Alias], host: &ClientHost) -> Opti
         .map(|alias| &alias.main)
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum IpNetOrAddr {
     Net(IpNet),
     Addr(IpAddr),
@@ -784,7 +784,7 @@ impl<'de> Deserialize<'de> for IpNetOrAddr {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(from = "String")]
 pub(crate) enum LogDestination {
     Console,

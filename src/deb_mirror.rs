@@ -181,7 +181,7 @@ impl std::fmt::Display for Mirror {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Origin {
     pub(crate) mirror: Mirror,
     pub(crate) fields: OriginFields,
@@ -370,7 +370,7 @@ pub(crate) enum FlatKind {
     ByHash(HashAlgo),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ResourceFile<'a> {
     /// A pool file
     Pool {

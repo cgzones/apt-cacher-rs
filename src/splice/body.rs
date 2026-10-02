@@ -62,6 +62,7 @@ use super::upstream::UpstreamConn;
 
 /// Pre-computed byte offsets for range-filtering the splice loop output.
 /// `skip` bytes are suppressed at the start, then `send` bytes are forwarded.
+#[derive(Clone, Copy)]
 pub(super) struct SpliceRangeFilter {
     pub(super) skip: u64,
     pub(super) send: u64,
@@ -756,7 +757,7 @@ pub(super) struct BodyTransfer<'a> {
     client_file_pos: u64,
     /// Bytes still owed to the client.
     client_remaining: u64,
-    range_filter: &'a SpliceRangeFilter,
+    range_filter: SpliceRangeFilter,
     cache_path: &'a Path,
     /// Who the delivery is for: a client-side failure counts against it
     /// (`client_trouble`), here and in a demoted file-serve task. `None`
@@ -785,7 +786,7 @@ impl<'a> BodyTransfer<'a> {
         client: BodyClient<'a>,
         cache: &'a mut CacheWriter,
         barrier: &'a mut DownloadBarrier,
-        range_filter: &'a SpliceRangeFilter,
+        range_filter: SpliceRangeFilter,
         cache_path: &'a Path,
         content_length: u64,
         mirror_peak: Option<NonZero<u64>>,
@@ -3016,12 +3017,11 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.min_download_rate = Some(nonzero!(1_000_000));
         config.rate_check_timeframe = nonzero!(1);
-        let filter = SpliceRangeFilter { skip: 0, send: 1 };
         let mut xfer = BodyTransfer::new(
             BodyClient::Attached(&client, local_client()),
             &mut writer,
             &mut barrier,
-            &filter,
+            SpliceRangeFilter { skip: 0, send: 1 },
             &scratch.path,
             1,
             None,
@@ -3130,7 +3130,7 @@ mod tests {
             BodyClient::Attached(&client, local_client()),
             &mut writer,
             &mut barrier,
-            &filter,
+            filter,
             &scratch.path,
             4_000,
             NonZero::new(8 * 1_000_000),
@@ -3161,7 +3161,7 @@ mod tests {
             BodyClient::Attached(&client, local_client()),
             &mut writer,
             &mut barrier,
-            &filter,
+            filter,
             &scratch.path,
             4_000,
             NonZero::new(8 * 1_000_000),
@@ -3197,12 +3197,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let filter = SpliceRangeFilter { skip: 0, send: 0 };
         let mut xfer = BodyTransfer::new(
             BodyClient::Absent,
             &mut writer,
             &mut barrier,
-            &filter,
+            SpliceRangeFilter { skip: 0, send: 0 },
             &scratch.path,
             1,
             None,

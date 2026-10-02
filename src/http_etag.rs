@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::atomic::AtomicBool};
+use std::{borrow::Cow, iter::FusedIterator, sync::atomic::AtomicBool};
 
 use crate::{sticky, xattr_helpers::XattrValue};
 
@@ -156,6 +156,8 @@ impl<'a> Iterator for IfNoneMatchSplit<'a> {
         Some(self.header[start..].trim())
     }
 }
+
+impl FusedIterator for IfNoneMatchSplit<'_> {}
 
 /// Check if a stored `ETag` matches an `If-None-Match` header value.
 ///
