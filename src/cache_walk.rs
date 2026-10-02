@@ -282,7 +282,7 @@ pub(crate) struct Walker<T> {
     io_failures: u64,
 }
 
-impl<T: Copy + Send + Sync> Walker<T> {
+impl<T: Copy + Send> Walker<T> {
     /// Prepare a walk of `root`; nothing is read until the first
     /// [`Walker::next`].  `root_tag` is handed back on every entry of the
     /// root directory itself.
@@ -560,7 +560,7 @@ pub(crate) struct Entry<'w, T> {
     io_failures: &'w mut u64,
 }
 
-impl<T: Copy + Send + Sync> Entry<'_, T> {
+impl<T: Copy + Send> Entry<'_, T> {
     #[must_use]
     pub(crate) const fn kind(&self) -> EntryKind {
         self.kind

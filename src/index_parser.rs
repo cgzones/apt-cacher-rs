@@ -399,7 +399,7 @@ pub(crate) struct StanzaStream<R> {
     done: sticky::Bool,
 }
 
-impl<R: AsyncBufRead + Unpin + Send> StanzaStream<R> {
+impl<R: AsyncBufRead + Unpin> StanzaStream<R> {
     pub(crate) fn new(reader: R, stanza: Stanza) -> Self {
         Self {
             reader,
