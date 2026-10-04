@@ -874,7 +874,7 @@ fn build_cache_stats_html(
         .saturating_sub(total_download_count)
         .max(0);
 
-    let uncacheable_count = get_uncacheables().read().len();
+    let uncacheable_count = get_uncacheables().len();
 
     // One statement covers both windows, so they succeed or fail together.
     let (bandwidth_day, bandwidth_week) = match bandwidth_result {

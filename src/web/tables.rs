@@ -1075,7 +1075,7 @@ pub(super) fn render_client_table(
 
 #[must_use]
 pub(super) fn build_uncacheable_table() -> Section {
-    let uncacheables = get_uncacheables().read();
+    let uncacheables = get_uncacheables();
 
     if uncacheables.is_empty() {
         return Section::EMPTY;
