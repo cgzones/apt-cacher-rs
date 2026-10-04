@@ -1856,6 +1856,7 @@ async fn splice_proxy_drive(
         &mut rates,
     )
     .await?;
+    drop(header_buf);
     rates.t_client_done = PreciseInstant::now();
 
     let BodyTransferred {

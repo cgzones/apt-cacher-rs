@@ -1022,6 +1022,9 @@ async fn run_connect_tunnel(
         return;
     }
 
+    let pipelined_len = pipelined.len() as u64;
+    drop(buf);
+
     let start = PreciseInstant::now();
     // Bounded like a hyper-run tunnel: a client that keeps sending but stops
     // reading never looks idle to the relay's watchdog.
@@ -1033,7 +1036,7 @@ async fn run_connect_tunnel(
     )
     .await;
     // The pipelined bytes crossed the tunnel too, ahead of the relay.
-    outcome.from_client += pipelined.len() as u64;
+    outcome.from_client += pipelined_len;
     report_tunnel_outcome(&outcome, &client, &target, start.elapsed());
 }
 
