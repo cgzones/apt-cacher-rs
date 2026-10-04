@@ -68,7 +68,6 @@ const DIR_SCAN_CONCURRENCY: usize = 8;
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct DirStats {
-    pub(super) files: usize,
     pub(super) size: u64,
     pub(super) byhash_files: usize,
     /// Files whose extension is `.deb`. Disjoint from `metadata_files`,
@@ -84,9 +83,12 @@ pub(super) struct DirStats {
 }
 
 impl DirStats {
+    fn files(self) -> usize {
+        self.deb_files + self.metadata_files
+    }
+
     fn merge(&mut self, other: Self) {
         let Self {
-            files,
             size,
             byhash_files,
             deb_files,
@@ -96,7 +98,6 @@ impl DirStats {
             newest_mtime,
         } = other;
 
-        self.files += files;
         self.size += size;
         self.byhash_files += byhash_files;
         self.deb_files += deb_files;
@@ -222,7 +223,6 @@ async fn mirror_directory_size(path: &Path) -> DirStats {
                 };
                 let len = mdata.len();
                 stats.size += len;
-                stats.files += 1;
                 stats.max_file_size = stats.max_file_size.max(len);
                 if entry.tag() {
                     stats.byhash_files += 1;
@@ -807,12 +807,12 @@ pub(super) async fn build_mirror_table(
                 size: stats.size,
                 total: aggregate.size,
             } => Some(stats.size),
-            Count::len(stats.files) => Some(stats.files),
+            Count::len(stats.files()) => Some(stats.files()),
             AvgMaxCell {
-                files: stats.files,
+                files: stats.files(),
                 size: stats.size,
                 max_file: stats.max_file_size,
-            } => (stats.files > 0).then(|| stats.size / stats.files as u64),
+            } => (stats.files() > 0).then(|| stats.size / stats.files() as u64),
             format_args!(
                 "{} / {}",
                 Count::len(stats.deb_files),
@@ -1188,7 +1188,7 @@ mod tests {
                 walks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 DirStats {
-                    files: 7,
+                    deb_files: 7,
                     ..DirStats::default()
                 }
             })
@@ -1207,7 +1207,7 @@ mod tests {
             std::iter::repeat_with(|| cached_dir_stats(dir.path(), counted_walk(&walks))).take(5),
         )
         .await;
-        assert!(results.iter().all(|stats| stats.files == 7));
+        assert!(results.iter().all(|stats| stats.files() == 7));
         assert_eq!(walks.load(Ordering::SeqCst), 1);
         DIR_STATS_CACHE.lock().remove(dir.path());
     }
@@ -1230,7 +1230,7 @@ mod tests {
             "the first load is cancelled before its 50 ms walk ends"
         );
         let stats = cached_dir_stats(dir.path(), counted_walk(&walks)).await;
-        assert_eq!(stats.files, 7);
+        assert_eq!(stats.files(), 7);
         assert_eq!(
             walks.load(Ordering::SeqCst),
             1,
@@ -1268,7 +1268,6 @@ mod tests {
     fn dir_stats_merge_sums_counts_and_folds_extremes() {
         let mut acc = DirStats::default();
         acc.merge(DirStats {
-            files: 3,
             size: 300,
             byhash_files: 1,
             deb_files: 2,
@@ -1279,7 +1278,6 @@ mod tests {
         });
         // A mirror whose walk saw no mtimes leaves the extremes untouched.
         acc.merge(DirStats {
-            files: 1,
             size: 10,
             byhash_files: 0,
             deb_files: 0,
@@ -1289,7 +1287,6 @@ mod tests {
             newest_mtime: None,
         });
         acc.merge(DirStats {
-            files: 2,
             size: 1000,
             byhash_files: 2,
             deb_files: 0,
@@ -1299,12 +1296,12 @@ mod tests {
             newest_mtime: Some(at(70)),
         });
 
-        assert_eq!(acc.files, 6);
+        assert_eq!(acc.files(), 6);
         assert_eq!(acc.size, 1310);
         assert_eq!(acc.byhash_files, 3);
         assert_eq!(acc.deb_files, 2);
         assert_eq!(acc.metadata_files, 4);
-        assert_eq!(acc.deb_files + acc.metadata_files, acc.files);
+        assert_eq!(acc.deb_files + acc.metadata_files, acc.files());
         assert_eq!(acc.max_file_size, 900);
         assert_eq!(acc.oldest_mtime, Some(at(20)));
         assert_eq!(acc.newest_mtime, Some(at(80)));
@@ -1313,7 +1310,6 @@ mod tests {
     #[test]
     fn dir_stats_merge_into_default_is_identity() {
         let stats = DirStats {
-            files: 1,
             size: 2,
             byhash_files: 3,
             deb_files: 4,
@@ -1324,7 +1320,7 @@ mod tests {
         };
         let mut acc = DirStats::default();
         acc.merge(stats);
-        assert_eq!(acc.files, 1);
+        assert_eq!(acc.files(), 9);
         assert_eq!(acc.size, 2);
         assert_eq!(acc.byhash_files, 3);
         assert_eq!(acc.deb_files, 4);
