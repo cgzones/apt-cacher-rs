@@ -39,8 +39,8 @@ use crate::{
     AppState, Never, Scheme,
     accounted_body::{AccountedBody, Subject},
     active_downloads::{
-        ActiveDownloadStatus, AttachedReaderState, Declined, InsertOutcome, JoinFailure,
-        Origination, Serveable, await_serveable,
+        ActiveDownloadStatus, Admission, AttachedReaderState, Declined, JoinFailure, Origination,
+        Serveable, await_serveable,
     },
     build_info::{APP_USER_AGENT, APP_VIA},
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
@@ -1454,8 +1454,8 @@ async fn serve_cache_miss(
     appstate: AppState,
 ) -> Response<ProxyCacheBody> {
     loop {
-        return match appstate.active_downloads.insert(conn_details.key()) {
-            InsertOutcome::Originator(origination) => {
+        return match appstate.active_downloads.register(conn_details.key()) {
+            Admission::Originator(origination) => {
                 let cfstate = match miss {
                     CacheMiss::NotFound => {
                         trace!(
@@ -1472,7 +1472,7 @@ async fn serve_cache_miss(
                 };
                 serve_new_file(conn_details, origination, req, cfstate, appstate).await
             }
-            InsertOutcome::Joined { status } => {
+            Admission::LateJoiner { status } => {
                 match miss {
                     CacheMiss::NotFound => {
                         trace!(
@@ -1503,7 +1503,7 @@ async fn serve_cache_miss(
                 }
                 serve_joined(joined, conn_details, &req, status, None, Role::LateJoiner).await
             }
-            InsertOutcome::AtCapacity { max } => upstream_cap_rejection(&conn_details, max),
+            Admission::AtCapacity { max } => upstream_cap_rejection(&conn_details, max),
         };
     }
 }
@@ -1818,7 +1818,7 @@ fn log_unfollowed_redirect(moved_uri: &Uri) {
 }
 
 /// Log and build the canonical 503 for a download origination refused by the
-/// `max_upstream_downloads` cap (`InsertOutcome::AtCapacity`). The
+/// `max_upstream_downloads` cap (`Admission::AtCapacity`). The
 /// `UPSTREAM_DOWNLOAD_REJECTED_CAP` bump already happened inside
 /// `ActiveDownloads::lookup_or_insert`, the enforcement site shared with the
 /// splice backend.

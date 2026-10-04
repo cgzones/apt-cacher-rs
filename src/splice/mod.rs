@@ -96,7 +96,7 @@ use crate::upstream_head::{
 };
 use crate::{
     AppState,
-    active_downloads::{ActiveDownloadStatus, Declined, OriginateOutcome, Origination},
+    active_downloads::{ActiveDownloadStatus, Admission, Declined, Origination},
     build_info::APP_VIA,
     cache_metadata::{self, write_upstream_metadata},
     client_counter,
@@ -191,17 +191,17 @@ pub(crate) async fn splice_proxy(
     client_range: RangeRequestHeaders<'_>,
 ) -> Result<SpliceProxyOutcome, SpliceProxyError> {
     // Register with active downloads to coordinate with concurrent clients.
-    // A `Concurrent` outcome means another download for this key won the race
-    // between sendfile's earlier `attach()` and our `originate()` here. It is
+    // A `LateJoiner` admission means another download for this key won the race
+    // between sendfile's earlier `attach()` and our `register()` here. It is
     // an alternate success — the caller retries as a sendfile late joiner
     // instead of falling all the way back to hyper. No late-joiner double
-    // count, since `attach()` and `insert()` are mutually exclusive paths.
-    let origination = match appstate.active_downloads.originate(conn_details.key()) {
-        OriginateOutcome::Originator(origination) => origination,
-        OriginateOutcome::Concurrent { status } => {
+    // count, since `attach()` and `register()` are mutually exclusive paths.
+    let origination = match appstate.active_downloads.register(conn_details.key()) {
+        Admission::Originator(origination) => origination,
+        Admission::LateJoiner { status } => {
             return Ok(SpliceProxyOutcome::Concurrent { status });
         }
-        OriginateOutcome::AtCapacity { max } => {
+        Admission::AtCapacity { max } => {
             return Ok(SpliceProxyOutcome::AtCapacity { max });
         }
     };
@@ -229,7 +229,7 @@ pub(crate) async fn splice_proxy(
 /// barrier, then deliver the file with `sendfile(2)`. The file is the
 /// descriptor [`read_volatile_validators`] opened and stat-ed for the
 /// conditional request, so this opens and stats nothing: the registry entry
-/// held since `originate()` keeps any commit of the same key -- the only way
+/// held since `register()` keeps any commit of the same key -- the only way
 /// a cache file is replaced -- from renaming a newer copy in meanwhile. The
 /// per-path bits (status recording, upstream-connection pooling, `debug!`
 /// wording) stay at the call site, and `invalid_tag` carries the call-site
@@ -785,7 +785,7 @@ async fn open_partial_resume(
 /// very descriptor ([`serve_volatile_304_via_sendfile`]); its size is the
 /// `prev_file_size` a download's quota reservation frees. Holding the
 /// descriptor across the upstream round trip is safe because the caller's
-/// `InitBarrier` owns the key's registry entry from `originate()` until it
+/// `InitBarrier` owns the key's registry entry from `register()` until it
 /// settles, and a cache file is only ever replaced by the rename of that
 /// key's commit.
 struct StaleCopy {
@@ -1947,7 +1947,7 @@ async fn splice_proxy_drive(
 /// originate race, and the carried `status` lets the caller serve the client
 /// from the in-flight partial via the sendfile backend without falling back
 /// to hyper. Late-joiner accounting was already performed inside
-/// [`crate::active_downloads::ActiveDownloads::originate`].
+/// [`crate::active_downloads::ActiveDownloads::register`].
 pub(crate) enum SpliceProxyOutcome {
     Served,
     /// Served, but the response's body was delimited by closing the
@@ -1965,7 +1965,7 @@ pub(crate) enum SpliceProxyOutcome {
         status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     },
     /// Origination refused by the `max_upstream_downloads` cap
-    /// (`OriginateOutcome::AtCapacity`); nothing was written to the client.
+    /// (`Admission::AtCapacity`); nothing was written to the client.
     /// The sendfile caller answers with the canonical 503
     /// (`"Too many concurrent upstream downloads"`) — not an error, the
     /// connection stays usable.

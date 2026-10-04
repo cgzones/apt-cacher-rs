@@ -4,15 +4,13 @@
 //! this (mirror, debname) currently in flight?", shared between the hyper,
 //! splice, and sendfile delivery backends. It is also the single enforcement
 //! site for `max_upstream_downloads`: a new origination at the cap returns
-//! `AtCapacity` from `ActiveDownloads::insert` /
-//! `ActiveDownloads::originate` (late joiners are exempt — they open no new
-//! upstream connection), which every backend maps to the canonical 503. It
+//! `AtCapacity` from [`ActiveDownloads::register`] (late joiners are exempt:
+//! they open no new upstream connection), which every backend maps to the canonical 503. It
 //! also drives the related metric accounting so callers don't have to:
 //!
 //! - Late-joiner counts ([`metrics::LATE_JOINERS_TOTAL`] /
 //!   [`metrics::LATE_JOINER_PEAK_PER_DOWNLOAD`]) — bumped atomically when
-//!   `ActiveDownloads::insert` joins, `ActiveDownloads::attach` hits, or
-//!   `ActiveDownloads::originate` returns `Concurrent`.
+//!   [`ActiveDownloads::register`] joins or `ActiveDownloads::attach` hits.
 //! - Saturation transitions for `max_upstream_downloads`
 //!   ([`metrics::UPSTREAM_DOWNLOAD_CAP_TRANSITIONS`]) — debounced via the
 //!   module-private [`AT_CAP`] latch so each saturation episode counts once.
@@ -584,7 +582,7 @@ impl std::fmt::Debug for ActiveDownloads {
 
 /// The unit `max_upstream_downloads` counts: one upstream connection opened
 /// on behalf of a download. Minted by the origination that opens it
-/// ([`LookupResult::Originator`]) and released by drop, so it can neither
+/// ([`Admission::Originator`]) and released by drop, so it can neither
 /// be forgotten nor released twice -- whoever holds it holds the slot.
 ///
 /// The barrier chain in `guards.rs` carries it from `InitBarrier::new` and
@@ -644,47 +642,11 @@ pub(crate) struct Origination {
     pub(crate) slot: UpstreamSlot,
 }
 
-/// Outcome of `ActiveDownloads::insert`: either this caller originates the
-/// download, or it attaches as a late joiner to one already in flight. The
-/// late-joiner accounting (per-entry count + global metrics) is performed
-/// inside `insert()` itself — callers do not need any follow-up helper.
-#[cfg(feature = "hyper")]
-pub(crate) enum InsertOutcome {
-    Originator(Origination),
-    Joined {
-        status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-    },
-    /// See [`LookupResult::AtCapacity`].
-    AtCapacity {
-        max: NonZero<usize>,
-    },
-}
-
-/// Outcome of `ActiveDownloads::originate`: either this caller originates
-/// the download, or another download is already in flight for the same key.
-/// `Concurrent` carries the existing download's status so the caller can hand
-/// it straight to the sendfile late-joiner path without a separate `attach()`
-/// — the `Arc<RwLock<…>>` outlives any subsequent `remove()` of the entry.
-#[cfg(feature = "splice")]
-pub(crate) enum OriginateOutcome {
-    Originator(Origination),
-    Concurrent {
-        status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-    },
-    /// See [`LookupResult::AtCapacity`].
-    AtCapacity {
-        max: NonZero<usize>,
-    },
-}
-
-/// Neutral result of [`ActiveDownloads::lookup_or_insert`], the shared
-/// body of `ActiveDownloads::insert` and `ActiveDownloads::originate`.
-/// Each public method maps this onto its own outcome enum.
-///
-/// Late-joiner metrics (`LATE_JOINERS_TOTAL`, `LATE_JOINER_PEAK_PER_DOWNLOAD`)
-/// have already been bumped inside `lookup_or_insert` when this returns
-/// `LateJoiner`; the public adapters do not need to bump them.
-enum LookupResult {
+/// Outcome of [`ActiveDownloads::register`]: originate a new download,
+/// join an existing one, or refuse a new origination at the configured cap.
+/// Late-joiner accounting is already complete when this returns; the
+/// status handle stays alive even after the registry entry is retired.
+pub(crate) enum Admission {
     /// A new entry, and with it the [`UpstreamSlot`] it counts against
     /// `max_upstream_downloads` with.
     Originator(Origination),
@@ -774,23 +736,22 @@ impl ActiveDownloads {
         self.inner.read().upstream_slots
     }
 
-    /// Common locked-region body shared by `Self::insert` and
-    /// `Self::originate`: pre-allocate channel + status, perform the
-    /// `entry()` Occupied / Vacant transition, do the cap-saturation +
-    /// peak + late-joiner accounting, return the neutral [`LookupResult`].
+    /// Registration with an explicit cap: pre-allocate channel + status,
+    /// perform the `entry()` Occupied / Vacant transition, do the cap-saturation +
+    /// peak + late-joiner accounting, return the neutral [`Admission`].
     ///
     /// This is also the single enforcement site for
     /// `max_upstream_downloads`: a new origination while `upstream_slots` is
-    /// at the cap returns [`LookupResult::AtCapacity`] without inserting.
+    /// at the cap returns [`Admission::AtCapacity`] without inserting.
     /// Late joiners are exempt by construction (an occupied entry opens no
     /// new upstream connection), and the check happens under the same write
     /// lock as the insert and the slot mint, so the cap is exact — no
     /// check-then-insert race can overshoot it. Both backends inherit the
-    /// cap through their public adapters and must map `AtCapacity` to the
-    /// canonical 503.
+    /// cap through the shared registration method and must map `AtCapacity`
+    /// to the canonical 503.
     ///
-    /// `max_upstream_downloads` is threaded in by the public callers
-    /// (which read it from `global_config()`) so this helper can be
+    /// `max_upstream_downloads` is threaded in by [`Self::register`]
+    /// (which reads it from `global_config()`) so this helper can be
     /// driven from unit tests without standing up a full configuration.
     /// The helper is not side-effect-free: minting the slot latches the
     /// module-private [`AT_CAP`] flag via [`record_cap_saturation`], and it
@@ -801,7 +762,7 @@ impl ActiveDownloads {
         &self,
         keyref: CacheEntryKeyRef<'_>,
         max_upstream_downloads: Option<NonZero<usize>>,
-    ) -> LookupResult {
+    ) -> Admission {
         // First pass with the borrowed key: joining an in-flight download
         // allocates nothing (no owned key, no channel, no status Arc).
         {
@@ -814,7 +775,7 @@ impl ActiveDownloads {
 
                 metrics::LATE_JOINERS_TOTAL.increment();
                 metrics::LATE_JOINER_PEAK_PER_DOWNLOAD.update(peak as u64);
-                return LookupResult::LateJoiner { status };
+                return Admission::LateJoiner { status };
             }
         }
 
@@ -845,7 +806,7 @@ impl ActiveDownloads {
                 let peak = entry.late_joiners;
                 let existing_status = Arc::clone(&entry.status);
                 (
-                    LookupResult::LateJoiner {
+                    Admission::LateJoiner {
                         status: existing_status,
                     },
                     Some(peak),
@@ -856,14 +817,14 @@ impl ActiveDownloads {
                     // Refused origination: nothing inserted, the
                     // pre-allocations are discarded like on the Occupied
                     // race-loser path.
-                    (LookupResult::AtCapacity { max }, None)
+                    (Admission::AtCapacity { max }, None)
                 } else {
                     ventry.insert(ActiveDownloadEntry {
                         status: Arc::clone(&status),
                         late_joiners: 0,
                     });
                     (
-                        LookupResult::Originator(Origination {
+                        Admission::Originator(Origination {
                             init_tx: tx,
                             status,
                             // Under the same lock as the insert and the
@@ -879,7 +840,7 @@ impl ActiveDownloads {
         drop(guard);
 
         metrics::ACTIVE_UPSTREAM_DOWNLOADS_PEAK.update(upstream_slots as u64);
-        if matches!(outcome, LookupResult::AtCapacity { max: _ }) {
+        if matches!(outcome, Admission::AtCapacity { max: _ }) {
             metrics::UPSTREAM_DOWNLOAD_REJECTED_CAP.increment();
         }
         if let Some(peak) = late_joiner_peak {
@@ -895,19 +856,13 @@ impl ActiveDownloads {
     /// so callers do not need to follow up with any metric helper.
     /// `AtCapacity` means the `max_upstream_downloads` cap refused a new
     /// origination — the caller answers with the canonical 503.
-    #[cfg(feature = "hyper")]
     #[must_use]
-    pub(crate) fn insert(&self, key: CacheEntryKeyRef<'_>) -> InsertOutcome {
-        let max = global_config().max_upstream_downloads;
-        match self.lookup_or_insert(key, max) {
-            LookupResult::Originator(origination) => InsertOutcome::Originator(origination),
-            LookupResult::LateJoiner { status } => InsertOutcome::Joined { status },
-            LookupResult::AtCapacity { max } => InsertOutcome::AtCapacity { max },
-        }
+    pub(crate) fn register(&self, key: CacheEntryKeyRef<'_>) -> Admission {
+        self.lookup_or_insert(key, global_config().max_upstream_downloads)
     }
 
     /// Register `key` and hand back its status handle, skipping the
-    /// `max_upstream_downloads` gate that makes [`Self::insert`] read the
+    /// `max_upstream_downloads` gate that makes [`Self::register`] read the
     /// config globals. Exists so tests elsewhere in the crate can build a
     /// barrier over a *real* registry entry - `Drop` asserts the entry it
     /// retires was registered. The slot is dropped on the spot: those
@@ -918,13 +873,13 @@ impl ActiveDownloads {
         key: CacheEntryKeyRef<'_>,
     ) -> Arc<tokio::sync::RwLock<ActiveDownloadStatus>> {
         match self.lookup_or_insert(key, None) {
-            LookupResult::Originator(Origination {
+            Admission::Originator(Origination {
                 init_tx: _,
                 status,
                 slot: _,
             })
-            | LookupResult::LateJoiner { status } => Some(status),
-            LookupResult::AtCapacity { max: _ } => None,
+            | Admission::LateJoiner { status } => Some(status),
+            Admission::AtCapacity { max: _ } => None,
         }
         .expect("no cap was passed, so origination cannot be refused")
     }
@@ -933,29 +888,10 @@ impl ActiveDownloads {
     #[cfg(test)]
     pub(crate) fn originate_uncapped(&self, key: CacheEntryKeyRef<'_>) -> Origination {
         match self.lookup_or_insert(key, None) {
-            LookupResult::Originator(origination) => Some(origination),
-            LookupResult::LateJoiner { .. } | LookupResult::AtCapacity { .. } => None,
+            Admission::Originator(origination) => Some(origination),
+            Admission::LateJoiner { .. } | Admission::AtCapacity { .. } => None,
         }
         .expect("test key must be newly registered")
-    }
-
-    /// Originate-only variant of `Self::insert`: returns `Concurrent`
-    /// when a download for the same key is already in flight, while still
-    /// bumping the existing entry's late-joiner accounting to mirror
-    /// [`Self::attach`]. `Concurrent` carries the existing entry's status,
-    /// which the sendfile caller serves the partial file from directly — no
-    /// separate `attach()`, no re-check race. `AtCapacity` means the
-    /// `max_upstream_downloads` cap refused a new origination — the caller
-    /// answers with the canonical 503.
-    #[cfg(feature = "splice")]
-    #[must_use]
-    pub(crate) fn originate(&self, key: CacheEntryKeyRef<'_>) -> OriginateOutcome {
-        let max = global_config().max_upstream_downloads;
-        match self.lookup_or_insert(key, max) {
-            LookupResult::Originator(origination) => OriginateOutcome::Originator(origination),
-            LookupResult::LateJoiner { status } => OriginateOutcome::Concurrent { status },
-            LookupResult::AtCapacity { max } => OriginateOutcome::AtCapacity { max },
-        }
     }
 
     /// Retire `key`'s entry. Touches the entries only: the cap and its
@@ -978,7 +914,7 @@ impl ActiveDownloads {
     /// When `serve_unfinished_sendfile` cannot frame the response (upstream
     /// omitted Content-Length) the returned status travels to hyper inside
     /// `HandoffPlan::JoinDownload`, so the joiner is never re-registered via
-    /// `insert()`.
+    /// `register()`.
     #[cfg(feature = "sendfile")]
     #[must_use]
     pub(crate) fn attach(
@@ -1050,7 +986,7 @@ mod tests {
             CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
             None,
         );
-        assert!(matches!(result, LookupResult::Originator(_)));
+        assert!(matches!(result, Admission::Originator(_)));
     }
 
     #[test]
@@ -1062,13 +998,13 @@ mod tests {
             CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
             None,
         );
-        assert!(matches!(first, LookupResult::Originator(_)));
+        assert!(matches!(first, Admission::Originator(_)));
         // Second call on the same key: late joiner.
         let second = ad.lookup_or_insert(
             CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
             None,
         );
-        assert!(matches!(second, LookupResult::LateJoiner { .. }));
+        assert!(matches!(second, Admission::LateJoiner { .. }));
     }
 
     #[test]
@@ -1109,12 +1045,12 @@ mod tests {
             CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
             Some(max),
         );
-        assert!(matches!(first, LookupResult::Originator(_)));
+        assert!(matches!(first, Admission::Originator(_)));
         let second = ad.lookup_or_insert(
             CacheEntryKeyRef::new(&mirror, "b.deb", CacheLayout::StructuredPool),
             Some(max),
         );
-        assert!(matches!(second, LookupResult::AtCapacity { max: m } if m == max));
+        assert!(matches!(second, Admission::AtCapacity { max: m } if m == max));
         // The refused origination must not have registered anything.
         assert_eq!(ad.len(), 1, "rejected origination must not insert");
         assert_eq!(
@@ -1133,14 +1069,14 @@ mod tests {
             CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
             Some(max),
         );
-        assert!(matches!(first, LookupResult::Originator(_)));
+        assert!(matches!(first, Admission::Originator(_)));
         // Same key at cap: joins the in-flight download, no new upstream
         // connection — exempt from the cap.
         let join = ad.lookup_or_insert(
             CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
             Some(max),
         );
-        assert!(matches!(join, LookupResult::LateJoiner { .. }));
+        assert!(matches!(join, Admission::LateJoiner { .. }));
         assert_eq!(ad.upstream_slots(), 1, "a join mints no slot");
     }
 
@@ -1153,17 +1089,17 @@ mod tests {
             CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
             Some(max),
         );
-        assert!(matches!(first, LookupResult::Originator(_)));
+        assert!(matches!(first, Admission::Originator(_)));
         let second = ad.lookup_or_insert(
             CacheEntryKeyRef::new(&mirror, "b.deb", CacheLayout::StructuredPool),
             Some(max),
         );
-        assert!(matches!(second, LookupResult::Originator(_)));
+        assert!(matches!(second, Admission::Originator(_)));
         let third = ad.lookup_or_insert(
             CacheEntryKeyRef::new(&mirror, "c.deb", CacheLayout::StructuredPool),
             Some(max),
         );
-        assert!(matches!(third, LookupResult::AtCapacity { max: _ }));
+        assert!(matches!(third, Admission::AtCapacity { max: _ }));
     }
 
     /// The cap follows the slot, not the entry: an entry whose slot is gone
@@ -1179,7 +1115,7 @@ mod tests {
             CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
             Some(max),
         );
-        let slot = if let LookupResult::Originator(Origination {
+        let slot = if let Admission::Originator(Origination {
             init_tx: _,
             status: _,
             slot,
@@ -1199,7 +1135,7 @@ mod tests {
             CacheEntryKeyRef::new(&mirror, "b.deb", CacheLayout::StructuredPool),
             Some(max),
         );
-        let second_slot = if let LookupResult::Originator(Origination {
+        let second_slot = if let Admission::Originator(Origination {
             init_tx: _,
             status: _,
             slot,
@@ -1223,7 +1159,7 @@ mod tests {
             CacheEntryKeyRef::new(&mirror, "c.deb", CacheLayout::StructuredPool),
             Some(max),
         );
-        assert!(matches!(third, LookupResult::AtCapacity { max: _ }));
+        assert!(matches!(third, Admission::AtCapacity { max: _ }));
         drop(second_slot);
         assert_eq!(ad.upstream_slots(), 0);
     }
@@ -1237,7 +1173,7 @@ mod tests {
                 CacheEntryKeyRef::new(&mirror, name, CacheLayout::StructuredPool),
                 None,
             );
-            assert!(matches!(result, LookupResult::Originator(_)));
+            assert!(matches!(result, Admission::Originator(_)));
         }
     }
 }
