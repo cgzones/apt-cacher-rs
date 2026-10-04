@@ -819,6 +819,11 @@ mod tests {
         }
         let expected_bytes = u64::try_from((0..count).map(|i| i % 5).sum::<usize>()).unwrap();
 
+        let mut expected_names: Vec<_> = (0..count)
+            .map(|i| OsString::from(format!("f{i}")))
+            .collect();
+        expected_names.sort_unstable();
+
         for stat_files in [false, true] {
             let walker = Walker::new(dir.path(), &CONTINUE, OnMissing::Fail, ());
             let mut walker = if stat_files {
@@ -835,8 +840,7 @@ mod tests {
             }
             assert!(matches!(walker.finish(), WalkOutcome::Complete));
             names.sort_unstable();
-            names.dedup();
-            assert_eq!(names.len(), count, "stat_files: {stat_files}");
+            assert_eq!(names, expected_names, "stat_files: {stat_files}");
             assert_eq!(bytes, expected_bytes, "stat_files: {stat_files}");
         }
     }
