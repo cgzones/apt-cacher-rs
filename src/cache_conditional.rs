@@ -36,7 +36,8 @@ use crate::{
 
 /// Raw `Range` / `If-Range` / `If-None-Match` / `If-Modified-Since` values
 /// from a client request, as the plan reads them.  Header values that are
-/// not valid UTF-8 are treated as absent.
+/// not valid UTF-8 are treated as absent, except `If-Range`: an unreadable
+/// value is represented by an empty, unmatchable validator.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RangeRequestHeaders<'a> {
     pub(crate) range: Option<&'a str>,
@@ -55,7 +56,10 @@ impl<'a> RangeRequestHeaders<'a> {
 
         Self {
             range: find_header(headers, &RANGE),
-            if_range: find_header(headers, &IF_RANGE),
+            if_range: headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case(IF_RANGE.as_str()))
+                .map(|h| str::from_utf8(h.value).unwrap_or("")),
             if_none_match: find_header(headers, &IF_NONE_MATCH),
             if_modified_since: find_header(headers, &IF_MODIFIED_SINCE),
         }
@@ -97,13 +101,13 @@ impl<'a> RangeRequestHeaders<'a> {
         // reads `None` as "no precondition sent" and answers an
         // unconditional 206, so a resuming client can staple bytes onto
         // a different revision.
-        let if_range = range.and_then(|_| headers.get(IF_RANGE)).and_then(|v| match v.to_str() {
-            Ok(s) => Some(s),
+        let if_range = range.and_then(|_| headers.get(IF_RANGE)).map(|v| match v.to_str() {
+            Ok(s) => s,
             Err(_err @ ToStrError { .. }) => {
                 warn_once!(
-                    "Client {client} sent an invalid If-Range header {v:?}; serving the range unconditionally"
+                    "Client {client} sent an invalid If-Range header {v:?}; serving the full representation"
                 );
-                None
+                ""
             }
         });
 
@@ -560,9 +564,7 @@ mod tests {
         assert_eq!(extracted.if_modified_since, Some(LAST_MODIFIED));
     }
 
-    /// A non-UTF-8 precondition must be dropped, not silently mistaken for a
-    /// value: dropping turns the request unconditional, which is safe, while
-    /// misreading it could answer a stale 304 or a mis-stitched 206.
+    /// Unreadable If-Range remains present and cannot authorize a partial response.
     #[cfg(feature = "hyper")]
     #[test]
     fn from_http_drops_non_utf8_headers() {
@@ -578,7 +580,7 @@ mod tests {
 
         let extracted = RangeRequestHeaders::from_http(&headers, &local_client());
         assert_eq!(extracted.range, Some("bytes=0-9"));
-        assert_eq!(extracted.if_range, None);
+        assert_eq!(extracted.if_range, Some(""));
         assert_eq!(extracted.if_none_match, None);
         assert_eq!(extracted.if_modified_since, None);
     }
