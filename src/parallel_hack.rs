@@ -305,10 +305,13 @@ mod tests {
 
     #[test]
     fn nudge_head_carries_the_configured_status_and_retry_after() {
-        let head = nudge_head(&enabled_config());
-        assert_eq!(head.status, StatusCode::TOO_MANY_REQUESTS);
+        let mut config = enabled_config();
+        config.experimental_parallel_hack_statuscode = StatusCode::SERVICE_UNAVAILABLE;
+        config.experimental_parallel_hack_retryafter = 17;
+        let head = nudge_head(&config);
+        assert_eq!(head.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(head.kind, ResponseKind::Success);
-        assert_eq!(head.retry_after, Some(5));
+        assert_eq!(head.retry_after, Some(17));
         assert_eq!(head.content_length, Some(20));
         assert_eq!(NUDGE_BODY.len(), 20, "the pinned body length");
     }
