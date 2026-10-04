@@ -1168,12 +1168,16 @@ mod tests {
     fn lookup_or_insert_unlimited_without_cap() {
         let ad = ActiveDownloads::new();
         let mirror = test_mirror();
+        let mut admissions = Vec::new();
         for name in ["a.deb", "b.deb", "c.deb", "d.deb"] {
             let result = ad.lookup_or_insert(
                 CacheEntryKeyRef::new(&mirror, name, CacheLayout::StructuredPool),
                 None,
             );
             assert!(matches!(result, Admission::Originator(_)));
+            admissions.push(result);
         }
+        assert_eq!(ad.upstream_slots(), admissions.len());
+        assert_eq!(ad.len(), admissions.len());
     }
 }
