@@ -19,15 +19,7 @@ pub(super) async fn serve_logs(options: QueryOptions) -> WebResponse {
 
     // HTML-escape every entry on the blocking pool: with a large
     // `logstore_capacity` this can dominate the request handler.
-    //
-    // The `LogStore` read guard returned by `entries()` blocks any logger
-    // trying to write a new entry. Confine the clone to a tight scope so
-    // the guard drops before we `spawn_blocking` the (longer-running)
-    // escape pass and before the request handler does any other work.
-    let entries: Vec<String> = {
-        let guard = ls.entries();
-        guard.iter().cloned().collect()
-    };
+    let entries = ls.snapshot();
     let entry_count = entries.len();
     let escaped_logs = tokio::task::spawn_blocking(move || {
         let mut buf = String::with_capacity(entries.iter().map(|e| e.len() + 8).sum());

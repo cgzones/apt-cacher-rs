@@ -725,7 +725,7 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
             Count(metrics::LOGSTORE_EVICTIONS.get())
         ))
         .value(Gauge {
-            current: logstore.entries().len() as u64,
+            current: logstore.len() as u64,
             cap: Some(config.logstore_capacity.get() as u64),
             peak: None,
         });
@@ -1003,11 +1003,7 @@ fn orphans_over_quota_share(orphaned_bytes: u64, quota: Option<u64>) -> bool {
 }
 
 fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
-    let log_count = LOGSTORE
-        .get()
-        .expect("initialized in main()")
-        .entries()
-        .len();
+    let log_count = LOGSTORE.get().expect("initialized in main()").len();
     let mut body = String::with_capacity(8 * 1024);
     let page = Page::Dashboard { log_count };
     body.push_str(&build_nav_html(page, options));
