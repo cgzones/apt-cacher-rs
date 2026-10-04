@@ -2376,7 +2376,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_with_known_matching_digest_proceeds() {
+    fn expected_matching_digest_proceeds() {
         let f = temp_file_with(b"hello world");
         let plan = VerifyInput {
             verify_enabled: true,
@@ -2389,37 +2389,8 @@ mod tests {
     }
 
     #[test]
-    fn pool_with_known_mismatching_digest_rejects() {
+    fn expected_mismatching_digest_rejects() {
         let f = temp_file_with(b"tampered deb");
-        let plan = VerifyInput {
-            verify_enabled: true,
-            kind: expect_zero_sha256(),
-            file: f.as_file(),
-            temp_path: f.path(),
-            streamed: None,
-        };
-        assert!(matches!(
-            verify_temp_file(&plan),
-            VerifyOutcome::Reject(CommitError::ChecksumMismatch)
-        ));
-    }
-
-    #[test]
-    fn packages_with_known_matching_digest_proceeds() {
-        let f = temp_file_with(b"hello world");
-        let plan = VerifyInput {
-            verify_enabled: true,
-            kind: expect_sha256(HELLO_SHA256),
-            file: f.as_file(),
-            temp_path: f.path(),
-            streamed: None,
-        };
-        assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
-    }
-
-    #[test]
-    fn packages_with_mismatching_digest_rejects() {
-        let f = temp_file_with(b"tampered packages");
         let plan = VerifyInput {
             verify_enabled: true,
             kind: expect_zero_sha256(),
