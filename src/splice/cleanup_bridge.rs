@@ -7,7 +7,7 @@
 
 use std::{io::ErrorKind, path::Path, time::Duration};
 
-use http::StatusCode;
+use http::{StatusCode, Uri, uri::PathAndQuery};
 use tokio::io::AsyncReadExt as _;
 use tracing::{debug, error};
 
@@ -177,19 +177,17 @@ async fn splice_cleanup_request(
             return cleanup_response(StatusCode::INTERNAL_SERVER_ERROR);
         }
     }
-    cleanup_upstream_fetch(&conn_details.mirror, &req.uri().to_string()).await
+    cleanup_upstream_fetch(&conn_details.mirror, req.uri()).await
 }
 
 #[must_use]
 async fn cleanup_upstream_fetch(
     mirror: &Mirror,
-    upstream_uri: &str,
+    upstream_uri: &Uri,
 ) -> http::Response<ProxyCacheBody> {
-    let upstream_path_buf = upstream_uri
-        .parse::<http::Uri>()
-        .ok()
-        .and_then(|uri| uri.path_and_query().map(|pq| pq.as_str().to_owned()));
-    let upstream_path = upstream_path_buf.as_deref().unwrap_or(upstream_uri);
+    let upstream_path = upstream_uri
+        .path_and_query()
+        .map_or_else(|| upstream_uri.path(), PathAndQuery::as_str);
     let host_authority = mirror.format_authority();
     let exchange =
         match standard_upstream_connect(mirror, host_authority, upstream_path, 0, None, None, None)
