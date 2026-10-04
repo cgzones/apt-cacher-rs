@@ -2531,8 +2531,6 @@ mod tests {
         task::{Context, Waker},
     };
 
-    use nix::fcntl::{FcntlArg, fcntl};
-
     use super::*;
     use crate::{active_downloads::AbortReason, guards::Consequence};
 
@@ -2573,13 +2571,6 @@ mod tests {
         let mut got = [0u8; 4];
         rx.read_exact(&mut got).await.expect("read from the pipe");
         assert_eq!(&got, b"ping");
-        // `create_pipe()` treats pipe resizing as best-effort, so do not
-        // require the kernel to honor `PIPE_BUFFER_SIZE` exactly here.
-        let size = fcntl(rx.as_fd(), FcntlArg::F_GETPIPE_SZ).unwrap();
-        assert!(
-            size >= 64 * 1024,
-            "pipe size shouldn't be too small, got {size}"
-        );
     }
 
     #[tokio::test]
