@@ -704,6 +704,8 @@ mod tests {
         // No `Range` and a failed `If-Range` both serve the whole entity; a
         // valid-but-unsatisfiable range is the caller's 416.
         assert_eq!(ServeParams::from_parsed(None, 7), Ok(ServeParams::full(7)));
+        assert!(!ServeParams::full(7).is_partial());
+        assert_eq!(ServeParams::full(7).http_status(), StatusCode::OK);
         assert_eq!(
             ServeParams::from_parsed(Some(ParsedRange::IfRangeFailed), 7),
             Ok(ServeParams::full(7))
@@ -716,21 +718,25 @@ mod tests {
             ServeParams::from_parsed(Some(ParsedRange::NotSatisfiable), 7),
             Err(RangeNotSatisfiable)
         );
+        let partial = ServeParams::from_parsed(
+            Some(ParsedRange::Satisfiable {
+                content_range: String::from("bytes 2-4/7"),
+                start: 2,
+                length: 3,
+            }),
+            7,
+        )
+        .expect("satisfiable");
         assert_eq!(
-            ServeParams::from_parsed(
-                Some(ParsedRange::Satisfiable {
-                    content_range: String::from("bytes 2-4/7"),
-                    start: 2,
-                    length: 3,
-                }),
-                7
-            ),
-            Ok(ServeParams {
+            partial,
+            ServeParams {
                 content_start: 2,
                 content_length: 3,
                 content_range: Some(String::from("bytes 2-4/7")),
-            })
+            }
         );
+        assert!(partial.is_partial());
+        assert_eq!(partial.http_status(), StatusCode::PARTIAL_CONTENT);
     }
 
     #[test]

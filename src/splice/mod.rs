@@ -2016,53 +2016,19 @@ mod tests {
     use super::http::parse_upstream_response;
 
     use super::*;
-    use crate::cache_conditional::RangeNotSatisfiable;
 
     #[test]
-    fn client_range_plan_resolves_every_parsed_range() {
-        let whole = || ServeParams {
-            content_range: None,
-            content_start: 0,
-            content_length: 1000,
-        };
-        assert_eq!(ServeParams::from_parsed(None, 1000), Ok(whole()));
-        assert_eq!(
-            ServeParams::from_parsed(Some(ParsedRange::Invalid), 1000),
-            Ok(whole())
-        );
-        assert_eq!(
-            ServeParams::from_parsed(Some(ParsedRange::IfRangeFailed), 1000),
-            Ok(whole())
-        );
-        assert_eq!(
-            ServeParams::from_parsed(Some(ParsedRange::NotSatisfiable), 1000),
-            Err(RangeNotSatisfiable)
-        );
-        assert!(!whole().is_partial());
-        assert_eq!(whole().content_end(), 1000);
-        assert_eq!(whole().http_status(), StatusCode::OK);
-        assert_eq!(whole().status_line(), "200 OK");
+    fn client_range_plan_exposes_wire_bounds_and_status_lines() {
+        let whole = ServeParams::full(1000);
+        assert_eq!(whole.content_end(), 1000);
+        assert_eq!(whole.status_line(), "200 OK");
 
-        let partial = ServeParams::from_parsed(
-            Some(ParsedRange::Satisfiable {
-                content_range: "bytes 200-499/1000".to_owned(),
-                start: 200,
-                length: 300,
-            }),
-            1000,
-        )
-        .expect("satisfiable");
-        assert_eq!(
-            partial,
-            ServeParams {
-                content_range: Some("bytes 200-499/1000".to_owned()),
-                content_start: 200,
-                content_length: 300,
-            }
-        );
-        assert!(partial.is_partial());
+        let partial = ServeParams {
+            content_range: Some("bytes 200-499/1000".to_owned()),
+            content_start: 200,
+            content_length: 300,
+        };
         assert_eq!(partial.content_end(), 500);
-        assert_eq!(partial.http_status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(partial.status_line(), "206 Partial Content");
     }
 
