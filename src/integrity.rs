@@ -1796,17 +1796,16 @@ pub(crate) fn stream_hash_algo_for_download(
     authority: &str,
     mirror_path: &str,
 ) -> Option<HashAlgo> {
+    if !global_config().verify_checksums {
+        return None;
+    }
     let registry_hit =
         registry_lookup_key(resource_kind, debname, raw_uri_path).is_some_and(|key| {
             global_checksum_registry()
                 .lookup(authority, mirror_path, &key)
                 .is_some()
         });
-    stream_hash_algo(
-        resource_kind,
-        registry_hit,
-        global_config().verify_checksums,
-    )
+    stream_hash_algo(resource_kind, registry_hit, true)
 }
 
 /// Detect Packages compression by reading magic bytes from the file. Used for
