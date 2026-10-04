@@ -24,12 +24,11 @@
 //!   5. unsafe-cache-path gate     - empty/dot segments, control bytes once
 //!      decoded, on a classified request
 //!   6. flat-blocklist collision   - host-level `flat/` claimed by structured
-//!   7. deferred `Origin` DB write - for `Packages` requests w/ a real arch
-//!   8. unsafe-proxy-path gate     - traversal/control bytes in passthrough
+//!   7. unsafe-proxy-path gate     - traversal/control bytes in passthrough
 //!
 //! Backends translate the returned [`DispatchOutcome`] into their response
-//! type.  All logging, metric bumping, the deferred `Origin` DB write and
-//! `record_uncacheable` happen here, so the two parallel paths cannot drift
+//! type.  Classification logging, metric bumping and `record_uncacheable`
+//! happen here, so the two parallel paths cannot drift
 //! apart.  [`dispatch_request`] runs exactly once per client request: the
 //! sendfile backend's `NotApplicable` handoff carries its outcome to hyper
 //! (`hyper_conn::HandoffPlan`) instead of letting hyper re-dispatch, so every
@@ -529,8 +528,8 @@ impl PassthroughReason {
 }
 
 /// Dispatcher verdict.  Backends own response-type construction; this
-/// module owns logging, metric bumping, the deferred `Origin` DB write and
-/// `record_uncacheable`, so the two backends stay structurally in sync.
+/// module owns classification logging, metrics and `record_uncacheable`.
+/// The backend records `origin_fields` only once the request is answered.
 #[derive(Debug)]
 pub(crate) enum DispatchOutcome {
     /// Route through the cache pipeline; the request's `ConnectionDetails`
@@ -541,8 +540,8 @@ pub(crate) enum DispatchOutcome {
     /// already done.
     Reject(RejectReason),
     /// Forward to upstream uncached.  Logging, metric bumping and
-    /// `record_uncacheable` already done.  `requested_host` is returned so
-    /// backends can build an upstream `Mirror` or emit per-request log lines
+    /// `record_uncacheable` done by [`dispatch_request`].  `requested_host`
+    /// lets backends build an upstream `Mirror` or emit per-request log lines
     /// without re-deriving it.
     Passthrough {
         // Named in the "Proxying (without caching)" line by both backends
@@ -557,28 +556,6 @@ pub(crate) enum DispatchOutcome {
         canonical_host: ClientHost,
         // Consumed by both backends: `splice_simple_proxy` (`splice/simple_proxy.rs`,
         // via the sendfile dispatch) and `PassthroughBody` (`hyper_conn.rs`).
-        request_received_at: PreciseInstant,
-    },
-}
-
-/// Output of [`decide_request`].
-///
-/// Mirrors [`DispatchOutcome`] without the async wrapper's side-effects
-/// (`record_uncacheable`), so unit tests exercise the routing logic without
-/// standing up the DB task channel.
-#[derive(Debug)]
-enum Decision {
-    /// `conn_details.origin_fields` is `Some` when `class.origin_fields`
-    /// indicated a real (non-pseudo) architecture; the backend records it
-    /// once the request is answered.
-    Cache {
-        conn_details: ConnectionDetails,
-    },
-    Reject(RejectReason),
-    Passthrough {
-        reason: PassthroughReason,
-        requested_host: ClientHost,
-        canonical_host: ClientHost,
         request_received_at: PreciseInstant,
     },
 }
@@ -599,7 +576,7 @@ fn split_query(path_and_query: &str) -> (&str, Option<&str>) {
 /// internally for parsing while keeping the raw form for logs and the
 /// uncacheables ring.  `client` is borrowed for log inclusion only; nothing
 /// about the classification depends on caller identity.
-pub(crate) async fn dispatch_request(
+pub(crate) fn dispatch_request(
     path_and_query: &str,
     requested_host: ClientHost,
     requested_port: Option<NonZero<u16>>,
@@ -617,40 +594,25 @@ pub(crate) async fn dispatch_request(
         flat_blocklist::is_blocked,
         request_received_at,
     );
-    match decision {
-        // The `Origin` row rides along in `conn_details.origin_fields` and is
-        // recorded by the backend once the request is answered
-        // (`ConnectionDetails::record_origin`), not here: a probe the
-        // upstream 404s must not mint a row.
-        Decision::Cache { conn_details } => DispatchOutcome::Cache(conn_details),
-        Decision::Reject(reason) => DispatchOutcome::Reject(reason),
-        Decision::Passthrough {
-            reason,
+    if let DispatchOutcome::Passthrough {
+        requested_host,
+        reason: _,
+        canonical_host: _,
+        request_received_at: _,
+    } = &decision
+    {
+        // Exactly-once: dispatch runs once per request, including a handoff.
+        record_uncacheable(
             requested_host,
-            canonical_host,
-            request_received_at,
-        } => {
-            // Exactly-once: the dispatcher runs once per request (see the
-            // module docs), so the uncacheables ring buffer and its
-            // `UNCACHEABLE` counter are fed here rather than at each
-            // backend's forwarding step.
-            record_uncacheable(
-                &requested_host,
-                requested_port,
-                split_query(path_and_query).0,
-            );
-            DispatchOutcome::Passthrough {
-                reason,
-                requested_host,
-                canonical_host,
-                request_received_at,
-            }
-        }
+            requested_port,
+            split_query(path_and_query).0,
+        );
     }
+    decision
 }
 
-/// Routing decision without `RUNTIMEDETAILS`/DB dependencies or async
-/// side-effects (it does bump reject metrics and the `warn_once` state).
+/// Routing decision without `RUNTIMEDETAILS`/DB dependencies or recording
+/// uncacheables (it does bump reject metrics and the `warn_once` state).
 ///
 /// The two real-world side-effects that surround it -
 /// `flat_blocklist::is_blocked` and the deferred `Origin` DB write - are
@@ -670,7 +632,7 @@ fn decide_request(
     reject_pdiff_requests: bool,
     is_flat_blocked: impl FnOnce(&CacheHost, Option<NonZero<u16>>) -> bool,
     request_received_at: PreciseInstant,
-) -> Decision {
+) -> DispatchOutcome {
     let (uri_path, query) = split_query(path_and_query);
     trace!("Dispatching request from client {client} (host=`{requested_host}` path=`{uri_path}`)");
 
@@ -688,7 +650,7 @@ fn decide_request(
             "Rejecting diff request {uri_path} for client {client}; pdiff URLs are uncacheable here and are refused with 410 (further rejections counted in PDIFF_REJECTED)"
         );
         metrics::PDIFF_REJECTED.increment();
-        return Decision::Reject(RejectReason::DiffRequest);
+        return DispatchOutcome::Reject(RejectReason::DiffRequest);
     }
 
     // Resolve the alias exactly once, for both verdicts: the `Mirror` every
@@ -719,7 +681,7 @@ fn decide_request(
                         "Rejecting unsafe cache path {uri_path} for client {client} with 400"
                     );
                     metrics::UNSAFE_PATH_REJECTED.increment();
-                    return Decision::Reject(RejectReason::UnsafePath);
+                    return DispatchOutcome::Reject(RejectReason::UnsafePath);
                 }
 
                 let cache_id = aliased_host.unwrap_or_else(|| requested_host.as_cache_host());
@@ -753,17 +715,15 @@ fn decide_request(
                         layout.mirror_kind(),
                     );
 
-                    return Decision::Cache {
-                        conn_details: ConnectionDetails {
-                            client: *client,
-                            request_received_at,
-                            mirror,
-                            upstream_host: requested_host,
-                            debname: class.debname,
-                            resource_kind: class.resource_kind,
-                            origin_fields: class.origin_fields.map(Box::new),
-                        },
-                    };
+                    return DispatchOutcome::Cache(ConnectionDetails {
+                        client: *client,
+                        request_received_at,
+                        mirror,
+                        upstream_host: requested_host,
+                        debname: class.debname,
+                        resource_kind: class.resource_kind,
+                        origin_fields: class.origin_fields.map(Box::new),
+                    });
                 }
             }
             Err(ClassifyError::BadEncoding { kind, raw, source }) => {
@@ -772,7 +732,7 @@ fn decide_request(
                     raw.escape_debug(),
                     ErrorReport(&source)
                 );
-                return Decision::Reject(RejectReason::BadEncoding);
+                return DispatchOutcome::Reject(RejectReason::BadEncoding);
             }
             Err(ClassifyError::InvalidValue { kind, decoded }) => {
                 warn_once_or_info!(
@@ -784,7 +744,7 @@ fn decide_request(
                 // a decoded field is refused here, before the whole-path
                 // `is_unsafe_cache_path` check could see it.
                 metrics::UNSAFE_PATH_REJECTED.increment();
-                return Decision::Reject(RejectReason::InvalidValue);
+                return DispatchOutcome::Reject(RejectReason::InvalidValue);
             }
             Err(ClassifyError::EncodedSeparator { kind, raw }) => {
                 warn_once_or_info!(
@@ -792,7 +752,7 @@ fn decide_request(
                     raw.escape_debug()
                 );
                 metrics::UNSAFE_PATH_REJECTED.increment();
-                return Decision::Reject(RejectReason::InvalidValue);
+                return DispatchOutcome::Reject(RejectReason::InvalidValue);
             }
             Err(ClassifyError::JoinedFieldUnderscore { kind, decoded }) => {
                 warn_once_or_info!(
@@ -829,13 +789,12 @@ fn decide_request(
             passthrough_reason.label()
         );
         metrics::UNSAFE_PATH_REJECTED.increment();
-        return Decision::Reject(RejectReason::UnsafePath);
+        return DispatchOutcome::Reject(RejectReason::UnsafePath);
     }
 
-    // `record_uncacheable` happens in the async wrapper (`dispatch_request`)
-    // alongside the other global side-effects, keeping this function pure
-    // for the unit tests.
-    Decision::Passthrough {
+    // `record_uncacheable` happens in the wrapper (`dispatch_request`)
+    // so unit tests do not need the global uncacheables store.
+    DispatchOutcome::Passthrough {
         reason: passthrough_reason,
         canonical_host: canonical_host(),
         requested_host,
@@ -1262,12 +1221,12 @@ mod tests {
     }
 
     /// The details of a `Cache` decision; any other decision fails the test.
-    fn expect_cache(decision: Decision) -> ConnectionDetails {
+    fn expect_cache(decision: DispatchOutcome) -> ConnectionDetails {
         assert!(
-            matches!(decision, Decision::Cache { .. }),
+            matches!(decision, DispatchOutcome::Cache(_)),
             "expected Cache outcome, got {decision:?}"
         );
-        let conn_details = if let Decision::Cache { conn_details } = decision {
+        let conn_details = if let DispatchOutcome::Cache(conn_details) = decision {
             Some(conn_details)
         } else {
             None
@@ -1369,14 +1328,14 @@ mod tests {
             assert!(
                 matches!(
                     decision,
-                    Decision::Passthrough {
+                    DispatchOutcome::Passthrough {
                         reason: PassthroughReason::QueryString,
                         ..
                     }
                 ),
                 "expected a QueryString passthrough, got {decision:?}"
             );
-            let hosts = if let Decision::Passthrough {
+            let hosts = if let DispatchOutcome::Passthrough {
                 reason: _,
                 requested_host,
                 canonical_host,
@@ -1408,7 +1367,7 @@ mod tests {
         assert!(
             matches!(
                 decision,
-                Decision::Passthrough {
+                DispatchOutcome::Passthrough {
                     reason: PassthroughReason::Unrecognized,
                     ..
                 }
@@ -1439,7 +1398,7 @@ mod tests {
             assert!(
                 matches!(
                     decision,
-                    Decision::Passthrough {
+                    DispatchOutcome::Passthrough {
                         reason: PassthroughReason::QueryString,
                         ..
                     }
@@ -1462,7 +1421,7 @@ mod tests {
         assert!(
             matches!(
                 decision,
-                Decision::Passthrough {
+                DispatchOutcome::Passthrough {
                     reason: PassthroughReason::Unrecognized,
                     ..
                 }
@@ -1486,7 +1445,7 @@ mod tests {
         assert!(
             matches!(
                 decision,
-                Decision::Passthrough {
+                DispatchOutcome::Passthrough {
                     reason: PassthroughReason::JoinedFieldUnderscore,
                     ..
                 }
@@ -1510,7 +1469,7 @@ mod tests {
         assert!(
             matches!(
                 decision,
-                Decision::Passthrough {
+                DispatchOutcome::Passthrough {
                     reason: PassthroughReason::PackagesOutsideArchitecture,
                     ..
                 }
@@ -1552,7 +1511,7 @@ mod tests {
             assert!(
                 matches!(
                     decision,
-                    Decision::Passthrough {
+                    DispatchOutcome::Passthrough {
                         reason: PassthroughReason::NameTooLong,
                         ..
                     }
@@ -1562,7 +1521,7 @@ mod tests {
         }
         let decision = decide(&pool_at(MAX_DEBNAME_LEN));
         assert!(
-            matches!(decision, Decision::Cache { .. }),
+            matches!(decision, DispatchOutcome::Cache(_)),
             "expected Cache at the limit, got {decision:?}"
         );
     }
@@ -1582,7 +1541,7 @@ mod tests {
         assert!(
             matches!(
                 decision,
-                Decision::Passthrough {
+                DispatchOutcome::Passthrough {
                     reason: PassthroughReason::NonDebPool,
                     ..
                 }
@@ -1613,7 +1572,7 @@ mod tests {
             assert!(
                 matches!(
                     decision,
-                    Decision::Passthrough {
+                    DispatchOutcome::Passthrough {
                         reason: PassthroughReason::FlatAnchoredMirror,
                         ..
                     }
@@ -1632,7 +1591,7 @@ mod tests {
             PreciseInstant::now(),
         );
         assert!(
-            matches!(decision, Decision::Cache { .. }),
+            matches!(decision, DispatchOutcome::Cache(_)),
             "only the `flat` segment itself is reserved, got {decision:?}"
         );
     }
@@ -1652,7 +1611,7 @@ mod tests {
         assert!(
             matches!(
                 decision,
-                Decision::Passthrough {
+                DispatchOutcome::Passthrough {
                     reason: PassthroughReason::FlatBlocked,
                     ..
                 }
@@ -1674,7 +1633,7 @@ mod tests {
             PreciseInstant::now(),
         );
         assert!(
-            matches!(decision, Decision::Cache { .. }),
+            matches!(decision, DispatchOutcome::Cache(_)),
             "expected Cache, got {decision:?}"
         );
     }
@@ -1692,7 +1651,7 @@ mod tests {
             PreciseInstant::now(),
         );
         assert!(
-            matches!(decision, Decision::Reject(RejectReason::DiffRequest)),
+            matches!(decision, DispatchOutcome::Reject(RejectReason::DiffRequest)),
             "expected DiffRequest reject, got {decision:?}"
         );
     }
@@ -1715,7 +1674,7 @@ mod tests {
         assert!(
             matches!(
                 decision,
-                Decision::Passthrough {
+                DispatchOutcome::Passthrough {
                     reason: PassthroughReason::Unrecognized,
                     ..
                 }
@@ -1737,7 +1696,7 @@ mod tests {
             PreciseInstant::now(),
         );
         assert!(
-            matches!(decision, Decision::Reject(RejectReason::UnsafePath)),
+            matches!(decision, DispatchOutcome::Reject(RejectReason::UnsafePath)),
             "expected UnsafePath reject, got {decision:?}"
         );
     }
@@ -1763,7 +1722,10 @@ mod tests {
                 PreciseInstant::now(),
             );
             assert!(
-                matches!(decision, Decision::Reject(RejectReason::InvalidValue)),
+                matches!(
+                    decision,
+                    DispatchOutcome::Reject(RejectReason::InvalidValue)
+                ),
                 "{path}: expected InvalidValue reject, got {decision:?}"
             );
         }
@@ -1784,7 +1746,7 @@ mod tests {
             PreciseInstant::now(),
         );
         assert!(
-            matches!(decision, Decision::Reject(RejectReason::BadEncoding)),
+            matches!(decision, DispatchOutcome::Reject(RejectReason::BadEncoding)),
             "expected BadEncoding reject, got {decision:?}"
         );
     }
@@ -1805,7 +1767,10 @@ mod tests {
             PreciseInstant::now(),
         );
         assert!(
-            matches!(decision, Decision::Reject(RejectReason::InvalidValue)),
+            matches!(
+                decision,
+                DispatchOutcome::Reject(RejectReason::InvalidValue)
+            ),
             "expected InvalidValue reject, got {decision:?}"
         );
         assert_eq!(
@@ -1831,7 +1796,10 @@ mod tests {
             PreciseInstant::now(),
         );
         assert!(
-            matches!(decision, Decision::Reject(RejectReason::InvalidValue)),
+            matches!(
+                decision,
+                DispatchOutcome::Reject(RejectReason::InvalidValue)
+            ),
             "expected InvalidValue reject, got {decision:?}"
         );
         assert_eq!(metrics::UNSAFE_PATH_REJECTED.get(), unsafe_before + 1);
@@ -1854,7 +1822,7 @@ mod tests {
             PreciseInstant::now(),
         );
         assert!(
-            matches!(decision, Decision::Reject(RejectReason::DiffRequest)),
+            matches!(decision, DispatchOutcome::Reject(RejectReason::DiffRequest)),
             "expected DiffRequest reject, got {decision:?}"
         );
     }
