@@ -131,14 +131,6 @@ pub(crate) fn hex_decode_exact<const N: usize>(hex: &str) -> Option<[u8; N]> {
     const_hex::decode_to_array(hex).ok()
 }
 
-/// Parse a stanza line of the form `"<prefix><hex>"` into `N` bytes. Like
-/// [`split_field`], an indented (continuation) line never matches.
-#[cfg(test)]
-pub(crate) fn parse_hex_field<const N: usize>(line: &str, prefix: &str) -> Option<[u8; N]> {
-    let rest = line.trim_end().strip_prefix(prefix)?.trim_start();
-    hex_decode_exact::<N>(rest)
-}
-
 /// Lowercase-hex encoding suitable for log messages.
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     const_hex::encode(bytes)
@@ -823,10 +815,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_hex_field_sha256() {
-        let hash = [0x11u8; 32];
-        let line = format!("SHA256: {}\n", hex_encode(&hash));
-        assert_eq!(parse_hex_field::<32>(&line, "SHA256: "), Some(hash));
+    fn stanza_ingest_accepts_sha512_whitespace_and_crlf() {
+        let mut stanza = Stanza::new();
+        let hash = [0x22u8; 64];
+        stanza.ingest(&format!("SHA512:  {}\r\n", hex_encode(&hash)));
+        assert_eq!(stanza.sha512, Some(hash));
+    }
+
+    #[test]
+    fn stanza_ingest_ignores_unrecognized_digest_fields() {
+        let mut stanza = Stanza::new();
+        stanza.ingest(&format!("MD5sum: {}\n", hex_encode(&[0u8; 32])));
+        assert_eq!(stanza.chosen(), None);
+    }
+
+    #[test]
+    fn stanza_ingest_rejects_a_short_sha256() {
+        let mut stanza = Stanza::new();
+        stanza.ingest(&format!("SHA256: {}\n", "0".repeat(63)));
+        assert_eq!(stanza.sha256, None);
     }
 
     #[test]
