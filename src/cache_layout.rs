@@ -600,18 +600,8 @@ impl ConnectionDetails {
         }
     }
 
-    /// The absolute directory holding this request's cached file
-    /// ([`CachePaths::entry_dir`] for its layout and site).  The full file
-    /// path is [`Self::cache_file_path`]; the leaf is appended there, not
-    /// by callers.
-    #[must_use]
-    pub(crate) fn cache_dir_path(&self) -> PathBuf {
-        CachePaths::global().entry_dir(self.layout(), self.site())
-    }
-
-    /// [`Self::cache_dir_path`] plus the `debname` leaf, in one pre-sized
-    /// allocation - use this instead of pushing/joining the filename onto
-    /// the directory path.
+    /// The absolute cached file path for this request, in one pre-sized
+    /// allocation through [`CachePaths::entry_file`].
     #[must_use]
     pub(crate) fn cache_file_path(&self) -> PathBuf {
         CachePaths::global().entry_file(self.layout(), self.site(), Path::new(&self.debname))
