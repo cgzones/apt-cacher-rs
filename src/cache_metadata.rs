@@ -391,16 +391,12 @@ impl CacheMetadataStore {
     /// on the cold cache-miss insert.  The `block_in_place` round-trip
     /// happens only on miss; subsequent hits return an [`Arc`] clone with
     /// no syscalls.
-    pub(crate) fn resolve<K>(
+    pub(crate) fn resolve(
         &self,
-        key: &K,
+        key: &CacheEntryKeyRef<'_>,
         file: &tokio::fs::File,
         path: &Path,
-    ) -> Arc<UpstreamMetadata>
-    where
-        K: Hash + Equivalent<CacheEntryKey> + ?Sized,
-        Self: ResolveOwn<K>,
-    {
+    ) -> Arc<UpstreamMetadata> {
         if let Some(entry) = self.map.read().get(key) {
             return Arc::clone(entry);
         }
@@ -461,7 +457,7 @@ impl CacheMetadataStore {
         // best-effort and silently swallows `ErrorKind::Unsupported`), trust
         // the publisher, and skip the assert.  Asserting here would fire
         // spuriously on filesystems without xattr support.
-        let owned = <Self as ResolveOwn<K>>::own(key);
+        let owned = (*key).to_owned();
         let mut map = self.map.write();
         if map.len() >= CACHE_METADATA_MAX_ENTRIES && !map.contains_key(&owned) {
             log_metadata_cache_cleared();
@@ -538,28 +534,6 @@ impl CacheMetadataStore {
     /// interface "Daemon Status" row that surfaces in-memory cache size.
     pub(crate) fn len(&self) -> usize {
         self.map.read().len()
-    }
-}
-
-/// Helper trait used by [`CacheMetadataStore::resolve`] to materialise an
-/// owned [`CacheEntryKey`] on the cold cache-miss insert.  Implemented
-/// for both the borrowed [`CacheEntryKeyRef`] (hot-path callers) and
-/// the owned [`CacheEntryKey`] (test/cold callers).
-pub(crate) trait ResolveOwn<K: ?Sized> {
-    fn own(key: &K) -> CacheEntryKey;
-}
-
-impl ResolveOwn<CacheEntryKey> for CacheMetadataStore {
-    #[inline]
-    fn own(key: &CacheEntryKey) -> CacheEntryKey {
-        key.clone()
-    }
-}
-
-impl ResolveOwn<CacheEntryKeyRef<'_>> for CacheMetadataStore {
-    #[inline]
-    fn own(key: &CacheEntryKeyRef<'_>) -> CacheEntryKey {
-        (*key).to_owned()
     }
 }
 
@@ -644,7 +618,7 @@ mod tests {
         write_last_modified(&file, &path, "Thu, 01 Jan 1970 00:00:00 GMT");
 
         let key = fixture_key();
-        let first = store.resolve(&key, &file, &path);
+        let first = store.resolve(&key.as_ref(), &file, &path);
         // Skip entirely on filesystems that reject xattr writes (the prior
         // `write_etag` would have silently been a no-op).
         if first.etag.is_none() && first.last_modified.is_none() {
@@ -657,7 +631,7 @@ mod tests {
         // Mutate the file's xattr to confirm the second resolve returns the
         // cached value, not a fresh disk read.
         write_etag(&file, &path, "\"xyz\"");
-        let second = store.resolve(&key, &file, &path);
+        let second = store.resolve(&key.as_ref(), &file, &path);
         assert_eq!(second.etag.as_deref(), Some("\"abc\""));
     }
 
@@ -671,7 +645,7 @@ mod tests {
         );
         write_upstream_metadata(&file, &path, &meta, Some(4096), TargetFile::New);
 
-        let resolved = store.resolve(&fixture_key(), &file, &path);
+        let resolved = store.resolve(&fixture_key().as_ref(), &file, &path);
         // Skip on filesystems that reject xattr writes.
         if resolved.etag.is_none() && resolved.last_modified.is_none() {
             return;
@@ -819,7 +793,7 @@ mod tests {
             )),
         );
         let (_dir, file, path) = fixture_file().await;
-        let entry = store.resolve(&key, &file, &path);
+        let entry = store.resolve(&key.as_ref(), &file, &path);
         assert_eq!(entry.etag.as_deref(), Some("\"new\""));
     }
 
@@ -852,17 +826,26 @@ mod tests {
 
         let (_dir, file, path) = fixture_file().await;
         assert_eq!(
-            store.resolve(&pool_key, &file, &path).etag.as_deref(),
+            store
+                .resolve(&pool_key.as_ref(), &file, &path)
+                .etag
+                .as_deref(),
             Some("\"pool\"")
         );
         assert_eq!(
-            store.resolve(&flat_key, &file, &path).etag.as_deref(),
+            store
+                .resolve(&flat_key.as_ref(), &file, &path)
+                .etag
+                .as_deref(),
             Some("\"flat\"")
         );
 
         store.invalidate(&flat_key);
         assert_eq!(
-            store.resolve(&pool_key, &file, &path).etag.as_deref(),
+            store
+                .resolve(&pool_key.as_ref(), &file, &path)
+                .etag
+                .as_deref(),
             Some("\"pool\""),
             "invalidating one layout leaves the other entry alone"
         );
@@ -880,7 +863,7 @@ mod tests {
         let via_ref = store.resolve(&key.as_ref(), &file, &path);
         assert_eq!(store.len(), 1, "the cold path materialises the owned key");
 
-        let via_owned = store.resolve(&key, &file, &path);
+        let via_owned = Arc::clone(store.map.read().get(&key).expect("owned key finds entry"));
         assert!(
             Arc::ptr_eq(&via_ref, &via_owned),
             "the owned key must hit the entry the borrowed key inserted"
@@ -923,13 +906,13 @@ mod tests {
             )),
         );
         assert_eq!(
-            store.resolve(&key, &file, &path).etag.as_deref(),
+            store.resolve(&key.as_ref(), &file, &path).etag.as_deref(),
             Some("\"published\""),
             "a published entry shadows the file's own xattrs"
         );
 
         store.invalidate(&key);
-        let reread = store.resolve(&key, &file, &path);
+        let reread = store.resolve(&key.as_ref(), &file, &path);
         // Skip on filesystems that reject xattr writes (`write_etag` was a
         // silent no-op there).
         if reread.etag.is_none() {
@@ -947,12 +930,12 @@ mod tests {
         let store = CacheMetadataStore::new();
         let (_dir, file, path) = fixture_file().await;
         let key = fixture_key();
-        let entry = store.resolve(&key, &file, &path);
+        let entry = store.resolve(&key.as_ref(), &file, &path);
         assert!(entry.etag.is_none());
         assert!(entry.last_modified.is_none());
         // Second call still hits the cache.
         assert_eq!(store.len(), 1);
-        let _again = store.resolve(&key, &file, &path);
+        let _again = store.resolve(&key.as_ref(), &file, &path);
         assert_eq!(store.len(), 1);
     }
 
