@@ -253,7 +253,7 @@ pub(super) async fn byhash_dir_present(path: &Path) -> Result<bool, CleanupUnitE
 mod tests {
     use super::*;
     use crate::config::ClientHost;
-    use crate::limits::RETENTION_TIME;
+    use crate::limits::{MAX_RELEASE_SIZE, RETENTION_TIME};
     use crate::{index_parser::hex_encode, metrics, swrite};
 
     fn origin(distribution: &str, age: Duration) -> OriginEntry {
@@ -474,12 +474,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_reference_set_bails_on_unreadable_release() {
+    async fn build_reference_set_bails_on_oversized_release() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // A *directory* named like a Release file: opening + read_to_string
-        // fails (EISDIR), so the builder must bail to None (conservative
-        // whole-dir fallback) rather than build a partial set.
-        std::fs::create_dir(dir.path().join("sid_InRelease")).expect("mkdir");
+        // A regular but oversized Release must reject the whole set even
+        // when another Release provides usable references.
+        std::fs::write(
+            dir.path().join("stable_InRelease"),
+            release_with_sha256(&[[0xcc; 32]]),
+        )
+        .expect("valid Release");
+        let path = dir.path().join("sid_InRelease");
+        std::fs::File::create(&path)
+            .expect("create oversized Release")
+            .set_len(MAX_RELEASE_SIZE.get() + 1)
+            .expect("size oversized Release");
+        assert!(read_release_to_string(&path).await.is_err());
         assert!(
             build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &[])
                 .await
