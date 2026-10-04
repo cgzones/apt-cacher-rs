@@ -53,6 +53,24 @@ pub(crate) fn nofollow_nonblock_options() -> std::fs::OpenOptions {
     options
 }
 
+/// Open a cache file for reading on the calling thread, for a cache hit.
+///
+/// Through [`tokio::fs`] the `openat` is a blocking-pool round trip on every
+/// hit (a pool thread's wake, the wake back, a few `futex` calls), where the
+/// call itself resolves a hot dentry in about a microsecond; the hit path
+/// already `fstat`s and `sendfile`s on the worker. `block_in_place` would
+/// not save the handoff: it moves the worker's core to another thread
+/// through the same blocking pool. `O_NONBLOCK`, inert for a regular file,
+/// keeps a FIFO planted at the path from blocking the worker in `open`
+/// ([`nofollow_nonblock_options`]); callers reject every non-regular file
+/// after the `fstat`, as they do for any open.
+pub(crate) fn open_cached_file_inline(path: &Path) -> std::io::Result<tokio::fs::File> {
+    nofollow_nonblock_options()
+        .read(true)
+        .open(path)
+        .map(tokio::fs::File::from_std)
+}
+
 /// [`nofollow_options`] over [`tokio::fs::OpenOptions`], with the same
 /// `custom_flags` caveat.
 pub(crate) fn tokio_nofollow_options() -> tokio::fs::OpenOptions {
