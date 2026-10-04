@@ -523,8 +523,9 @@ impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for DomainName {
 /// Stored in [`crate::deb_mirror::Mirror::host`] and in the
 /// `mirrors_v2.host` column; threaded into the upstream-connection path
 /// (TCP connect, TLS SNI, outgoing `Host:` header).
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, sqlx::Type)]
 #[repr(transparent)]
+#[sqlx(transparent)]
 pub(crate) struct ClientHost(DomainName);
 
 /// Alias-resolved on-disk identity.
@@ -667,36 +668,6 @@ impl<'de> Deserialize<'de> for CacheHost {
         D: Deserializer<'de>,
     {
         DomainName::deserialize(deserializer).map(Self)
-    }
-}
-
-// sqlx delegations: the inner `DomainName` already validates on decode
-// and encodes via its `into` to `&String`; both wrappers forward without
-// reimplementing the column/type plumbing.
-impl sqlx::Type<sqlx::Sqlite> for ClientHost {
-    fn type_info() -> <sqlx::Sqlite as sqlx::Database>::TypeInfo {
-        <DomainName as sqlx::Type<sqlx::Sqlite>>::type_info()
-    }
-
-    fn compatible(ty: &<sqlx::Sqlite as sqlx::Database>::TypeInfo) -> bool {
-        <DomainName as sqlx::Type<sqlx::Sqlite>>::compatible(ty)
-    }
-}
-
-impl<'q> sqlx::Encode<'q, sqlx::Sqlite> for ClientHost {
-    fn encode_by_ref(
-        &self,
-        buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer,
-    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
-        <DomainName as sqlx::Encode<'q, sqlx::Sqlite>>::encode_by_ref(&self.0, buf)
-    }
-}
-
-impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for ClientHost {
-    fn decode(
-        value: <sqlx::Sqlite as sqlx::Database>::ValueRef<'r>,
-    ) -> Result<Self, sqlx::error::BoxDynError> {
-        <DomainName as sqlx::Decode<'r, sqlx::Sqlite>>::decode(value).map(Self)
     }
 }
 
