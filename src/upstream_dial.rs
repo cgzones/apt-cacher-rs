@@ -236,6 +236,7 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
+    use crate::main_loop::is_missing_ipv6;
 
     const V6_A: SocketAddr = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::LOCALHOST), 80);
     const V6_B: SocketAddr = SocketAddr::new(
@@ -442,8 +443,12 @@ mod tests {
             socket.bind(&SocketAddr::from((Ipv6Addr::LOCALHOST, 0)).into())?;
             Ok(socket)
         });
-        let Ok(v6) = v6 else {
-            return; // no IPv6 loopback on this host
+        let v6 = match v6 {
+            Ok(socket) => socket,
+            Err(err) => {
+                assert!(is_missing_ipv6(&err), "unexpected IPv6 bind failure: {err}");
+                return;
+            }
         };
         // Retain the bound, non-listening socket so another test cannot take
         // the port before the dial: this address must refuse the connection.
@@ -468,8 +473,12 @@ mod tests {
     /// resolver.
     #[tokio::test]
     async fn connect_dials_a_bare_ipv6_literal() {
-        let Ok(listener) = tokio::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await else {
-            return; // no IPv6 loopback on this host
+        let listener = match tokio::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                assert!(is_missing_ipv6(&err), "unexpected IPv6 bind failure: {err}");
+                return;
+            }
         };
         let port = listener.local_addr().unwrap().port();
         let stream = connect("::1", port, Duration::from_secs(10)).await.unwrap();

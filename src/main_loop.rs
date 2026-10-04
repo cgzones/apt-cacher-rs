@@ -780,7 +780,7 @@ fn bind_socket(addr: SocketAddr) -> std::io::Result<TcpListener> {
 /// Whether a failed IPv6 bind means the host has no IPv6 at all: the address
 /// family is compiled out or disabled (`EAFNOSUPPORT`), or no IPv6 address
 /// is available (`EADDRNOTAVAIL`).
-fn is_missing_ipv6(err: &std::io::Error) -> bool {
+pub(crate) fn is_missing_ipv6(err: &std::io::Error) -> bool {
     err.raw_os_error()
         .is_some_and(|errno| errno == nix::libc::EAFNOSUPPORT || errno == nix::libc::EADDRNOTAVAIL)
 }
@@ -849,8 +849,12 @@ mod listener_tests {
     /// an IPv4 client reaches it, as an IPv4-mapped peer.
     #[tokio::test]
     async fn an_ipv6_listener_accepts_ipv4_clients() {
-        let Ok(listener) = bind_socket(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))) else {
-            return; // no IPv6 on this host
+        let listener = match bind_socket(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))) {
+            Ok(listener) => listener,
+            Err(err) => {
+                assert!(is_missing_ipv6(&err), "unexpected IPv6 bind failure: {err}");
+                return;
+            }
         };
         let port = listener.local_addr().unwrap().port();
         let _client = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
