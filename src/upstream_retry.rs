@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use coarsetime::Instant;
 
-use crate::{metrics, sticky};
+use crate::metrics;
 
 /// Maximum upstream connect *retries* before giving up (both backends), so a
 /// request makes at most `MAX_ATTEMPTS + 1` backoff-paced connect attempts.
@@ -19,7 +19,7 @@ use crate::{metrics, sticky};
 /// invariant assert in `hyper_conn.rs`.
 pub(crate) const MAX_ATTEMPTS: u32 = 10;
 
-/// Which budget ended the retry loop. Reported by [`Backoff::limit`] so the
+/// Which budget ended the retry loop. Returned by [`Backoff::next_retry`] so the
 /// terminal log line tells an operator whether the attempt cap or
 /// `upstream_retry_budget` was the limiter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,7 +75,6 @@ pub(crate) struct Backoff {
     curr: u64,
     attempt: u32,
     deadline: Instant,
-    budget_spent: sticky::Bool,
     /// Whether a granted retry bumps `UPSTREAM_RETRIES`.
     counted: bool,
 }
@@ -90,7 +89,6 @@ impl Backoff {
             curr: INITIAL_DELAY_MS,
             attempt: 1,
             deadline: now.saturating_add(budget.into()),
-            budget_spent: sticky::Bool::new(),
             counted: true,
         }
     }
@@ -112,42 +110,31 @@ impl Backoff {
         self.attempt
     }
 
-    /// The budget that ended the retry loop, for the terminal log line. Only
-    /// meaningful once [`Backoff::next_retry`] has returned `None`.
-    pub(crate) fn limit(&self) -> RetryLimit {
-        if self.budget_spent.get() {
-            RetryLimit::Budget
-        } else {
-            RetryLimit::Attempts
-        }
-    }
-
-    /// The delay to wait before retrying, or `None` once the attempt budget OR
+    /// The delay to wait before retrying, or the limiting budget once the attempt budget OR
     /// the wall-clock budget is spent and the caller must fail terminally.
     /// Charges the attempt, advances the schedule and bumps `UPSTREAM_RETRIES`
     /// (unless built by `Backoff::uncounted`, which is hyper-only).
     ///
     /// The wall-clock rule is "do not start a sleep that finishes past the
     /// deadline": a delay ending after `now + budget` (measured from the `now`
-    /// passed to [`Backoff::new`]) yields `None` rather than sleeping first and
+    /// passed to [`Backoff::new`]) returns an error rather than sleeping first and
     /// failing anyway. Only the delays are bounded here — each attempt is
     /// separately bounded by `http_timeout`, so a slow connect can still carry
     /// the envelope past the budget before the next check sees it.
-    pub(crate) fn next_retry(&mut self, now: Instant) -> Option<Duration> {
+    pub(crate) fn next_retry(&mut self, now: Instant) -> Result<Duration, RetryLimit> {
         if self.attempt > MAX_ATTEMPTS {
-            return None;
+            return Err(RetryLimit::Attempts);
         }
         let delay = Duration::from_millis(self.curr);
         if now.saturating_add(delay.into()) > self.deadline {
-            self.budget_spent.set();
-            return None;
+            return Err(RetryLimit::Budget);
         }
         (self.curr, self.prev) = (self.curr + self.prev, self.curr);
         self.attempt += 1;
         if self.counted {
             metrics::UPSTREAM_RETRIES.increment();
         }
-        Some(delay)
+        Ok(delay)
     }
 
     /// Restart the delay schedule without refunding either budget — neither the
@@ -173,17 +160,21 @@ mod tests {
     }
 
     /// Drive the loop the way both backends do: sleep for each returned delay,
-    /// then ask again. Returns the delays granted before the terminal `None`.
+    /// then ask again. Returns the delays granted before the terminal error.
     fn drive(budget: Duration) -> (Vec<Duration>, RetryLimit) {
         let start = Instant::now();
         let mut backoff = Backoff::new(budget, start);
         let mut now = start;
         let mut delays = Vec::new();
-        while let Some(delay) = backoff.next_retry(now) {
-            delays.push(delay);
-            now = advance(now, delay);
+        loop {
+            match backoff.next_retry(now) {
+                Ok(delay) => {
+                    delays.push(delay);
+                    now = advance(now, delay);
+                }
+                Err(limit) => return (delays, limit),
+            }
         }
-        (delays, backoff.limit())
     }
 
     fn millis(values: &[u64]) -> Vec<Duration> {
@@ -203,11 +194,10 @@ mod tests {
         loop {
             let delay = counted.next_retry(now);
             assert_eq!(uncounted.next_retry(now), delay);
-            if delay.is_none() {
+            if delay.is_err() {
                 break;
             }
         }
-        assert_eq!(uncounted.limit(), counted.limit());
     }
 
     #[test]
@@ -215,7 +205,7 @@ mod tests {
         let now = Instant::now();
         let mut b = Backoff::new(GENEROUS, now);
         for want in [500, 500, 1000, 1500, 2500, 4000, 6500] {
-            assert_eq!(b.next_retry(now), Some(Duration::from_millis(want)));
+            assert_eq!(b.next_retry(now), Ok(Duration::from_millis(want)));
         }
     }
 
@@ -225,12 +215,12 @@ mod tests {
         let mut b = Backoff::new(Duration::from_secs(30), start);
         let mut now = start;
         for want in [500, 500, 1000] {
-            assert_eq!(b.next_retry(now), Some(Duration::from_millis(want)));
+            assert_eq!(b.next_retry(now), Ok(Duration::from_millis(want)));
             now = advance(now, Duration::from_millis(want));
         }
         b.reset_delay();
         for want in [500, 500] {
-            assert_eq!(b.next_retry(now), Some(Duration::from_millis(want)));
+            assert_eq!(b.next_retry(now), Ok(Duration::from_millis(want)));
             now = advance(now, Duration::from_millis(want));
         }
         // The attempt budget kept counting across the reset.
@@ -238,8 +228,7 @@ mod tests {
         // ... and so did the wall-clock budget: the deadline is still 30s after
         // `start`, so a delay that would run past it is refused.
         let near_deadline = advance(start, Duration::from_millis(29_800));
-        assert_eq!(b.next_retry(near_deadline), None);
-        assert_eq!(b.limit(), RetryLimit::Budget);
+        assert_eq!(b.next_retry(near_deadline), Err(RetryLimit::Budget));
     }
 
     #[test]
@@ -248,12 +237,12 @@ mod tests {
         let mut b = Backoff::new(GENEROUS, now);
         assert_eq!(b.attempt(), 1);
         for _ in 0..MAX_ATTEMPTS {
-            assert!(b.next_retry(now).is_some());
+            assert!(b.next_retry(now).is_ok());
         }
         // MAX_ATTEMPTS retries after the initial attempt: MAX_ATTEMPTS + 1 connects.
         assert_eq!(b.attempt(), MAX_ATTEMPTS + 1);
-        assert_eq!(b.next_retry(now), None);
-        assert_eq!(b.next_retry(now), None);
+        assert_eq!(b.next_retry(now), Err(RetryLimit::Attempts));
+        assert_eq!(b.next_retry(now), Err(RetryLimit::Attempts));
     }
 
     #[test]
@@ -285,8 +274,7 @@ mod tests {
     fn budget_below_the_first_delay_yields_no_retries() {
         let now = Instant::now();
         let mut b = Backoff::new(Duration::from_millis(100), now);
-        assert_eq!(b.next_retry(now), None);
+        assert_eq!(b.next_retry(now), Err(RetryLimit::Budget));
         assert_eq!(b.attempt(), 1);
-        assert_eq!(b.limit(), RetryLimit::Budget);
     }
 }

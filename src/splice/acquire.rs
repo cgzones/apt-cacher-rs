@@ -297,64 +297,62 @@ pub(super) async fn standard_upstream_connect(
         // sparing 10 pointless TCP connects and TLS handshakes.
         let permanent = err.transience == Transience::Permanent;
         let next = if permanent {
-            None
+            Err(RetryStop::Permanent)
         } else {
-            backoff.next_retry(coarsetime::Instant::now())
+            backoff
+                .next_retry(coarsetime::Instant::now())
+                .map_err(RetryStop::from)
         };
-        let Some(delay) = next else {
-            if let Some(decision) = decision {
-                if err.certificate_rejected {
-                    // Terminal because the policy chose HTTPS; the remembered
-                    // scheme stays, as it is what keeps the next request from
-                    // falling back (mirroring the hyper backend).
-                    warn_once_or_info!(
-                        "splice proxy: HTTPS certificate of host {} failed verification; not falling back to plain HTTP since {} (list the host in `http_only_mirrors` to fetch it over plain HTTP, or fix the mirror's certificate)",
-                        mirror.format_authority(),
-                        scheme_cache::no_fallback_reason(global_config().https_upgrade_mode)
-                    );
-                } else if let Some(scheme) = scheme_cache::record_failure(mirror.into()) {
-                    // Evict a stale cached scheme so the next request
-                    // re-resolves, mirroring the hyper backend. A learned
-                    // scheme is sticky, so losing it silently changes
-                    // how every later request to this host is dialled (an
-                    // evicted https entry can hand the host back to plain http
-                    // under Auto mode).
-                    warn_once_or_info!(
-                        "splice proxy: evicted cached {scheme} scheme for host {} after connect failure; the next request re-decides the scheme",
-                        mirror.format_authority()
-                    );
+        let delay = match next {
+            Ok(delay) => delay,
+            Err(limit) => {
+                if let Some(decision) = decision {
+                    if err.certificate_rejected {
+                        // Terminal because the policy chose HTTPS; the remembered
+                        // scheme stays, as it is what keeps the next request from
+                        // falling back (mirroring the hyper backend).
+                        warn_once_or_info!(
+                            "splice proxy: HTTPS certificate of host {} failed verification; not falling back to plain HTTP since {} (list the host in `http_only_mirrors` to fetch it over plain HTTP, or fix the mirror's certificate)",
+                            mirror.format_authority(),
+                            scheme_cache::no_fallback_reason(global_config().https_upgrade_mode)
+                        );
+                    } else if let Some(scheme) = scheme_cache::record_failure(mirror.into()) {
+                        // Evict a stale cached scheme so the next request
+                        // re-resolves, mirroring the hyper backend. A learned
+                        // scheme is sticky, so losing it silently changes
+                        // how every later request to this host is dialled (an
+                        // evicted https entry can hand the host back to plain http
+                        // under Auto mode).
+                        warn_once_or_info!(
+                            "splice proxy: evicted cached {scheme} scheme for host {} after connect failure; the next request re-decides the scheme",
+                            mirror.format_authority()
+                        );
+                    }
+                    if decision.is_upgrade_attempt() {
+                        metrics::HTTPS_UPGRADE_FAILED.increment();
+                    }
                 }
-                if decision.is_upgrade_attempt() {
-                    metrics::HTTPS_UPGRADE_FAILED.increment();
-                }
+                // The failure itself is not logged here: the attempt count and
+                // the reason that ended the loop ride on it. The download callers
+                // hand it to the runner, which logs it once-gated with them; the
+                // two callers that have no runner carry the cause themselves --
+                // `simple_proxy` logs its own once-gated 502 line, and
+                // `cleanup_bridge` passes it on as an `UpstreamFetchError`
+                // extension for cleanup's decision log.
+                return Err(
+                    UpstreamError::connect("connect upstream", err.err, attempt, limit)
+                        .with_target(format!(
+                            "{}://{host_authority}{upstream_path}",
+                            // Auto mode fails on its HTTP fallback, or on the HTTPS
+                            // probe itself when it refused to fall back.
+                            resolved_scheme.unwrap_or(if err.certificate_rejected {
+                                Scheme::Https
+                            } else {
+                                Scheme::Http
+                            })
+                        )),
+                );
             }
-            // The failure itself is not logged here: the attempt count and
-            // the reason that ended the loop ride on it. The download callers
-            // hand it to the runner, which logs it once-gated with them; the
-            // two callers that have no runner carry the cause themselves --
-            // `simple_proxy` logs its own once-gated 502 line, and
-            // `cleanup_bridge` passes it on as an `UpstreamFetchError`
-            // extension for cleanup's decision log.
-            return Err(UpstreamError::connect(
-                "connect upstream",
-                err.err,
-                attempt,
-                if permanent {
-                    RetryStop::Permanent
-                } else {
-                    backoff.limit().into()
-                },
-            )
-            .with_target(format!(
-                "{}://{host_authority}{upstream_path}",
-                // Auto mode fails on its HTTP fallback, or on the HTTPS
-                // probe itself when it refused to fall back.
-                resolved_scheme.unwrap_or(if err.certificate_rejected {
-                    Scheme::Https
-                } else {
-                    Scheme::Http
-                })
-            )));
         };
         debug!(
             "splice proxy: failed to connect to {host_authority} after {attempt} connection attempts, will retry in {} ms:  {}",
