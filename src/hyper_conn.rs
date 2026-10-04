@@ -1661,8 +1661,11 @@ async fn download_file(
         let rbarrier = dbarrier.begin_rename().await;
 
         /* Should only happen for concurrent downloads from aliased mirrors */
+        // A `stat` of a hot directory entry, inline like the cache-hit open
+        // (`open_cached_file_inline`): through `tokio::fs` it was a
+        // blocking-pool round trip on every fresh permanent download.
         if warn_on_override {
-            match tokio::fs::try_exists(&dest_file_path).await {
+            match dest_file_path.try_exists() {
                 Ok(true) => {
                     warn!(
                         "Target file `{}` already exists; overwriting{}",
