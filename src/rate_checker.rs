@@ -87,7 +87,11 @@ impl RateChecker {
 
     /// Adds the given number of bytes to the rate checker.
     pub(crate) fn add(&mut self, bytes: usize) {
-        let elapsed = self.last.elapsed();
+        self.add_at(bytes, Instant::now());
+    }
+
+    fn add_at(&mut self, bytes: usize, now: Instant) {
+        let elapsed = now.duration_since(self.last);
         let elapsed_secs = elapsed.as_secs();
         if elapsed_secs >= 1 {
             if elapsed_secs > 1 {
@@ -135,7 +139,7 @@ impl RateChecker {
 
 #[cfg(test)]
 mod tests {
-    use super::RateChecker;
+    use super::{Duration, RateChecker};
     use crate::nonzero;
 
     #[test]
@@ -143,10 +147,8 @@ mod tests {
         let mut rc = RateChecker::with_timeframe(nonzero!(100), nonzero!(3));
 
         // Simulate 1 byte per second for 3 seconds.
-        // Use 1050ms to ensure coarsetime registers a full second.
         for _ in 0..3 {
-            std::thread::sleep(std::time::Duration::from_millis(1050));
-            rc.add(1);
+            rc.add_at(1, rc.last + Duration::from_secs(1));
         }
 
         // Buffer should now be full with 3 bytes over 3s = 1 B/s < 100 B/s.
@@ -163,8 +165,7 @@ mod tests {
 
         // Simulate 500 bytes per second for 3 seconds.
         for _ in 0..3 {
-            std::thread::sleep(std::time::Duration::from_millis(1050));
-            rc.add(500);
+            rc.add_at(500, rc.last + Duration::from_secs(1));
         }
 
         // ~1500 bytes over 3s = 500 B/s > 100 B/s.
@@ -179,8 +180,7 @@ mod tests {
         let mut rc = RateChecker::with_timeframe(nonzero!(100), nonzero!(3));
 
         // Only 1 second elapsed — buffer not full.
-        std::thread::sleep(std::time::Duration::from_millis(1050));
-        rc.add(1);
+        rc.add_at(1, rc.last + Duration::from_secs(1));
 
         assert!(
             rc.check_fail().is_none(),
@@ -192,11 +192,7 @@ mod tests {
     fn rate_checker_fills_zeros_for_gaps() {
         let mut rc = RateChecker::with_timeframe(nonzero!(100), nonzero!(3));
 
-        // Sleep slightly over 3 seconds to ensure at least 3 elapsed seconds
-        // are seen by coarsetime (which has ~1ms resolution but rounding can
-        // lose a tick).
-        std::thread::sleep(std::time::Duration::from_millis(3100));
-        rc.add(1);
+        rc.add_at(1, rc.last + Duration::from_secs(3));
 
         // Buffer should be [0, 0, 1] — full with 1 byte over 3s = 0 B/s < 100 B/s.
         let fail = rc.check_fail().expect("rate check should fail after gap");
@@ -210,12 +206,12 @@ mod tests {
     #[test]
     fn one_second_window_threshold_is_inclusive() {
         let mut rc = RateChecker::with_timeframe(nonzero!(1000), nonzero!(1));
-        rc.add(999);
+        rc.add_at(999, rc.last);
         let fail = rc.check_fail().expect("999 B/s is below 1000 B/s");
         assert_eq!(fail.transferred, 999);
 
         let mut rc = RateChecker::with_timeframe(nonzero!(1000), nonzero!(1));
-        rc.add(1000);
+        rc.add_at(1000, rc.last);
         assert!(
             rc.check_fail().is_none(),
             "exactly the minimum rate must pass"
@@ -231,13 +227,12 @@ mod tests {
 
         // One gap-filling add lands the window at [0, 0, 299]; the later
         // sub-second add folds into the newest sample.
-        std::thread::sleep(std::time::Duration::from_millis(3100));
-        rc.add(299);
+        rc.add_at(299, rc.last + Duration::from_secs(3));
         let fail = rc.check_fail().expect("299 / 3 = 99 B/s is below 100 B/s");
         assert_eq!(fail.transferred, 299);
         assert_eq!(fail.timeframe, nonzero!(3));
 
-        rc.add(1);
+        rc.add_at(1, rc.last);
         assert!(
             rc.check_fail().is_none(),
             "300 / 3 = 100 B/s meets the minimum exactly"
@@ -255,14 +250,14 @@ mod tests {
             "an empty window cannot judge a rate"
         );
 
-        rc.add(1);
+        rc.add_at(1, rc.last);
         let fail = rc
             .check_fail()
             .expect("1 B/s is below the 1000 B/s minimum");
         assert_eq!(fail.transferred, 1);
         assert_eq!(fail.timeframe, nonzero!(1));
 
-        rc.add(5000);
+        rc.add_at(5000, rc.last);
         assert!(
             rc.check_fail().is_none(),
             "the second sample folds into the same window and clears the breach"
