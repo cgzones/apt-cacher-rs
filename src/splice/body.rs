@@ -878,6 +878,42 @@ impl<'a> BodyTransfer<'a> {
         Ok(())
     }
 
+    /// Hand the `got` bytes `pipe_A` holds to the cache alone (no client
+    /// to write: absent, gone or demoted, or the bytes are outside its
+    /// Range). They join the `pipe_B` batch and land under the
+    /// [`CacheBatch`] policy, like a teed batch: draining `pipe_A` straight
+    /// to the file cost one blocking-pool round trip per batch, and a batch
+    /// ends at every `EAGAIN`, a few KiB apart on a trickling upstream.
+    async fn write_cache_only(&mut self, got: usize) -> Result<(), DownloadFailure> {
+        let mut remaining = got;
+        while remaining > 0 {
+            match self.cache.pipes_mut().stash(remaining) {
+                Ok(0) => {
+                    return Err(internal_io(std::io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "pipe closed while moving bytes to the cache batch",
+                    )));
+                }
+                Ok(n) => remaining -= n,
+                Err(nix::errno::Errno::EINTR) => {}
+                // `pipe_B` is full; landing it empties it.
+                Err(nix::errno::Errno::EAGAIN) if !self.cache.batch().is_empty() => {
+                    self.flush_cache().await?;
+                }
+                // No room in an empty `pipe_B`: land `pipe_A` directly
+                // instead, which is what it holds.
+                Err(nix::errno::Errno::EAGAIN) => return self.write_through().await,
+                Err(err) => {
+                    return Err(internal_io(errno_to_io_error(
+                        err,
+                        "splice to the cache batch failed",
+                    )));
+                }
+            }
+        }
+        self.flush_cache_if_due().await
+    }
+
     /// Account a chunk just pulled from upstream and return the body-offset
     /// range it covers. `BYTES_DOWNLOADED_UPSTREAM` is not bumped here but
     /// where the bytes arrive, in the accumulation loops: a chunk can fail
@@ -1305,8 +1341,8 @@ async fn drive_batches(
         } else {
             // Chunk is entirely outside the client range, or the client is
             // absent/gone/demoted — cache only. `pipe_A` holds exactly the
-            // batch, so draining it is the chunk write.
-            xfer.write_through().await?;
+            // batch.
+            xfer.write_cache_only(got).await?;
         }
     }
 
@@ -1913,6 +1949,30 @@ impl SplicePipes {
         matches!(self.head, PipeHead::Duplicated(_))
     }
 
+    /// Move up to `count` unique bytes from `pipe_A` behind the pending
+    /// `pipe_B` batch: the cache-only fan-out. A pipe-to-pipe splice moves
+    /// page references, with no copy and no blocking-pool hop. A `pipe_B`
+    /// out of room -- bytes or buffer slots, which small segments use up
+    /// first -- takes a short count or returns `EAGAIN`, never a wait.
+    fn stash(&mut self, count: usize) -> nix::Result<usize> {
+        debug_assert!(
+            matches!(self.head, PipeHead::Unique),
+            "cache-only writes consume unique pipe bytes"
+        );
+        let moved = splice(
+            &self.upstream_rx,
+            None,
+            &self.cache.sink.tx,
+            None,
+            count,
+            SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_NONBLOCK,
+        )?;
+        if moved > 0 {
+            self.cache.queue(moved);
+        }
+        Ok(moved)
+    }
+
     fn send_to_client(
         &mut self,
         client: &impl std::os::fd::AsFd,
@@ -2005,10 +2065,12 @@ impl SplicePipes {
 ///   every other reader;
 /// - before the demotion hand-off: the file-serve task reads the partial
 ///   from `client_file_pos`;
-/// - before anything else writes the cache file (the cache-only path's
-///   direct `pipe_A` drain, the boundary chunk's `pwrite`):
-///   `CacheWriter::file_offset` is one cursor and the pending bytes come
-///   earlier in the body ([`CacheWriter::write_through`] pairs the two drains);
+/// - before anything else writes the cache file (the boundary chunk's
+///   `pwrite`, a direct `pipe_A` drain): `CacheWriter::file_offset` is one
+///   cursor and the pending bytes come earlier in the body
+///   ([`CacheWriter::write_through`] pairs the two drains). The zero-copy
+///   loop's cache-only batches do not write directly: they join `pipe_B`
+///   ([`BodyTransfer::write_cache_only`]);
 /// - a batch older than [`Self::MAX_BATCH_AGE`] while parked for upstream.
 ///   That park is deliberately not an unconditional flush point: every batch
 ///   ends on an EAGAIN probe (a `Pending` read on the TLS stream), so
@@ -2377,10 +2439,9 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), D
                 .checked_sub(teed)
                 .expect("splice should not return more than requested");
         } else {
-            // Client is absent, gone or demoted — splice pipe_A directly to
-            // cache (no tee needed). The batch's `remaining` bytes are all
-            // `pipe_A` holds, so draining it is exactly that write.
-            xfer.write_through().await?;
+            // Client is absent, gone or demoted — cache only (no tee
+            // needed). The batch's `remaining` bytes are all `pipe_A` holds.
+            xfer.write_cache_only(remaining).await?;
             remaining = 0;
         }
     }
@@ -2461,8 +2522,8 @@ fn range_overlap(
 /// Splice everything a pipe holds into the cache file at `file_offset`,
 /// advance the offset by what landed, and return that count.
 ///
-/// Count-free by design. Every caller wants the pipe emptied -- a batch on the
-/// cache-only path, `pipe_B` after a tee, either pipe on the exit salvage --
+/// Count-free by design. Every caller wants the pipe emptied -- `pipe_B`'s
+/// batch, `pipe_A` when it cannot join it, either pipe on the exit salvage --
 /// and taking a byte count instead would make the caller's bookkeeping a
 /// correctness input: a count larger than the pipe's contents waits for bytes
 /// nobody will ever write (the write ends live in the caller's frame) and
@@ -3222,6 +3283,69 @@ mod tests {
             std::fs::read(&scratch.path).unwrap(),
             b"resume-queued-boundary-queued2-tail"
         );
+    }
+
+    /// Cache-only batches join `pipe_B` and land under the batch policy:
+    /// the first at once, later ones when `pipe_B` fills or at the exit
+    /// flush, in body order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cache_only_batches_join_the_pipe_b_batch() {
+        let scratch = ScratchFile::new();
+        let mut barrier = cache_barrier(&scratch.path).await;
+        let mut writer = CacheWriter::new(
+            scratch.file,
+            0,
+            CacheWriteMode::Kernel,
+            &barrier,
+            &scratch.path,
+        )
+        .await
+        .unwrap();
+        let filter = SpliceRangeFilter { skip: 0, send: 0 };
+        let mut xfer = BodyTransfer::new(
+            BodyClient::Absent,
+            &mut writer,
+            &mut barrier,
+            filter,
+            &scratch.path,
+            1,
+            None,
+            &crate::config::Config::default(),
+        );
+        xfer.cache.pipes = Some(SplicePipes::new().unwrap());
+
+        // Nothing of the transfer is on disk yet, so the first batch lands.
+        let mut expected = b"first-".to_vec();
+        accumulate(xfer.cache.pipes_mut(), &expected);
+        xfer.write_cache_only(expected.len()).await.unwrap();
+        assert_eq!(xfer.cache.file_offset, 6);
+        assert!(xfer.cache.batch().is_empty());
+
+        // Each small batch arrives as one pipe buffer, so 300 of them
+        // outrun `pipe_B`'s buffer slots (256 at 1 MiB) long before its
+        // byte capacity: the full pipe lands and the stash goes on.
+        for i in 0..300_u32 {
+            let chunk = format!("{i:04}-");
+            accumulate(xfer.cache.pipes_mut(), chunk.as_bytes());
+            xfer.write_cache_only(chunk.len()).await.unwrap();
+            expected.extend_from_slice(chunk.as_bytes());
+        }
+        assert!(
+            xfer.cache.file_offset > 6,
+            "a full pipe_B landed on the way"
+        );
+        assert!(
+            !xfer.cache.batch().is_empty(),
+            "small batches wait for the threshold"
+        );
+        xfer.flush_cache().await.unwrap();
+        assert_eq!(
+            xfer.cache.file_offset,
+            i64::try_from(expected.len()).unwrap()
+        );
+        drop(xfer);
+        drop(writer);
+        assert_eq!(std::fs::read(&scratch.path).unwrap(), expected);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
