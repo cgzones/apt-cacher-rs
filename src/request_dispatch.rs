@@ -297,8 +297,13 @@ pub(crate) fn preflight_headers<'a>(
             if !value.is_empty() {
                 let authority = http::uri::Authority::try_from(value)
                     .map_err(|_utf8err| "Invalid Host header")?;
+                // Host permits a trailing DNS root dot, including the web
+                // interface's `localhost.` and configured names. Strip only
+                // one so empty labels such as `localhost..` stay invalid.
+                let host = authority.host();
+                let host = host.strip_suffix('.').unwrap_or(host);
                 if authority.as_str().contains('@')
-                    || crate::config::DomainName::new(authority.host()).is_err()
+                    || crate::config::DomainName::new(host).is_err()
                     || uri_authority::port(&authority).is_err()
                 {
                     return Err("Invalid Host header");
@@ -888,6 +893,33 @@ mod tests {
                 acls.admits(&local_client()),
                 admitted,
                 "proxy {proxy_clients:?}, webif {webif_clients:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_headers_accepts_a_single_dns_root_dot() {
+        for host in ["localhost.", "LocalHost.:3142", "apt.corp.example.:"] {
+            assert_eq!(
+                preflight_headers(true, [("Host", host.as_bytes())].into_iter()),
+                Ok(()),
+                "{host}"
+            );
+        }
+        for host in [
+            ".",
+            "localhost..",
+            "localhost..:3142",
+            ".localhost",
+            "apt..corp.example.",
+            "localhost.:0",
+            "localhost.:65536",
+            "user@localhost.",
+        ] {
+            assert_eq!(
+                preflight_headers(true, [("Host", host.as_bytes())].into_iter()),
+                Err("Invalid Host header"),
+                "{host}"
             );
         }
     }
