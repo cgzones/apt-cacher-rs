@@ -161,7 +161,7 @@ impl FusedIterator for IfNoneMatchSplit<'_> {}
 
 /// Check if a stored `ETag` matches an `If-None-Match` header value.
 ///
-/// Parses comma-separated values and the `*` wildcard. Uses weak comparison
+/// Parses comma-separated entity-tags or a lone `*` wildcard. Uses weak comparison
 /// per RFC 9110 §8.8.3.2: the `W/` prefix is stripped before comparing opaque-tags.
 #[must_use]
 pub(crate) fn if_none_match(header: &str, etag: &str) -> bool {
@@ -170,13 +170,26 @@ pub(crate) fn if_none_match(header: &str, etag: &str) -> bool {
     /// means the client gets a normal `200`, never a stale `304`.
     const MAX_IF_NONE_MATCH_ENTRIES: usize = 64;
 
+    // RFC 9110 §13.1.2: If-None-Match = "*" / #entity-tag.
+    // The wildcard is an alternative to the entire list, not a list member.
+    if header.trim_matches([' ', '\t']) == "*" {
+        return true;
+    }
+
     let stored = etag_opaque_tag(etag);
     // A stored value that is not a quoted opaque-tag can never be equivalent
     // to a well-formed candidate; only the `*` wildcard still matches.
     let stored_is_tag = stored.starts_with('"');
-    split_if_none_match(header)
-        .take(MAX_IF_NONE_MATCH_ENTRIES)
-        .any(|part| part == "*" || (stored_is_tag && etag_opaque_tag(part) == stored))
+    let mut matched = false;
+    for (index, part) in split_if_none_match(header).enumerate() {
+        // Do not return an earlier match before ruling out a later wildcard.
+        // If the list exceeds the scan budget, conservatively refuse a 304.
+        if index >= MAX_IF_NONE_MATCH_ENTRIES || part == "*" {
+            return false;
+        }
+        matched |= stored_is_tag && etag_opaque_tag(part) == stored;
+    }
+    matched
 }
 
 #[cfg(test)]
@@ -260,12 +273,9 @@ mod tests {
 
     #[test]
     fn if_none_match_wildcard_and_degenerate_headers() {
-        // `*` matches wherever it appears in the list, and regardless of what
-        // is stored -- RFC 9110 section 13.1.2 makes it "any current
-        // representation".
-        assert!(if_none_match("\"x\", *", "\"abc\""));
-        assert!(if_none_match("*, \"x\"", "\"abc\""));
+        // A lone `*` matches any current representation, even without a tag.
         assert!(if_none_match("*", "not-a-tag"));
+        assert!(if_none_match(" \t*\t ", ""));
 
         // A stored value that is not a quoted opaque-tag never matches a
         // candidate; only `*` above can.
@@ -280,6 +290,27 @@ mod tests {
     }
 
     #[test]
+    fn if_none_match_rejects_wildcard_list_members() {
+        for header in [
+            "\"x\", *",
+            "*, \"x\"",
+            "\"abc\", *",
+            "*, W/\"abc\"",
+            "*, *",
+            ",*",
+            "*,",
+            "\"other,tag\", *",
+        ] {
+            for stored in ["", "\"abc\"", "W/\"abc\""] {
+                assert!(!if_none_match(header, stored), "{header:?}, {stored:?}");
+            }
+        }
+        // A quoted asterisk is an ordinary opaque-tag, not a wildcard.
+        assert!(if_none_match("\"*\", \"x\"", "\"*\""));
+        assert!(if_none_match("\"other,*\", \"x\"", "\"other,*\""));
+    }
+
+    #[test]
     fn if_none_match_caps_at_max_entries() {
         // Build a header where "target" only appears at index 64 (past the cap of 64).
         // The first 64 entries are all "x" (indices 0..63), then "target" at index 64.
@@ -288,6 +319,12 @@ mod tests {
         parts.push("\"target\"");
         let header = parts.join(",");
         assert!(!if_none_match(&header, "\"target\""));
+
+        // A match before the cap must not hide a wildcard beyond it.
+        let mut parts = vec!["\"target\""; 64];
+        assert!(if_none_match(&parts.join(","), "\"target\""));
+        parts.push("*");
+        assert!(!if_none_match(&parts.join(","), "\"target\""));
     }
 
     #[test]

@@ -14,7 +14,7 @@
 
 #[cfg(feature = "sendfile")]
 use std::path::Path;
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 #[cfg(feature = "hyper")]
 use http::HeaderMap;
@@ -36,13 +36,15 @@ use crate::{
 
 /// Raw `Range` / `If-Range` / `If-None-Match` / `If-Modified-Since` values
 /// from a client request, as the plan reads them.  Header values that are
-/// not valid UTF-8 are treated as absent, except `If-Range`: an unreadable
-/// value is represented by an empty, unmatchable validator.
-#[derive(Clone, Copy, Debug, Default)]
+/// not valid UTF-8 are treated as absent, except `If-Range` and
+/// `If-None-Match`: unreadable values remain present as empty, unmatchable
+/// validators. This preserves `If-None-Match` precedence over
+/// `If-Modified-Since`, including when decoding fails.
+#[derive(Clone, Debug, Default)]
 pub(crate) struct RangeRequestHeaders<'a> {
     pub(crate) range: Option<&'a str>,
     pub(crate) if_range: Option<&'a str>,
-    pub(crate) if_none_match: Option<&'a str>,
+    pub(crate) if_none_match: Option<Cow<'a, str>>,
     pub(crate) if_modified_since: Option<&'a str>,
 }
 
@@ -60,14 +62,20 @@ impl<'a> RangeRequestHeaders<'a> {
                 .iter()
                 .find(|h| h.name.eq_ignore_ascii_case(IF_RANGE.as_str()))
                 .map(|h| str::from_utf8(h.value).unwrap_or("")),
-            if_none_match: find_header(headers, &IF_NONE_MATCH),
+            if_none_match: combine_conditions(
+                headers
+                    .iter()
+                    .filter(|h| h.name.eq_ignore_ascii_case(IF_NONE_MATCH.as_str()))
+                    .map(|h| h.value),
+            ),
             if_modified_since: find_header(headers, &IF_MODIFIED_SINCE),
         }
     }
 
-    /// Extract from a hyper header map.  A non-UTF-8 precondition header is
-    /// dropped with a one-shot warning: silently ignoring one turns a
-    /// conditional request into an unconditional one.  `If-Range` is only
+    /// Extract from a hyper header map. Unreadable `If-None-Match` values
+    /// remain present as empty validators. An unreadable `If-Modified-Since`
+    /// is dropped with a one-shot warning, while an unreadable `If-Range`
+    /// becomes an empty validator with a one-shot warning. `If-Range` is only
     /// read alongside a `Range` (it is meaningless without one), and a
     /// non-UTF-8 `Range` is ignored silently - RFC 9110 §14.2 says to serve
     /// the full entity for a malformed `Range` anyway.
@@ -78,15 +86,12 @@ impl<'a> RangeRequestHeaders<'a> {
 
         use crate::warn_once;
 
-        let if_none_match = headers.get(IF_NONE_MATCH).and_then(|v| match v.to_str() {
-            Ok(s) => Some(s),
-            Err(_err @ ToStrError { .. }) => {
-                warn_once!(
-                    "Client {client} sent an invalid If-None-Match header {v:?}; ignoring the precondition"
-                );
-                None
-            }
-        });
+        let if_none_match = combine_conditions(
+            headers
+                .get_all(IF_NONE_MATCH)
+                .iter()
+                .map(http::HeaderValue::as_bytes),
+        );
         let if_modified_since = headers.get(IF_MODIFIED_SINCE).and_then(|v| match v.to_str() {
             Ok(s) => Some(s),
             Err(_err @ ToStrError { .. }) => {
@@ -118,6 +123,21 @@ impl<'a> RangeRequestHeaders<'a> {
             if_modified_since,
         }
     }
+}
+
+/// Combine repeated list fields before evaluating their grammar. An unreadable
+/// line remains present (and unmatchable), preserving If-None-Match precedence.
+fn combine_conditions<'a>(values: impl Iterator<Item = &'a [u8]>) -> Option<Cow<'a, str>> {
+    let mut values = values;
+    let first = str::from_utf8(values.next()?).unwrap_or("");
+    let mut combined = Cow::Borrowed(first);
+    for value in values {
+        combined.to_mut().push(',');
+        combined
+            .to_mut()
+            .push_str(str::from_utf8(value).unwrap_or(""));
+    }
+    Some(combined)
 }
 
 /// Byte-range parameters for serving a cached representation.  A present
@@ -281,7 +301,7 @@ impl CacheInfo {
     /// Apply RFC 9110 §13.1.2 precedence: `If-None-Match` evaluated against the
     /// stored `ETag` wins; otherwise fall back to `If-Modified-Since` against the
     /// stored `Last-Modified`. Header values come pre-decoded as strings;
-    /// unparsable values are treated as absent.
+    /// a nonmatching `If-None-Match` still suppresses the date.
     #[must_use]
     fn decide_serve_304(
         &self,
@@ -289,11 +309,9 @@ impl CacheInfo {
         if_modified_since_header: Option<&str>,
     ) -> bool {
         if let Some(inm) = if_none_match_header {
-            return inm.trim() == "*"
-                || self
-                    .file_etag
-                    .as_deref()
-                    .is_some_and(|etag| if_none_match(inm, etag));
+            // An empty fallback cannot match a tag, but still lets the shared
+            // parser recognize a lone wildcard for an untagged representation.
+            return if_none_match(inm, self.file_etag.as_deref().unwrap_or(""));
         }
 
         if let Some(ims) = if_modified_since_header
@@ -319,7 +337,7 @@ impl CacheInfo {
         headers: &RangeRequestHeaders<'_>,
         client: &ClientInfo,
     ) -> ServePlan {
-        if self.decide_serve_304(headers.if_none_match, headers.if_modified_since) {
+        if self.decide_serve_304(headers.if_none_match.as_deref(), headers.if_modified_since) {
             return ServePlan::NotModified;
         }
 
@@ -396,7 +414,7 @@ mod tests {
     fn plan_if_none_match_wins_over_range() {
         let headers = RangeRequestHeaders {
             range: Some("bytes=0-99"),
-            if_none_match: Some(ETAG),
+            if_none_match: Some(ETAG.into()),
             ..RangeRequestHeaders::default()
         };
         assert_eq!(
@@ -410,7 +428,7 @@ mod tests {
         // RFC 9110 precedence: a present If-None-Match that does not match
         // means "modified", even when If-Modified-Since alone would say 304.
         let headers = RangeRequestHeaders {
-            if_none_match: Some("\"other\""),
+            if_none_match: Some("\"other\"".into()),
             if_modified_since: Some(LAST_MODIFIED),
             ..RangeRequestHeaders::default()
         };
@@ -533,6 +551,64 @@ mod tests {
         assert!(info(None).decide_serve_304(Some("*"), None));
     }
 
+    #[test]
+    fn wildcard_must_be_the_entire_combined_field_value() {
+        for (values, matches) in [
+            (&["*"][..], true),
+            (&[" \t*\t "][..], true),
+            (&["\"other\"", "*"][..], false),
+            (&["*", "\"other\""][..], false),
+            (&["\"other,tag\"", " * "][..], false),
+            (&[ETAG, "*"][..], false),
+            (&["*", ETAG][..], false),
+            (&["*", "*"][..], false),
+            (&["", "*"][..], false),
+            (&["*", ""][..], false),
+        ] {
+            let check = |mut extracted: RangeRequestHeaders<'_>| {
+                // A malformed condition still takes precedence over the date.
+                extracted.if_modified_since = Some(LAST_MODIFIED);
+                for etag in [None, Some(ETAG)] {
+                    assert_eq!(
+                        info(etag).plan(SIZE, &extracted, &local_client()),
+                        if matches {
+                            ServePlan::NotModified
+                        } else {
+                            full()
+                        },
+                        "{values:?}, {etag:?}",
+                    );
+                }
+            };
+            #[cfg(feature = "sendfile")]
+            {
+                let headers: Vec<_> = values
+                    .iter()
+                    .map(|value| httparse::Header {
+                        name: "If-None-Match",
+                        value: value.as_bytes(),
+                    })
+                    .collect();
+                check(RangeRequestHeaders::extract(&headers));
+            }
+            #[cfg(feature = "hyper")]
+            {
+                let mut headers = HeaderMap::new();
+                for value in values {
+                    headers.append(http::header::IF_NONE_MATCH, value.parse().unwrap());
+                }
+                check(RangeRequestHeaders::from_http(&headers, &local_client()));
+            }
+        }
+
+        for value in ["", ",", "\"\"", "\"*\"", "\"other,*\""] {
+            assert!(
+                !info(None).decide_serve_304(Some(value), Some(LAST_MODIFIED)),
+                "{value:?} must not match or fall back to the date",
+            );
+        }
+    }
+
     #[cfg(feature = "sendfile")]
     #[test]
     fn extract_reads_all_four_headers_case_insensitively() {
@@ -557,7 +633,7 @@ mod tests {
         let extracted = RangeRequestHeaders::extract(&headers);
         assert_eq!(extracted.range, Some("bytes=0-9"));
         assert_eq!(extracted.if_range, Some(ETAG));
-        assert_eq!(extracted.if_none_match, Some("*"));
+        assert_eq!(extracted.if_none_match.as_deref(), Some("*"));
         assert_eq!(extracted.if_modified_since, Some(LAST_MODIFIED));
     }
 
@@ -578,7 +654,7 @@ mod tests {
         let extracted = RangeRequestHeaders::from_http(&headers, &local_client());
         assert_eq!(extracted.range, Some("bytes=0-9"));
         assert_eq!(extracted.if_range, Some(""));
-        assert_eq!(extracted.if_none_match, None);
+        assert_eq!(extracted.if_none_match.as_deref(), Some(""));
         assert_eq!(extracted.if_modified_since, None);
     }
 
