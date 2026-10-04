@@ -36,6 +36,10 @@
 //! otherwise be what a restart reads back for a file whose download
 //! published `None`. Every other download writes to a file it just created
 //! ([`TargetFile::New`]), which has nothing to remove.
+//! Volatile 304 revalidation also writes xattrs: [`revalidate`] merges the
+//! supplied validators with the selected stored representation, persists
+//! that snapshot, then publishes it through [`CacheMetadataStore::set`]
+//! before the refreshed entry is released to waiting readers.
 //!
 //! # Publication invariant
 //!
@@ -162,6 +166,26 @@ impl UpstreamMetadata {
             last_modified,
         }
     }
+}
+
+/// Persist a 304's validator updates before publishing the refreshed entry.
+/// Absent fields retain the values of the selected stored representation.
+pub(crate) fn revalidate(
+    key: CacheEntryKeyRef<'_>,
+    file: &tokio::fs::File,
+    path: &Path,
+    update: UpstreamMetadata,
+) -> Arc<UpstreamMetadata> {
+    let stored = store().resolve(&key, file, path);
+    let updated = Arc::new(UpstreamMetadata {
+        etag: update.etag.or_else(|| stored.etag.clone()),
+        last_modified: update
+            .last_modified
+            .or_else(|| stored.last_modified.clone()),
+    });
+    write_upstream_metadata(file, path, &updated, None, TargetFile::Resumed);
+    store().set(key.to_owned(), Arc::clone(&updated));
+    updated
 }
 
 /// Where [`write_upstream_metadata`] writes: what decides whether a
@@ -479,10 +503,9 @@ impl CacheMetadataStore {
 
     /// Replace the entry for `key` with `meta`.  Used by the rename
     /// barrier transition to publish post-flight metadata before clearing
-    /// the active-downloads entry.  The volatile-revalidation 304 path
-    /// does **not** call this — the cached file's xattrs are unchanged
-    /// across the revalidation, so a subsequent [`Self::resolve`] lazy-
-    /// loads the same values directly from xattr.
+    /// the active-downloads entry, and by volatile 304 [`revalidate`] to
+    /// publish merged validators after writing them to the cached file's
+    /// xattrs and before releasing the refreshed entry to waiting readers.
     ///
     /// **Publication invariant:** callers must have already persisted
     /// matching xattrs to the cached file before invoking this.  See

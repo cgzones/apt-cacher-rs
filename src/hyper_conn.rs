@@ -2365,6 +2365,44 @@ async fn serve_new_file_worker(
         mirror_perf::record_ttfb(&conn_details.mirror, head_timing);
     }
 
+    // Validate before dispatch so a 304 update follows the same rules as a fresh body.
+    // Wording mirrors `splice/http.rs::UpstreamResponse::discard_invalid_validators`
+    // modulo the subsystem prefix. The raw values are read the way splice's
+    // `find_header` reads them, as UTF-8 rather than through `to_str` (visible
+    // ASCII only): an obs-text value then reaches the check and its warn
+    // instead of vanishing silently, so both backends log it alike.
+    let (upstream_etag, upstream_last_modified) = check_upstream_validators(
+        fwd_response
+            .headers()
+            .get(ETAG)
+            .and_then(|hv| std::str::from_utf8(hv.as_bytes()).ok())
+            .map(String::from),
+        fwd_response
+            .headers()
+            .get(LAST_MODIFIED)
+            .and_then(|hv| std::str::from_utf8(hv.as_bytes()).ok())
+            .map(String::from),
+        |invalid| match invalid {
+            InvalidValidator::ETag(etag) => warn_once_or_info!(
+                "Upstream mirror {} sent an invalid ETag `{}` for {}; discarding it",
+                conn_details.mirror,
+                etag.escape_debug(),
+                conn_details.debname
+            ),
+            InvalidValidator::LastModified(lm) => warn_once_or_info!(
+                "Upstream mirror {} sent an invalid Last-Modified `{}` for {}; discarding it",
+                conn_details.mirror,
+                lm.escape_debug(),
+                conn_details.debname
+            ),
+            InvalidValidator::Oversized { header, len } => warn_once_or_info!(
+                "Upstream mirror {} sent a {len} byte {header} for {}; discarding it",
+                conn_details.mirror,
+                conn_details.debname
+            ),
+        },
+    );
+
     let (total_content_length, body_content_length, resume_offset) = match plan {
         DownloadPlan::NotModified((file, file_path)) => {
             note_cached_index_touch(conn_details, req.uri().path(), &file_path);
@@ -2372,6 +2410,12 @@ async fn serve_new_file_worker(
             if !conn_details.client.is_cleanup_synthetic() {
                 metrics::VOLATILE_REFETCHED_UPTODATE.increment();
             }
+            let updated = cache_metadata::revalidate(
+                conn_details.key(),
+                &file,
+                &file_path,
+                UpstreamMetadata::from_upstream(upstream_etag, upstream_last_modified),
+            );
             let file = touch_volatile_mtime(file, &file_path).await;
 
             let settled = ibarrier.finished(file_path.clone()).await;
@@ -2383,7 +2427,7 @@ async fn serve_new_file_worker(
                     req,
                     file,
                     file_path,
-                    prefetched_upstream_metadata.as_deref(),
+                    Some(&updated),
                     None,
                 )
                 .await,
@@ -2547,43 +2591,6 @@ async fn serve_new_file_worker(
             }
         }
     };
-
-    // Wording mirrors `splice/http.rs::UpstreamResponse::discard_invalid_validators`
-    // modulo the subsystem prefix. The raw values are read the way splice's
-    // `find_header` reads them, as UTF-8 rather than through `to_str` (visible
-    // ASCII only): an obs-text value then reaches the check and its warn
-    // instead of vanishing silently, so both backends log it alike.
-    let (upstream_etag, upstream_last_modified) = check_upstream_validators(
-        fwd_response
-            .headers()
-            .get(ETAG)
-            .and_then(|hv| std::str::from_utf8(hv.as_bytes()).ok())
-            .map(String::from),
-        fwd_response
-            .headers()
-            .get(LAST_MODIFIED)
-            .and_then(|hv| std::str::from_utf8(hv.as_bytes()).ok())
-            .map(String::from),
-        |invalid| match invalid {
-            InvalidValidator::ETag(etag) => warn_once_or_info!(
-                "Upstream mirror {} sent an invalid ETag `{}` for {}; discarding it",
-                conn_details.mirror,
-                etag.escape_debug(),
-                conn_details.debname
-            ),
-            InvalidValidator::LastModified(lm) => warn_once_or_info!(
-                "Upstream mirror {} sent an invalid Last-Modified `{}` for {}; discarding it",
-                conn_details.mirror,
-                lm.escape_debug(),
-                conn_details.debname
-            ),
-            InvalidValidator::Oversized { header, len } => warn_once_or_info!(
-                "Upstream mirror {} sent a {len} byte {header} for {}; discarding it",
-                conn_details.mirror,
-                conn_details.debname
-            ),
-        },
-    );
 
     let upstream_content_type: Option<&str> = fwd_response
         .headers()

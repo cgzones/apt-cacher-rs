@@ -1611,6 +1611,15 @@ async fn splice_proxy_drive(
                 upstream.complete();
             }
 
+            cache_metadata::revalidate(
+                conn_details.key(),
+                &stale.file,
+                &stale.path,
+                cache_metadata::UpstreamMetadata::from_upstream(
+                    upstream_resp.etag.clone(),
+                    upstream_resp.last_modified.clone(),
+                ),
+            );
             return serve_volatile_304_via_sendfile(
                 client,
                 conn_details,
