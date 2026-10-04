@@ -1080,6 +1080,15 @@ async fn try_sendfile_request(
             };
         }
     }
+    if let Err(msg) = crate::request_dispatch::preflight_headers(
+        req.version == Some(1),
+        req.headers.iter().map(|h| (h.name, h.value)),
+    ) {
+        return ZeroCopyResult::Invalid {
+            status: StatusCode::BAD_REQUEST,
+            msg,
+        };
+    }
     let req = req; // mark immutable
 
     trace!("Parsed client request:\n{req:?}");

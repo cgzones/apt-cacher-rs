@@ -2985,6 +2985,15 @@ async fn pre_process_client_request_wrapper(
     handoff: Option<HandoffPlan>,
     hold: ConnectionHold,
 ) -> Result<Response<ProxyCacheBody>, Infallible> {
+    if let Err(msg) = crate::request_dispatch::preflight_headers(
+        req.version() == http::Version::HTTP_11,
+        req.headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    ) {
+        metrics::record_client_status(StatusCode::BAD_REQUEST);
+        return Ok(quick_response_closing(StatusCode::BAD_REQUEST, msg));
+    }
     let response = pre_process_client_request(client, req, appstate, handoff, hold).await;
     metrics::record_client_status(response.status());
     Ok(response)
