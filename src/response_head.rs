@@ -519,10 +519,7 @@ mod tests {
         /// with `Content-Length` left to the empty body.
         #[test]
         fn unsatisfied_range_carries_content_range() {
-            let response = render(ResponseHead {
-                content_range: Some(ResponseHead::unsatisfied_range(1234)),
-                ..ResponseHead::bare(StatusCode::RANGE_NOT_SATISFIABLE, ResponseKind::Error)
-            });
+            let response = render(ResponseHead::range_not_satisfiable(1234));
             let headers = response.headers();
             assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
             assert_eq!(headers.get(CONTENT_RANGE).unwrap(), "bytes */1234");
@@ -540,12 +537,11 @@ mod tests {
         /// test.
         #[test]
         fn not_modified_head_carries_validators_only() {
-            let response = render(ResponseHead {
-                last_modified: Some("Wed, 20 Dec 2023 04:45:32 GMT"),
-                etag: Some("\"abc\""),
-                age: Some(7),
-                ..ResponseHead::bare(StatusCode::NOT_MODIFIED, ResponseKind::Success)
-            });
+            let response = render(ResponseHead::not_modified(
+                "Wed, 20 Dec 2023 04:45:32 GMT",
+                Some("\"abc\""),
+                7,
+            ));
             let headers = response.headers();
             assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
             assert_eq!(
@@ -706,8 +702,7 @@ mod tests {
         fn unsatisfied_range_carries_content_range() {
             let wire = render(&ResponseHead {
                 content_length: Some(0),
-                content_range: Some(ResponseHead::unsatisfied_range(1234)),
-                ..ResponseHead::bare(StatusCode::RANGE_NOT_SATISFIABLE, ResponseKind::Error)
+                ..ResponseHead::range_not_satisfiable(1234)
             });
             assert!(
                 wire.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"),
@@ -727,12 +722,11 @@ mod tests {
         /// must stay header-for-header the hyper backend's 304.
         #[test]
         fn not_modified_head_carries_validators_only() {
-            let wire = render(&ResponseHead {
-                last_modified: Some("Wed, 20 Dec 2023 04:45:32 GMT"),
-                etag: Some("\"abc\""),
-                age: Some(7),
-                ..ResponseHead::bare(StatusCode::NOT_MODIFIED, ResponseKind::Success)
-            });
+            let wire = render(&ResponseHead::not_modified(
+                "Wed, 20 Dec 2023 04:45:32 GMT",
+                Some("\"abc\""),
+                7,
+            ));
             assert!(wire.starts_with("HTTP/1.1 304 Not Modified\r\n"), "{wire}");
             let lines = header_lines(&wire);
             assert!(
