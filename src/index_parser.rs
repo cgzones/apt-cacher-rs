@@ -141,13 +141,7 @@ pub(crate) fn parse_hex_field<const N: usize>(line: &str, prefix: &str) -> Optio
 
 /// Lowercase-hex encoding suitable for log messages.
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(char::from(HEX[(*b >> 4) as usize]));
-        out.push(char::from(HEX[(*b & 0x0f) as usize]));
-    }
-    out
+    const_hex::encode(bytes)
 }
 
 /// Hash algorithm accepted from Debian indices. SHA256 is the modern default;
