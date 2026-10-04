@@ -1432,7 +1432,7 @@ mod tests {
     fn from_response_chunked_overrides_content_length() {
         let response = http::Response::builder()
             .status(200)
-            .header("transfer-encoding", "gzip, Chunked")
+            .header("transfer-encoding", "Chunked")
             .header("content-length", "60")
             .body(())
             .unwrap();
