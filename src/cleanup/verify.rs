@@ -74,20 +74,15 @@ fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> Verdict {
     hint_sequential_read(&file, pre_size, path);
 
     let computed = match algo {
-        HashAlgo::Sha256 => match hash_open_file::<sha2::Sha256>(&mut file) {
-            Ok(h) => h,
-            Err(err) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                return Verdict::IoError(err);
-            }
-        },
-        HashAlgo::Sha512 => match hash_open_file::<sha2::Sha512>(&mut file) {
-            Ok(h) => h,
-            Err(err) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                return Verdict::IoError(err);
-            }
-        },
+        HashAlgo::Sha256 => hash_open_file::<sha2::Sha256>(&mut file),
+        HashAlgo::Sha512 => hash_open_file::<sha2::Sha512>(&mut file),
+    };
+    let computed = match computed {
+        Ok(hash) => hash,
+        Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
+            return Verdict::IoError(err);
+        }
     };
 
     // The pages were read for a scheduled integrity pass, not for a client.
