@@ -1344,9 +1344,9 @@ fn admit<'l, 's>(
     }
 }
 
-/// Run `ingest` under one of the [`PACKAGES_INGEST_PERMITS`].
-async fn with_decode_permit<F: Future>(ingest: F) -> F::Output {
-    let _permit = PACKAGES_INGEST_PERMITS
+/// Run `ingest` under a decode permit; production passes [`PACKAGES_INGEST_PERMITS`].
+async fn with_decode_permit<F: Future>(permits: &Semaphore, ingest: F) -> F::Output {
+    let _permit = permits
         .acquire()
         .await
         .expect("the ingest semaphore is never closed");
@@ -1480,18 +1480,21 @@ async fn ingest_once(
     let (authority, mirror_path) = (mirror.format_authority(), mirror.path());
     let result = match kind {
         IngestKind::Packages { compression } => {
-            with_decode_permit(ingest_packages_file(
-                registry,
-                authority,
-                mirror_path,
-                dest,
-                *compression,
-                buffer_size,
-            ))
+            with_decode_permit(
+                &PACKAGES_INGEST_PERMITS,
+                ingest_packages_file(
+                    registry,
+                    authority,
+                    mirror_path,
+                    dest,
+                    *compression,
+                    buffer_size,
+                ),
+            )
             .await
         }
         IngestKind::PackagesSniff => {
-            with_decode_permit(async {
+            with_decode_permit(&PACKAGES_INGEST_PERMITS, async {
                 let compression = sniff_packages_compression(dest).await?;
                 ingest_packages_file(
                     registry,
@@ -2082,24 +2085,34 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn packages_ingests_run_at_most_two_at_a_time() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::cell::Cell;
 
-        static RUNNING: AtomicUsize = AtomicUsize::new(0);
-        static PEAK: AtomicUsize = AtomicUsize::new(0);
-        let tasks: Vec<_> = std::iter::repeat_with(|| {
-            tokio::spawn(with_decode_permit(async {
-                let now = RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
-                PEAK.fetch_max(now, Ordering::SeqCst);
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                RUNNING.fetch_sub(1, Ordering::SeqCst);
+        let running = Cell::new(0);
+        // Other tests may ingest through the process-global decode semaphore.
+        let permits = Semaphore::new(PACKAGES_INGEST_CONCURRENCY);
+        let release = Semaphore::new(0);
+        let mut tasks: Vec<_> = std::iter::repeat_with(|| {
+            Box::pin(with_decode_permit(&permits, async {
+                running.set(running.get() + 1);
+                release
+                    .acquire()
+                    .await
+                    .expect("release gate stays open")
+                    .forget();
+                running.set(running.get() - 1);
             }))
         })
         .take(6)
         .collect();
-        for task in tasks {
-            task.await.expect("ingest task");
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        for task in &mut tasks {
+            assert!(task.as_mut().poll(&mut cx).is_pending());
         }
-        assert_eq!(PEAK.load(Ordering::SeqCst), PACKAGES_INGEST_CONCURRENCY);
+        assert_eq!(running.get(), PACKAGES_INGEST_CONCURRENCY);
+        release.add_permits(tasks.len());
+        futures_util::future::join_all(tasks).await;
+        assert_eq!(running.get(), 0);
+        assert_eq!(permits.available_permits(), PACKAGES_INGEST_CONCURRENCY);
     }
 
     #[test]
