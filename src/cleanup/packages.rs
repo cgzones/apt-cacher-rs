@@ -715,7 +715,7 @@ mod tests {
     async fn packages_body_to_memfd_counts_bytes_and_rewinds() {
         use tokio::io::AsyncReadExt as _;
 
-        let config: Config = toml::from_str("").expect("default config");
+        let config = Config::default();
         let payload = b"Package: hello\nFilename: pool/main/h/hello/hello_1_amd64.deb\n\n";
         let mut body = full_body(bytes::Bytes::from_static(payload));
 
@@ -743,7 +743,7 @@ mod tests {
 
     #[tokio::test]
     async fn body_to_file_rejects_body_over_cap() {
-        let config: Config = toml::from_str("").expect("default config");
+        let config = Config::default();
         // A single 4 KiB data frame against a 1 KiB cap: the first chunk already
         // overshoots, so buffering must bail with an error (not truncate, which
         // would silently shrink the reference set and over-evict).
@@ -764,7 +764,7 @@ mod tests {
 
     #[tokio::test]
     async fn body_to_file_accepts_body_at_cap() {
-        let config: Config = toml::from_str("").expect("default config");
+        let config = Config::default();
         // Exactly at the cap: `written > max_bytes` is strict, so this is kept.
         let mut body = full_body(bytes::Bytes::from(vec![b'y'; 1024]));
         let memfd = MemfdOptions::new()
@@ -1027,7 +1027,7 @@ mod tests {
             .expect("write fixture");
         let file = tokio::fs::File::open(&path).await.expect("open fixture");
 
-        let config: Config = toml::from_str("").expect("default config");
+        let config = Config::default();
         // Mirror the EXACT Mirror / ReduceContext construction used by the
         // existing process_stanza_flat_prefix_strips_in_subtree_and_drops_siblings
         // test in this module.
@@ -1081,7 +1081,7 @@ mod tests {
         drop(std_file);
         let file = tokio::fs::File::open(&path).await.expect("open fixture");
 
-        let config: Config = toml::from_str("").expect("default config");
+        let config = Config::default();
         let mirror = Mirror::new(
             ClientHost::new("example.com").expect("valid host"),
             None::<NonZero<u16>>,
@@ -1127,7 +1127,7 @@ mod tests {
         tokio::fs::write(&path, b"").await.expect("write empty");
         let file = tokio::fs::File::open(&path).await.expect("open empty");
 
-        let config: Config = toml::from_str("").expect("default config");
+        let config = Config::default();
         let mirror = Mirror::new(
             ClientHost::new("example.com").expect("valid host"),
             None::<NonZero<u16>>,
@@ -1198,7 +1198,7 @@ mod tests {
         tokio::fs::write(&path, &raw).await.expect("write fixture");
         let file = tokio::fs::File::open(&path).await.expect("open fixture");
 
-        let config: Config = toml::from_str("").expect("default config");
+        let config = Config::default();
         let mirror = Mirror::new(
             ClientHost::new("example.com").expect("valid host"),
             None::<NonZero<u16>>,
@@ -1255,7 +1255,7 @@ mod tests {
         tokio::fs::write(&path, b"").await.expect("write empty");
         let file = tokio::fs::File::open(&path).await.expect("open empty");
 
-        let config: Config = toml::from_str("").expect("default config");
+        let config = Config::default();
         let mirror = Mirror::new(
             ClientHost::new("example.com").expect("valid host"),
             None::<NonZero<u16>>,
