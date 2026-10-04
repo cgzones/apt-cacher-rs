@@ -16,6 +16,7 @@ use crate::cache_walk::{AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkCont
 use crate::error::ErrorReport;
 use crate::metrics;
 use crate::partial_claim::{FileId, Reap, reap_unclaimed};
+use crate::partial_file::PARTIAL_SUFFIX;
 
 use super::scan::{remove_non_regular, remove_stray_dir};
 
@@ -134,7 +135,7 @@ pub(super) async fn cleanup_tmp_dir(
             && entry
                 .name()
                 .to_str()
-                .is_some_and(|name| name.ends_with(".partial"));
+                .is_some_and(|name| name.ends_with(PARTIAL_SUFFIX));
         let stale = if is_partial {
             cutoffs.is_stale(mdata.len(), mtime)
         } else if mtime < foreign_cutoff {
