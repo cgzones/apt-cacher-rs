@@ -1191,15 +1191,15 @@ async fn try_sendfile_request(
     let conn_action = compute_conn_action(&req, *conn_version, &client);
 
     // Unified dispatch shared with hyper_conn.rs: diff-reject -> normalize
-    // -> parse -> classify -> flat-blocklist -> deferred-Origin-DB ->
-    // unsafe-path gate.  Logging, metric bumping, the deferred Origin DB
-    // write and `record_uncacheable` happen inside `dispatch_request`, which
+    // -> parse -> classify -> flat-blocklist -> unsafe-path gate.
+    // Classification logging, metrics and `record_uncacheable` happen
+    // inside `dispatch_request`, which
     // runs once per request: a handoff carries its outcome to hyper.  This
     // match only maps outcomes to ZeroCopyResult.
     let uri_path = uri.path();
     let path_and_query = uri.path_and_query().map_or(uri_path, PathAndQuery::as_str);
     let conn_details =
-        match dispatch_request(path_and_query, requested_host, requested_port, &client).await {
+        match dispatch_request(path_and_query, requested_host, requested_port, &client) {
             DispatchOutcome::Cache(conn_details) => conn_details,
             DispatchOutcome::Reject(reason) => return reject_result(reason, || conn_action),
             #[cfg(feature = "splice")]

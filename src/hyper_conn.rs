@@ -3165,7 +3165,7 @@ async fn pre_process_client_request(
             .uri()
             .path_and_query()
             .map_or_else(|| req.uri().path(), PathAndQuery::as_str);
-        match dispatch_request(path_and_query, requested_host, requested_port, &client).await {
+        match dispatch_request(path_and_query, requested_host, requested_port, &client) {
             DispatchOutcome::Cache(conn_details) => {
                 return process_cache_request(conn_details, req, appstate).await;
             }
