@@ -62,18 +62,25 @@ impl LogStoreImpl {
 
 impl std::io::Write for LogStoreImpl {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buffer.extend_from_slice(buf);
-        let mut start = 0;
-        while let Some(pos) = self.buffer[start..].iter().position(|&x| x == b'\n') {
-            let entry = entry_from_line(&self.buffer[start..start + pos]);
+        for fragment in buf.split_inclusive(|&byte| byte == b'\n') {
+            let Some(line) = fragment.strip_suffix(b"\n") else {
+                self.buffer.extend_from_slice(fragment);
+                continue;
+            };
+            // Formatters normally supply complete lines. Borrow those bytes
+            // so one oversized warning does not enlarge the scratch buffer.
+            let entry = if self.buffer.is_empty() {
+                entry_from_line(line)
+            } else {
+                self.buffer.extend_from_slice(line);
+                let entry = entry_from_line(&self.buffer);
+                self.buffer.clear();
+                entry
+            };
             if self.entries.is_full() {
                 metrics::LOGSTORE_EVICTIONS.increment();
             }
             self.entries.push(entry);
-            start += pos + 1;
-        }
-        if start > 0 {
-            self.buffer.drain(..start);
         }
         Ok(buf.len())
     }
@@ -184,6 +191,10 @@ mod tests {
         line.push_str(&"\u{e9}".repeat(1000));
         line.push('\n');
         store.write_all(line.as_bytes()).expect("write");
+        assert!(
+            store.inner.read().buffer.capacity() <= MAX_ENTRY_LEN,
+            "a complete oversized line must not enlarge the scratch buffer"
+        );
         store.write_all(b"next\n").expect("write");
 
         let entries = store.snapshot();
