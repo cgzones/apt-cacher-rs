@@ -969,15 +969,15 @@ mod tests {
 
     #[test]
     fn check_upstream_validators_keeps_well_formed_values() {
-        let mut rejected = Vec::new();
+        let mut calls = 0;
         let (etag, lm) = check_upstream_validators(
             Some("W/\"abc\"".into()),
             Some("Thu, 01 Jan 1970 00:00:00 GMT".into()),
-            |invalid| rejected.push(format!("{invalid:?}")),
+            |_invalid| calls += 1,
         );
         assert_eq!(etag.as_deref(), Some("W/\"abc\""));
         assert_eq!(lm.as_deref(), Some("Thu, 01 Jan 1970 00:00:00 GMT"));
-        assert_eq!(rejected, Vec::<String>::new());
+        assert_eq!(calls, 0);
     }
 
     #[test]
@@ -991,28 +991,28 @@ mod tests {
 
     #[test]
     fn check_upstream_validators_discards_malformed_etag() {
-        let mut rejected = Vec::new();
+        let mut expected = [InvalidValidator::ETag("not-an-etag")].into_iter();
         let (etag, lm) = check_upstream_validators(
             Some("not-an-etag".into()),
             Some("Thu, 01 Jan 1970 00:00:00 GMT".into()),
-            |invalid| rejected.push(format!("{invalid:?}")),
+            |invalid| assert_eq!(Some(invalid), expected.next()),
         );
         assert_eq!(etag, None);
         assert_eq!(lm.as_deref(), Some("Thu, 01 Jan 1970 00:00:00 GMT"));
-        assert_eq!(rejected, vec!["ETag(\"not-an-etag\")".to_owned()]);
+        assert_eq!(expected.next(), None);
     }
 
     #[test]
     fn check_upstream_validators_discards_malformed_last_modified() {
-        let mut rejected = Vec::new();
+        let mut expected = [InvalidValidator::LastModified("not a date")].into_iter();
         let (etag, lm) = check_upstream_validators(
             Some("\"abc\"".into()),
             Some("not a date".into()),
-            |invalid| rejected.push(format!("{invalid:?}")),
+            |invalid| assert_eq!(Some(invalid), expected.next()),
         );
         assert_eq!(etag.as_deref(), Some("\"abc\""));
         assert_eq!(lm, None);
-        assert_eq!(rejected, vec!["LastModified(\"not a date\")".to_owned()]);
+        assert_eq!(expected.next(), None);
     }
 
     #[test]
@@ -1025,23 +1025,23 @@ mod tests {
             "Thu, 01 Jan 1970 00:00:00 GMT{}",
             " ".repeat(MAX_VALIDATOR_LEN)
         );
-        let mut rejected = Vec::new();
-        let (kept_etag, kept_lm) =
-            check_upstream_validators(Some(etag.clone()), Some(lm.clone()), |invalid| {
-                rejected.push(format!("{invalid:?}"));
-            });
+        let mut expected = [
+            InvalidValidator::Oversized {
+                header: "ETag",
+                len: etag.len(),
+            },
+            InvalidValidator::Oversized {
+                header: "Last-Modified",
+                len: lm.len(),
+            },
+        ]
+        .into_iter();
+        let (kept_etag, kept_lm) = check_upstream_validators(Some(etag), Some(lm), |invalid| {
+            assert_eq!(Some(invalid), expected.next());
+        });
         assert_eq!(kept_etag, None);
         assert_eq!(kept_lm, None);
-        assert_eq!(
-            rejected,
-            vec![
-                format!("Oversized {{ header: \"ETag\", len: {} }}", etag.len()),
-                format!(
-                    "Oversized {{ header: \"Last-Modified\", len: {} }}",
-                    lm.len()
-                ),
-            ]
-        );
+        assert_eq!(expected.next(), None);
 
         let at_cap = format!("\"{}\"", "a".repeat(MAX_VALIDATOR_LEN - 2));
         let mut calls = 0;
@@ -1053,19 +1053,17 @@ mod tests {
 
     #[test]
     fn check_upstream_validators_reports_both_malformed_values() {
-        let mut rejected = Vec::new();
+        let mut expected = [
+            InvalidValidator::ETag("bad"),
+            InvalidValidator::LastModified("worse"),
+        ]
+        .into_iter();
         let (etag, lm) =
             check_upstream_validators(Some("bad".into()), Some("worse".into()), |invalid| {
-                rejected.push(format!("{invalid:?}"));
+                assert_eq!(Some(invalid), expected.next());
             });
         assert_eq!(etag, None);
         assert_eq!(lm, None);
-        assert_eq!(
-            rejected,
-            vec![
-                "ETag(\"bad\")".to_owned(),
-                "LastModified(\"worse\")".to_owned()
-            ]
-        );
+        assert_eq!(expected.next(), None);
     }
 }
