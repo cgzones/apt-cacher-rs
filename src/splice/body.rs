@@ -2885,7 +2885,6 @@ mod tests {
         let length = ContentLength::Exact(NonZero::new(1024 * 1024).unwrap());
         let quota = CacheQuota::new(0, None)
             .try_acquire(length, 0, None, "writer.deb")
-            .ok()
             .expect("unlimited quota");
         InitBarrier::new(origination, active.clone(), &details, "/debian/writer.deb")
             .download(
