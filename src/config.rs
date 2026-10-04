@@ -680,7 +680,7 @@ pub(crate) struct Alias {
 
 /// Resolve a client-supplied host through `aliases` to the on-disk
 /// cache identity used by
-/// [`crate::cache_layout::ConnectionDetails::cache_dir_path`].
+/// [`crate::cache_layout::ConnectionDetails::cache_file_path`].
 ///
 /// Returns `Some(&main)` when `host` is listed as an alias of some
 /// configured group, otherwise `None` — callers that want the
