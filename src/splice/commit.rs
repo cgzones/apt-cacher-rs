@@ -477,8 +477,8 @@ impl Committed {
 
         if let CompletionClient::Served(Served { bytes: _, partial }) = client {
             let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
-                mirror: conn_details.mirror.clone(),
-                debname: conn_details.debname.clone(),
+                mirror: conn_details.mirror,
+                debname: conn_details.debname,
                 size: bytes.total.get(),
                 elapsed,
                 kind: TransferKind::Delivery { partial },
