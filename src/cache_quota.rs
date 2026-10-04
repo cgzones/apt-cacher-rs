@@ -1529,8 +1529,6 @@ mod tests {
 
     #[test]
     fn a_resume_is_admitted_by_its_remainder_only() {
-        let (_dir, path) = partial_path();
-        write_len(&path, 40);
         let quota = CacheQuota::new(b(90), Some(nz(100)));
         assert!(
             quota
