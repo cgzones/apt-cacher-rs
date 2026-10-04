@@ -543,62 +543,62 @@ pub(crate) async fn request_with_retry(
                     }
 
                     let next = if certificate_rejected {
-                        None
+                        Err(RetryStop::Permanent)
                     } else {
-                        backoff.next_retry(coarsetime::Instant::now())
+                        backoff
+                            .next_retry(coarsetime::Instant::now())
+                            .map_err(RetryStop::from)
                     };
-                    let Some(delay) = next else {
-                        if probe.is_probing() {
-                            // Terminal connect failure while still probing:
-                            // in Always mode the revert branch above is gated
-                            // off, so the only outcome of an attempted upgrade
-                            // is failure here. Keep the
-                            // ATTEMPTED == SUCCEEDED + REVERTED + FAILED
-                            // identity.
-                            traffic.count(|| metrics::HTTPS_UPGRADE_FAILED.increment());
-                        }
-                        if certificate_rejected {
-                            // Terminal only where the proxy chose HTTPS (not
-                            // for an `https://` URL the client named); the
-                            // remembered scheme stays, as it is what keeps
-                            // the next request from falling back.
-                            if orig_scheme.as_ref() != Some(&http::uri::Scheme::HTTPS)
+                    let delay = match next {
+                        Ok(delay) => delay,
+                        Err(limit) => {
+                            if probe.is_probing() {
+                                // Terminal connect failure while still probing:
+                                // in Always mode the revert branch above is gated
+                                // off, so the only outcome of an attempted upgrade
+                                // is failure here. Keep the
+                                // ATTEMPTED == SUCCEEDED + REVERTED + FAILED
+                                // identity.
+                                traffic.count(|| metrics::HTTPS_UPGRADE_FAILED.increment());
+                            }
+                            if certificate_rejected {
+                                // Terminal only where the proxy chose HTTPS (not
+                                // for an `https://` URL the client named); the
+                                // remembered scheme stays, as it is what keeps
+                                // the next request from falling back.
+                                if orig_scheme.as_ref() != Some(&http::uri::Scheme::HTTPS)
+                                    && let Some(auth) = parts.uri.authority()
+                                {
+                                    warn_once_or_info!(
+                                        "HTTPS certificate of host {auth} failed verification; not falling back to plain HTTP since {} (list the host in `http_only_mirrors` to fetch it over plain HTTP, or fix the mirror's certificate)",
+                                        scheme_cache::no_fallback_reason(
+                                            global_config().https_upgrade_mode
+                                        )
+                                    );
+                                }
+                            } else if scheme_decided
                                 && let Some(auth) = parts.uri.authority()
+                                && let Some(scheme) = scheme_cache::record_failure(auth.into())
                             {
+                                // A learned scheme is sticky, so losing it silently
+                                // changes how every later request to this host is
+                                // dialled (an evicted https entry can hand the host
+                                // back to plain http under Auto mode).
                                 warn_once_or_info!(
-                                    "HTTPS certificate of host {auth} failed verification; not falling back to plain HTTP since {} (list the host in `http_only_mirrors` to fetch it over plain HTTP, or fix the mirror's certificate)",
-                                    scheme_cache::no_fallback_reason(
-                                        global_config().https_upgrade_mode
-                                    )
+                                    "Evicted cached {scheme} scheme for host {auth} after {attempt} connection attempts, original scheme was {orig_scheme:?}; the next request re-decides the scheme"
                                 );
                             }
-                        } else if scheme_decided
-                            && let Some(auth) = parts.uri.authority()
-                            && let Some(scheme) = scheme_cache::record_failure(auth.into())
-                        {
-                            // A learned scheme is sticky, so losing it silently
-                            // changes how every later request to this host is
-                            // dialled (an evicted https entry can hand the host
-                            // back to plain http under Auto mode).
-                            warn_once_or_info!(
-                                "Evicted cached {scheme} scheme for host {auth} after {attempt} connection attempts, original scheme was {orig_scheme:?}; the next request re-decides the scheme"
-                            );
-                        }
 
-                        let limit = if certificate_rejected {
-                            RetryStop::Permanent
-                        } else {
-                            backoff.limit().into()
-                        };
-                        debug!(
-                            "Upstream retries ended after {attempt} connection attempts ({limit})"
-                        );
-                        return Err(RequestFailure::new(FailedRequest {
-                            error: err.into(),
-                            uri: parts.uri,
-                            attempts: attempt,
-                            limit: Some(limit),
-                        }));
+                            debug!(
+                                "Upstream retries ended after {attempt} connection attempts ({limit})"
+                            );
+                            return Err(RequestFailure::new(FailedRequest {
+                                error: err.into(),
+                                uri: parts.uri,
+                                attempts: attempt,
+                                limit: Some(limit),
+                            }));
+                        }
                     };
 
                     debug!(
