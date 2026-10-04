@@ -289,10 +289,11 @@ impl CacheInfo {
         if_modified_since_header: Option<&str>,
     ) -> bool {
         if let Some(inm) = if_none_match_header {
-            return self
-                .file_etag
-                .as_deref()
-                .is_some_and(|etag| if_none_match(inm, etag));
+            return inm.trim() == "*"
+                || self
+                    .file_etag
+                    .as_deref()
+                    .is_some_and(|etag| if_none_match(inm, etag));
         }
 
         if let Some(ims) = if_modified_since_header
@@ -527,13 +528,9 @@ mod tests {
         // A present but non-matching If-None-Match ends the evaluation: the
         // date is never consulted (RFC 9110 section 13.1.3).
         assert!(!tagged.decide_serve_304(Some("\"other\""), Some(LAST_MODIFIED)));
-        // The `*` wildcard matches whenever an ETag is stored -- but *only*
-        // then.  RFC 9110 section 13.1.2 makes it match any stored
-        // representation; a cached file without an ETag xattr therefore gets
-        // a 200 where the RFC allows a 304.  Known deviation, harmless for
-        // APT clients, which do not send `If-None-Match: *`.
+        // The cached representation exists independently of its validators.
         assert!(tagged.decide_serve_304(Some("*"), None));
-        assert!(!info(None).decide_serve_304(Some("*"), None));
+        assert!(info(None).decide_serve_304(Some("*"), None));
     }
 
     #[cfg(feature = "sendfile")]
