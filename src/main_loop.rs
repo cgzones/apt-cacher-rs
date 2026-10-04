@@ -311,6 +311,9 @@ pub(crate) async fn main_loop(
         }
     }
 
+    // The migration checks are the last users of this startup snapshot.
+    drop(mirrors);
+
     // Initial cache scan. Awaited before the listener binds: the quota is
     // enforced against this total, so a download admitted earlier would be
     // checked against an empty cache, and one committing mid-scan would be
