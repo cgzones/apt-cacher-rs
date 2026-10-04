@@ -279,6 +279,62 @@ pub(crate) fn preflight_method(
     }
 }
 
+/// Validate the request fields before method dispatch, including cache hits
+/// and CONNECT. Absolute-form does not waive HTTP/1.1's Host requirement.
+pub(crate) fn preflight_headers<'a>(
+    is_http11: bool,
+    headers: impl Iterator<Item = (&'a str, &'a [u8])>,
+) -> Result<(), &'static str> {
+    let mut hosts = 0;
+    let mut length = None;
+    let mut transfer_encoding = false;
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("host") {
+            hosts += 1;
+            if hosts > 1 {
+                return Err("Multiple Host headers");
+            }
+            if !value.is_empty() {
+                let authority = http::uri::Authority::try_from(value)
+                    .map_err(|_utf8err| "Invalid Host header")?;
+                if authority.as_str().contains('@')
+                    || crate::config::DomainName::new(authority.host()).is_err()
+                    || uri_authority::port(&authority).is_err()
+                {
+                    return Err("Invalid Host header");
+                }
+            }
+        } else if name.eq_ignore_ascii_case("content-length") {
+            let value = str::from_utf8(value).map_err(|_utf8err| "Invalid Content-Length")?;
+            for part in value.split(',') {
+                let part = part.trim_matches([' ', '\t']);
+                if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err("Invalid Content-Length");
+                }
+                let parsed = part
+                    .parse::<u64>()
+                    .map_err(|_parserr| "Invalid Content-Length")?;
+                if length.is_some_and(|length| length != parsed) {
+                    return Err("Conflicting Content-Length");
+                }
+                length = Some(parsed);
+            }
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            if transfer_encoding || !value.eq_ignore_ascii_case(b"chunked") || !is_http11 {
+                return Err("Unsupported request Transfer-Encoding");
+            }
+            transfer_encoding = true;
+        }
+    }
+    if is_http11 && hosts == 0 {
+        return Err("Missing Host header");
+    }
+    if transfer_encoding && length.is_some() {
+        return Err("Ambiguous request framing");
+    }
+    Ok(())
+}
+
 /// Loop gate shared by both backends: a `Via` element whose received-by
 /// token is this proxy's pseudonym means the request has already passed
 /// through here (RFC 9110 §7.6.3).  `via_values` are the raw `Via` header
