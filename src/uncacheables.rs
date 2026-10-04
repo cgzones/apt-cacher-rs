@@ -69,8 +69,8 @@ pub(crate) fn record_uncacheable(host: &ClientHost, port: Option<NonZero<u16>>, 
     }
 }
 
-pub(crate) fn get_uncacheables() -> &'static parking_lot::RwLock<RingBuffer<Uncacheable>> {
-    &UNCACHEABLES
+pub(crate) fn get_uncacheables() -> parking_lot::RwLockReadGuard<'static, RingBuffer<Uncacheable>> {
+    UNCACHEABLES.read()
 }
 
 #[cfg(test)]
@@ -83,7 +83,6 @@ mod tests {
 
     fn snapshot() -> Vec<(String, String)> {
         get_uncacheables()
-            .read()
             .iter()
             .map(|entry| (entry.authority().into_owned(), entry.path.clone()))
             .collect()
@@ -91,7 +90,6 @@ mod tests {
 
     fn contains(host: &ClientHost, path: &str) -> bool {
         get_uncacheables()
-            .read()
             .iter()
             .any(|entry| entry.host == *host && entry.port.is_none() && entry.path == path)
     }
@@ -129,7 +127,7 @@ mod tests {
         let before = metrics::UNCACHEABLE.get();
         record_uncacheable(&a, None, "/x");
         assert_eq!(metrics::UNCACHEABLE.get() - before, 0);
-        assert_eq!(get_uncacheables().read().len(), 3);
+        assert_eq!(get_uncacheables().len(), 3);
         assert_eq!(
             snapshot(),
             [
@@ -146,7 +144,7 @@ mod tests {
             record_uncacheable(&a, None, &format!("/fill{i}"));
         }
         assert_eq!(metrics::UNCACHEABLE.get() - before, cap as u64);
-        let ring = get_uncacheables().read();
+        let ring = get_uncacheables();
         assert_eq!(ring.len(), cap);
         assert!(ring.is_full());
         drop(ring);
