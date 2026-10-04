@@ -678,6 +678,20 @@ pub(crate) async fn main_loop(
             }
         };
 
+        // Nagle holds a response's last, sub-MSS segment back while earlier
+        // data is unacknowledged, and a client that only reads delays that
+        // ACK: on a keep-alive connection every pipelined burst of small
+        // answers (apt revalidating its indexes: one 304 each) then stalls
+        // for the client's delayed-ACK timer, ~40 ms. Nothing is lost to
+        // small segments: a head still coalesces with its body through
+        // `MSG_MORE`, and the splice paths cork.
+        if let Err(err) = stream.set_nodelay(true) {
+            warn_once_or_debug!(
+                "Failed to set TCP_NODELAY on the connection from client {client}; continuing with Nagle enabled:  {}",
+                ErrorReport(&err)
+            );
+        }
+
         debug!("New client connection from {client}");
         let client_start = Instant::now();
 
