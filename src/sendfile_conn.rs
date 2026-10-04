@@ -2533,11 +2533,11 @@ async fn sendfile_unfinished_transfer(
                 if matches!(state, AttachedReaderState::Drainable) {
                     finished = true;
                 } else if transferred < sendable {
-                    // Neither finished nor aborted: the writer still claims
-                    // the download is in flight while the file is shorter
-                    // than the fstat two lines above reported. The loop
-                    // re-runs with the same inputs, so a stuck writer shows
-                    // up as a spin, not as an error.
+                    // The download is still in flight. Re-stat on the next
+                    // iteration: if the file shrank to the current offset,
+                    // the zero-available path waits for download progress.
+                    // Repeated EOF with metadata still claiming available
+                    // bytes would retry without that wait.
                     warn_once!(
                         "sendfile: EOF at offset {file_offset} for `{}` while the download is still in progress ({} bytes owed), retrying",
                         file_path.display(),
