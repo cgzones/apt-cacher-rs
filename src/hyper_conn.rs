@@ -67,8 +67,8 @@ use crate::{
         is_tls_certificate_rejection,
     },
     fs_open::{
-        CacheAccessFailure, count_cache_failure, hint_sequential_read, regular_file_metadata,
-        tokio_nofollow_options, touch_volatile_mtime,
+        CacheAccessFailure, count_cache_failure, hint_sequential_read, open_cached_file_inline,
+        regular_file_metadata, touch_volatile_mtime,
     },
     global_cache_quota, global_config, global_verify_throttle, global_webif_hosts,
     guards::{Consequence, DownloadBarrier, InitBarrier, Settled},
@@ -2768,7 +2768,7 @@ pub(crate) async fn process_cache_request(
 ) -> Response<ProxyCacheBody> {
     let cache_path = conn_details.cache_file_path();
 
-    match tokio_nofollow_options().read(true).open(&cache_path).await {
+    match open_cached_file_inline(&cache_path) {
         Ok(file) => {
             conn_details.refresh_origin();
 

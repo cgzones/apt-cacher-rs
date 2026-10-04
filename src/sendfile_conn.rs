@@ -71,8 +71,8 @@ use crate::{
     delivery::{Mechanism, Role, ServeOutcome, finish_cached_serve},
     error::{ErrorReport, is_expected_client_end, is_peer_disconnect},
     fs_open::{
-        CacheAccessFailure, count_cache_failure, hint_sequential_read, regular_file_metadata,
-        regular_file_metadata_typed, tokio_nofollow_options,
+        CacheAccessFailure, count_cache_failure, hint_sequential_read, open_cached_file_inline,
+        regular_file_metadata, regular_file_metadata_typed,
     },
     global_config, global_webif_hosts,
     http_helpers::{
@@ -1313,7 +1313,7 @@ async fn try_sendfile_request(
 
     // Try to open the cached file; for volatile resources, treat stale files as cache misses.
     let cached_file = 'cache_lookup: {
-        let file = match tokio_nofollow_options().read(true).open(&cache_path).await {
+        let file = match open_cached_file_inline(&cache_path) {
             Ok(f) => f,
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 break 'cache_lookup Err(CacheMiss::NotFound);
