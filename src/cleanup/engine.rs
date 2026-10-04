@@ -1500,8 +1500,7 @@ mod tests {
             prefix: "pool/php-zts/main/",
         };
         assert_eq!(
-            km.map("pool/php-zts/main/php-zts-cli_8.5.7-1_amd64.deb")
-                .as_deref(),
+            km.map("pool/php-zts/main/php-zts-cli_8.5.7-1_amd64.deb"),
             Some("php-zts-cli_8.5.7-1_amd64.deb")
         );
         assert_eq!(km.map("pool/other-pkg/main/x_1.0_amd64.deb"), None);
