@@ -302,12 +302,11 @@ pub(crate) fn preflight_headers<'a>(
                 // one so empty labels such as `localhost..` stay invalid.
                 let host = authority.host();
                 let host = host.strip_suffix('.').unwrap_or(host);
-                if authority.as_str().contains('@')
-                    || crate::config::DomainName::new(host).is_err()
-                    || uri_authority::port(&authority).is_err()
+                if authority.as_str().contains('@') || crate::config::DomainName::new(host).is_err()
                 {
                     return Err("Invalid Host header");
                 }
+                uri_authority::port(&authority).map_err(|_err| "Invalid port")?;
             }
         } else if name.eq_ignore_ascii_case("content-length") {
             let value = str::from_utf8(value).map_err(|_utf8err| "Invalid Content-Length")?;
@@ -912,13 +911,18 @@ mod tests {
             "localhost..:3142",
             ".localhost",
             "apt..corp.example.",
-            "localhost.:0",
-            "localhost.:65536",
             "user@localhost.",
         ] {
             assert_eq!(
                 preflight_headers(true, [("Host", host.as_bytes())].into_iter()),
                 Err("Invalid Host header"),
+                "{host}"
+            );
+        }
+        for host in ["localhost.:0", "localhost.:65536"] {
+            assert_eq!(
+                preflight_headers(true, [("Host", host.as_bytes())].into_iter()),
+                Err("Invalid port"),
                 "{host}"
             );
         }

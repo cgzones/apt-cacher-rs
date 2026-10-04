@@ -3001,7 +3001,17 @@ async fn pre_process_client_request_wrapper(
         metrics::record_client_status(StatusCode::BAD_REQUEST);
         return Ok(quick_response_closing(StatusCode::BAD_REQUEST, msg));
     }
-    let response = pre_process_client_request(client, req, appstate, handoff, hold).await;
+    // Hyper gives Transfer-Encoding precedence and removes Content-Length
+    // before invoking the service. Close every transfer-coded request so a
+    // hidden TE+CL ambiguity can never reach another request on this socket
+    // (RFC 9112 section 6.1). Request bodies are discarded, never forwarded.
+    let close = req.headers().contains_key(http::header::TRANSFER_ENCODING);
+    let mut response = pre_process_client_request(client, req, appstate, handoff, hold).await;
+    if close {
+        response
+            .headers_mut()
+            .insert(CONNECTION, HeaderValue::from_static("close"));
+    }
     metrics::record_client_status(response.status());
     Ok(response)
 }

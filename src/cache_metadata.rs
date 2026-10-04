@@ -117,7 +117,7 @@ impl UpstreamMetadata {
         let last_modified =
             last_modified.and_then(|s| HttpDate::parse(&s).map(|t| (Arc::from(s), t)));
         Self {
-            etag: etag.map(Arc::from),
+            etag: etag.filter(|value| is_valid_etag(value)).map(Arc::from),
             last_modified,
         }
     }
@@ -964,6 +964,17 @@ mod tests {
         );
         assert_eq!(m.etag.as_deref(), Some("\"abc\""));
         let (s, _date) = m.last_modified.expect("parsed");
+        assert_eq!(&*s, "Thu, 01 Jan 1970 00:00:00 GMT");
+    }
+
+    #[test]
+    fn from_upstream_drops_malformed_etag() {
+        let m = UpstreamMetadata::from_upstream(
+            Some("not-an-etag".into()),
+            Some("Thu, 01 Jan 1970 00:00:00 GMT".into()),
+        );
+        assert!(m.etag.is_none());
+        let (s, _date) = m.last_modified.expect("valid Last-Modified is retained");
         assert_eq!(&*s, "Thu, 01 Jan 1970 00:00:00 GMT");
     }
 
