@@ -292,16 +292,16 @@ pub(crate) async fn handle_sendfile_connection(
                     ErrorReport(&err),
                 );
                 // Count the attempted request so REQUESTS_TOTAL stays >=
-                // CLIENT_STATUS_*: write_invalid_response below bumps
+                // CLIENT_STATUS_*: write_request_error_response below bumps
                 // CLIENT_STATUS_* even though parsing failed.
                 metrics::REQUESTS_TOTAL.increment();
-                let _ignore = write_invalid_response(
+                let _ignore = write_request_error_response(
                     &stream,
                     conn_version,
                     ConnectionAction::Close,
                     status,
                     body,
-                    None,
+                    &buf,
                 )
                 .await;
                 graceful_close(&stream).await;
@@ -396,13 +396,13 @@ pub(crate) async fn handle_sendfile_connection(
                 }
             }
             ZeroCopyResult::Invalid { status, msg } => {
-                if let Err(err) = write_invalid_response(
+                if let Err(err) = write_request_error_response(
                     &stream,
                     conn_version,
                     ConnectionAction::Close,
                     status,
                     msg,
-                    None,
+                    &buf,
                 )
                 .await
                 {
@@ -417,9 +417,15 @@ pub(crate) async fn handle_sendfile_connection(
                 conn_action,
                 msg,
             } => {
-                if let Err(err) =
-                    write_invalid_response(&stream, conn_version, conn_action, status, msg, None)
-                        .await
+                if let Err(err) = write_request_error_response(
+                    &stream,
+                    conn_version,
+                    conn_action,
+                    status,
+                    msg,
+                    &buf,
+                )
+                .await
                 {
                     log_client_write_failure(client, "rejection response", &err);
                     return;
@@ -462,6 +468,29 @@ pub(crate) async fn handle_sendfile_connection(
             }
         };
     }
+}
+
+/// Suppress error bodies for HEAD, including errors before parsing completes.
+/// `read_request_headers` has already removed leading empty lines from `buf`.
+async fn write_request_error_response(
+    stream: &TcpStream,
+    conn_version: ConnectionVersion,
+    conn_action: ConnectionAction,
+    status: StatusCode,
+    msg: &'static str,
+    buf: &[u8],
+) -> std::io::Result<()> {
+    // Retain the error representation's length, as hyper does for HEAD.
+    let head = ResponseHead {
+        content_length: Some(msg.len() as u64),
+        ..ResponseHead::error(status)
+    };
+    let body = if buf.starts_with(b"HEAD ") {
+        WireBody::None
+    } else {
+        WireBody::Inline(msg)
+    };
+    head.write_to(stream, conn_version, conn_action, body).await
 }
 
 /// Read HTTP request headers from the stream into the buffer.
