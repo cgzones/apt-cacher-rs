@@ -407,17 +407,20 @@ mod tests {
 
     #[tokio::test]
     async fn empty_buffer_read_does_not_surface_tail_error() {
-        // Corrupt input so the blocking decoder finishes with an Err in the
-        // tail channel. An empty-buffer read must NOT be misread as EOF,
-        // consume `tail`, and surface that error — it should behave like a
-        // normal AsyncRead and return Ok(()) immediately.
-        let mut bad = HELLO_XZ.to_vec();
-        bad[32] ^= 0xFF;
-        let mut decoder = xz_decoder(Cursor::new(bad));
-
-        // Let the blocking task run to completion so the Err is sitting in
-        // the oneshot. 100ms is ample for decoding ~70 bytes.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Establish EOF and a pending terminal error before the empty read.
+        let (inner, writer) = tokio::io::duplex(1);
+        drop(writer);
+        let (sender, receiver) = oneshot::channel();
+        sender
+            .send(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "decode failed",
+            )))
+            .expect("receiver is alive");
+        let mut decoder = XzDecoderStream {
+            inner,
+            tail: Some(receiver),
+        };
 
         let mut empty: [u8; 0] = [];
         let result = std::future::poll_fn(|cx| {
@@ -431,7 +434,7 @@ mod tests {
         );
 
         // The tail must still be intact: a subsequent real read should still
-        // surface the decode error (or at minimum, not yield the clean output).
+        // surface the decode error.
         let mut out = Vec::new();
         let err = decoder
             .read_to_end(&mut out)
