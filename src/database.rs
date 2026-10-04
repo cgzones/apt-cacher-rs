@@ -384,6 +384,23 @@ impl OriginRow {
     }
 }
 
+/// Remove a mirror and its dependants within the caller's transaction.
+async fn delete_mirror_rows(tx: &mut SqliteConnection, id: i64) -> Result<(), Error> {
+    query!(r"DELETE FROM origins WHERE mirror_id = ?;", id)
+        .execute(&mut *tx)
+        .await?;
+    query!(r"DELETE FROM downloads WHERE mirror_id = ?;", id)
+        .execute(&mut *tx)
+        .await?;
+    query!(r"DELETE FROM deliveries WHERE mirror_id = ?;", id)
+        .execute(&mut *tx)
+        .await?;
+    query!(r"DELETE FROM mirrors_v2 WHERE id = ?;", id)
+        .execute(&mut *tx)
+        .await?;
+    Ok(())
+}
+
 /// Upsert a mirror row and return `(id, was_inserted)` in a single round
 /// trip via `RETURNING`. `was_inserted` is `first_seen = last_seen`: equal
 /// on a fresh INSERT, since ON CONFLICT rewrites `last_seen` (and
@@ -1353,18 +1370,7 @@ impl Database {
                 );
             }
 
-            query!(r"DELETE FROM origins WHERE mirror_id = ?;", mirror.id)
-                .execute(&mut *tx)
-                .await?;
-            query!(r"DELETE FROM downloads WHERE mirror_id = ?;", mirror.id)
-                .execute(&mut *tx)
-                .await?;
-            query!(r"DELETE FROM deliveries WHERE mirror_id = ?;", mirror.id)
-                .execute(&mut *tx)
-                .await?;
-            query!(r"DELETE FROM mirrors_v2 WHERE id = ?;", mirror.id)
-                .execute(&mut *tx)
-                .await?;
+            delete_mirror_rows(&mut tx, mirror.id).await?;
         }
 
         tx.commit().await
@@ -1517,18 +1523,7 @@ impl Database {
         let mut tx = self.conn.begin().await?;
 
         for id in ids {
-            query!(r"DELETE FROM origins WHERE mirror_id = ?;", id)
-                .execute(&mut *tx)
-                .await?;
-            query!(r"DELETE FROM downloads WHERE mirror_id = ?;", id)
-                .execute(&mut *tx)
-                .await?;
-            query!(r"DELETE FROM deliveries WHERE mirror_id = ?;", id)
-                .execute(&mut *tx)
-                .await?;
-            query!(r"DELETE FROM mirrors_v2 WHERE id = ?;", id)
-                .execute(&mut *tx)
-                .await?;
+            delete_mirror_rows(&mut tx, *id).await?;
         }
 
         tx.commit().await
