@@ -1050,13 +1050,9 @@ async fn relay_passthrough(
     // holds its own `ACTIVE_CLIENT_DOWNLOADS` count until it ends, like the
     // simple proxy's relay and hyper's passthrough body.
     let _client_count = client_counter::ClientDownload::new();
-    write_all_to_stream(
-        client.stream,
-        passthrough_headers.as_bytes(),
-        WritePhase::Header,
-    )
-    .await
-    .map_err(SpliceProxyError::client("passthrough headers"))?;
+    write_all_to_stream(client.stream, &passthrough_headers, WritePhase::Header)
+        .await
+        .map_err(SpliceProxyError::client("passthrough headers"))?;
 
     // Forward the body that arrived with the headers plus the rest,
     // framed per the upstream's (precedence-resolved) framing.

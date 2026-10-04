@@ -54,7 +54,7 @@ pub(super) fn rewrite_simple_proxy_headers(
     conn_action: ConnectionAction,
     status_code: StatusCode,
     framing: BodyFraming,
-) -> std::io::Result<String> {
+) -> std::io::Result<Vec<u8>> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_UPSTREAM_HEADERS];
     let mut parsed = httparse::Response::new(&mut headers);
     if parsed.parse(raw_headers).is_err() {
@@ -66,42 +66,32 @@ pub(super) fn rewrite_simple_proxy_headers(
 
     let relayed = RelayedHeaders::new(parsed.headers.iter().map(|h| (h.name, h.value)));
 
-    let mut buf = format!("{conn_version} {status_code}\r\nConnection: {conn_action}\r\n");
+    let mut buf =
+        format!("{conn_version} {status_code}\r\nConnection: {conn_action}\r\n").into_bytes();
     if let Some(line) = framing.header_line(status_code, conn_version) {
-        buf.push_str(&line);
+        buf.extend_from_slice(line.as_bytes());
     }
     for h in parsed.headers.iter() {
         if !relayed.keeps(h.name) {
             continue;
         }
-        // Reject non-ASCII header values: HTTP headers are ASCII per RFC
-        // 9110 §5.5, and non-ASCII bytes smuggled via `from_utf8_lossy`
-        // would silently introduce U+FFFD replacement chars into the
-        // rewritten headers.
-        let Ok(value) = std::str::from_utf8(h.value) else {
+        // Field values are opaque bytes: obs-text is permitted by RFC 9110.
+        // Keep rejecting control bytes that could introduce a new field.
+        if h.value.iter().any(|&b| b < 0x20 && b != b'\t' || b == 0x7f) {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidData,
-                format!("non-UTF8 value for header `{}`", h.name),
-            ));
-        };
-        if value
-            .bytes()
-            .any(|b| !b.is_ascii() || b == b'\r' || b == b'\n')
-        {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                format!("invalid bytes in header `{}` value", h.name),
+                "invalid control byte in header",
             ));
         }
-        buf.push_str(h.name);
-        buf.push_str(": ");
-        buf.push_str(value);
-        buf.push_str("\r\n");
+        buf.extend_from_slice(h.name.as_bytes());
+        buf.extend_from_slice(b": ");
+        buf.extend_from_slice(h.value);
+        buf.extend_from_slice(b"\r\n");
     }
-    buf.push_str("Via: ");
-    buf.push_str(APP_VIA);
-    buf.push_str("\r\n");
-    buf.push_str("\r\n");
+    buf.extend_from_slice(b"Via: ");
+    buf.extend_from_slice(APP_VIA.as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"\r\n");
     Ok(buf)
 }
 
@@ -220,7 +210,7 @@ pub(crate) async fn splice_simple_proxy(
         }
     };
 
-    trace!("Outgoing rewritten headers:\n{rewritten_headers}");
+    trace!("Outgoing rewritten headers:\n{rewritten_headers:?}");
 
     metrics::record_client_status(resp.status_code);
     metrics::REQUESTS_PASSTHROUGH.increment();
@@ -239,13 +229,9 @@ pub(crate) async fn splice_simple_proxy(
     }
 
     let t_client_first = PreciseInstant::now();
-    write_all_to_stream(
-        client_stream,
-        rewritten_headers.as_bytes(),
-        WritePhase::Header,
-    )
-    .await
-    .map_err(SpliceProxyError::client("simple-proxy headers"))?;
+    write_all_to_stream(client_stream, &rewritten_headers, WritePhase::Header)
+        .await
+        .map_err(SpliceProxyError::client("simple-proxy headers"))?;
 
     // Forward the body that arrived with the headers plus the rest, framed
     // per the upstream's framing. The parser resolved it (or refused an
@@ -303,6 +289,7 @@ mod tests {
             BodyFraming::ContentLength(5),
         )
         .expect("rewrite should succeed");
+        let out = String::from_utf8(out).unwrap();
 
         let connection_lines = out
             .split("\r\n")
@@ -398,6 +385,7 @@ mod tests {
                 framing,
             )
             .expect("rewrite should succeed");
+            let out = String::from_utf8(out).unwrap();
             assert_eq!(
                 framing_lines(&out),
                 expected,
@@ -472,6 +460,7 @@ mod tests {
             BodyFraming::Chunked,
         )
         .expect("rewrite should succeed");
+        let out = String::from_utf8(out).unwrap();
         assert!(!out.to_ascii_lowercase().contains("content-length:"));
         assert!(out.contains("Transfer-Encoding: chunked\r\n"));
     }
@@ -493,6 +482,7 @@ mod tests {
             BodyFraming::CloseDelimited,
         )
         .expect("rewrite should succeed");
+        let out = String::from_utf8(out).unwrap();
 
         // The nominated field must not be forwarded.
         assert!(
@@ -509,6 +499,27 @@ mod tests {
         assert_eq!(
             connection_lines, 1,
             "expected exactly one Connection header in rewritten output, got:\n{out}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod opaque_headers_tests {
+    use super::*;
+    #[test]
+    fn relay_preserves_opaque_header_bytes() {
+        let raw = b"HTTP/1.1 200 OK\r\nX-Opaque: \xff\x80\r\nContent-Length: 0\r\n\r\n";
+        let out = rewrite_simple_proxy_headers(
+            raw,
+            ConnectionVersion::Http11,
+            ConnectionAction::KeepAlive,
+            StatusCode::OK,
+            BodyFraming::ContentLength(0),
+        )
+        .unwrap();
+        assert!(
+            out.windows(b"X-Opaque: \xff\x80\r\n".len())
+                .any(|bytes| bytes == b"X-Opaque: \xff\x80\r\n")
         );
     }
 }
