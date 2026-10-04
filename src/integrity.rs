@@ -651,9 +651,22 @@ impl ChecksumRegistry {
     /// one oversized (or hostile) index cannot drain the digests of every
     /// other mirror. Re-inserting an existing key refreshes its
     /// eviction-order position to most-recent.
+    #[cfg(test)]
     fn insert(&self, authority: &str, mirror_path: &str, relpath: &str, digest: [u8; 32]) {
+        self.insert_many(authority, mirror_path, [(relpath, digest)]);
+    }
+
+    /// [`Self::insert`] for several entries of one scope under one lock.
+    fn insert_many<'k>(
+        &self,
+        authority: &str,
+        mirror_path: &str,
+        entries: impl IntoIterator<Item = (&'k str, [u8; 32])>,
+    ) {
         let mut inner = self.inner.lock();
-        self.insert_locked(&mut inner, authority, mirror_path, relpath, digest);
+        for (relpath, digest) in entries {
+            self.insert_locked(&mut inner, authority, mirror_path, relpath, digest);
+        }
     }
 
     /// Register a `Release`/`InRelease`'s `Packages` entries unless a newer
@@ -1710,7 +1723,7 @@ fn registry_lookup_key<'a>(
 ) -> Option<Cow<'a, str>> {
     match resource_kind {
         // Layer B: a pool .deb's key is its bare basename, the form
-        // `ingest_stanza_into_registry` inserted. Flat-pool downloads are
+        // `PendingDigests::push_stanza` registers. Flat-pool downloads are
         // not verified this way, so no flat variant is needed.
         ResourceKind::Pool => Some(Cow::Borrowed(debname)),
         // Layer C: the full host-relative URI path, normalized like the
@@ -1893,13 +1906,22 @@ async fn ingest_packages_file(
             path.display(),
         )),
     );
+    let mut pending = PendingDigests::default();
     loop {
         match stanzas.next().await {
             Ok(Some(stanza)) => {
-                ingest_stanza_into_registry(stanza, registry, authority, mirror_path);
+                if pending.push_stanza(stanza, authority, mirror_path) {
+                    pending.flush(registry, authority, mirror_path);
+                }
             }
-            Ok(None) => return Ok(()),
+            Ok(None) => {
+                pending.flush(registry, authority, mirror_path);
+                return Ok(());
+            }
             Err(err) => {
+                // What was read before the failure registers, as it did
+                // entry by entry.
+                pending.flush(registry, authority, mirror_path);
                 warn_once_or_debug!(
                     "Failed to read `{}` during Packages ingestion (may exceed size/line limits); aborting the ingest of this index:  {}",
                     path.display(),
@@ -2050,25 +2072,66 @@ async fn ingest_release_file(
 /// usable SHA256 (a SHA512-only mirror leaves every stanza that way, so deb
 /// verification stays off for the whole archive) was already warned about
 /// by [`StanzaStream`] and registers nothing.
-fn ingest_stanza_into_registry(
-    stanza: &index_parser::Stanza,
-    registry: &ChecksumRegistry,
-    authority: &str,
-    mirror_path: &str,
-) {
-    let (Some(filename), Some(sha256)) = (stanza.filename(), stanza.sha256) else {
-        return;
-    };
-    let Some(key) = index_parser::registry_key_from_filename_field(filename) else {
-        // `Stanza` already rejected (and logged) unsafe values, so this is
-        // the length gate: a name no cache file can have.
-        warn_once_or_debug!(
-            "Not registering the digest of a {} byte Filename value from host {authority} mirror {mirror_path}; no cache file can have that name",
-            filename.len(),
+/// The `(key, digest)` pairs of one `Packages` ingest not yet registered.
+/// A `Debian` `Packages` holds ~65k stanzas, and taking the registry lock
+/// (which every cache miss's digest lookup also takes) once per stanza
+/// cost as many lock round trips; a batch takes it once per
+/// [`Self::BATCH`]. The keys share one reused buffer, since each stanza's
+/// fields are overwritten by the next.
+#[derive(Default)]
+struct PendingDigests {
+    keys: String,
+    entries: Vec<(std::ops::Range<usize>, [u8; 32])>,
+}
+
+impl PendingDigests {
+    /// Entries per lock: short enough that a concurrent lookup waits
+    /// microseconds, not the ingest.
+    const BATCH: usize = 256;
+
+    /// Queue `stanza`'s digest; whether the batch is full.
+    fn push_stanza(
+        &mut self,
+        stanza: &index_parser::Stanza,
+        authority: &str,
+        mirror_path: &str,
+    ) -> bool {
+        let (Some(filename), Some(sha256)) = (stanza.filename(), stanza.sha256) else {
+            return false;
+        };
+        let Some(key) = index_parser::registry_key_from_filename_field(filename) else {
+            // `Stanza` already rejected (and logged) unsafe values, so this
+            // is the length gate: a name no cache file can have.
+            warn_once_or_debug!(
+                "Not registering the digest of a {} byte Filename value from host {authority} mirror {mirror_path}; no cache file can have that name",
+                filename.len(),
+            );
+            return false;
+        };
+        let start = self.keys.len();
+        self.keys.push_str(key);
+        self.entries.push((start..self.keys.len(), sha256));
+        self.entries.len() >= Self::BATCH
+    }
+
+    fn flush(&mut self, registry: &ChecksumRegistry, authority: &str, mirror_path: &str) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let Self { keys, entries } = self;
+        registry.insert_many(
+            authority,
+            mirror_path,
+            entries.iter().map(|(range, digest)| {
+                let key = keys
+                    .get(range.clone())
+                    .expect("each range spans one pushed key");
+                (key, *digest)
+            }),
         );
-        return;
-    };
-    registry.insert(authority, mirror_path, key, sha256);
+        keys.clear();
+        entries.clear();
+    }
 }
 
 #[cfg(test)]
@@ -3172,6 +3235,53 @@ mod tests {
             reg.lookup("deb.debian.org", "debian", "b_2_amd64.deb"),
             Some(sha_b)
         );
+    }
+
+    /// An index of more stanzas than one registry batch registers all of
+    /// them: the full batches as they fill, the rest at the end.
+    #[tokio::test]
+    async fn ingest_registers_every_stanza_across_batches() {
+        let count = 2 * PendingDigests::BATCH + 7;
+        let reg = ChecksumRegistry::new(NonZero::new(4 * count).expect("non-zero"));
+        let digest = |i: usize| {
+            let mut digest = [0u8; 32];
+            digest[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            digest
+        };
+        let mut packages = String::new();
+        for i in 0..count {
+            crate::swrite!(
+                packages,
+                "Package: p{i}\nFilename: pool/main/p/p{i}/p{i}_1_amd64.deb\nSHA256: {}\n\n",
+                index_parser::hex_encode(&digest(i)),
+            );
+        }
+        let f = temp_file_with(packages.as_bytes());
+
+        ingest_packages_file(
+            &reg,
+            "deb.debian.org",
+            "debian",
+            f.path(),
+            PackagesCompression::Raw,
+            64 * 1024,
+        )
+        .await
+        .expect("ingest ok");
+
+        assert_eq!(reg.len(), count);
+        for i in [
+            0,
+            PendingDigests::BATCH - 1,
+            PendingDigests::BATCH,
+            count - 1,
+        ] {
+            assert_eq!(
+                reg.lookup("deb.debian.org", "debian", &format!("p{i}_1_amd64.deb")),
+                Some(digest(i)),
+                "stanza {i}"
+            );
+        }
     }
 
     #[tokio::test]
