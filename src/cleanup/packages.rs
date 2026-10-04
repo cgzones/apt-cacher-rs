@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::num::NonZero;
@@ -58,11 +57,11 @@ pub(super) enum KeyMapper<'a> {
 }
 
 impl KeyMapper<'_> {
-    pub(super) fn map<'a>(&self, filename: &'a str) -> Option<Cow<'a, str>> {
+    pub(super) fn map<'a>(&self, filename: &'a str) -> Option<&'a str> {
         match self {
-            Self::Basename => Some(Cow::Borrowed(structured_lookup_key(filename))),
-            Self::Relpath => Some(Cow::Borrowed(filename)),
-            Self::RelpathUnderPrefix { prefix } => filename.strip_prefix(prefix).map(Cow::Borrowed),
+            Self::Basename => Some(structured_lookup_key(filename)),
+            Self::Relpath => Some(filename),
+            Self::RelpathUnderPrefix { prefix } => filename.strip_prefix(prefix),
         }
     }
 }
@@ -209,7 +208,6 @@ async fn process_stanza(
     let Some(lookup_key) = ctx.keymap.map(filename) else {
         return;
     };
-    let lookup_key: &str = &lookup_key;
 
     // Every path below drops the entry from the reference set, so take it out
     // once rather than looking it up again per exit.
@@ -678,20 +676,19 @@ mod tests {
 
     #[test]
     fn key_mapper_maps_each_layout() {
-        use std::borrow::Cow;
         // Structured: basename of the relpath.
         assert_eq!(
             KeyMapper::Basename.map("pool/main/a/abc/abc_1.0_amd64.deb"),
-            Some(Cow::Borrowed("abc_1.0_amd64.deb")),
+            Some("abc_1.0_amd64.deb"),
         );
         // Flat co-located: relpath verbatim.
         assert_eq!(
             KeyMapper::Relpath.map("amd64/twilio-cli_5.0.0_amd64.deb"),
-            Some(Cow::Borrowed("amd64/twilio-cli_5.0.0_amd64.deb")),
+            Some("amd64/twilio-cli_5.0.0_amd64.deb"),
         );
         // Flat walk-up: strip the prefix, drop siblings outside it.
         let km = KeyMapper::RelpathUnderPrefix { prefix: "amd64/" };
-        assert_eq!(km.map("amd64/pkg.deb"), Some(Cow::Borrowed("pkg.deb")));
+        assert_eq!(km.map("amd64/pkg.deb"), Some("pkg.deb"));
         assert_eq!(km.map("arm64/sibling.deb"), None);
     }
 
