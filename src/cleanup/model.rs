@@ -875,7 +875,7 @@ mod tests {
     }
 
     fn test_config(cache_dir: &str) -> Config {
-        let mut config: Config = toml::from_str("").expect("built-in defaults must parse");
+        let mut config = Config::default();
         config.cache_directory = PathBuf::from(cache_dir);
         config
     }

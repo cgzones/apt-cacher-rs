@@ -115,11 +115,9 @@ mod tests {
     use crate::nonzero;
 
     /// A config with the hack enabled and both size/parallel limits set to
-    /// values the callers below pass deliberately. Built by deserializing an
-    /// empty document rather than `Config::default()`, whose `present` field
-    /// is private to `config.rs` and so blocks struct-update syntax here.
+    /// values the callers below pass deliberately.
     fn enabled_config() -> Config {
-        let mut config: Config = toml::from_str("").expect("built-in defaults must parse");
+        let mut config = Config::default();
         config.experimental_parallel_hack_enabled = true;
         config.experimental_parallel_hack_maxparallel = Some(nonzero!(3_usize));
         config.experimental_parallel_hack_minsize = Some(nonzero!(1024_u64));

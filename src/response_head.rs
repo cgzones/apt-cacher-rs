@@ -413,16 +413,14 @@ impl ResponseHead<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::parallel_hack::NUDGE_BODY;
 
     /// A config with the parallel-download hack on its defaults (`429`,
-    /// `Retry-After: 5`), for the two nudge-head renderer tests. Built by
-    /// deserializing an empty document because `Config`'s `present` field is
-    /// private to `config.rs`.
+    /// `Retry-After: 5`), for the two nudge-head renderer tests.
     #[cfg(any(feature = "hyper", feature = "sendfile"))]
-    fn nudge_config() -> crate::config::Config {
-        let mut config: crate::config::Config =
-            toml::from_str("").expect("built-in defaults must parse");
+    fn nudge_config() -> Config {
+        let mut config = Config::default();
         config.experimental_parallel_hack_enabled = true;
         config
     }
