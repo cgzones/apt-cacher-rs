@@ -9,8 +9,8 @@
 //! pack several lines into one. Entries are therefore cut on `\n`, and the
 //! tail of an unterminated line stays in `buffer` until its newline arrives.
 //!
-//! Readers take the same lock the writer does, so `entries()` blocks every
-//! logging thread for as long as its guard lives — copy out and drop it.
+//! Readers copy entries with [`LogStore::snapshot`], releasing the shared
+//! lock before rendering so that formatting cannot block logging threads.
 //!
 //! An entry keeps at most [`MAX_ENTRY_LEN`] bytes: some warnings quote
 //! upstream- or client-supplied values, and the ring holds
@@ -96,9 +96,12 @@ impl LogStore {
         }
     }
 
-    pub(crate) fn entries(&self) -> LogStoreEntryListGuard<'_> {
-        let guard = self.inner.read();
-        LogStoreEntryListGuard { guard }
+    pub(crate) fn snapshot(&self) -> Vec<String> {
+        self.inner.read().entries.iter().cloned().collect()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.inner.read().entries.len()
     }
 }
 
@@ -112,22 +115,6 @@ impl std::io::Write for LogStore {
     }
 }
 
-#[must_use]
-pub(crate) struct LogStoreEntryListGuard<'a> {
-    guard: parking_lot::RwLockReadGuard<'a, LogStoreImpl>,
-}
-
-impl LogStoreEntryListGuard<'_> {
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &String> {
-        self.guard.entries.iter()
-    }
-
-    #[must_use]
-    pub(crate) fn len(&self) -> usize {
-        self.guard.entries.len()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
@@ -138,11 +125,6 @@ mod tests {
         LogStore::new(NonZero::new(capacity).expect("non-zero capacity"))
     }
 
-    fn lines(store: &LogStore) -> Vec<String> {
-        let guard = store.entries();
-        guard.iter().cloned().collect()
-    }
-
     /// The subscriber writes formatted bytes, not records: a line can arrive
     /// in pieces and must not surface until its newline does.
     #[test]
@@ -150,10 +132,10 @@ mod tests {
         let mut store = new_store(4);
 
         store.write_all(b"hello ").expect("write");
-        assert!(lines(&store).is_empty(), "no newline seen yet");
+        assert!(store.snapshot().is_empty(), "no newline seen yet");
 
         store.write_all(b"world\n").expect("write");
-        assert_eq!(lines(&store), ["hello world"]);
+        assert_eq!(store.snapshot(), ["hello world"]);
     }
 
     /// One `write` can carry several records plus the head of the next one.
@@ -165,9 +147,9 @@ mod tests {
             .write_all(b"first\r\n  second  \nthird-so-far")
             .expect("write");
 
-        assert_eq!(lines(&store), ["first", "second"]);
+        assert_eq!(store.snapshot(), ["first", "second"]);
 
-        let count = store.entries().len();
+        let count = store.len();
         assert_eq!(count, 2, "the unterminated tail is not an entry yet");
     }
 
@@ -187,7 +169,7 @@ mod tests {
         );
 
         store.write_all(b"three\n").expect("write");
-        assert_eq!(lines(&store), ["two", "three"]);
+        assert_eq!(store.snapshot(), ["two", "three"]);
         assert_eq!(metrics::LOGSTORE_EVICTIONS.get(), before + 1);
     }
 
@@ -204,7 +186,7 @@ mod tests {
         store.write_all(line.as_bytes()).expect("write");
         store.write_all(b"next\n").expect("write");
 
-        let entries = lines(&store);
+        let entries = store.snapshot();
         assert_eq!(entries.len(), 2);
         let expected = format!("{}{TRUNCATION_MARK}", "a".repeat(MAX_ENTRY_LEN - 1));
         assert_eq!(entries[0], expected);
@@ -216,7 +198,7 @@ mod tests {
         store
             .write_all(format!("{at_cap}\n").as_bytes())
             .expect("write");
-        assert_eq!(lines(&store), [at_cap]);
+        assert_eq!(store.snapshot(), [at_cap]);
     }
 
     /// Invalid UTF-8 must not lose the record or panic the logging path.
@@ -226,6 +208,6 @@ mod tests {
 
         store.write_all(b"bad \xff byte\n").expect("write");
 
-        assert_eq!(lines(&store), ["bad \u{fffd} byte"]);
+        assert_eq!(store.snapshot(), ["bad \u{fffd} byte"]);
     }
 }
