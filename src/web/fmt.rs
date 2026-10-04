@@ -782,30 +782,6 @@ impl Display for Count {
     }
 }
 
-/// Render `0` plain; render any positive value inside `<span class="alert">`.
-pub(super) struct AlertNonzero(pub(super) u64);
-impl Display for AlertNonzero {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        if self.0 == 0 {
-            f.write_str("0")
-        } else {
-            write!(f, "<span class=\"alert\">{}</span>", Count(self.0))
-        }
-    }
-}
-
-/// Render `0` plain; render any positive value inside `<span class="warn">`.
-pub(super) struct WarnNonzero(pub(super) u64);
-impl Display for WarnNonzero {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        if self.0 == 0 {
-            f.write_str("0")
-        } else {
-            write!(f, "<span class=\"warn\">{}</span>", Count(self.0))
-        }
-    }
-}
-
 /// How loudly a non-zero bad-sign counter is painted: `Warn` for a condition
 /// the operator should look at, `Alert` for one that is broken.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -823,8 +799,8 @@ pub(super) struct Nonzero {
 impl Display for Nonzero {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.level {
-            Level::Warn => Display::fmt(&WarnNonzero(self.value), f),
-            Level::Alert => Display::fmt(&AlertNonzero(self.value), f),
+            Level::Warn => Display::fmt(&warn_if(Count(self.value), self.value != 0), f),
+            Level::Alert => Display::fmt(&alert_if(Count(self.value), self.value != 0), f),
         }
     }
 }
