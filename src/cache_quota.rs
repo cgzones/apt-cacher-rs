@@ -98,6 +98,7 @@ use crate::{
 };
 
 /// Represents a quota violation.
+#[derive(Debug)]
 pub(crate) struct QuotaExceeded;
 
 /// The allocation granularity the quota charges every file in: the block
@@ -1054,14 +1055,12 @@ mod tests {
         let tiny = ContentLength::Exact(NonZero::new(10).expect("non-zero"));
         let first = quota
             .try_acquire(tiny, 0, None, "first")
-            .ok()
             .expect("one block");
         assert_eq!(quota.current_size(), b(1));
         first.finalize(10);
         assert_eq!(quota.current_size(), b(1));
         let second = quota
             .try_acquire(tiny, 0, None, "second")
-            .ok()
             .expect("the second block");
         assert!(
             quota.try_acquire(tiny, 0, None, "third").is_err(),
@@ -1077,7 +1076,6 @@ mod tests {
                 None,
                 "overwrite",
             )
-            .ok()
             .expect("fits");
         assert_eq!(quota.current_size(), b(1));
         overwrite.finalize(20);
@@ -1086,7 +1084,6 @@ mod tests {
         let (_dir, path) = partial_path();
         let reservation = quota
             .try_acquire(tiny, 0, Some(reserved(&path, 0)), "kept")
-            .ok()
             .expect("fits");
         std::fs::write(&path, b"x").expect("write partial");
         drop(reservation);
@@ -1100,7 +1097,6 @@ mod tests {
         let quota = CacheQuota::new(b(80), Some(nz(100)));
         let reservation = quota
             .try_acquire(exact(10), 0, None, "fresh-under")
-            .ok()
             .expect("fresh download under quota should be accepted");
         assert_eq!(quota.current_size(), b(90));
         drop(reservation);
@@ -1126,7 +1122,6 @@ mod tests {
         let quota = CacheQuota::new(b(90), Some(nz(100)));
         let reservation = quota
             .try_acquire(exact(10), 0, None, "fresh-at")
-            .ok()
             .expect("projected size equal to the quota must be accepted");
         assert_eq!(quota.current_size(), b(100));
         drop(reservation);
@@ -1145,7 +1140,6 @@ mod tests {
         let quota = CacheQuota::new(b(80), Some(nz(100)));
         let reservation = quota
             .try_acquire(exact(10), b(10), None, "overwrite-same")
-            .ok()
             .expect("same-size overwrite under quota should be accepted");
         // Reserve adds 10, subtracts prev 10: net 0.
         assert_eq!(quota.current_size(), b(80));
@@ -1160,7 +1154,6 @@ mod tests {
         let quota = CacheQuota::new(b(110), Some(nz(100)));
         let reservation = quota
             .try_acquire(exact(5), b(20), None, "shrink-while-over")
-            .ok()
             .expect("smaller overwrite must be accepted to allow self-heal");
         assert_eq!(quota.current_size(), b(95));
         drop(reservation);
@@ -1184,7 +1177,6 @@ mod tests {
         let quota = CacheQuota::new(b(50), Some(nz(100)));
         let reservation = quota
             .try_acquire(exact(20), b(5), None, "round-trip")
-            .ok()
             .expect("must accept");
         // 50 - 5 + 20 = 65 in flight.
         assert_eq!(quota.current_size(), b(65));
@@ -1198,7 +1190,6 @@ mod tests {
         let quota = CacheQuota::new(b(50), Some(nz(100)));
         let reservation = quota
             .try_acquire(exact(20), 0, None, "under-deliver")
-            .ok()
             .expect("must accept");
         assert_eq!(quota.current_size(), b(70));
         // Upstream sent only 12 bytes — the unused 8-byte reservation
@@ -1212,7 +1203,6 @@ mod tests {
         let quota = CacheQuota::new(b(50), Some(nz(100)));
         let reservation = quota
             .try_acquire(exact(20), 0, None, "over-deliver")
-            .ok()
             .expect("must accept");
         assert_eq!(quota.current_size(), b(70));
         // Upstream sent 25 bytes despite announcing 20; the accounted size
@@ -1231,7 +1221,6 @@ mod tests {
         let window = quota.begin_reconcile_window();
         let reservation = quota
             .try_acquire(exact(30), 0, None, "abandoned")
-            .ok()
             .expect("must accept");
         assert_eq!(quota.current_size(), b(80));
         drop(reservation);
@@ -1247,7 +1236,6 @@ mod tests {
         let quota = CacheQuota::new(b(50), Some(nz(100)));
         let reservation = quota
             .try_acquire(exact(20), b(5), None, "drop-revert")
-            .ok()
             .expect("must accept");
         assert_eq!(quota.current_size(), b(65));
         drop(reservation);
@@ -1260,7 +1248,6 @@ mod tests {
         let quota = CacheQuota::new(u64::MAX / 2, None);
         let reservation = quota
             .try_acquire(exact(1_000), 0, None, "no-quota")
-            .ok()
             .expect("must accept when quota is unconfigured");
         drop(reservation);
     }
@@ -1282,7 +1269,6 @@ mod tests {
         let quota = CacheQuota::new(b(80), Some(nz(1000)));
         let reservation = quota
             .try_acquire(exact(30), b(20), None, "index")
-            .ok()
             .expect("must accept");
         assert_eq!(quota.current_size(), b(90));
         let window = quota.begin_reconcile_window();
@@ -1299,7 +1285,6 @@ mod tests {
         let quota = CacheQuota::new(b(80), Some(nz(1000)));
         let reservation = quota
             .try_acquire(exact(5), b(20), None, "index")
-            .ok()
             .expect("must accept");
         assert_eq!(quota.current_size(), b(65));
         let window = quota.begin_reconcile_window();
@@ -1317,7 +1302,6 @@ mod tests {
         // walked: the scan reports 50, the accounted size is already 80.
         let reservation = quota
             .try_acquire(exact(30), 0, None, "late")
-            .ok()
             .expect("must accept");
         reservation.finalize(b(30));
         assert_eq!(quota.current_size(), b(80));
@@ -1333,7 +1317,6 @@ mod tests {
         let window = quota.begin_reconcile_window();
         let reservation = quota
             .try_acquire(exact(30), 0, None, "early")
-            .ok()
             .expect("must accept");
         reservation.finalize(b(30));
         // The scan walked the directory after the commit: it reports 80.
@@ -1348,7 +1331,6 @@ mod tests {
         let window = quota.begin_reconcile_window();
         let reservation = quota
             .try_acquire(exact(30), 0, None, "late")
-            .ok()
             .expect("must accept");
         reservation.finalize(b(30));
         // Scan reports 40: even if the commit was missed, 80 exceeds
@@ -1422,7 +1404,6 @@ mod tests {
         let window = quota.begin_reconcile_window();
         let reservation = quota
             .try_acquire(exact(100), 0, Some(reserved(&path, b(40))), "resume")
-            .ok()
             .expect("must accept");
         assert_eq!(quota.current_size(), b(150));
 
@@ -1473,7 +1454,6 @@ mod tests {
         let quota = CacheQuota::new(b(50), Some(nz(1000)));
         let reservation = quota
             .try_acquire(exact(100), 0, Some(reserved(&path, b(0))), "kept")
-            .ok()
             .expect("must accept");
         assert_eq!(quota.current_size(), b(150));
         write_len(&path, 30);
@@ -1491,7 +1471,6 @@ mod tests {
         let quota = CacheQuota::new(b(50), Some(nz(1000)));
         let reservation = quota
             .try_acquire(exact(100), 0, Some(reserved(&path, b(0))), "none")
-            .ok()
             .expect("must accept");
         drop(reservation);
         assert_eq!(quota.current_size(), b(50));
@@ -1506,7 +1485,6 @@ mod tests {
         let quota = CacheQuota::new(b(90), Some(nz(100)));
         let reservation = quota
             .try_acquire(exact(50), 0, Some(reserved(&path, b(40))), "resume")
-            .ok()
             .expect("a resume adding 10 bytes fits");
         assert_eq!(quota.current_size(), b(100));
         reservation.finalize(b(50));
@@ -1520,7 +1498,6 @@ mod tests {
         let quota = CacheQuota::new(b(90), Some(nz(100)));
         let reservation = quota
             .try_acquire(exact(50), 0, Some(reserved(&path, b(40))), "resume")
-            .ok()
             .expect("must accept");
         write_len(&path, 45);
         drop(reservation);
@@ -1551,7 +1528,6 @@ mod tests {
         let quota = CacheQuota::new(b(50), Some(nz(1000)));
         let reservation = quota
             .try_acquire(exact(100), 0, Some(reserved(&path, b(0))), "live")
-            .ok()
             .expect("must accept");
         let window = quota.begin_reconcile_window();
         // The scan walked the partial empty, 30 bytes in, or complete.
@@ -1574,7 +1550,6 @@ mod tests {
         let window = quota.begin_reconcile_window();
         let reservation = quota
             .try_acquire(exact(100), 0, Some(reserved(&path, b(0))), "kept")
-            .ok()
             .expect("must accept");
         write_len(&path, 30);
         drop(reservation);
@@ -1593,7 +1568,6 @@ mod tests {
         let window = quota.begin_reconcile_window();
         let reservation = quota
             .try_acquire(exact(30), 0, Some(reserved(&path, b(0))), "moved")
-            .ok()
             .expect("must accept");
         reservation.finalize(b(30));
         assert_eq!(quota.current_size(), b(80));
@@ -1648,7 +1622,6 @@ mod tests {
         assert_eq!(quota.current_size(), b(0), "a rejection reserves nothing");
         let first = quota
             .try_acquire(exact(300), 0, None, "first")
-            .ok()
             .expect("300 of the 400 spare bytes");
         // The sample predates the first reservation and cannot reflect it.
         assert!(quota.try_acquire(exact(200), 0, None, "second").is_err());
@@ -1667,7 +1640,6 @@ mod tests {
         let quota = headroom_quota(512, Some(1536));
         let first = quota
             .try_acquire(exact(700), 0, None, "first")
-            .ok()
             .expect("700 of the 1024 spare blocks");
         // A second later: the first download has written 10 blocks.
         quota.record_disk_free(Some(b(1526)));
@@ -1689,7 +1661,6 @@ mod tests {
         let quota = headroom_quota(100, Some(1000));
         let first = quota
             .try_acquire(exact(500), 0, None, "first")
-            .ok()
             .expect("fits");
         first.finalize(b(500));
         assert!(
@@ -1707,7 +1678,6 @@ mod tests {
         drop(
             quota
                 .try_acquire(exact(500), 0, None, "abandoned")
-                .ok()
                 .expect("fits"),
         );
         assert!(quota.try_acquire(exact(450), 0, None, "next").is_err());

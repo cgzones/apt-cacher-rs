@@ -1076,7 +1076,6 @@ mod tests {
                 let length = ContentLength::Exact(std::num::NonZero::new(1024).unwrap());
                 let quota = crate::cache_quota::CacheQuota::new(0, None)
                     .try_acquire(length, 0, None, &key.debname)
-                    .ok()
                     .expect("unlimited quota");
                 let mut transition = Box::pin(barrier.download(
                     PathBuf::from("test.partial"),
@@ -1397,7 +1396,6 @@ mod tests {
         let length = ContentLength::Exact(std::num::NonZero::new(1024).unwrap());
         let quota = crate::cache_quota::CacheQuota::new(0, None)
             .try_acquire(length, 0, None, &key.debname)
-            .ok()
             .expect("unlimited quota");
         InitBarrier::new(
             active.originate_uncapped(key.as_ref()),
@@ -1526,7 +1524,6 @@ mod tests {
         let length = ContentLength::Exact(std::num::NonZero::new(1024).unwrap());
         let quota = CacheQuota::new(0, None)
             .try_acquire(length, 0, None, &key.debname)
-            .ok()
             .expect("unlimited quota");
         let (_settled, download) = init
             .download(
