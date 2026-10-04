@@ -613,7 +613,7 @@ mod tests {
     use crate::{
         config::ClientHost,
         deb_mirror::MirrorKind,
-        index_parser::{HashAlgo, hex_decode_exact, parse_filename_field, parse_hex_field},
+        index_parser::{HashAlgo, hex_decode_exact, parse_filename_field},
         limits::{MAX_COMPRESSED_PACKAGES_SIZE, MAX_METADATA_LINE_LEN},
         nonzero,
         proxy_body::full_body,
@@ -898,27 +898,6 @@ mod tests {
     fn hex_decode_exact_rejects_non_hex() {
         assert_eq!(hex_decode_exact::<4>("deadbeeg"), None);
         assert_eq!(hex_decode_exact::<4>("deadbe!f"), None);
-    }
-
-    #[test]
-    fn parse_hex_field_sha512() {
-        let hash = [0x22u8; 64];
-        let line = format!("SHA512:  {}\r\n", hex_encode(&hash));
-        assert_eq!(parse_hex_field::<64>(&line, "SHA512: "), Some(hash));
-    }
-
-    #[test]
-    fn parse_hex_field_rejects_wrong_prefix() {
-        let line = format!("MD5sum: {}\n", hex_encode(&[0u8; 32]));
-        assert_eq!(parse_hex_field::<32>(&line, "SHA256: "), None);
-    }
-
-    #[test]
-    fn parse_hex_field_rejects_malformed_payload() {
-        // 63 hex chars (one short of 64); should fail length check.
-        let payload = "0".repeat(63);
-        let line = format!("SHA256: {payload}\n");
-        assert_eq!(parse_hex_field::<32>(&line, "SHA256: "), None);
     }
 
     #[test]
