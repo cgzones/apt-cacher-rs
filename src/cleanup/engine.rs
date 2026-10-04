@@ -29,8 +29,8 @@ use http::{StatusCode, header::CONTENT_LENGTH};
 
 use crate::cleanup::model::{
     ByHashUnit, CleanupUnit, DistGate, FlatFetch, GroupOutcome, GroupResult, IndexSource,
-    KeymapSpec, MetadataUnit, OriginOwner, PartialsUnit, ReconcileFacet, ReconcilePolicy,
-    ReconcileUnit, SkipReason, SourceGroup, SweepAction, SweepReason, decide_sweep,
+    MetadataUnit, PartialsUnit, ReconcileFacet, ReconcilePolicy, ReconcileUnit, SkipReason,
+    SourceGroup, SweepAction, SweepReason, decide_sweep,
 };
 use crate::cleanup::packages::{
     DebnameKind, FetchFailure, KeyMapper, PackagesLayout, ReduceContext, ReduceError,
@@ -969,25 +969,9 @@ async fn resolve_group(
     tally: &mut UnitStats,
 ) -> GroupResolution {
     match &group.source {
-        IndexSource::OriginPackages {
-            origin_rows_of: OriginOwner::SelfRow,
-            keymap: _,
-            cache_layout: _,
-        } => resolve_origin_packages_self(ctx, cached_files, tally).await,
-        IndexSource::OriginPackages {
-            origin_rows_of: OriginOwner::ArchiveRoot { root },
-            keymap,
-            cache_layout,
-        } => {
-            resolve_origin_packages_archive_root(
-                ctx,
-                root,
-                keymap,
-                *cache_layout,
-                cached_files,
-                tally,
-            )
-            .await
+        IndexSource::SelfOrigins => resolve_origin_packages_self(ctx, cached_files, tally).await,
+        IndexSource::ArchiveRoot { root, prefix } => {
+            resolve_origin_packages_archive_root(ctx, root, prefix, cached_files, tally).await
         }
         IndexSource::FlatPackages {
             fetch: FlatFetch::Colocated,
@@ -999,20 +983,11 @@ async fn resolve_group(
 }
 
 /// Extract the archive-root segment of an owning hybrid group's source, for the
-/// strict-reconcile summary. Only [`OriginOwner::ArchiveRoot`] carries one.
+/// strict-reconcile summary. Only [`IndexSource::ArchiveRoot`] carries one.
 fn archive_root_segment(source: &IndexSource) -> Option<&str> {
     match source {
-        IndexSource::OriginPackages {
-            origin_rows_of: OriginOwner::ArchiveRoot { root },
-            keymap: _,
-            cache_layout: _,
-        } => Some(root.as_str()),
-        IndexSource::OriginPackages {
-            origin_rows_of: OriginOwner::SelfRow,
-            keymap: _,
-            cache_layout: _,
-        }
-        | IndexSource::FlatPackages { fetch: _ } => None,
+        IndexSource::ArchiveRoot { root, prefix: _ } => Some(root.as_str()),
+        IndexSource::SelfOrigins | IndexSource::FlatPackages { fetch: _ } => None,
     }
 }
 
@@ -1027,22 +1002,8 @@ fn flat_root_segment(source: &IndexSource) -> Option<&str> {
         IndexSource::FlatPackages {
             fetch: FlatFetch::Colocated,
         }
-        | IndexSource::OriginPackages {
-            origin_rows_of: _,
-            keymap: _,
-            cache_layout: _,
-        } => None,
-    }
-}
-
-/// Build the reduce-time [`KeyMapper`] for a [`KeymapSpec`]. Flat-repo `Relpath`
-/// keying has no [`KeymapSpec`] form (the co-located flat resolver hard-codes
-/// it); only the structured-pool `Basename` and hybrid/root `RelpathUnderPrefix`
-/// specs reach here.
-fn keymapper_for(spec: &KeymapSpec) -> KeyMapper<'_> {
-    match spec {
-        KeymapSpec::Basename => KeyMapper::Basename,
-        KeymapSpec::RelpathUnderPrefix { prefix } => KeyMapper::RelpathUnderPrefix { prefix },
+        | IndexSource::SelfOrigins
+        | IndexSource::ArchiveRoot { root: _, prefix: _ } => None,
     }
 }
 
@@ -1148,7 +1109,7 @@ fn map_reduce(
     }
 }
 
-/// Hybrid flat-pool source resolver (`OriginPackages { ArchiveRoot }`, issue
+/// Hybrid flat-pool source resolver (`ArchiveRoot`, issue
 /// #162, e.g. Gitea/Forgejo `.../pool/<dist>/<comp>`). The referencing
 /// `Packages` index lives in the structured `dists/` tree of the flat repo's
 /// *archive root*, so this reconciles the sub-path mirror's cached debs against
@@ -1165,8 +1126,7 @@ fn map_reduce(
 async fn resolve_origin_packages_archive_root(
     ctx: &ReconcileCtx<'_>,
     root: &str,
-    keymap: &KeymapSpec,
-    cache_layout: CacheLayout,
+    prefix: &str,
     cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
 ) -> GroupResolution {
@@ -1217,11 +1177,11 @@ async fn resolve_origin_packages_archive_root(
         MirrorKind::Structured,
     );
 
-    let keymap = keymapper_for(keymap);
+    let keymap = KeyMapper::RelpathUnderPrefix { prefix };
     for origin in &active_origins {
         // The debs live under the original flat sub-path `mirror`, not the
         // archive root, so metadata invalidation must key by `mirror`.
-        let plan = origin_fetch_plan(&archive_mirror, mirror, origin, cache_layout, keymap);
+        let plan = origin_fetch_plan(&archive_mirror, mirror, origin, CacheLayout::Flat, keymap);
         let step = map_reduce(
             reduce_against(&plan, ctx, cached_files, tally).await,
             mirror,
@@ -1328,7 +1288,7 @@ async fn resolve_flat_colocated(
     }
 }
 
-/// Structured-pool source resolver (`OriginPackages { SelfRow }`). Looks up the
+/// Structured-pool source resolver (`SelfOrigins`). Looks up the
 /// mirror's own origins, filters to the active ones, logs the enumeration + the
 /// no-origin / stale diagnostics, then reduces the candidate map against each
 /// active origin's `dists/.../Packages*`. Returns a [`GroupResult`] the tail's
@@ -1511,27 +1471,18 @@ mod tests {
     fn archive_root_segment_only_for_owning_hybrid_source() {
         // Only the hybrid `ArchiveRoot` source carries the archive-root segment
         // the strict-reconcile summary needs; every other source (structured
-        // `SelfRow`, flat, by-hash) yields `None`, so the tail never mistakes a
+        // `SelfOrigins`, flat, by-hash) yields `None`, so the tail never mistakes a
         // non-owning group for the strict early-finish.
-        let hybrid = IndexSource::OriginPackages {
-            origin_rows_of: OriginOwner::ArchiveRoot {
-                root: "api/packages/85/debian".to_owned(),
-            },
-            keymap: KeymapSpec::RelpathUnderPrefix {
-                prefix: "pool/php-zts/main/".to_owned(),
-            },
-            cache_layout: CacheLayout::Flat,
+        let hybrid = IndexSource::ArchiveRoot {
+            root: "api/packages/85/debian".to_owned(),
+            prefix: "pool/php-zts/main/".to_owned(),
         };
         assert_eq!(
             archive_root_segment(&hybrid),
             Some("api/packages/85/debian")
         );
 
-        let self_row = IndexSource::OriginPackages {
-            origin_rows_of: OriginOwner::SelfRow,
-            keymap: KeymapSpec::Basename,
-            cache_layout: CacheLayout::StructuredPool,
-        };
+        let self_row = IndexSource::SelfOrigins;
         assert_eq!(archive_root_segment(&self_row), None);
 
         let colocated = IndexSource::FlatPackages {
@@ -1541,14 +1492,13 @@ mod tests {
     }
 
     #[test]
-    fn keymapper_for_strips_hybrid_prefix_and_excludes_siblings() {
+    fn hybrid_prefix_mapping_excludes_siblings() {
         // The hybrid/root sources key on the in-mirror relpath with the archive
         // prefix stripped; an entry outside that subtree belongs to a sibling
         // mirror and must not match (invariant-8 owner keying depends on this).
-        let spec = KeymapSpec::RelpathUnderPrefix {
-            prefix: "pool/php-zts/main/".to_owned(),
+        let km = KeyMapper::RelpathUnderPrefix {
+            prefix: "pool/php-zts/main/",
         };
-        let km = keymapper_for(&spec);
         assert_eq!(
             km.map("pool/php-zts/main/php-zts-cli_8.5.7-1_amd64.deb")
                 .as_deref(),
