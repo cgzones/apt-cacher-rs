@@ -1220,15 +1220,28 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let walks = Arc::new(AtomicUsize::new(0));
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(10),
-                cached_dir_stats(dir.path(), counted_walk(&walks)),
-            )
-            .await
-            .is_err(),
-            "the first load is cancelled before its 50 ms walk ends"
-        );
+        let (started_tx, mut started) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let walk_count = Arc::clone(&walks);
+        let mut load = Box::pin(cached_dir_stats(dir.path(), move |_path| async move {
+            walk_count.fetch_add(1, Ordering::SeqCst);
+            started_tx.send(()).expect("caller waits for the walk");
+            released.await.expect("test releases the walk");
+            DirStats {
+                deb_files: 7,
+                ..DirStats::default()
+            }
+        }));
+        std::future::poll_fn(|cx| {
+            assert!(load.as_mut().poll(cx).is_pending());
+            std::pin::Pin::new(&mut started).poll(cx)
+        })
+        .await
+        .expect("walk started");
+        drop(load);
+        release
+            .send(())
+            .expect("cancelled caller left the walk alive");
         let stats = cached_dir_stats(dir.path(), counted_walk(&walks)).await;
         assert_eq!(stats.files(), 7);
         assert_eq!(
