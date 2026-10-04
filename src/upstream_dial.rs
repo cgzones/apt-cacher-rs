@@ -433,11 +433,21 @@ mod tests {
     /// through to a listening IPv4 one resolved for the same "name".
     #[tokio::test]
     async fn a_refused_ipv6_address_falls_through_to_ipv4() {
-        let Ok(v6) = std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) else {
+        let v6 = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .and_then(|socket| {
+            socket.bind(&SocketAddr::from((Ipv6Addr::LOCALHOST, 0)).into())?;
+            Ok(socket)
+        });
+        let Ok(v6) = v6 else {
             return; // no IPv6 loopback on this host
         };
-        let v6_addr = v6.local_addr().unwrap();
-        drop(v6); // nothing listens there any more: a connect is refused
+        // Retain the bound, non-listening socket so another test cannot take
+        // the port before the dial: this address must refuse the connection.
+        let v6_addr = v6.local_addr().unwrap().as_socket().unwrap();
         let v4 = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
