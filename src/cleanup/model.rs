@@ -195,7 +195,7 @@ impl TreeSpec {
 
 /// One source *description* applied to the unit's candidate map. Per-origin
 /// fan-out happens at resolution time in the engine and is conjunctive there:
-/// an `OriginPackages` group counts as complete only when every one of its
+/// an origin group counts as complete only when every one of its
 /// origins' `Packages` fetches resolved.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct SourceGroup {
@@ -208,33 +208,13 @@ pub(super) struct SourceGroup {
 /// instead, so every variant here is one `resolve_group` can actually dispatch.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum IndexSource {
-    /// Per-active-origin structured `Packages` fetch.
-    OriginPackages {
-        origin_rows_of: OriginOwner,
-        keymap: KeymapSpec,
-        cache_layout: CacheLayout,
-    },
+    /// Active origins of the row being cleaned, keyed by package basename.
+    SelfOrigins,
+    /// Active origins of a hybrid mirror's structured archive root, reducing
+    /// its flat package tree by stripping the in-mirror prefix.
+    ArchiveRoot { root: String, prefix: String },
     /// A flat-repository `Packages` fetch (co-located or root-segment).
     FlatPackages { fetch: FlatFetch },
-}
-
-/// Whose `mirrors_v2` row the active origins are read from for an
-/// [`IndexSource::OriginPackages`] group.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum OriginOwner {
-    /// The row being cleaned itself.
-    SelfRow,
-    /// The Gitea/Forgejo archive-root row (issue #162 hybrid).
-    ArchiveRoot { root: String },
-}
-
-/// How a `Packages` stanza's `Filename` field maps to a candidate map key.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum KeymapSpec {
-    /// Key on the basename only (structured pool).
-    Basename,
-    /// Key on the relative path with a fixed prefix stripped.
-    RelpathUnderPrefix { prefix: String },
 }
 
 /// Where a flat `Packages` index is fetched from.
@@ -517,11 +497,7 @@ pub(super) fn classify_mirror(
             facet,
             tree: TreeSpec::shallow(paths.entry_dir(facet.cache_layout(), site)),
             groups: vec![SourceGroup {
-                source: IndexSource::OriginPackages {
-                    origin_rows_of: OriginOwner::SelfRow,
-                    keymap: KeymapSpec::Basename,
-                    cache_layout: CacheLayout::StructuredPool,
-                },
+                source: IndexSource::SelfOrigins,
                 owning: false,
             }],
             policy: ReconcilePolicy::ReferencedOrBail {
@@ -533,12 +509,9 @@ pub(super) fn classify_mirror(
     let mut flat_groups = Vec::with_capacity(3);
     if let Some((root, prefix)) = flat_pool_archive_root(&entry.path) {
         flat_groups.push(SourceGroup {
-            source: IndexSource::OriginPackages {
-                origin_rows_of: OriginOwner::ArchiveRoot {
-                    root: root.to_owned(),
-                },
-                keymap: KeymapSpec::RelpathUnderPrefix { prefix },
-                cache_layout: CacheLayout::Flat,
+            source: IndexSource::ArchiveRoot {
+                root: root.to_owned(),
+                prefix,
             },
             owning: true,
         });
@@ -924,11 +897,7 @@ mod tests {
                     facet: ReconcileFacet::StructuredPool,
                     tree: TreeSpec::shallow(PathBuf::from("/cache/deb.debian.org/debian")),
                     groups: vec![SourceGroup {
-                        source: IndexSource::OriginPackages {
-                            origin_rows_of: OriginOwner::SelfRow,
-                            keymap: KeymapSpec::Basename,
-                            cache_layout: CacheLayout::StructuredPool,
-                        },
+                        source: IndexSource::SelfOrigins,
                         owning: false,
                     }],
                     policy: ReconcilePolicy::ReferencedOrBail {
@@ -1100,14 +1069,9 @@ mod tests {
             flat_tree.groups,
             vec![
                 SourceGroup {
-                    source: IndexSource::OriginPackages {
-                        origin_rows_of: OriginOwner::ArchiveRoot {
-                            root: "api/packages/85/debian".to_owned(),
-                        },
-                        keymap: KeymapSpec::RelpathUnderPrefix {
-                            prefix: "pool/php-zts/main/".to_owned(),
-                        },
-                        cache_layout: CacheLayout::Flat,
+                    source: IndexSource::ArchiveRoot {
+                        root: "api/packages/85/debian".to_owned(),
+                        prefix: "pool/php-zts/main/".to_owned(),
                     },
                     owning: true,
                 },
