@@ -2930,7 +2930,6 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_release_populates_packages_digests() {
-        use std::io::Write as _;
         use std::num::NonZero;
 
         let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
@@ -2939,9 +2938,7 @@ mod tests {
             "Origin: Test\nSHA256:\n 0000000000000000000000000000000000000000000000000000000000000000 1 main/binary-amd64/Release\n {} 4242 main/binary-amd64/Packages.xz\n",
             index_parser::hex_encode(&pkg_sha),
         );
-        let mut f = tempfile::NamedTempFile::new().expect("temp file");
-        f.write_all(release.as_bytes()).expect("write");
-        f.flush().expect("flush");
+        let f = temp_file_with(release.as_bytes());
 
         // The Release file lives at dists/sid/Release; its entries are relative
         // to dists/sid/.
@@ -3114,7 +3111,6 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_packages_populates_registry() {
-        use std::io::Write as _;
         use std::num::NonZero;
 
         let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
@@ -3127,9 +3123,7 @@ mod tests {
             index_parser::hex_encode(&sha_a),
             index_parser::hex_encode(&sha_b),
         );
-        let mut f = tempfile::NamedTempFile::new().expect("temp file");
-        f.write_all(packages.as_bytes()).expect("write");
-        f.flush().expect("flush");
+        let f = temp_file_with(packages.as_bytes());
 
         ingest_packages_file(
             &reg,
@@ -3154,7 +3148,6 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_scopes_digests_by_port() {
-        use std::io::Write as _;
         use std::num::NonZero;
 
         use crate::{
@@ -3168,9 +3161,7 @@ mod tests {
             "Package: a\nFilename: pool/main/a/a/a_1_amd64.deb\nSHA256: {}\n",
             index_parser::hex_encode(&sha),
         );
-        let mut f = tempfile::NamedTempFile::new().expect("temp file");
-        f.write_all(packages.as_bytes()).expect("write");
-        f.flush().expect("flush");
+        let f = temp_file_with(packages.as_bytes());
         let mirror = Mirror::new(
             ClientHost::new("deb.debian.org").expect("valid host"),
             NonZero::new(8080),
@@ -3196,7 +3187,6 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_packages_skips_filenames_no_cache_file_can_have() {
-        use std::io::Write as _;
         use std::num::NonZero;
 
         let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
@@ -3208,9 +3198,7 @@ mod tests {
             "Package: a\nFilename: pool/main/a/a/a_1_amd64.deb\nSHA256: {digest}\n\n\
              Package: long\nFilename: pool/main/l/l/{long}.deb\nSHA256: {digest}\n"
         );
-        let mut f = tempfile::NamedTempFile::new().expect("temp file");
-        f.write_all(packages.as_bytes()).expect("write");
-        f.flush().expect("flush");
+        let f = temp_file_with(packages.as_bytes());
 
         ingest_packages_file(
             &reg,
@@ -3276,9 +3264,7 @@ mod tests {
         encoder.shutdown().await.expect("shutdown");
         let compressed = encoder.into_inner();
 
-        let mut f = tempfile::NamedTempFile::new().expect("temp file");
-        f.write_all(&compressed).expect("write");
-        f.flush().expect("flush");
+        let f = temp_file_with(&compressed);
 
         let err = ingest_packages_file(
             &reg,
