@@ -3192,13 +3192,12 @@ mod tests {
 
     #[test]
     fn normalize_uri_path_at_cap_normalizes() {
-        let at_cap = format!("/{}/", "a/".repeat(MAX_NORMALIZED_PATH_LEN / 3));
-        assert!(at_cap.len() <= MAX_NORMALIZED_PATH_LEN);
+        let segment = "a".repeat(MAX_NORMALIZED_PATH_LEN - 2);
+        let at_cap = format!("//{segment}");
+        assert_eq!(at_cap.len(), MAX_NORMALIZED_PATH_LEN);
         let normalized = normalize_uri_path(&at_cap);
         assert!(matches!(normalized, Cow::Owned(_)));
-        if at_cap.contains("//") {
-            assert!(!normalized.contains("//"));
-        }
+        assert_eq!(normalized, format!("/{segment}"));
     }
 
     #[test]
