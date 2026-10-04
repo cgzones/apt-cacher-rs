@@ -119,6 +119,8 @@ impl DetachedDownload {
             Err(_reported) => return,
         };
 
+        drop(header_buf);
+
         let target = match transfer_body(
             &mut upstream,
             BodyClient::Absent,
