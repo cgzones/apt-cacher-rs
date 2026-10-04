@@ -1636,18 +1636,7 @@ async fn download_file(
     // Not created here: `integrity::rename_into_cache` creates it at commit
     // time, and only on `ENOENT`. The `warn_on_override` `try_exists` below
     // reads a missing directory as "no file to overwrite", which is right.
-    let dest_dir_path = conn_details.cache_dir_path();
-
-    let dest_file_path = {
-        let mut p = dest_dir_path;
-        let filename = Path::new(&conn_details.debname);
-        assert!(
-            filename.is_relative(),
-            "path construction must not contain absolute components"
-        );
-        p.push(filename);
-        p
-    };
+    let dest_file_path = conn_details.cache_file_path();
 
     debug!("Saving downloaded file to `{}`", dest_file_path.display());
 

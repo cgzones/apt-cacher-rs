@@ -506,15 +506,8 @@ async fn prepare_cache_target(
     // Not created here: `integrity::rename_into_cache` creates it at commit
     // time, and only on `ENOENT`. Everything below tolerates its absence:
     // `dest_path` is pure path construction.
-    let dest_dir = conn_details.cache_dir_path();
-
+    let dest_path = conn_details.cache_file_path();
     let filename = Path::new(&conn_details.debname);
-    assert!(
-        filename.is_relative(),
-        "path construction must not contain absolute components"
-    );
-
-    let dest_path = dest_dir.join(filename);
     let reservation = if conn_details.client.is_cleanup_synthetic() {
         // Mirrors the hyper gate: cleanup's own index fetches are admitted
         // over quota (`CacheQuota::acquire_for_cleanup`).
