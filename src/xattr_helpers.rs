@@ -324,6 +324,21 @@ pub(crate) mod tests {
     use super::*;
     use crate::test_support::levels_during;
 
+    /// Probe user-xattr support independently of the typed helpers under test.
+    pub(crate) fn supports_user_xattrs(path: &Path) -> bool {
+        const KEY: &str = "user.apt_cacher_rs.test_probe";
+        match xattr::set(path, KEY, b"probe") {
+            Ok(()) => {
+                xattr::remove(path, KEY).expect("remove probe attribute");
+                true
+            }
+            Err(err) => {
+                assert_eq!(err.kind(), io::ErrorKind::Unsupported, "xattr probe: {err}");
+                false
+            }
+        }
+    }
+
     /// Plant a raw (possibly malformed) value under `V`'s key, bypassing the
     /// typed layer. `false` when the test filesystem rejects user xattrs, so
     /// the caller skips its assertions instead of failing on tmpfs without
@@ -441,12 +456,14 @@ pub(crate) mod tests {
         let path = dir.path().join("probe");
         let file = tokio::fs::File::create(&path).await.expect("create file");
 
-        write(&file, &path, &ExpectedSize(1_071_434_820));
-
-        // Skip the round-trip assertion when xattrs aren't supported on the test FS.
-        if let Some(size) = read::<ExpectedSize>(&file, &path) {
-            assert_eq!(size, ExpectedSize(1_071_434_820));
+        if !supports_user_xattrs(&path) {
+            return;
         }
+        write(&file, &path, &ExpectedSize(1_071_434_820));
+        assert_eq!(
+            read::<ExpectedSize>(&file, &path),
+            Some(ExpectedSize(1_071_434_820))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

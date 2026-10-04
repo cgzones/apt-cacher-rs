@@ -576,6 +576,7 @@ mod tests {
     use super::*;
     use crate::cache_layout::CacheLayout;
     use crate::deb_mirror::{Mirror, MirrorKind};
+    use crate::xattr_helpers::tests::supports_user_xattrs;
 
     fn write_etag(file: &File, path: &Path, etag: &str) {
         xattr_helpers::write(file, path, &ETag::parse(etag).expect("valid ETag"));
@@ -614,16 +615,14 @@ mod tests {
     async fn resolve_misses_then_caches() {
         let store = CacheMetadataStore::new();
         let (_dir, file, path) = fixture_file().await;
+        if !supports_user_xattrs(&path) {
+            return;
+        }
         write_etag(&file, &path, "\"abc\"");
         write_last_modified(&file, &path, "Thu, 01 Jan 1970 00:00:00 GMT");
 
         let key = fixture_key();
         let first = store.resolve(&key.as_ref(), &file, &path);
-        // Skip entirely on filesystems that reject xattr writes (the prior
-        // `write_etag` would have silently been a no-op).
-        if first.etag.is_none() && first.last_modified.is_none() {
-            return;
-        }
         assert_eq!(first.etag.as_deref(), Some("\"abc\""));
         assert!(first.last_modified.is_some());
         assert_eq!(store.len(), 1);
@@ -639,6 +638,9 @@ mod tests {
     async fn write_upstream_metadata_persists_what_resolve_reads() {
         let store = CacheMetadataStore::new();
         let (_dir, file, path) = fixture_file().await;
+        if !supports_user_xattrs(&path) {
+            return;
+        }
         let meta = UpstreamMetadata::from_upstream(
             Some("\"abc\"".into()),
             Some("Thu, 01 Jan 1970 00:00:00 GMT".into()),
@@ -646,10 +648,6 @@ mod tests {
         write_upstream_metadata(&file, &path, &meta, Some(4096), TargetFile::New);
 
         let resolved = store.resolve(&fixture_key().as_ref(), &file, &path);
-        // Skip on filesystems that reject xattr writes.
-        if resolved.etag.is_none() && resolved.last_modified.is_none() {
-            return;
-        }
         assert_eq!(
             resolved.as_ref(),
             &meta,
@@ -668,12 +666,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn write_upstream_metadata_removes_validators_the_download_lacks() {
         let (_dir, file, path) = fixture_file().await;
-        write_etag(&file, &path, "\"first\"");
-        write_last_modified(&file, &path, "Thu, 01 Jan 1970 00:00:00 GMT");
-        // Skip on filesystems that reject xattr writes.
-        if xattr_helpers::read::<ETag>(&file, &path).is_none() {
+        if !supports_user_xattrs(&path) {
             return;
         }
+        write_etag(&file, &path, "\"first\"");
+        write_last_modified(&file, &path, "Thu, 01 Jan 1970 00:00:00 GMT");
 
         let meta = UpstreamMetadata::from_upstream(None, None);
         write_upstream_metadata(&file, &path, &meta, Some(4096), TargetFile::Resumed);
@@ -698,11 +695,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn write_upstream_metadata_skips_removals_on_a_new_file() {
         let (_dir, file, path) = fixture_file().await;
-        write_etag(&file, &path, "\"planted\"");
-        // Skip on filesystems that reject xattr writes.
-        if xattr_helpers::read::<ETag>(&file, &path).is_none() {
+        if !supports_user_xattrs(&path) {
             return;
         }
+        write_etag(&file, &path, "\"planted\"");
 
         let meta = UpstreamMetadata::from_upstream(None, None);
         write_upstream_metadata(&file, &path, &meta, None, TargetFile::New);
@@ -895,6 +891,9 @@ mod tests {
     async fn invalidate_makes_resolve_re_read_the_xattrs() {
         let store = CacheMetadataStore::new();
         let (_dir, file, path) = fixture_file().await;
+        if !supports_user_xattrs(&path) {
+            return;
+        }
         write_etag(&file, &path, "\"on-disk\"");
         let key = fixture_key();
 
@@ -913,11 +912,6 @@ mod tests {
 
         store.invalidate(&key);
         let reread = store.resolve(&key.as_ref(), &file, &path);
-        // Skip on filesystems that reject xattr writes (`write_etag` was a
-        // silent no-op there).
-        if reread.etag.is_none() {
-            return;
-        }
         assert_eq!(
             reread.etag.as_deref(),
             Some("\"on-disk\""),

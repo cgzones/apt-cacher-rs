@@ -236,6 +236,7 @@ mod tests {
         use std::io::Write as _;
         use std::os::unix::fs::MetadataExt as _;
 
+        use crate::xattr_helpers::tests::supports_user_xattrs;
         use sha2::Digest as _;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -252,20 +253,17 @@ mod tests {
             Verdict::Match
         ));
 
-        // The marker may be missing on filesystems without user-xattr
-        // support (stamping is best-effort); only assert the fast path
-        // where it actually stuck.
-        let file = std::fs::File::open(&path).expect("open");
-        let meta = file.metadata().expect("metadata");
-        let stamped = has_valid_marker(
-            &file,
-            &path,
-            meta.ino(),
-            meta.len(),
-            HashAlgo::Sha256,
-            &expected,
-        );
-        if stamped {
+        if supports_user_xattrs(&path) {
+            let file = std::fs::File::open(&path).expect("open");
+            let meta = file.metadata().expect("metadata");
+            assert!(has_valid_marker(
+                &file,
+                &path,
+                meta.ino(),
+                meta.len(),
+                HashAlgo::Sha256,
+                &expected,
+            ));
             // The counter is process-global and other unit tests in this
             // binary bump it concurrently, so assert the delta as a lower
             // bound.
