@@ -42,7 +42,9 @@ use crate::{
     config::{Config, DomainName},
     error::{ErrorReport, is_peer_disconnect},
     humanfmt::HumanFmt,
-    limits, metrics, uri_authority, warn_once_or_info,
+    limits, metrics,
+    tunnel_limiter::{self, TunnelGuard},
+    uri_authority, warn_once_or_info,
     write_stall::is_client_write_stall,
 };
 
@@ -74,12 +76,37 @@ impl std::fmt::Display for TunnelTarget {
     }
 }
 
-/// A rejected CONNECT target: the status/body the backend should return to the
+/// A rejected CONNECT request: the status/body the backend should return to the
 /// client. All logging and metric bumping already happened inside
-/// [`validate_connect_target`].
+/// [`validate_connect_target`] or [`admit`].
 pub(crate) struct ConnectReject {
     pub status: StatusCode,
     pub msg: &'static str,
+}
+
+/// Acquire the configured per-client tunnel slot, recording any refusal.
+/// The caller separately holds an active-tunnel guard even with no cap.
+pub(crate) fn admit(
+    config: &Config,
+    client: &ClientInfo,
+) -> Result<Option<TunnelGuard>, ConnectReject> {
+    let Some(max) = config.https_tunnel_max_connections_per_client else {
+        return Ok(None);
+    };
+    let Some(guard) = tunnel_limiter::try_acquire(client.ip(), max, config.client_ipv6_prefix_len)
+    else {
+        info!(
+            "Rejecting https tunnel request for client {client}, \
+             concurrent connection limit ({max}) reached"
+        );
+        metrics::TUNNEL_REJECTED_CAPACITY.increment();
+        client_trouble::record(client, Trouble::CapRefused);
+        return Err(ConnectReject {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            msg: "Too many concurrent HTTPS tunnel connections",
+        });
+    };
+    Ok(Some(guard))
 }
 
 /// Validate a CONNECT request's authority against tunnel policy.

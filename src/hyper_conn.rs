@@ -55,7 +55,7 @@ use crate::{
     client_trouble::{self, Trouble},
     config::ClientHost,
     connect_tunnel::{
-        ConnectReject, TunnelTarget, copy_bidirectional_idle, report_tunnel_outcome,
+        ConnectReject, TunnelTarget, admit, copy_bidirectional_idle, report_tunnel_outcome,
         validate_connect_target,
     },
     content_type::{content_type_for_cached_file, warn_on_content_type_mismatch},
@@ -2850,24 +2850,9 @@ fn connect_response(
         Err(ConnectReject { status, msg }) => return quick_response_closing(status, msg),
     };
 
-    let tunnel_guard = if let Some(max) = config.https_tunnel_max_connections_per_client {
-        let Some(guard) =
-            tunnel_limiter::try_acquire(client.ip(), max, config.client_ipv6_prefix_len)
-        else {
-            info!(
-                "Rejecting https tunnel request for client {client}, \
-                     concurrent connection limit ({max}) reached"
-            );
-            metrics::TUNNEL_REJECTED_CAPACITY.increment();
-            client_trouble::record(&client, Trouble::CapRefused);
-            return quick_response_closing(
-                StatusCode::TOO_MANY_REQUESTS,
-                "Too many concurrent HTTPS tunnel connections",
-            );
-        };
-        Some(guard)
-    } else {
-        None
+    let tunnel_guard = match admit(config, &client) {
+        Ok(guard) => guard,
+        Err(ConnectReject { status, msg }) => return quick_response_closing(status, msg),
     };
 
     // Account for the active tunnel regardless of whether the per-IP cap
