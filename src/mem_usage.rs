@@ -175,6 +175,116 @@ pub(crate) fn allocator_stats() -> AllocatorStats {
     }
 }
 
+/// The least mmap threshold [`tune_allocator`] pins: blocks of this size
+/// and above come straight from `mmap(2)` and go back to the kernel the
+/// moment they are freed. Above every table the daemon keeps around and the
+/// default transfer buffer; below an LZMA dictionary, a `Packages` buffer
+/// and a registry scope's slot log once it holds a few tens of thousands of
+/// entries.
+#[cfg(target_env = "gnu")]
+const MIN_MMAP_THRESHOLD: usize = if MAX_MMAP_THRESHOLD < 1024 * 1024 {
+    MAX_MMAP_THRESHOLD
+} else {
+    1024 * 1024
+};
+
+/// The most glibc accepts, half its arena heap size: 32 MiB on 64-bit,
+/// which is also where its dynamic threshold stops rising, and 512 KiB on
+/// 32-bit.
+#[cfg(all(target_env = "gnu", target_pointer_width = "64"))]
+const MAX_MMAP_THRESHOLD: usize = 32 * 1024 * 1024;
+#[cfg(all(target_env = "gnu", not(target_pointer_width = "64")))]
+const MAX_MMAP_THRESHOLD: usize = 512 * 1024;
+
+/// Slack between the largest buffer and the pin. glibc compares the
+/// threshold with the chunk it allocates, the request plus a header rounded
+/// up to 16 bytes, so a block of exactly the buffer's size would sit above a
+/// pin one byte beyond it; a page covers the header and the rounding.
+#[cfg(target_env = "gnu")]
+const BUFFER_HEADROOM: usize = 4096;
+
+/// What [`tune_allocator`] did, for [`Self::log`] once logging is up.
+#[cfg(target_env = "gnu")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AllocatorTuning {
+    Pinned(usize),
+    /// glibc refused the value, so its dynamic threshold stays.
+    Rejected(usize),
+}
+
+#[cfg(target_env = "gnu")]
+impl AllocatorTuning {
+    pub(crate) fn log(self) {
+        match self {
+            Self::Pinned(threshold) => {
+                tracing::debug!("Allocator mmap threshold pinned at {threshold} bytes");
+            }
+            Self::Rejected(threshold) => {
+                tracing::warn!(
+                    "Failed to set the allocator's mmap threshold to {threshold} bytes; freed index buffers may stay resident"
+                );
+            }
+        }
+    }
+}
+
+/// The pin for a process whose largest per-connection buffer is
+/// `largest_buffer` bytes: [`BUFFER_HEADROOM`] above it, within glibc's
+/// range.
+#[cfg(target_env = "gnu")]
+const fn pinned_threshold(largest_buffer: usize) -> usize {
+    let threshold = largest_buffer.saturating_add(BUFFER_HEADROOM);
+    if threshold < MIN_MMAP_THRESHOLD {
+        MIN_MMAP_THRESHOLD
+    } else if threshold > MAX_MMAP_THRESHOLD {
+        MAX_MMAP_THRESHOLD
+    } else {
+        threshold
+    }
+}
+
+/// Pin glibc's mmap threshold just above `largest_buffer`, the biggest block
+/// a connection allocates, and at [`MIN_MMAP_THRESHOLD`] at least.
+///
+/// By default the threshold starts at 128 KiB and rises to the size of
+/// every larger block freed, up to 32 MiB: the first freed 8 MiB LZMA
+/// dictionary moves every later dictionary, every `Packages` buffer and
+/// every reallocation of a growing table into the arenas, where a freed
+/// block only leaves if it sits at the arena's top. Measured on nine Debian
+/// indexes: 85 MB freed but retained next to 85 MB in use, the retained
+/// part never returned. Pinned, those blocks are mapped on their own and
+/// unmapped on free; the arenas keep the small blocks they are good at.
+///
+/// The per-connection buffers stay below the pin whatever `buffer_size`
+/// says (up to glibc's ceiling, past which the dynamic threshold would have
+/// mapped them too): a buffer per connection through `mmap(2)` would be a
+/// mapping and a round of page faults per transfer.
+///
+/// Call it once the configuration is loaded and before the process starts
+/// a second thread: glibc lists `mallopt(3)` as MT-unsafe, its parameter
+/// writes being unsynchronised with allocations on other threads. The
+/// outcome is returned for logging because logging is not up yet at that
+/// point. It overrides a `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=` the
+/// operator may have set.
+///
+/// mimalloc (the musl build's allocator) returns freed memory itself, so
+/// there is nothing to tune there.
+#[cfg(target_env = "gnu")]
+#[must_use]
+pub(crate) fn tune_allocator(largest_buffer: usize) -> AllocatorTuning {
+    let threshold = pinned_threshold(largest_buffer);
+    let value = nix::libc::c_int::try_from(threshold).expect("at most 32 MiB");
+    // SAFETY: `mallopt(3)` takes two integers and only writes the
+    // allocator's parameters; the caller keeps every other thread from
+    // allocating meanwhile (see above).
+    let ok = unsafe { nix::libc::mallopt(nix::libc::M_MMAP_THRESHOLD, value) };
+    if ok == 1 {
+        AllocatorTuning::Pinned(threshold)
+    } else {
+        AllocatorTuning::Rejected(threshold)
+    }
+}
+
 /// SQLite's heap, in bytes: the page caches of the pool's connections, their
 /// prepared statements and schema copies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -271,6 +381,52 @@ mod tests {
             "{before:?} -> {during:?}"
         );
         drop(block);
+    }
+
+    #[cfg(target_env = "gnu")]
+    #[test]
+    fn the_pin_sits_above_the_largest_buffer_within_glibc_s_range() {
+        assert_eq!(pinned_threshold(0), MIN_MMAP_THRESHOLD);
+        // The largest buffer the headroom still fits above; on 32-bit the
+        // floor and the ceiling coincide and the pin is the ceiling.
+        let largest = MAX_MMAP_THRESHOLD - BUFFER_HEADROOM;
+        assert_eq!(pinned_threshold(largest), MAX_MMAP_THRESHOLD);
+        assert!(
+            pinned_threshold(largest) > largest + 16,
+            "the chunk header must fit below the pin"
+        );
+        assert_eq!(pinned_threshold(usize::MAX), MAX_MMAP_THRESHOLD);
+    }
+
+    /// The pin exists so that a per-connection buffer is never a mapping of
+    /// its own; one of exactly the largest size must come from the arena
+    /// while a larger block is mapped and returned on free. Runs in its own
+    /// process under nextest, so the pin affects no other test.
+    #[cfg(all(target_env = "gnu", target_pointer_width = "64"))]
+    #[test]
+    fn a_block_of_the_largest_buffer_s_size_stays_in_the_arena() {
+        let largest = 4 * 1024 * 1024;
+        assert_eq!(
+            tune_allocator(largest),
+            AllocatorTuning::Pinned(largest + BUFFER_HEADROOM)
+        );
+        let before = allocator_stats().mmapped;
+        let buffer: Vec<u8> = Vec::with_capacity(largest);
+        std::hint::black_box(&buffer);
+        assert_eq!(
+            allocator_stats().mmapped,
+            before,
+            "a block of the buffer's size must come from the arena"
+        );
+        let bigger: Vec<u8> = Vec::with_capacity(2 * largest);
+        std::hint::black_box(&bigger);
+        assert!(
+            allocator_stats().mmapped > before,
+            "a block above the pin is mapped on its own"
+        );
+        drop(bigger);
+        assert_eq!(allocator_stats().mmapped, before, "and unmapped on free");
+        drop(buffer);
     }
 
     #[test]

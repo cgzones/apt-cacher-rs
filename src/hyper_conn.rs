@@ -3400,7 +3400,7 @@ const CLIENT_HEAD_ALLOWANCE: usize = 16 * 1024;
 /// (48 KiB at the default 32 KiB `buffer_size`) stays far below hyper's
 /// default.
 #[must_use]
-fn client_max_buf_size(buffer_size: usize) -> usize {
+pub(crate) fn client_max_buf_size(buffer_size: usize) -> usize {
     CLIENT_HEAD_ALLOWANCE.max(buffer_size.saturating_add(CLIENT_HEAD_ALLOWANCE))
 }
 

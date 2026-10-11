@@ -551,6 +551,17 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
         unsafe { std::env::set_var("SQLITE_TMPDIR", path) };
     }
 
+    // Also before the first thread: `mallopt(3)` is MT-unsafe. Reported once
+    // logging is up.
+    #[cfg(target_env = "gnu")]
+    let allocator_tuning = {
+        #[cfg(feature = "hyper")]
+        let largest_buffer = hyper_conn::client_max_buf_size(config.buffer_size);
+        #[cfg(not(feature = "hyper"))]
+        let largest_buffer = config.buffer_size;
+        mem_usage::tune_allocator(largest_buffer)
+    };
+
     let output_log_level = args.log_level.unwrap_or(config.log_level);
     let output_log_file = args.log_file.as_ref().unwrap_or(&config.log_file);
 
@@ -649,6 +660,9 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
             Some(guard)
         }
     };
+
+    #[cfg(target_env = "gnu")]
+    allocator_tuning.log();
 
     #[cfg(feature = "hyper")]
     let config_http_timeout = config.http_timeout;
