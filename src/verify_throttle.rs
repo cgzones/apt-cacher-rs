@@ -21,12 +21,13 @@ use coarsetime::{Duration, Instant};
 use hashbrown::HashMap;
 
 use crate::cache_layout::{CacheEntryKey, CacheEntryKeyRef};
+use crate::mem_usage::Footprint;
 use crate::warn_once;
 
 /// Soft cap on the entry count. Every entry requires an actual upstream
 /// download that failed verification, so realistic workloads stay tiny;
 /// the cap purely bounds memory if an upstream serves endless garbage.
-const MAX_THROTTLE_ENTRIES: usize = 256;
+pub(crate) const MAX_THROTTLE_ENTRIES: usize = 256;
 
 #[derive(Clone, Copy, Debug)]
 struct ThrottleEntry {
@@ -66,6 +67,20 @@ impl VerifyThrottle {
             map: parking_lot::RwLock::new(HashMap::new()),
             base: (base.as_ticks() != 0).then_some(base),
             cap: Duration::from(cap).max(base),
+        }
+    }
+
+    /// Entries and the heap they take: the table and each key's mirror and
+    /// name. Walks the table, which the cap keeps small.
+    pub(crate) fn footprint(&self) -> Footprint {
+        let map = self.map.read();
+        let keys: usize = map
+            .keys()
+            .map(|key| key.mirror.heap_bytes() + key.debname.capacity())
+            .sum();
+        Footprint {
+            entries: map.len(),
+            bytes: map.allocation_size() + keys,
         }
     }
 

@@ -25,6 +25,7 @@ use parking_lot::RwLock;
 
 use crate::config::{Config, DomainName, HttpsUpgradeMode};
 use crate::deb_mirror::Mirror;
+use crate::mem_usage::Footprint;
 use crate::metrics;
 use crate::permitted_host_cache::port_permitted;
 use crate::uri_authority;
@@ -206,6 +207,17 @@ static SCHEME_CACHE: OnceLock<RwLock<HashMap<SchemeKey, CachedScheme>>> = OnceLo
 
 fn cache() -> &'static RwLock<HashMap<SchemeKey, CachedScheme>> {
     SCHEME_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Hosts cached and the heap they take: the table and each key's host
+/// text. Walks the table, which holds one entry per upstream host.
+pub(crate) fn footprint() -> Footprint {
+    let map = cache().read();
+    let hosts: usize = map.keys().map(|key| key.host.capacity()).sum();
+    Footprint {
+        entries: map.len(),
+        bytes: map.allocation_size() + hosts,
+    }
 }
 
 /// Debug-format the current cache contents, for the startup warm-up trace.

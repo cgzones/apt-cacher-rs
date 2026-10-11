@@ -61,6 +61,12 @@ impl<T> RingBuffer<T> {
         self.inner.len()
     }
 
+    /// The slots the ring holds at most, which it has reserved up front.
+    #[must_use]
+    pub(crate) const fn capacity(&self) -> NonZero<usize> {
+        self.capacity
+    }
+
     #[must_use]
     pub(crate) fn iter(&self) -> std::collections::vec_deque::Iter<'_, T> {
         self.inner.iter()

@@ -89,6 +89,7 @@ use crate::{
     http_etag::{ETag, MAX_ETAG_LEN, is_valid_etag},
     http_last_modified::{LastModified, is_valid_http_date},
     http_range::HttpDate,
+    mem_usage::{Footprint, table_bytes},
     warn_once, warn_once_or_info,
     xattr_helpers::{self, ExpectedSize, XattrValue as _},
 };
@@ -351,7 +352,7 @@ pub(crate) struct CacheMetadataStore {
 /// lazily re-loadable from the on-disk xattrs, so overflow simply clears
 /// the map (no LRU) and subsequent serves re-populate it — same
 /// best-effort approach as `verify_throttle` and `permitted_host_cache`.
-const CACHE_METADATA_MAX_ENTRIES: usize = 64 * 1024;
+pub(crate) const CACHE_METADATA_MAX_ENTRIES: usize = 64 * 1024;
 
 /// The clear is silent otherwise: serves go back to two `fgetxattr(2)`
 /// round-trips through `block_in_place` -- the cost this cache exists to
@@ -530,10 +531,40 @@ impl CacheMetadataStore {
         self.map.write().remove(key);
     }
 
-    /// Number of currently cached entries.  Used by tests and by the web
-    /// interface "Daemon Status" row that surfaces in-memory cache size.
+    /// Number of currently cached entries (the dashboard reads
+    /// [`Self::footprint`]).
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.map.read().len()
+    }
+
+    /// Entries and the heap they take: the table, each key's mirror and
+    /// name, and each value's validator strings. Walks the table under the
+    /// read lock, which blocks no reader and holds writers (a commit, a
+    /// cleanup unlink) for the few hundred microseconds a full table takes.
+    pub(crate) fn footprint(&self) -> Footprint {
+        let map = self.map.read();
+        let owned: usize = map
+            .iter()
+            .map(|(key, meta)| {
+                let UpstreamMetadata {
+                    etag,
+                    last_modified,
+                } = meta.as_ref();
+                key.mirror.heap_bytes()
+                    + key.debname.capacity()
+                    + size_of::<UpstreamMetadata>()
+                    + etag.as_ref().map_or(0, |etag| etag.len())
+                    + last_modified.as_ref().map_or(0, |(raw, _)| raw.len())
+            })
+            .sum();
+        Footprint {
+            entries: map.len(),
+            bytes: table_bytes(
+                map.capacity(),
+                size_of::<(CacheEntryKey, Arc<UpstreamMetadata>)>(),
+            ) + owned,
+        }
     }
 }
 

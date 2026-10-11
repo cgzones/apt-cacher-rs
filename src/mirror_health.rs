@@ -25,6 +25,7 @@ use hashbrown::HashMap;
 
 use crate::{
     deb_mirror::Mirror,
+    mem_usage::Footprint,
     mirror_registry::{MAX_MIRRORS, MirrorRegistry, Twin},
 };
 
@@ -100,6 +101,12 @@ pub(crate) fn record(mirror: &Mirror, fault: MirrorFault) {
 #[must_use]
 pub(crate) fn snapshot() -> HashMap<Box<str>, MirrorHealth> {
     HEALTH.snapshot()
+}
+
+/// Mirrors tracked and the heap they take (the counts are inline).
+#[must_use]
+pub(crate) fn footprint() -> Footprint {
+    HEALTH.footprint(|_| 0)
 }
 
 #[cfg(test)]

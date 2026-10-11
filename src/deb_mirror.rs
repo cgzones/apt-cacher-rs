@@ -112,6 +112,25 @@ impl Mirror {
     pub(crate) const fn path(&self) -> &str {
         self.path.as_str()
     }
+
+    /// The heap this value owns beyond its inline size: the host text, the
+    /// path and the rendered authority once cached. The host text is a
+    /// shared allocation when the value is a clone, and is counted anyway.
+    #[must_use]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let Self {
+            host,
+            port: _,
+            path,
+            kind: _,
+            cached_authority,
+        } = self;
+        host.as_str().len()
+            + path.capacity()
+            + cached_authority
+                .get()
+                .map_or(0, |authority| authority.len())
+    }
 }
 
 impl PartialEq for Mirror {

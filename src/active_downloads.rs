@@ -43,6 +43,7 @@ use crate::error::ErrorReport;
 use crate::fs_open::{count_cache_failure, tokio_nofollow_options};
 use crate::guards::CANCELLED_DOWNLOAD;
 use crate::humanfmt::HumanFmt;
+use crate::mem_usage::{ARC_HEADER, Footprint};
 use crate::passthrough_limiter;
 use crate::transfer_error::DownloadFailure;
 use crate::upstream_head::{ContentLength, RejectReason};
@@ -725,6 +726,25 @@ impl ActiveDownloads {
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.inner.read().entries.len()
+    }
+
+    /// Entries and the heap they take: the table, each key's mirror and
+    /// name, and each entry's shared status. A `Download` status also owns
+    /// its temp path, whose length the estimate skips (it lives behind an
+    /// async lock).
+    pub(crate) fn footprint(&self) -> Footprint {
+        let inner = self.inner.read();
+        let keys: usize = inner
+            .entries
+            .keys()
+            .map(|key| key.mirror.heap_bytes() + key.debname.capacity())
+            .sum();
+        let statuses = inner.entries.len()
+            * (ARC_HEADER + size_of::<tokio::sync::RwLock<ActiveDownloadStatus>>());
+        Footprint {
+            entries: inner.entries.len(),
+            bytes: inner.entries.allocation_size() + keys + statuses,
+        }
     }
 
     /// Downloads with an upstream connection open right now: the number of

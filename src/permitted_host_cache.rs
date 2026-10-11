@@ -7,7 +7,9 @@ use crate::{
     client_info::ClientInfo,
     client_trouble::{self, Trouble},
     config::{ClientHost, Config, DomainName, HostError},
-    global_config, metrics,
+    global_config,
+    mem_usage::Footprint,
+    metrics,
     request_dispatch::client_permitted,
     uri_authority::HTTP_DEFAULT_PORT,
     warn_once_or_info,
@@ -44,7 +46,7 @@ pub(crate) fn mirror_permitted(
 /// traffic uses a handful of mirrors so this almost never trips; the
 /// cap exists purely to bound memory under attacker-driven random
 /// `Host:` spam.
-const PERMITTED_HOST_CACHE_MAX_ENTRIES: usize = 256;
+pub(crate) const PERMITTED_HOST_CACHE_MAX_ENTRIES: usize = 256;
 
 /// Reason [`permitted_host`] rejected a host; cached so repeat-spam of the
 /// same bad host doesn't re-validate or re-scan `allowed_mirrors`.
@@ -84,6 +86,27 @@ impl PermittedHostCache {
 
 static PERMITTED_HOST_CACHE: LazyLock<PermittedHostCache> =
     LazyLock::new(PermittedHostCache::default);
+
+/// Hosts cached and the heap they take: the table, each raw host text and
+/// each admitted host's canonical text. Walks the table, which the cap
+/// keeps small.
+pub(crate) fn footprint() -> Footprint {
+    let entries = PERMITTED_HOST_CACHE.entries.read();
+    let text: usize = entries
+        .iter()
+        .map(|(raw, result)| {
+            raw.len()
+                + match result {
+                    Ok(host) => host.as_str().len(),
+                    Err(HostReject::Unsupported(_) | HostReject::Forbidden) => 0,
+                }
+        })
+        .sum();
+    Footprint {
+        entries: entries.len(),
+        bytes: entries.allocation_size() + text,
+    }
+}
 
 /// Validate a raw host (an authority's `host()`, brackets and all) and
 /// check it against `allowed_mirrors`, through the cache: the raw spelling

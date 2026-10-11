@@ -35,6 +35,7 @@ use hashbrown::HashMap;
 use crate::{
     deb_mirror::Mirror,
     index_parser::ReleaseHeader,
+    mem_usage::{Footprint, buffer_bytes},
     mirror_registry::{MAX_MIRRORS, MirrorRegistry, Twin},
 };
 
@@ -287,6 +288,19 @@ pub(crate) fn confirm(mirror: &Mirror, release_dir: &str, at: u64) {
 #[must_use]
 pub(crate) fn snapshot() -> HashMap<Box<str>, MirrorIndexes> {
     INDEXES.snapshot()
+}
+
+/// Mirrors tracked and the heap they take: each mirror's suite lists and
+/// suite names.
+#[must_use]
+pub(crate) fn footprint() -> Footprint {
+    INDEXES.footprint(|indexes| {
+        let MirrorIndexes { suites, pending } = indexes;
+        buffer_bytes(suites.capacity(), size_of::<(Box<str>, SuiteIndex)>())
+            + suites.iter().map(|(suite, _)| suite.len()).sum::<usize>()
+            + buffer_bytes(pending.capacity(), size_of::<(Box<str>, i64)>())
+            + pending.iter().map(|(suite, _)| suite.len()).sum::<usize>()
+    })
 }
 
 #[cfg(test)]

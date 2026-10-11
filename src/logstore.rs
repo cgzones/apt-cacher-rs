@@ -19,7 +19,11 @@
 
 use std::{num::NonZero, sync::Arc};
 
-use crate::{metrics, ringbuffer::RingBuffer};
+use crate::{
+    mem_usage::{Footprint, buffer_bytes},
+    metrics,
+    ringbuffer::RingBuffer,
+};
 
 /// Longest entry the ring keeps, in bytes; a longer line is cut at a char
 /// boundary and marked with [`TRUNCATION_MARK`].
@@ -109,6 +113,19 @@ impl LogStore {
 
     pub(crate) fn len(&self) -> usize {
         self.inner.read().entries.len()
+    }
+
+    /// Entries held and the heap they take: the ring's slots, each entry's
+    /// text and the scratch buffer.
+    pub(crate) fn footprint(&self) -> Footprint {
+        let inner = self.inner.read();
+        let text: usize = inner.entries.iter().map(String::capacity).sum();
+        Footprint {
+            entries: inner.entries.len(),
+            bytes: buffer_bytes(inner.entries.capacity().get(), size_of::<String>())
+                + text
+                + inner.buffer.capacity(),
+        }
     }
 }
 

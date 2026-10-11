@@ -63,6 +63,7 @@ mod log_once;
 mod logstore;
 mod macros;
 mod main_loop;
+mod mem_usage;
 mod metrics;
 mod mirror_health;
 mod mirror_indexes;

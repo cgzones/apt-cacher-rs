@@ -51,6 +51,7 @@ use crate::error::ErrorReport;
 use crate::fs_open::{hint_sequential_read, nofollow_options, tokio_nofollow_options};
 use crate::ingest_ledger::{Claim, IngestLedger, Outcome};
 use crate::limits::{self, PackagesCompression};
+use crate::mem_usage::{Footprint, buffer_bytes, table_bytes};
 use crate::{
     cache_layout::{ByHashContent, ConnectionDetails, ResourceKind},
     cache_quota::QuotaReservation,
@@ -448,8 +449,8 @@ impl Equivalent<Arc<RegistryScope>> for RegistryScopeRef<'_> {
 /// the ingests `schedule_ingest` runs (on commit or on a cache-hit touch)
 /// and the only reader is `verify_and_rename`, so nothing outside this
 /// module can seed or consult expected digests.
-/// `new` (from `main`) and `len` (the dashboard gauge) are the whole
-/// crate-visible surface.
+/// `new` (from `main`), `len` and `footprint` (the dashboard's gauge and
+/// memory row) are the whole crate-visible surface.
 #[derive(Debug)]
 pub(crate) struct ChecksumRegistry {
     inner: Mutex<RegistryInner>,
@@ -563,6 +564,10 @@ struct RegistryInner {
     /// Total relpath entry count across all scopes (the outer map's `len`
     /// counts scopes, not entries).
     len: usize,
+    /// Heap bytes of every live entry's relpath allocation (the `Arc<str>`
+    /// header and text), kept here so the dashboard's footprint never walks
+    /// the entries under the lock every lookup takes.
+    key_bytes: usize,
     /// Monotonic counter, incremented on every `insert`. Overflow at 2^64
     /// is unreachable in practice (millennia at any realistic insert rate).
     next_gen: u64,
@@ -639,6 +644,7 @@ impl ChecksumRegistry {
             inner: Mutex::new(RegistryInner {
                 map: HashMap::new(),
                 len: 0,
+                key_bytes: 0,
                 next_gen: 0,
             }),
             epochs: Mutex::new(EvictionEpochs::new(MAX_EPOCH_SCOPES)),
@@ -766,6 +772,48 @@ impl ChecksumRegistry {
         self.inner.lock().len
     }
 
+    /// Entries and the heap they take: every scope's entry table, order
+    /// log and `Release` dates, the relpath allocations (counted as they
+    /// come and go, see `RegistryInner::key_bytes`) and the scope keys.
+    /// Walks the scopes, a handful, never the entries.
+    pub(crate) fn footprint(&self) -> Footprint {
+        let inner = self.inner.lock();
+        let scopes: usize = inner
+            .map
+            .iter()
+            .map(|(scope, state)| {
+                let RegistryScope {
+                    authority,
+                    mirror_path,
+                } = scope.as_ref();
+                let ScopeState {
+                    entries,
+                    order,
+                    release_dates,
+                    packages: _,
+                } = state;
+                size_of::<RegistryScope>()
+                    + authority.capacity()
+                    + mirror_path.capacity()
+                    + table_bytes(entries.capacity(), size_of::<(Arc<str>, ([u8; 32], u64))>())
+                    + buffer_bytes(order.capacity(), size_of::<(Arc<str>, u64)>())
+                    + table_bytes(
+                        release_dates.capacity(),
+                        size_of::<(Box<str>, Option<i64>)>(),
+                    )
+                    + release_dates.keys().map(|dir| dir.len()).sum::<usize>()
+            })
+            .sum();
+        Footprint {
+            entries: inner.len,
+            bytes: table_bytes(
+                inner.map.capacity(),
+                size_of::<(Arc<RegistryScope>, ScopeState)>(),
+            ) + scopes
+                + inner.key_bytes,
+        }
+    }
+
     /// `(entries, entry capacity, order length, order capacity)` of one
     /// scope.
     #[cfg(test)]
@@ -855,6 +903,7 @@ impl ChecksumRegistry {
                 state.packages += 1;
             }
             inner.len += 1;
+            inner.key_bytes += relpath_bytes(relpath);
         }
 
         if inner.len > cap {
@@ -898,6 +947,7 @@ fn evict(inner: &mut RegistryInner, cap: usize, epochs: &Mutex<EvictionEpochs>) 
                         state.packages -= 1;
                     }
                     inner.len -= 1;
+                    inner.key_bytes -= relpath_bytes(&rel);
                     live += 1;
                 }
                 _ => {
@@ -920,6 +970,12 @@ fn evict(inner: &mut RegistryInner, cap: usize, epochs: &Mutex<EvictionEpochs>) 
             break;
         }
     }
+}
+
+/// Heap bytes of one relpath entry: the `Arc<str>` allocation, its two
+/// counters and the text.
+fn relpath_bytes(relpath: &str) -> usize {
+    2 * size_of::<usize>() + relpath.len()
 }
 
 /// Give back the memory an eviction freed. Neither the entry map nor the
@@ -1375,6 +1431,12 @@ const INGEST_LEDGER_CAP: usize = 16_384;
 
 static INGEST_LEDGER: LazyLock<IngestLedger> =
     LazyLock::new(|| IngestLedger::new(INGEST_LEDGER_CAP));
+
+/// The ingest ledger's footprint and cap, for the dashboard.
+#[must_use]
+pub(crate) fn ingest_ledger_footprint() -> (Footprint, usize) {
+    (INGEST_LEDGER.footprint(), INGEST_LEDGER_CAP)
+}
 
 /// Why an ingest is scheduled (only the counters differ).
 #[derive(Clone, Copy, PartialEq, Eq)]

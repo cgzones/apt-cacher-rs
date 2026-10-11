@@ -41,6 +41,7 @@ use hashbrown::HashMap;
 
 use crate::{
     deb_mirror::Mirror,
+    mem_usage::Footprint,
     mirror_registry::{MAX_MIRRORS, MirrorRegistry, Twin},
     precise_instant::PreciseInstant,
 };
@@ -174,6 +175,12 @@ pub(crate) fn peak_throughput(mirror: &Mirror) -> Option<std::num::NonZero<u64>>
 #[must_use]
 pub(crate) fn snapshot() -> HashMap<Box<str>, MirrorPerf> {
     PERF.snapshot()
+}
+
+/// Mirrors tracked and the heap they take (the figures are inline).
+#[must_use]
+pub(crate) fn footprint() -> Footprint {
+    PERF.footprint(|_| 0)
 }
 
 #[cfg(test)]

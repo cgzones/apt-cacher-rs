@@ -15,6 +15,7 @@ use tracing::error;
 
 use crate::{
     AppState, LOGSTORE, RUNTIMEDETAILS, RuntimeDetails,
+    active_downloads::ActiveDownloads,
     build_info::{APP_VERSION, FEATURES_ONE_LINE},
     cache_metadata,
     cleanup::{CLEANUP_INTERVAL_SECS, next_cleanup_epoch},
@@ -26,15 +27,17 @@ use crate::{
     },
     database_task::DB_TASK_QUEUE_SENDER,
     error::ErrorReport,
-    fd_usage, global_cache_quota, global_config,
+    fd_usage, global_cache_quota, global_checksum_registry, global_config, global_verify_throttle,
     humanfmt::HumanFmt,
+    integrity,
     main_loop::LISTEN_ADDR,
+    mem_usage::{self, Footprint, ProcessMemory},
     metrics, mirror_health, mirror_indexes, mirror_perf,
     passthrough_limiter::active_relays,
-    swrite,
+    permitted_host_cache, scheme_cache, swrite,
     tunnel_limiter::{active_tunnels, busiest_client_tunnels},
     uncacheables::{UNCACHEABLES_MAX, get_uncacheables},
-    warn_once_or_debug,
+    verify_throttle, warn_once_or_debug,
 };
 
 use super::{
@@ -73,6 +76,8 @@ struct DashboardData {
     daemon_status_html: String,
     /// One gauge per limiter; see [`build_capacity_html`].
     capacity_html: String,
+    /// The process's memory and each store's share; see [`build_memory_html`].
+    memory_html: String,
     configuration_html: String,
     maintenance_html: String,
     cache_stats_html: String,
@@ -362,7 +367,7 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
     // whose upstream connection is back in the pool but whose commit is still
     // running counts in `len()` (the shutdown summary), not here.
     let active_mirror_downloads = appstate.active_downloads.upstream_slots();
-    let memory_stats = memory_stats::memory_stats();
+    let process_memory = mem_usage::process_memory();
 
     // Sample utilization so the peak metric reflects long idle stretches.
     let cache_size = global_cache_quota().current_size();
@@ -370,8 +375,9 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
 
     let next_cleanup_epoch = next_cleanup_epoch();
 
-    let daemon_status_html = build_daemon_status_html(rd, now, memory_stats, database_size);
+    let daemon_status_html = build_daemon_status_html(rd, now, process_memory, database_size);
     let capacity_html = build_capacity_html(rd, active_mirror_downloads);
+    let memory_html = build_memory_html(rd, process_memory, &appstate.active_downloads);
 
     let configuration_html = build_configuration_html(rd);
     let maintenance_html = build_maintenance_html(mirror_rows, now_epoch, next_cleanup_epoch);
@@ -401,6 +407,7 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
         top_packages_by_size,
         daemon_status_html,
         capacity_html,
+        memory_html,
         configuration_html,
         maintenance_html,
         cache_stats_html,
@@ -505,7 +512,7 @@ fn build_hero_html(mirrors: &[MirrorStatEntry], cache_size: u64, quota: Option<u
 fn build_daemon_status_html(
     rd: &RuntimeDetails,
     now: Utc,
-    memory_stats: Option<memory_stats::MemoryStats>,
+    process_memory: Option<ProcessMemory>,
     database_size: Option<u64>,
 ) -> String {
     let mut t = DetailsList::new();
@@ -522,17 +529,20 @@ fn build_daemon_status_html(
             HumanFmt::Time((now.inner() - rd.start_time).unsigned_abs())
         ),
     );
-    t.entry("Memory Usage").kind(Kind::Live).value(format_args!(
-        "{} ({} virtual)",
-        OptSize {
-            bytes: memory_stats.map(|m| m.physical_mem as u64),
-            fallback: "N/A",
-        },
-        OptSize {
-            bytes: memory_stats.map(|m| m.virtual_mem as u64),
-            fallback: "N/A",
-        },
-    ));
+    t.entry("Memory Usage")
+        .kind(Kind::Live)
+        .tip("The process's resident set; the Memory section says what holds it.")
+        .value(format_args!(
+            "{} ({} virtual)",
+            OptSize {
+                bytes: process_memory.map(|m| m.resident),
+                fallback: "N/A",
+            },
+            OptSize {
+                bytes: process_memory.map(|m| m.virtual_size),
+                fallback: "N/A",
+            },
+        ));
     t.entry("Database Size").kind(Kind::Live).value(OptSize {
         bytes: database_size,
         fallback: "N/A",
@@ -544,11 +554,198 @@ fn build_daemon_status_html(
             Count::len(active_client_downloads()),
             Count(metrics::ACTIVE_CLIENT_DOWNLOADS_PEAK.get()),
         ));
-    t.entry("Metadata Cache Entries")
-        .kind(Kind::Live)
-        .tip("Process-local entries cached from per-file ETag and Last-Modified xattrs. Skips fgetxattr(2) on subsequent conditional-request hits; rebuilt lazily after restart.")
-        .value(Count::len(cache_metadata::store().len()));
     t.finish()
+}
+
+/// A store's row value: its estimated heap, with the entry count against
+/// the cap beside it, e.g. `~83.2MB 385 396 / 500 000 entries`. The tilde
+/// marks the estimate (see `mem_usage`); the process figures above the
+/// stores carry none.
+struct StoreUsage {
+    footprint: Footprint,
+    cap: Option<usize>,
+}
+
+impl Display for StoreUsage {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self { footprint, cap } = self;
+        write!(
+            f,
+            "~{} <span class=\"peak\">{}",
+            HumanFmt::Size(footprint.bytes as u64),
+            Count::len(footprint.entries)
+        )?;
+        if let Some(cap) = cap {
+            write!(f, " / {}", Count::len(*cap))?;
+        }
+        f.write_str(" entries</span>")
+    }
+}
+
+/// The SQLite row's tip; the allocator row it refers to is glibc-only.
+const SQLITE_TIP: &str = if cfg!(target_env = "gnu") {
+    "What the database engine holds: the page cache of each pool connection (up to 2 MiB each by default), prepared statements and schema copies. Part of the allocator heap above."
+} else {
+    "What the database engine holds: the page cache of each pool connection (up to 2 MiB each by default), prepared statements and schema copies."
+};
+
+/// The Memory section: what the kernel and the allocator measure, then the
+/// daemon's own stores with their estimated share, so an operator reading
+/// a large resident set can tell a registry sized to its cap from allocator
+/// slack or an index ingest in flight.
+fn build_memory_html(
+    rd: &RuntimeDetails,
+    process_memory: Option<ProcessMemory>,
+    active_downloads: &ActiveDownloads,
+) -> String {
+    let config = &rd.config;
+    let mut html = String::with_capacity(8192);
+    html.push_str(
+        "<p class=\"scope-note\">Measured figures first, then the daemon's stores that grow with the cache's content, with their estimated heap. Left out, holding an entry per mirror or one in all: the database task's mirror ids, the dashboard's directory sizes and its memoized aggregates. What the stores leave unaccounted for is transfer buffers (buffer_size per connection), TLS sessions, index decoding in flight, the runtime and the allocator's own overhead.</p>",
+    );
+    let mut t = DetailsList::new();
+
+    let resident = t
+        .entry("Resident")
+        .kind(Kind::Live)
+        .tip("Pages of this process in RAM, as top and systemd report it. Anonymous pages are the heap and the thread stacks; file-backed ones are the binary, its libraries and SQLite's WAL index, shared with every process mapping them; shared pages are tmpfs or System V shared memory, normally none.");
+    match process_memory {
+        Some(memory) => {
+            let ProcessMemory {
+                resident: total,
+                anonymous,
+                file_backed,
+                shared,
+                peak_resident,
+                virtual_size,
+            } = memory;
+            resident
+                .parts(|parts| {
+                    parts.row("Anonymous", HumanFmt::Size(anonymous));
+                    parts.row("File-backed", HumanFmt::Size(file_backed));
+                    parts.row("Shared", HumanFmt::Size(shared));
+                })
+                .note(format_args!(
+                    "peak {} since start; {} virtual",
+                    HumanFmt::Size(peak_resident),
+                    HumanFmt::Size(virtual_size)
+                ))
+                .value(HumanFmt::Size(total));
+        }
+        None => resident.value("N/A"),
+    }
+
+    #[cfg(target_env = "gnu")]
+    {
+        let stats = mem_usage::allocator_stats();
+        t.entry("Allocator Heap")
+            .kind(Kind::Live)
+            .tip("glibc malloc's account of the heap: the bytes handed out and still held, and the bytes free inside its arenas, mostly blocks freed since and kept for reuse (those stay resident; an arena's untouched top does not). The allocator gives memory back by itself only from an arena's top, so a burst (an index decode, a large dashboard query) can leave the retained figure high for good; it is not a leak.")
+            .note(format_args!(
+                "{} freed but retained; {} of the in-use bytes mapped directly",
+                HumanFmt::Size(stats.retained),
+                HumanFmt::Size(stats.mmapped)
+            ))
+            .value(format_args!("{} in use", HumanFmt::Size(stats.in_use)));
+    }
+
+    let sqlite = mem_usage::sqlite_memory();
+    t.entry("SQLite")
+        .kind(Kind::Live)
+        .tip(SQLITE_TIP)
+        .note(format_args!(
+            "peak {} since start",
+            HumanFmt::Size(sqlite.peak)
+        ))
+        .value(HumanFmt::Size(sqlite.used));
+
+    let mut total = Footprint::default();
+    let mut store = |t: &mut DetailsList,
+                     label: &'static str,
+                     tip: &'static str,
+                     footprint: Footprint,
+                     cap: Option<usize>| {
+        total += footprint;
+        t.entry(label)
+            .kind(Kind::Live)
+            .tip(tip)
+            .value(StoreUsage { footprint, cap });
+    };
+
+    store(
+        &mut t,
+        "Checksum Registry",
+        "Expected SHA-256 digests parsed from Packages and Release indexes, against verify_checksums_max_entries: each file's digest, keyed by its name, in eviction order. The largest store by far once a few indexes are ingested; lower the cap to trade memory for re-ingests (Metrics: Integrity, Re-ingests).",
+        global_checksum_registry().footprint(),
+        Some(config.verify_checksums_max_entries.get()),
+    );
+    store(
+        &mut t,
+        "Metadata Cache",
+        "Per-file ETag and Last-Modified validators read from xattrs once, so a conditional request on a cached file costs no fgetxattr(2). Cleared and refilled past its cap; rebuilt lazily after a restart.",
+        cache_metadata::store().footprint(),
+        Some(cache_metadata::CACHE_METADATA_MAX_ENTRIES),
+    );
+    let (ledger, ledger_cap) = integrity::ingest_ledger_footprint();
+    store(
+        &mut t,
+        "Ingest Ledger",
+        "The cached index files whose digests the registry holds, by path, so an index served from cache is only re-decoded when its digests are missing.",
+        ledger,
+        Some(ledger_cap),
+    );
+    store(
+        &mut t,
+        "Active Downloads",
+        "Downloads in flight, one entry per resource, shared by every client waiting on it; gone once the file is committed.",
+        active_downloads.footprint(),
+        None,
+    );
+    store(
+        &mut t,
+        "Verify Throttle",
+        "Resources in checksum-failure backoff (Metrics: Integrity, Mismatch); empty unless a mirror serves content its own index disagrees with.",
+        global_verify_throttle().footprint(),
+        Some(verify_throttle::MAX_THROTTLE_ENTRIES),
+    );
+    store(
+        &mut t,
+        "Permitted Hosts",
+        "Host headers and redirect targets already checked against allowed_mirrors, by their raw spelling, so a repeat costs no re-validation.",
+        permitted_host_cache::footprint(),
+        Some(permitted_host_cache::PERMITTED_HOST_CACHE_MAX_ENTRIES),
+    );
+    store(
+        &mut t,
+        "Scheme Cache",
+        "The scheme (HTTP or HTTPS) last known good for each upstream host, which https_upgrade_mode consults.",
+        scheme_cache::footprint(),
+        None,
+    );
+    store(
+        &mut t,
+        "Mirror Tables",
+        "Per-mirror performance, health and index-age records behind the Mirrors table, one of each per mirror seen.",
+        mirror_perf::footprint() + mirror_health::footprint() + mirror_indexes::footprint(),
+        None,
+    );
+    store(
+        &mut t,
+        "Log Store",
+        "The warnings and errors the Logs page shows: logstore_capacity entries of up to 4 KiB each, the ring reserved up front.",
+        LOGSTORE.get().expect("initialized in main()").footprint(),
+        Some(config.logstore_capacity.get()),
+    );
+    t.entry("Stores Total")
+        .kind(Kind::Live)
+        .tip("The estimated heap of every store above together; compare with the allocator's in-use figure.")
+        .value(StoreUsage {
+            footprint: total,
+            cap: None,
+        });
+
+    html.push_str(&t.finish());
+    html
 }
 
 /// A configured `usize` cap as the `u64` every gauge renders.
@@ -1117,6 +1314,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         &data.cache_stats_html,
     );
     write_section(&mut body, "Capacity", "capacity", &data.capacity_html);
+    write_section(&mut body, "Memory", "memory", &data.memory_html);
     write_section(
         &mut body,
         "Daemon Status",

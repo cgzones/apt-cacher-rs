@@ -26,6 +26,8 @@ use std::path::{Path, PathBuf};
 use hashbrown::HashMap;
 use parking_lot::Mutex;
 
+use crate::mem_usage::Footprint;
+
 /// What one ingest run concluded about its file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
@@ -94,6 +96,17 @@ impl IngestLedger {
             path: path.to_path_buf(),
             open: true,
         })
+    }
+
+    /// Paths tracked and the heap they take: the table and each path's
+    /// text. Walks the table, which the cap keeps small.
+    pub(crate) fn footprint(&self) -> Footprint {
+        let paths = self.paths.lock();
+        let text: usize = paths.keys().map(PathBuf::capacity).sum();
+        Footprint {
+            entries: paths.len(),
+            bytes: paths.allocation_size() + text,
+        }
     }
 
     /// A commit replaced the file at `path`: forget its mark, or tell its

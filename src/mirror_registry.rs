@@ -22,6 +22,7 @@ use std::sync::LazyLock;
 use hashbrown::HashMap;
 
 use crate::deb_mirror::Mirror;
+use crate::mem_usage::Footprint;
 
 /// Per-mirror state two twins (the same `host[:port]/path`, different
 /// kinds) fold into one snapshot entry through.
@@ -68,6 +69,21 @@ impl<T: Default + Clone + Twin> MirrorRegistry<T> {
     #[must_use]
     pub(crate) fn get(&self, mirror: &Mirror) -> Option<T> {
         self.map.lock().get(mirror).cloned()
+    }
+
+    /// Mirrors tracked and the heap they take: the table, each mirror's
+    /// text and what `heap` says each state owns. Walks the table, which
+    /// holds one entry per mirror.
+    pub(crate) fn footprint(&self, heap: impl Fn(&T) -> usize) -> Footprint {
+        let map = self.map.lock();
+        let owned: usize = map
+            .iter()
+            .map(|(mirror, state)| mirror.heap_bytes() + heap(state))
+            .sum();
+        Footprint {
+            entries: map.len(),
+            bytes: map.allocation_size() + owned,
+        }
     }
 
     /// Every tracked mirror's state keyed by its `host[:port]/path`
