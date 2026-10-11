@@ -682,7 +682,7 @@ fn build_memory_html(
     store(
         &mut t,
         "Metadata Cache",
-        "Per-file ETag and Last-Modified validators read from xattrs once, so a conditional request on a cached file costs no fgetxattr(2). Cleared and refilled past its cap; rebuilt lazily after a restart.",
+        "Per-file ETag and Last-Modified validators read from xattrs once, so a conditional request on a cached file costs no fgetxattr(2); the entries of one mirror share a single copy of it. Cleared and refilled past its cap; rebuilt lazily after a restart.",
         cache_metadata::store().footprint(),
         Some(cache_metadata::CACHE_METADATA_MAX_ENTRIES),
     );

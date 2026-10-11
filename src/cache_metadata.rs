@@ -80,16 +80,17 @@
 //! `(None, Some(...))`, and vice versa) but does not insert; the next
 //! reader retries both syscalls.
 
-use std::{hash::Hash, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
-use hashbrown::{Equivalent, HashMap, hash_map::Entry};
+use hashbrown::{Equivalent, HashMap, HashSet};
 
 use crate::{
-    cache_layout::{CacheEntryKey, CacheEntryKeyRef},
+    cache_layout::{CacheEntryKeyRef, CacheLayout},
+    deb_mirror::Mirror,
     http_etag::{ETag, MAX_ETAG_LEN, is_valid_etag},
     http_last_modified::{LastModified, is_valid_http_date},
     http_range::HttpDate,
-    mem_usage::{Footprint, table_bytes},
+    mem_usage::{ARC_HEADER, Footprint},
     warn_once, warn_once_or_info,
     xattr_helpers::{self, ExpectedSize, XattrValue as _},
 };
@@ -185,7 +186,7 @@ pub(crate) fn revalidate(
             .or_else(|| stored.last_modified.clone()),
     });
     write_upstream_metadata(file, path, &updated, None, TargetFile::Resumed);
-    store().set(key.to_owned(), Arc::clone(&updated));
+    store().set(&key, Arc::clone(&updated));
     updated
 }
 
@@ -344,7 +345,92 @@ pub(crate) fn check_upstream_validators(
 /// recently observed upstream metadata for the file.  Lookups return an
 /// [`Arc`] so readers drop the map lock before inspecting fields.
 pub(crate) struct CacheMetadataStore {
-    map: parking_lot::RwLock<HashMap<CacheEntryKey, Arc<UpstreamMetadata>>>,
+    inner: parking_lot::RwLock<Inner>,
+}
+
+/// The map and the mirrors its keys share.
+struct Inner {
+    map: HashMap<StoredKey, Arc<UpstreamMetadata>>,
+    /// One copy of each mirror that at least one entry names, so a cache
+    /// holding tens of thousands of files from a handful of mirrors stores
+    /// each mirror's host and path once rather than per entry.  An entry's
+    /// removal drops the copy its mirror no longer needs.
+    mirrors: HashSet<Arc<Mirror>>,
+}
+
+/// The owned form of a key as the map stores it: the mirror shared through
+/// [`Inner::mirrors`], the name boxed to its length.  A quarter the size of
+/// `CacheEntryKey`, which matters because the table keeps every key inline
+/// in a bucket, half of which are empty right after it doubles.
+///
+/// Hashes field by field like [`CacheEntryKeyRef`] (the `Arc` and the `Box`
+/// hash as their contents), which is what lets the borrowed key look it up.
+#[derive(Debug, Eq, Hash, PartialEq)]
+struct StoredKey {
+    mirror: Arc<Mirror>,
+    debname: Box<str>,
+    layout: CacheLayout,
+}
+
+impl Equivalent<StoredKey> for CacheEntryKeyRef<'_> {
+    fn equivalent(&self, key: &StoredKey) -> bool {
+        let &Self {
+            mirror,
+            debname,
+            layout,
+        } = self;
+        let StoredKey {
+            mirror: kmirror,
+            debname: kdebname,
+            layout: klayout,
+        } = key;
+        mirror == &**kmirror && debname == &**kdebname && layout == *klayout
+    }
+}
+
+impl Inner {
+    /// Clear the map once it is at its cap; call before inserting a key the
+    /// map does not hold.
+    fn make_room(&mut self) {
+        if self.map.len() >= CACHE_METADATA_MAX_ENTRIES {
+            log_metadata_cache_cleared();
+            self.map.clear();
+            self.mirrors.clear();
+        }
+    }
+
+    /// Insert an entry for a key the map does not hold, sharing its mirror
+    /// with the entries that already name it.
+    fn insert(&mut self, key: &CacheEntryKeyRef<'_>, meta: Arc<UpstreamMetadata>) {
+        let &CacheEntryKeyRef {
+            mirror,
+            debname,
+            layout,
+        } = key;
+        let mirror = if let Some(shared) = self.mirrors.get(mirror) {
+            Arc::clone(shared)
+        } else {
+            let shared = Arc::new(mirror.clone());
+            self.mirrors.insert(Arc::clone(&shared));
+            shared
+        };
+        let stored = StoredKey {
+            mirror,
+            debname: debname.into(),
+            layout,
+        };
+        self.map.insert(stored, meta);
+    }
+
+    fn remove(&mut self, key: &CacheEntryKeyRef<'_>) {
+        if let Some((stored, _meta)) = self.map.remove_entry(key) {
+            // Two owners left, the set's and this key's: no other entry
+            // names the mirror any more.
+            if Arc::strong_count(&stored.mirror) == 2 {
+                self.mirrors.remove(&*stored.mirror);
+            }
+        }
+    }
 }
 
 /// Soft cap on cached entries, bounding memory for caches holding very
@@ -377,7 +463,10 @@ impl CacheMetadataStore {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
-            map: parking_lot::RwLock::new(HashMap::new()),
+            inner: parking_lot::RwLock::new(Inner {
+                map: HashMap::new(),
+                mirrors: HashSet::new(),
+            }),
         }
     }
 
@@ -388,17 +477,17 @@ impl CacheMetadataStore {
     ///
     /// The hot-path lookup is zero-clone — readers pass a
     /// [`CacheEntryKeyRef`] that borrows the caller's `Mirror` and
-    /// `debname`, and we only materialise an owned [`CacheEntryKey`]
-    /// on the cold cache-miss insert.  The `block_in_place` round-trip
-    /// happens only on miss; subsequent hits return an [`Arc`] clone with
-    /// no syscalls.
+    /// `debname`, and we only materialise an owned [`StoredKey`] on the
+    /// cold cache-miss insert.  The `block_in_place` round-trip happens
+    /// only on miss; subsequent hits return an [`Arc`] clone with no
+    /// syscalls.
     pub(crate) fn resolve(
         &self,
         key: &CacheEntryKeyRef<'_>,
         file: &tokio::fs::File,
         path: &Path,
     ) -> Arc<UpstreamMetadata> {
-        if let Some(entry) = self.map.read().get(key) {
+        if let Some(entry) = self.inner.read().map.get(key) {
             return Arc::clone(entry);
         }
 
@@ -458,44 +547,36 @@ impl CacheMetadataStore {
         // best-effort and silently swallows `ErrorKind::Unsupported`), trust
         // the publisher, and skip the assert.  Asserting here would fire
         // spuriously on filesystems without xattr support.
-        let owned = (*key).to_owned();
-        let mut map = self.map.write();
-        if map.len() >= CACHE_METADATA_MAX_ENTRIES && !map.contains_key(&owned) {
-            log_metadata_cache_cleared();
-            map.clear();
-        }
-        match map.entry(owned) {
-            Entry::Occupied(occ) => {
-                let disagrees = !(meta.etag.is_none() && meta.last_modified.is_none())
-                    && occ.get().as_ref() != meta.as_ref();
-                debug_assert!(
-                    !disagrees,
-                    "publication invariant violated: a concurrent `set` published \
-                     metadata that disagrees with the on-disk xattrs; every caller \
-                     of `set` must persist matching xattrs first (published={:?}, \
-                     read={:?})",
-                    occ.get().as_ref(),
-                    meta.as_ref(),
+        let mut inner = self.inner.write();
+        if let Some(published) = inner.map.get(key) {
+            let disagrees = !(meta.etag.is_none() && meta.last_modified.is_none())
+                && published.as_ref() != meta.as_ref();
+            debug_assert!(
+                !disagrees,
+                "publication invariant violated: a concurrent `set` published \
+                 metadata that disagrees with the on-disk xattrs; every caller \
+                 of `set` must persist matching xattrs first (published={:?}, \
+                 read={:?})",
+                published.as_ref(),
+                meta.as_ref(),
+            );
+            if disagrees {
+                // Release builds accept the published value, so clients
+                // can be served validators that permanently disagree with
+                // the file's xattrs -- conditional requests then behave
+                // differently before and after a restart.
+                warn_once!(
+                    "Cache metadata publication invariant violated for `{}`: published {:?} disagrees with the on-disk xattrs {:?}; keeping the published value",
+                    path.display(),
+                    published.as_ref(),
+                    meta.as_ref()
                 );
-                if disagrees {
-                    // Release builds accept the published value, so clients
-                    // can be served validators that permanently disagree with
-                    // the file's xattrs -- conditional requests then behave
-                    // differently before and after a restart.
-                    warn_once!(
-                        "Cache metadata publication invariant violated for `{}`: published {:?} disagrees with the on-disk xattrs {:?}; keeping the published value",
-                        path.display(),
-                        occ.get().as_ref(),
-                        meta.as_ref()
-                    );
-                }
-                Arc::clone(occ.get())
             }
-            Entry::Vacant(vac) => {
-                vac.insert(Arc::clone(&meta));
-                meta
-            }
+            return Arc::clone(published);
         }
+        inner.make_room();
+        inner.insert(key, Arc::clone(&meta));
+        meta
     }
 
     /// Replace the entry for `key` with `meta`.  Used by the rename
@@ -510,60 +591,62 @@ impl CacheMetadataStore {
     /// [`Self::resolve`] reads xattrs after releasing its read lock and
     /// would otherwise clobber the published value with the stale xattr
     /// read).
-    pub(crate) fn set(&self, key: CacheEntryKey, meta: Arc<UpstreamMetadata>) {
-        let mut map = self.map.write();
-        if map.len() >= CACHE_METADATA_MAX_ENTRIES && !map.contains_key(&key) {
-            log_metadata_cache_cleared();
-            map.clear();
+    pub(crate) fn set(&self, key: &CacheEntryKeyRef<'_>, meta: Arc<UpstreamMetadata>) {
+        let mut inner = self.inner.write();
+        if let Some(published) = inner.map.get_mut(key) {
+            *published = meta;
+        } else {
+            inner.make_room();
+            inner.insert(key, meta);
         }
-        map.insert(key, meta);
     }
 
     /// Drop any cached entry for `key`.  Called from cleanup file
     /// removal and (in principle) from any other context where the on-
-    /// disk file is going away.  Accepts borrowed keys via the same
-    /// [`Equivalent`] mechanism as `resolve`, so callers don't need to
-    /// clone `Mirror` and `debname` to invalidate.
-    pub(crate) fn invalidate<K>(&self, key: &K)
-    where
-        K: Hash + Equivalent<CacheEntryKey> + ?Sized,
-    {
-        self.map.write().remove(key);
+    /// disk file is going away.
+    pub(crate) fn invalidate(&self, key: &CacheEntryKeyRef<'_>) {
+        self.inner.write().remove(key);
     }
 
     /// Number of currently cached entries (the dashboard reads
     /// [`Self::footprint`]).
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.map.read().len()
+        self.inner.read().map.len()
     }
 
-    /// Entries and the heap they take: the table, each key's mirror and
-    /// name, and each value's validator strings. Walks the table under the
-    /// read lock, which blocks no reader and holds writers (a commit, a
-    /// cleanup unlink) for the few hundred microseconds a full table takes.
+    /// Entries and the heap they take: the table, each key's name, each
+    /// value and its validator strings, and the shared mirrors. Walks the
+    /// table under the read lock, which blocks no reader and holds writers
+    /// (a commit, a cleanup unlink) for the few hundred microseconds a full
+    /// table takes.
     pub(crate) fn footprint(&self) -> Footprint {
-        let map = self.map.read();
-        let owned: usize = map
+        let inner = self.inner.read();
+        let entries: usize = inner
+            .map
             .iter()
             .map(|(key, meta)| {
                 let UpstreamMetadata {
                     etag,
                     last_modified,
                 } = meta.as_ref();
-                key.mirror.heap_bytes()
-                    + key.debname.capacity()
+                key.debname.len()
+                    + ARC_HEADER
                     + size_of::<UpstreamMetadata>()
-                    + etag.as_ref().map_or(0, |etag| etag.len())
-                    + last_modified.as_ref().map_or(0, |(raw, _)| raw.len())
+                    + etag.as_ref().map_or(0, |etag| ARC_HEADER + etag.len())
+                    + last_modified
+                        .as_ref()
+                        .map_or(0, |(raw, _)| ARC_HEADER + raw.len())
             })
             .sum();
+        let shared: usize = inner
+            .mirrors
+            .iter()
+            .map(|mirror| ARC_HEADER + size_of::<Mirror>() + mirror.heap_bytes())
+            .sum();
         Footprint {
-            entries: map.len(),
-            bytes: table_bytes(
-                map.capacity(),
-                size_of::<(CacheEntryKey, Arc<UpstreamMetadata>)>(),
-            ) + owned,
+            entries: inner.map.len(),
+            bytes: inner.map.allocation_size() + inner.mirrors.allocation_size() + entries + shared,
         }
     }
 }
@@ -605,8 +688,9 @@ mod tests {
     use tokio::fs::File;
 
     use super::*;
-    use crate::cache_layout::CacheLayout;
-    use crate::deb_mirror::{Mirror, MirrorKind};
+    use crate::cache_layout::CacheEntryKey;
+    use crate::config::ClientHost;
+    use crate::deb_mirror::MirrorKind;
     use crate::xattr_helpers::tests::supports_user_xattrs;
 
     fn write_etag(file: &File, path: &Path, etag: &str) {
@@ -622,7 +706,6 @@ mod tests {
     }
 
     fn fixture_key() -> CacheEntryKey {
-        use crate::config::ClientHost;
         CacheEntryKey {
             mirror: Mirror::new(
                 ClientHost::new("example.test").unwrap(),
@@ -806,14 +889,14 @@ mod tests {
         let store = CacheMetadataStore::new();
         let key = fixture_key();
         store.set(
-            key.clone(),
+            &key.as_ref(),
             Arc::new(UpstreamMetadata::from_upstream(
                 Some("\"old\"".into()),
                 None,
             )),
         );
         store.set(
-            key.clone(),
+            &key.as_ref(),
             Arc::new(UpstreamMetadata::from_upstream(
                 Some("\"new\"".into()),
                 None,
@@ -836,14 +919,14 @@ mod tests {
             ..fixture_key()
         };
         store.set(
-            pool_key.clone(),
+            &pool_key.as_ref(),
             Arc::new(UpstreamMetadata::from_upstream(
                 Some("\"pool\"".into()),
                 None,
             )),
         );
         store.set(
-            flat_key.clone(),
+            &flat_key.as_ref(),
             Arc::new(UpstreamMetadata::from_upstream(
                 Some("\"flat\"".into()),
                 None,
@@ -867,7 +950,7 @@ mod tests {
             Some("\"flat\"")
         );
 
-        store.invalidate(&flat_key);
+        store.invalidate(&flat_key.as_ref());
         assert_eq!(
             store
                 .resolve(&pool_key.as_ref(), &file, &path)
@@ -879,23 +962,105 @@ mod tests {
     }
 
     /// The `Equivalent` bridge: a borrowed key must hash and compare to the
-    /// owned key its own cold path materialised, or every hot-path lookup
+    /// stored key its own cold path materialised, or every hot-path lookup
     /// would miss and re-read the xattrs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn a_borrowed_key_populates_the_entry_an_owned_key_finds() {
+    async fn a_borrowed_key_finds_the_entry_it_populated() {
         let store = CacheMetadataStore::new();
         let (_dir, file, path) = fixture_file().await;
         let key = fixture_key();
 
-        let via_ref = store.resolve(&key.as_ref(), &file, &path);
-        assert_eq!(store.len(), 1, "the cold path materialises the owned key");
+        let cold = store.resolve(&key.as_ref(), &file, &path);
+        assert_eq!(store.len(), 1, "the cold path materialises the stored key");
 
-        let via_owned = Arc::clone(store.map.read().get(&key).expect("owned key finds entry"));
+        let hot = Arc::clone(
+            store
+                .inner
+                .read()
+                .map
+                .get(&key.as_ref())
+                .expect("the borrowed key finds the entry"),
+        );
         assert!(
-            Arc::ptr_eq(&via_ref, &via_owned),
-            "the owned key must hit the entry the borrowed key inserted"
+            Arc::ptr_eq(&cold, &hot),
+            "the lookup must hit the entry the cold path inserted"
         );
         assert_eq!(store.len(), 1);
+    }
+
+    /// Entries of one mirror share a single copy of it, which the last of
+    /// them to go takes along; a cap clear drops every copy.
+    #[test]
+    fn entries_share_their_mirror_until_the_last_one_goes() {
+        let store = CacheMetadataStore::new();
+        let meta = Arc::new(UpstreamMetadata::default());
+        let first = fixture_key();
+        let second = CacheEntryKey {
+            debname: "other.deb".into(),
+            ..fixture_key()
+        };
+        let elsewhere = CacheEntryKey {
+            mirror: Mirror::new(
+                ClientHost::new("other.test").unwrap(),
+                None,
+                "/debian".into(),
+                MirrorKind::Structured,
+            ),
+            ..fixture_key()
+        };
+        store.set(&first.as_ref(), Arc::clone(&meta));
+        store.set(&second.as_ref(), Arc::clone(&meta));
+        store.set(&elsewhere.as_ref(), Arc::clone(&meta));
+
+        {
+            let inner = store.inner.read();
+            assert_eq!(inner.mirrors.len(), 2, "one copy per distinct mirror");
+            let shared = inner
+                .mirrors
+                .get(&first.mirror)
+                .expect("the mirror is interned");
+            assert_eq!(
+                Arc::strong_count(shared),
+                3,
+                "the set and the two entries own the copy"
+            );
+            for (stored, _) in &inner.map {
+                if *stored.mirror == first.mirror {
+                    assert!(Arc::ptr_eq(&stored.mirror, shared));
+                }
+            }
+        }
+
+        store.invalidate(&first.as_ref());
+        assert_eq!(
+            store.inner.read().mirrors.len(),
+            2,
+            "a mirror with an entry left stays"
+        );
+        store.invalidate(&second.as_ref());
+        assert_eq!(
+            store.inner.read().mirrors.len(),
+            1,
+            "a mirror's last entry takes the copy along"
+        );
+
+        for n in 0..CACHE_METADATA_MAX_ENTRIES {
+            let key = CacheEntryKey {
+                debname: format!("fill-{n}.deb"),
+                ..fixture_key()
+            };
+            store.set(&key.as_ref(), Arc::clone(&meta));
+        }
+        assert_eq!(
+            store.len(),
+            1,
+            "the insert past the cap clears the map and holds only itself"
+        );
+        assert_eq!(
+            store.inner.read().mirrors.len(),
+            1,
+            "the clear drops the mirrors of the cleared entries"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -903,14 +1068,14 @@ mod tests {
         let store = CacheMetadataStore::new();
         let key = fixture_key();
         store.set(
-            key.clone(),
+            &key.as_ref(),
             Arc::new(UpstreamMetadata::from_upstream(
                 Some("\"abc\"".into()),
                 None,
             )),
         );
         assert_eq!(store.len(), 1);
-        store.invalidate(&key);
+        store.invalidate(&key.as_ref());
         assert_eq!(store.len(), 0);
     }
 
@@ -929,7 +1094,7 @@ mod tests {
         let key = fixture_key();
 
         store.set(
-            key.clone(),
+            &key.as_ref(),
             Arc::new(UpstreamMetadata::from_upstream(
                 Some("\"published\"".into()),
                 None,
@@ -941,7 +1106,7 @@ mod tests {
             "a published entry shadows the file's own xattrs"
         );
 
-        store.invalidate(&key);
+        store.invalidate(&key.as_ref());
         let reread = store.resolve(&key.as_ref(), &file, &path);
         assert_eq!(
             reread.etag.as_deref(),

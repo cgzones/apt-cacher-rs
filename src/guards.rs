@@ -921,7 +921,7 @@ impl RenameBarrier {
 
         let data = self.data.take().expect("every sink consumes the instance");
         if let Some(meta) = meta_for_status {
-            cache_metadata::store().set(data.lease.key.as_ref().clone(), meta);
+            cache_metadata::store().set(&data.lease.key.as_ref().as_ref(), meta);
         }
         global_verify_throttle().record_success(data.lease.key.as_ref().as_ref());
         drop(data.lease);
@@ -1295,7 +1295,7 @@ mod tests {
                 Some(String::from("\"previous-version\"")),
                 None,
             ));
-            cache_metadata::store().set(key.clone(), Arc::clone(&old_metadata));
+            cache_metadata::store().set(&key.as_ref(), Arc::clone(&old_metadata));
             let barrier = downloading(&active, &key).await.begin_rename().await;
             let status = Arc::clone(&barrier.data.as_ref().unwrap().status);
             let lease = Arc::clone(&barrier.data.as_ref().unwrap().lease);
@@ -1638,7 +1638,7 @@ mod tests {
             Some(String::from("\"current-version\"")),
             None,
         ));
-        store.set(key.clone(), Arc::clone(&metadata));
+        store.set(&key.as_ref(), Arc::clone(&metadata));
         // Count ownership of this unique entry, independent of concurrent
         // tests; resolve would reload the entry and hide accidental removal.
         assert_eq!(Arc::strong_count(&metadata), 2, "the store owns the entry");

@@ -48,19 +48,6 @@ impl AddAssign for Footprint {
     }
 }
 
-/// Heap bytes of a hashbrown table (`HashMap`, `HashSet`, `HashTable`)
-/// reporting `capacity` for buckets of `bucket` bytes: the bucket count is
-/// the power of two at or above 8/7 of the capacity, and each bucket costs
-/// one control byte on top of its payload, plus one trailing control group.
-#[must_use]
-pub(crate) const fn table_bytes(capacity: usize, bucket: usize) -> usize {
-    if capacity == 0 {
-        return 0;
-    }
-    let buckets = capacity.saturating_mul(8).div_ceil(7).next_power_of_two();
-    buckets.saturating_mul(bucket + 1).saturating_add(16)
-}
-
 /// Heap bytes of a `Vec`/`VecDeque` with `capacity` slots of `elem` bytes.
 #[must_use]
 pub(crate) const fn buffer_bytes(capacity: usize, elem: usize) -> usize {
@@ -351,25 +338,6 @@ mod tests {
 
     /// The estimate follows hashbrown's bucket rounding: the reported
     /// capacity is 7/8 of a power-of-two bucket count.
-    #[test]
-    fn table_bytes_follows_the_bucket_rounding() {
-        assert_eq!(table_bytes(0, 64), 0);
-        // 7 usable of 8 buckets: 8 payloads, 8 control bytes, one group.
-        assert_eq!(table_bytes(7, 64), 8 * 65 + 16);
-        // 14 of 16.
-        assert_eq!(table_bytes(14, 64), 16 * 65 + 16);
-        // 896 of 1024; 897 needs 2048.
-        assert_eq!(table_bytes(896, 8), 1024 * 9 + 16);
-        assert_eq!(table_bytes(897, 8), 2048 * 9 + 16);
-        let map: hashbrown::HashMap<u64, u64> = (0..1000).map(|i| (i, i)).collect();
-        assert_eq!(
-            table_bytes(map.capacity(), 16),
-            2048 * 17 + 16,
-            "capacity {}",
-            map.capacity()
-        );
-    }
-
     #[cfg(target_env = "gnu")]
     #[test]
     fn the_allocator_accounts_for_a_live_block() {
