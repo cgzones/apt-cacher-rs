@@ -36,12 +36,13 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
 use std::fs::Metadata;
+use std::hash::BuildHasher as _;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 
-use hashbrown::{Equivalent, HashMap};
+use hashbrown::{DefaultHashBuilder, Equivalent, HashMap, HashTable, hash_table::AbsentEntry};
 use parking_lot::Mutex;
 use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use tracing::{debug, error, warn};
@@ -51,7 +52,7 @@ use crate::error::ErrorReport;
 use crate::fs_open::{hint_sequential_read, nofollow_options, tokio_nofollow_options};
 use crate::ingest_ledger::{Claim, IngestLedger, Outcome};
 use crate::limits::{self, PackagesCompression};
-use crate::mem_usage::{Footprint, buffer_bytes, table_bytes};
+use crate::mem_usage::{ARC_HEADER, Footprint, buffer_bytes};
 use crate::{
     cache_layout::{ByHashContent, ConnectionDetails, ResourceKind},
     cache_quota::QuotaReservation,
@@ -440,10 +441,24 @@ impl Equivalent<Arc<RegistryScope>> for RegistryScopeRef<'_> {
 /// configured cap.
 ///
 /// Two-level layout: essentially all entries of one mirror share the same
-/// `(authority, mirror_path)` pair, so a flat per-entry key would store those
-/// strings ~100k times per Debian-main `Packages` ingest (tens of MB at the
-/// default 500k cap). The scope is allocated once per mirror; entries only
-/// own their relpath.
+/// `(authority, mirror_path)` pair, so the scope is allocated once per
+/// mirror. An entry holds no key text at all: a 128-bit fingerprint of its
+/// relpath (the first half of its SHA-256), the digest and its family, 49
+/// bytes in an insertion-ordered slot log ([`Slot`]) indexed by an 8-byte
+/// sequence number. Measured on nine Debian indexes (385k entries): ~70
+/// bytes per entry, 26 MB; keying on the relpath as an `Arc<str>` with a
+/// separate order log cost ~200, 76 MB, and the daemon sat at 172 MB
+/// resident. The fingerprint stands in for the
+/// key because nothing reads a key back (a miss is explained by counts) and
+/// a collision between two names a mirror actually publishes is a 2^-128
+/// event; an upstream that could craft a colliding name controls the index,
+/// and with it the digest, already. What that upstream must not be able to
+/// steer is where a slot lands in the index: it is filed under a hash of
+/// the fingerprint from a per-scope randomly seeded hasher, never under the
+/// fingerprint's own bits, which are public (a `Packages` whose names all
+/// share the low bits of their SHA-256 would otherwise make every insert
+/// walk one probe sequence, quadratic work under the lock each digest
+/// lookup takes).
 ///
 /// `insert` and `lookup` are module-private on purpose: the only writers are
 /// the ingests `schedule_ingest` runs (on commit or on a cache-hit touch)
@@ -462,30 +477,72 @@ pub(crate) struct ChecksumRegistry {
     cap: usize,
 }
 
-/// Per-scope relpath map: digest plus insert generation (see
-/// `RegistryInner::next_gen`).
-type ScopeEntries = HashMap<Arc<str>, ([u8; 32], u64)>;
+/// A registry key's 128-bit fingerprint, the first half of its SHA-256:
+/// what a scope stores and compares in place of the key text.
+type Fingerprint = [u8; 16];
 
-/// One `(authority, mirror_path)` scope: its entries and their insertion order.
+fn fingerprint(key: &str) -> Fingerprint {
+    use sha2::Digest as _;
+    let digest: [u8; 32] = sha2::Sha256::digest(key.as_bytes()).into();
+    *digest
+        .first_chunk::<16>()
+        .expect("a SHA-256 holds 16 bytes")
+}
+
+/// The hash a fingerprint's slot is filed under in a scope's `index`, from
+/// the scope's seeded hasher. Not the fingerprint's own bits: those are
+/// public, and the names behind them come from the upstream (see the
+/// [`ChecksumRegistry`] doc).
+fn fingerprint_hash(hasher: &DefaultHashBuilder, key: &Fingerprint) -> u64 {
+    hasher.hash_one(key)
+}
+
+/// One registered digest: its key's fingerprint, the digest and the key's
+/// family (so an eviction knows which count it lowers without the key
+/// text). 49 bytes, nothing on the heap.
+#[derive(Clone, Copy, Debug)]
+struct Slot {
+    key: Fingerprint,
+    digest: [u8; 32],
+    kind: KeyKind,
+}
+
+/// One `(authority, mirror_path)` scope: its slots in insertion order and
+/// the index of the live ones.
 #[derive(Debug, Default)]
 struct ScopeState {
-    entries: ScopeEntries,
-    /// Insertion-order log for FIFO eviction within the scope. Each entry
-    /// pairs the relpath with the generation it was inserted at. Entries
-    /// whose generation no longer matches the live entry are stale (the key
-    /// was re-inserted later); the eviction loop skips them and
-    /// `compact_order` periodically removes them.
-    order: VecDeque<(Arc<str>, u64)>,
+    /// Every insert appends a slot; the slot at position `i` has sequence
+    /// `base + i`. A slot is live while `index` maps its key to its
+    /// sequence. A re-inserted key gets a new slot at the back (the FIFO
+    /// refresh) and leaves its old one stale; eviction skips stale slots and
+    /// `compact_slots` drops them.
+    slots: VecDeque<Slot>,
+    /// Sequence of the front slot; moves with every pop and compaction, so
+    /// no sequence is ever handed out twice.
+    base: u64,
+    /// The sequence of each live key's slot, filed under `fingerprint_hash`
+    /// of its key: one entry per live key.
+    index: HashTable<u64>,
+    /// Seeds `index`'s placement; one random seed per scope.
+    hasher: DefaultHashBuilder,
     /// Per `Release` directory, the `Date:` (unix seconds; `None` when the
     /// file had none) of the newest `Release`/`InRelease` whose entries were
     /// registered. The two files of one directory write the same keys, so
     /// an older one ingested later must not overwrite the newer digests.
     /// Dropped with the scope when eviction drains it.
     release_dates: HashMap<Box<str>, Option<i64>>,
-    /// How many of `entries` are [`KeyKind::Package`] keys; the rest are
+    /// How many live slots are [`KeyKind::Package`] keys; the rest are
     /// [`KeyKind::Index`] ones. Read only to explain a miss
     /// ([`RegistryMiss`]).
     packages: usize,
+}
+
+/// The slot of sequence `seq` in `slots` whose front has sequence `base`.
+/// Free-standing (not a `ScopeState` method) so a closure over the slots
+/// can run while the scope's `index` is borrowed mutably.
+fn slot_in(slots: &VecDeque<Slot>, base: u64, seq: u64) -> Option<&Slot> {
+    let position = usize::try_from(seq.checked_sub(base)?).ok()?;
+    slots.get(position)
 }
 
 /// Which of the two digest families a registry key belongs to. One scope
@@ -549,28 +606,35 @@ impl fmt::Display for RegistryMiss {
 }
 
 impl ScopeState {
-    /// Live generation of `relpath`, if present.
-    fn live_generation(&self, relpath: &Arc<str>) -> Option<u64> {
-        self.entries.get(relpath).map(|&(_, generation)| generation)
+    /// The live slot of `key`, if it has one.
+    fn live(&self, key: &Fingerprint) -> Option<&Slot> {
+        self.index
+            .find(fingerprint_hash(&self.hasher, key), |&seq| {
+                slot_in(&self.slots, self.base, seq).is_some_and(|slot| slot.key == *key)
+            })
+            .and_then(|&seq| slot_in(&self.slots, self.base, seq))
+    }
+
+    /// The sequence the next appended slot gets.
+    fn next_seq(&self) -> u64 {
+        self.base + self.slots.len() as u64
+    }
+
+    /// Live entries.
+    fn len(&self) -> usize {
+        self.index.len()
     }
 }
 
 #[derive(Debug)]
 struct RegistryInner {
-    /// `(authority, mirror_path)` scope to its entries and eviction order. The
-    /// scope `Arc` and relpath `Arc<str>` are shared between the map and the
-    /// order log, so `insert` allocates each string once.
+    /// `(authority, mirror_path)` scope to its slots and index. The scope
+    /// `Arc` is shared with the eviction epochs, so a scope's strings are
+    /// allocated once.
     map: HashMap<Arc<RegistryScope>, ScopeState>,
-    /// Total relpath entry count across all scopes (the outer map's `len`
+    /// Total live entry count across all scopes (the outer map's `len`
     /// counts scopes, not entries).
     len: usize,
-    /// Heap bytes of every live entry's relpath allocation (the `Arc<str>`
-    /// header and text), kept here so the dashboard's footprint never walks
-    /// the entries under the lock every lookup takes.
-    key_bytes: usize,
-    /// Monotonic counter, incremented on every `insert`. Overflow at 2^64
-    /// is unreachable in practice (millennia at any realistic insert rate).
-    next_gen: u64,
 }
 
 /// Scopes [`EvictionEpochs`] remembers before it forgets them all at once.
@@ -644,8 +708,6 @@ impl ChecksumRegistry {
             inner: Mutex::new(RegistryInner {
                 map: HashMap::new(),
                 len: 0,
-                key_bytes: 0,
-                next_gen: 0,
             }),
             epochs: Mutex::new(EvictionEpochs::new(MAX_EPOCH_SCOPES)),
             cap: cap.get(),
@@ -727,9 +789,10 @@ impl ChecksumRegistry {
     }
 
     /// Look up an expected digest by `(authority, mirror_path, relpath)`.
-    /// Allocation-free via `hashbrown::Equivalent` and `Arc<str>:
-    /// Borrow<str>`.
+    /// Allocation-free: the scope through `hashbrown::Equivalent`, the key
+    /// through its fingerprint.
     fn lookup(&self, authority: &str, mirror_path: &str, relpath: &str) -> Option<[u8; 32]> {
+        let key = fingerprint(relpath);
         let inner = self.inner.lock();
         inner
             .map
@@ -737,8 +800,8 @@ impl ChecksumRegistry {
                 authority,
                 mirror_path,
             })
-            .and_then(|state| state.entries.get(relpath))
-            .map(|&(digest, _)| digest)
+            .and_then(|state| state.live(&key))
+            .map(|slot| slot.digest)
     }
 
     /// What the scope holds of `relpath`'s family, for the line reporting
@@ -757,7 +820,7 @@ impl ChecksumRegistry {
             })
             .map_or(0, |state| match kind {
                 KeyKind::Package => state.packages,
-                KeyKind::Index => state.entries.len() - state.packages,
+                KeyKind::Index => state.len() - state.packages,
             });
         let evicted = self.epochs.lock().evicted(authority, mirror_path);
         RegistryMiss {
@@ -772,49 +835,52 @@ impl ChecksumRegistry {
         self.inner.lock().len
     }
 
-    /// Entries and the heap they take: every scope's entry table, order
-    /// log and `Release` dates, the relpath allocations (counted as they
-    /// come and go, see `RegistryInner::key_bytes`) and the scope keys.
-    /// Walks the scopes, a handful, never the entries.
+    /// Entries and the heap they take: every scope's slot log, index and
+    /// release dates, the scope table, and the eviction epochs, whose table
+    /// keeps a scope's name alive after its last entry went. Reads only
+    /// capacities, so a 500k-entry scope costs nothing to account for.
     pub(crate) fn footprint(&self) -> Footprint {
         let inner = self.inner.lock();
         let scopes: usize = inner
             .map
             .iter()
             .map(|(scope, state)| {
-                let RegistryScope {
-                    authority,
-                    mirror_path,
-                } = scope.as_ref();
                 let ScopeState {
-                    entries,
-                    order,
+                    slots,
+                    base: _,
+                    index,
+                    hasher: _,
                     release_dates,
                     packages: _,
                 } = state;
-                size_of::<RegistryScope>()
-                    + authority.capacity()
-                    + mirror_path.capacity()
-                    + table_bytes(entries.capacity(), size_of::<(Arc<str>, ([u8; 32], u64))>())
-                    + buffer_bytes(order.capacity(), size_of::<(Arc<str>, u64)>())
-                    + table_bytes(
-                        release_dates.capacity(),
-                        size_of::<(Box<str>, Option<i64>)>(),
-                    )
+                ARC_HEADER
+                    + scope_bytes(scope)
+                    + buffer_bytes(slots.capacity(), size_of::<Slot>())
+                    + index.allocation_size()
+                    + release_dates.allocation_size()
                     + release_dates.keys().map(|dir| dir.len()).sum::<usize>()
             })
             .sum();
+        // Taken after `inner`, the order `evict` takes them in. A scope only
+        // the epochs still name (its entries all evicted) is theirs to
+        // account for; one the map holds too was counted above.
+        let epochs = self.epochs.lock();
+        let forgotten: usize = epochs
+            .by_scope
+            .keys()
+            .filter(|scope| Arc::strong_count(scope) == 1)
+            .map(|scope| ARC_HEADER + scope_bytes(scope))
+            .sum();
         Footprint {
             entries: inner.len,
-            bytes: table_bytes(
-                inner.map.capacity(),
-                size_of::<(Arc<RegistryScope>, ScopeState)>(),
-            ) + scopes
-                + inner.key_bytes,
+            bytes: inner.map.allocation_size()
+                + scopes
+                + epochs.by_scope.allocation_size()
+                + forgotten,
         }
     }
 
-    /// `(entries, entry capacity, order length, order capacity)` of one
+    /// `(live entries, index capacity, slot count, slot capacity)` of one
     /// scope.
     #[cfg(test)]
     fn scope_footprint(&self, authority: &str, mirror_path: &str) -> (usize, usize, usize, usize) {
@@ -827,18 +893,18 @@ impl ChecksumRegistry {
             })
             .map(|state| {
                 (
-                    state.entries.len(),
-                    state.entries.capacity(),
-                    state.order.len(),
-                    state.order.capacity(),
+                    state.len(),
+                    state.index.capacity(),
+                    state.slots.len(),
+                    state.slots.capacity(),
                 )
             })
             .expect("scope present")
     }
 
     #[cfg(test)]
-    fn order_len(&self) -> usize {
-        self.inner.lock().map.values().map(|s| s.order.len()).sum()
+    fn slot_len(&self) -> usize {
+        self.inner.lock().map.values().map(|s| s.slots.len()).sum()
     }
 
     /// The eviction epoch of `(authority, mirror_path)`: bumped by every
@@ -862,8 +928,6 @@ impl ChecksumRegistry {
         digest: [u8; 32],
     ) {
         let cap = self.cap;
-        let generation = inner.next_gen;
-        inner.next_gen += 1;
 
         let scope_ref = RegistryScopeRef {
             authority,
@@ -884,26 +948,44 @@ impl ChecksumRegistry {
             .map
             .get_mut(&scope)
             .expect("scope was just looked up or inserted");
-        // Reuse the existing relpath allocation on refresh; `Arc<str>:
-        // Borrow<str>` makes the borrowed lookup allocation-free.
-        let rel = match state.entries.get_key_value(relpath) {
-            Some((rel, _)) => Arc::clone(rel),
-            None => Arc::from(relpath),
+        let key = fingerprint(relpath);
+        let kind = KeyKind::of(relpath);
+        let seq = state.next_seq();
+        if state.slots.len() == state.slots.capacity() {
+            // Grow in eighths, not by doubling: at 49 bytes a slot, a log
+            // of half a million entries would otherwise reserve 25 MB it
+            // never fills. A reallocation per eighth is one memmove of the
+            // log; an insert is a hash and a probe anyway.
+            state.slots.reserve_exact(state.slots.len() / 8 + 16);
+        }
+        state.slots.push_back(Slot { key, digest, kind });
+        let ScopeState {
+            slots,
+            base,
+            index,
+            hasher,
+            ..
+        } = &mut *state;
+        let (slots, base, hasher) = (&*slots, *base, &*hasher);
+        let hash = fingerprint_hash(hasher, &key);
+        // A live key moves to the new slot; its old one goes stale.
+        let inserted = if let Some(live) = index.find_mut(hash, |&live| {
+            slot_in(slots, base, live).is_some_and(|slot| slot.key == key)
+        }) {
+            *live = seq;
+            false
+        } else {
+            index.insert_unique(hash, seq, |&live| index_hash(hasher, slots, base, live));
+            true
         };
-        let inserted = state
-            .entries
-            .insert(Arc::clone(&rel), (digest, generation))
-            .is_none();
-        state.order.push_back((rel, generation));
-        if state.order.len() > 2 * state.entries.len() + 16 {
-            compact_order(state);
+        if state.slots.len() > state.len() + stale_allowance(state.len()) {
+            compact_slots(state);
         }
         if inserted {
-            if KeyKind::of(relpath) == KeyKind::Package {
+            if kind == KeyKind::Package {
                 state.packages += 1;
             }
             inner.len += 1;
-            inner.key_bytes += relpath_bytes(relpath);
         }
 
         if inner.len > cap {
@@ -919,12 +1001,20 @@ impl ChecksumRegistry {
     }
 }
 
+/// The hash of the slot an index entry points at, for the index's own
+/// rehashes. Every index entry points at a present slot: a slot leaves
+/// `slots` only after its index entry is removed (`evict`) or the index is
+/// rebuilt (`compact_slots`).
+fn index_hash(hasher: &DefaultHashBuilder, slots: &VecDeque<Slot>, base: u64, seq: u64) -> u64 {
+    let slot = slot_in(slots, base, seq).expect("every index entry points at a present slot");
+    fingerprint_hash(hasher, &slot.key)
+}
+
 /// Eviction: free `cap / 4` live entries, always from the scope currently
 /// holding the most entries, oldest first. A scope that drains empty is
 /// removed and the next-largest scope pays the remainder. Within a scope,
-/// entries pop from the front of its `order`; stale ones (re-inserted keys
-/// whose live generation is newer) are skipped and do not count against the
-/// quota.
+/// slots pop from the front; stale ones (re-inserted keys, whose live slot
+/// is newer) are skipped and do not count against the quota.
 fn evict(inner: &mut RegistryInner, cap: usize, epochs: &Mutex<EvictionEpochs>) {
     let quota = (cap / 4).max(1);
     let mut live = 0usize;
@@ -937,60 +1027,92 @@ fn evict(inner: &mut RegistryInner, cap: usize, epochs: &Mutex<EvictionEpochs>) 
         };
         let before = live;
         while live < quota {
-            let Some((rel, generation)) = state.order.pop_front() else {
+            let Some(front) = state.slots.front().copied() else {
                 break;
             };
-            match state.entries.get(&rel) {
-                Some(&(_, current_gen)) if current_gen == generation => {
-                    state.entries.remove(&rel);
-                    if KeyKind::of(&rel) == KeyKind::Package {
-                        state.packages -= 1;
-                    }
-                    inner.len -= 1;
-                    inner.key_bytes -= relpath_bytes(&rel);
-                    live += 1;
+            let seq = state.base;
+            // Live iff the index still points at this slot; a stale slot's
+            // key was re-inserted later. The index entry goes before the
+            // slot, so no index entry ever points past the front.
+            let was_live = match state
+                .index
+                .find_entry(fingerprint_hash(&state.hasher, &front.key), |&live| {
+                    live == seq
+                }) {
+                Ok(entry) => {
+                    entry.remove();
+                    true
                 }
-                _ => {
-                    // Stale entry: the key was re-inserted later (newer gen)
-                    // or already evicted. Drop it; no eviction quota consumed.
+                Err(_absent @ AbsentEntry { .. }) => false,
+            };
+            state.slots.pop_front();
+            state.base += 1;
+            if was_live {
+                if front.kind == KeyKind::Package {
+                    state.packages -= 1;
                 }
+                inner.len -= 1;
+                live += 1;
             }
         }
         if live > before {
             epochs.lock().bump(&scope);
         }
-        if state.entries.is_empty() {
+        if state.len() == 0 {
             inner.map.remove(&scope);
             continue;
         }
         shrink_scope(state);
+        // The inner loop stops short of the quota only once the slots are
+        // drained, which empties the scope and is handled above; so this is
+        // unreachable while every live entry has a slot, and otherwise keeps
+        // the outer loop from picking the same scope forever.
+        debug_assert!(live >= quota, "a scope with entries but no slots");
         if live < quota {
-            // Its order log drained without meeting the quota: only stale
-            // entries were left, which the pops above already discarded.
             break;
         }
     }
 }
 
-/// Heap bytes of one relpath entry: the `Arc<str>` allocation, its two
-/// counters and the text.
-fn relpath_bytes(relpath: &str) -> usize {
-    2 * size_of::<usize>() + relpath.len()
+/// Stale slots a scope with `live` entries may carry before the log is
+/// compacted, and spare capacity it may keep after an eviction: a quarter,
+/// so the log costs at most ~1.25 slots per live entry while a compaction
+/// still only runs once per quarter of the scope re-inserted (every arch's
+/// `Packages` lists the `all` packages again, so re-inserts are the norm).
+fn stale_allowance(live: usize) -> usize {
+    live / 4 + 16
 }
 
-/// Give back the memory an eviction freed. Neither the entry map nor the
-/// order log shrinks on its own, so a scope that once held most of the cap
-/// (a hostile index, which is what eviction hits first) would keep its peak
-/// footprint after losing most of its entries. Shrinking only past twice the
-/// live size keeps the rehash cost amortised over the evictions that
-/// caused it.
+/// Give back the memory an eviction freed. Neither the index nor the slot
+/// log shrinks on its own, so a scope that once held most of the cap (a
+/// hostile index, which is what eviction hits first) would keep its peak
+/// footprint after losing most of its entries. Shrinking the index only
+/// past twice its live size, and the log only past its stale allowance,
+/// keeps the rehash and copy costs amortised over the evictions that
+/// caused them.
 fn shrink_scope(state: &mut ScopeState) {
-    if state.entries.capacity() > 2 * state.entries.len() + 16 {
-        state.entries.shrink_to_fit();
+    let ScopeState {
+        slots,
+        base,
+        index,
+        hasher,
+        ..
+    } = state;
+    if index.capacity() > 2 * index.len() + 16 {
+        index.shrink_to_fit(|&live| index_hash(hasher, slots, *base, live));
     }
-    if state.order.capacity() > 2 * state.order.len() + 16 {
-        state.order.shrink_to_fit();
+    if slots.capacity() > slots.len() + stale_allowance(slots.len()) {
+        slots.shrink_to_fit();
     }
+}
+
+/// The heap a scope's name takes beyond its `Arc`.
+fn scope_bytes(scope: &RegistryScope) -> usize {
+    let RegistryScope {
+        authority,
+        mirror_path,
+    } = scope;
+    size_of::<RegistryScope>() + authority.capacity() + mirror_path.capacity()
 }
 
 /// The scope holding the most live entries, if any.
@@ -999,23 +1121,50 @@ fn largest_scope(inner: &RegistryInner) -> Option<Arc<RegistryScope>> {
     inner
         .map
         .iter()
-        .max_by_key(|(_, state)| state.entries.len())
+        .max_by_key(|(_, state)| state.len())
         .map(|(scope, _)| Arc::clone(scope))
 }
 
-/// Rebuild a scope's `order` keeping only entries whose generation matches
-/// the current live entry. Preserves FIFO order of live entries. Triggered
-/// from `insert_locked` when the log outgrows twice the live count, so
-/// amortized O(1) per insert.
-fn compact_order(state: &mut ScopeState) {
-    let mut compacted = VecDeque::with_capacity(state.entries.len());
-    while let Some(entry) = state.order.pop_front() {
-        let (ref rel, generation) = entry;
-        if state.live_generation(rel) == Some(generation) {
-            compacted.push_back(entry);
-        }
+/// Rebuild a scope's slot log keeping only the live slots, in their order,
+/// re-sequenced past every sequence handed out so far. Triggered from
+/// `insert_locked` when the log outgrows the live count by
+/// [`stale_allowance`], so amortized O(1) per insert.
+fn compact_slots(state: &mut ScopeState) {
+    // Room for the next growth step too, or the insert that triggered the
+    // compaction reallocates the fresh log at once.
+    let mut live: VecDeque<Slot> = VecDeque::with_capacity(state.len() + state.len() / 8 + 16);
+    live.extend(
+        state
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|&(position, slot)| {
+                let seq = state.base + position as u64;
+                state
+                    .index
+                    .find(fingerprint_hash(&state.hasher, &slot.key), |&s| s == seq)
+                    .is_some()
+            })
+            .map(|(_, &slot)| slot),
+    );
+    state.base = state.next_seq();
+    state.slots = live;
+    state.index.clear();
+    let ScopeState {
+        slots,
+        base,
+        index,
+        hasher,
+        ..
+    } = state;
+    let (slots, base, hasher) = (&*slots, *base, &*hasher);
+    for (position, slot) in slots.iter().enumerate() {
+        index.insert_unique(
+            fingerprint_hash(hasher, &slot.key),
+            base + position as u64,
+            |&live| index_hash(hasher, slots, base, live),
+        );
     }
-    state.order = compacted;
 }
 
 /// Report a registry lookup that came up empty: this download is cached
@@ -2783,7 +2932,7 @@ mod tests {
     fn eviction_shrinks_the_scope_it_drains() {
         use std::num::NonZero;
         // One scope fills the cap, then another mirror's inserts make it pay
-        // for the evictions: its map and order log must give the memory back
+        // for the evictions: its index and slot log must give the memory back
         // instead of keeping the footprint of 1000 entries.
         let reg = ChecksumRegistry::new(NonZero::new(1000).unwrap());
         for i in 0..1000u32 {
@@ -2793,15 +2942,15 @@ mod tests {
         for i in 0..600u32 {
             reg.insert("small", "m", &format!("s{i}"), [0; 32]);
         }
-        let (len, capacity, order_len, order_capacity) = reg.scope_footprint("big", "m");
+        let (len, capacity, slot_len, slot_capacity) = reg.scope_footprint("big", "m");
         assert!(len <= 500, "big paid for the evictions, {len} left");
         assert!(
             capacity <= 2 * len + 16 && capacity < peak_capacity,
             "entry capacity {capacity} for {len} entries (peak {peak_capacity})"
         );
         assert!(
-            order_capacity <= 2 * order_len + 16,
-            "order capacity {order_capacity} for {order_len} records"
+            slot_capacity <= 2 * slot_len + 16,
+            "slot capacity {slot_capacity} for {slot_len} slots"
         );
     }
 
@@ -3494,9 +3643,9 @@ mod tests {
         reg.insert("h", "m", "b", d);
         reg.insert("h", "m", "c", d);
         reg.insert("h", "m", "d", d);
-        // Refresh A 100 times. Each re-insert leaves a stale order entry
-        // (until compaction fires at order.len() > 2 * entries.len() + 16)
-        // but moves A to the logical back of FIFO.
+        // Refresh A 100 times. Each re-insert leaves a stale slot (until the
+        // stale ones exceed a quarter of the live entries plus 16 and the
+        // log is compacted) but moves A to the logical back of FIFO.
         for _ in 0..100 {
             reg.insert("h", "m", "a", d);
         }
@@ -3568,23 +3717,23 @@ mod tests {
     }
 
     #[test]
-    fn registry_order_compaction_bounds_memory() {
+    fn registry_slot_compaction_bounds_memory() {
         use std::num::NonZero;
         let reg = ChecksumRegistry::new(NonZero::new(4).unwrap());
         let d = [0u8; 32];
         reg.insert("h", "m", "a", d);
-        // Every re-insert of a live key appends a stale order record. The
-        // compaction trigger is `order.len() > 2 * entries.len() + 16` -- 18
-        // for this one-entry scope -- so 20 further inserts must cross it and
-        // rebuild the log down to the single live entry. Without compaction
-        // the log would hold all 21 records and this assert would fail.
+        // Every re-insert of a live key appends a stale slot. The compaction
+        // trigger is `slots.len() > live + stale_allowance(live)` -- 17 for
+        // this one-entry scope -- so 20 further inserts must cross it and
+        // rebuild the log down to the single live slot. Without compaction
+        // the log would hold all 21 slots and this assert would fail.
         for _ in 0..20 {
             reg.insert("h", "m", "a", d);
         }
         assert!(
-            reg.order_len() <= 2 * reg.len() + 16,
-            "order_len={} must stay within the compaction trigger",
-            reg.order_len()
+            reg.slot_len() <= reg.len() + stale_allowance(reg.len()),
+            "slot_len={} must stay within the compaction trigger",
+            reg.slot_len()
         );
         assert_eq!(reg.len(), 1, "map still holds exactly one live entry");
         assert!(reg.lookup("h", "m", "a").is_some());
