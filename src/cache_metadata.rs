@@ -43,28 +43,23 @@
 //!
 //! # Publication invariant
 //!
+//! Every caller of [`CacheMetadataStore::set`] **must** persist matching
+//! xattrs to the cached file *before* invoking `set`: the entry is what
+//! clients are served until it is cleared or the daemon restarts, and the
+//! xattrs are what they are served after, so the two have to agree or
+//! conditional requests change their answer across a restart.
+//!
 //! `resolve`'s cold path releases the read lock before reading xattrs and
-//! re-acquires the write lock to insert.  A concurrent
-//! [`CacheMetadataStore::set`] can win that race and publish a fresher
-//! value before resolve's insert runs.  To keep resolve from clobbering
-//! the published value, every caller of [`CacheMetadataStore::set`]
-//! **must** persist matching xattrs to the cached file *before* invoking
-//! `set`.  With that invariant, the value
-//! the racing `resolve` reads from xattrs equals the value `set`
-//! published, so the two writers race to insert equivalent `Arc`s.
-//!
-//! Resolve's insert re-checks the entry under the write lock: if `set`
-//! got there first, it returns the published `Arc` and `debug_assert!`s
-//! it matches what we just read from xattrs.  If the assertion ever
-//! fires, a caller of `set` published metadata without first writing
-//! matching xattrs — fix that caller, not the assertion.
-//!
-//! The assertion is skipped when the xattr read produced `(None, None)`:
-//! `xattr_helpers::write` is best-effort and silently swallows
-//! `ErrorKind::Unsupported`, so on filesystems without xattr support a
-//! caller's xattr write is a no-op and the racing `resolve` legitimately
-//! reads `(None, None)` while `set` publishes `Some(...)`.  The publisher's
-//! value still wins; we just don't crash debug builds in that environment.
+//! re-acquires the write lock to insert.  A concurrent `set` can publish
+//! in between, and then wins: resolve's insert re-checks the entry under
+//! the write lock and returns the published `Arc`, dropping what it read.
+//! That read is stale by construction whenever it started before the
+//! publish (a volatile revalidation rewrites the xattrs of the very file a
+//! hit is resolving; a commit renames a new file over the one it opened),
+//! and under the lock nothing tells such a read from a caller that skipped
+//! its xattr write, so the mismatch is not asserted or logged.  The
+//! invariant is what keeps the published value and the file in step, not
+//! something resolve can check.
 //!
 //! # Negative caching and transient errors
 //!
@@ -91,7 +86,7 @@ use crate::{
     http_last_modified::{LastModified, is_valid_http_date},
     http_range::HttpDate,
     mem_usage::{ARC_HEADER, Footprint},
-    warn_once, warn_once_or_info,
+    warn_once_or_info,
     xattr_helpers::{self, ExpectedSize, XattrValue as _},
 };
 
@@ -537,41 +532,11 @@ impl CacheMetadataStore {
         });
 
         // Re-check under the write lock: a concurrent `set` may have
-        // published a value while we were reading xattrs.  Per the
-        // publication invariant (see module docs), that value must
-        // equal what we just read; the debug_assert catches violations.
-        // In release we trust the publisher's value.
-        //
-        // Exception: if our xattr read produced `(None, None)`, treat it
-        // as "xattrs unavailable on this FS" (`xattr_helpers::write` is
-        // best-effort and silently swallows `ErrorKind::Unsupported`), trust
-        // the publisher, and skip the assert.  Asserting here would fire
-        // spuriously on filesystems without xattr support.
+        // published while we were reading xattrs, and what we read is then
+        // older than it (see the module docs on why that is not a mismatch
+        // worth reporting).
         let mut inner = self.inner.write();
         if let Some(published) = inner.map.get(key) {
-            let disagrees = !(meta.etag.is_none() && meta.last_modified.is_none())
-                && published.as_ref() != meta.as_ref();
-            debug_assert!(
-                !disagrees,
-                "publication invariant violated: a concurrent `set` published \
-                 metadata that disagrees with the on-disk xattrs; every caller \
-                 of `set` must persist matching xattrs first (published={:?}, \
-                 read={:?})",
-                published.as_ref(),
-                meta.as_ref(),
-            );
-            if disagrees {
-                // Release builds accept the published value, so clients
-                // can be served validators that permanently disagree with
-                // the file's xattrs -- conditional requests then behave
-                // differently before and after a restart.
-                warn_once!(
-                    "Cache metadata publication invariant violated for `{}`: published {:?} disagrees with the on-disk xattrs {:?}; keeping the published value",
-                    path.display(),
-                    published.as_ref(),
-                    meta.as_ref()
-                );
-            }
             return Arc::clone(published);
         }
         inner.make_room();
@@ -586,11 +551,9 @@ impl CacheMetadataStore {
     /// xattrs and before releasing the refreshed entry to waiting readers.
     ///
     /// **Publication invariant:** callers must have already persisted
-    /// matching xattrs to the cached file before invoking this.  See
-    /// the module-level docs for the rationale (a concurrent cold-path
-    /// [`Self::resolve`] reads xattrs after releasing its read lock and
-    /// would otherwise clobber the published value with the stale xattr
-    /// read).
+    /// matching xattrs to the cached file before invoking this, so that
+    /// a restart, which reads the file, serves what this published (see
+    /// the module-level docs).
     pub(crate) fn set(&self, key: &CacheEntryKeyRef<'_>, meta: Arc<UpstreamMetadata>) {
         let mut inner = self.inner.write();
         if let Some(published) = inner.map.get_mut(key) {
