@@ -433,7 +433,11 @@ impl Inner {
 /// lazily re-loadable from the on-disk xattrs, so overflow simply clears
 /// the map (no LRU) and subsequent serves re-populate it — same
 /// best-effort approach as `verify_throttle` and `permitted_host_cache`.
-pub(crate) const CACHE_METADATA_MAX_ENTRIES: usize = 64 * 1024;
+///
+/// Seven eighths of 2^16: the most a hashbrown table of 2^16 buckets
+/// holds, so the table never doubles for a last eighth of entries and sits
+/// half empty at the cap.
+pub(crate) const CACHE_METADATA_MAX_ENTRIES: usize = 7 * (1 << 16) / 8;
 
 /// The clear is silent otherwise: serves go back to two `fgetxattr(2)`
 /// round-trips through `block_in_place` -- the cost this cache exists to
