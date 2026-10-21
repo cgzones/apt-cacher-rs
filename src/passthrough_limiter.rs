@@ -49,7 +49,7 @@ impl RelayCounter {
     #[must_use]
     const fn new(cap_clock: &'static metrics::CapClock) -> Self {
         Self {
-            held: parking_lot::const_mutex(0),
+            held: parking_lot::Mutex::new(0),
             cap_clock,
         }
     }

@@ -49,7 +49,7 @@ struct Snapshot {
 impl<'a> QueueObserver<'a> {
     pub(super) const fn new(clock: &'a metrics::CapClock) -> Self {
         Self {
-            sampling: parking_lot::const_mutex(()),
+            sampling: parking_lot::Mutex::new(()),
             clock,
         }
     }

@@ -42,7 +42,7 @@ pub(crate) struct KeyedGate {
 impl KeyedGate {
     pub(crate) const fn new(cap: usize) -> Self {
         Self {
-            fired: parking_lot::const_mutex(Vec::new()),
+            fired: parking_lot::Mutex::new(Vec::new()),
             cap,
         }
     }
