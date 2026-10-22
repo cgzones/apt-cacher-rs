@@ -2383,7 +2383,7 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test]
     async fn packages_ingests_run_at_most_two_at_a_time() {
         use std::cell::Cell;
 
