@@ -266,11 +266,13 @@ pub(crate) async fn touch_volatile_mtime_with(
     metadata: &std::fs::Metadata,
     display_path: &Path,
 ) -> (tokio::fs::File, Renewal) {
-    let has_birth_time = metadata.created().is_ok();
+    if metadata.created().is_err() {
+        return (file, Renewal::NoBirthTime);
+    }
     // Refactor when https://github.com/tokio-rs/tokio/issues/6368 is resolved
     let std_file = file.into_std().await;
     let renewal = tokio::task::block_in_place(|| {
-        renew_volatile_mtime(has_birth_time, display_path, || {
+        renew_volatile_mtime(true, display_path, || {
             std_file.set_modified(std::time::SystemTime::now())
         })
     });
