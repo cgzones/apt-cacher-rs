@@ -110,9 +110,9 @@ impl UpstreamMetadata {
     /// Build from raw upstream header strings.  The Last-Modified pair is
     /// produced only if the value parses as a valid HTTP-date.
     #[must_use]
-    pub(crate) fn from_upstream(etag: Option<String>, last_modified: Option<String>) -> Self {
+    pub(crate) fn from_upstream(etag: Option<&str>, last_modified: Option<&str>) -> Self {
         let last_modified =
-            last_modified.and_then(|s| HttpDate::parse(&s).map(|t| (Arc::from(s), t)));
+            last_modified.and_then(|s| HttpDate::parse(s).map(|t| (Arc::from(s), t)));
         Self {
             etag: etag.filter(|value| is_valid_etag(value)).map(Arc::from),
             last_modified,
@@ -300,12 +300,13 @@ const MAX_VALIDATOR_LEN: usize = MAX_ETAG_LEN;
 /// A value longer than [`MAX_VALIDATOR_LEN`] is discarded before it is
 /// parsed: a kept validator is retained per cached file (metadata store,
 /// xattr), which is sized for short values.
-pub(crate) fn check_upstream_validators(
-    etag: Option<String>,
-    last_modified: Option<String>,
+pub(crate) fn check_upstream_validators<S: AsRef<str>>(
+    etag: Option<S>,
+    last_modified: Option<S>,
     mut on_invalid: impl FnMut(InvalidValidator<'_>),
-) -> (Option<String>, Option<String>) {
+) -> (Option<S>, Option<S>) {
     let etag = etag.filter(|etag| {
+        let etag = etag.as_ref();
         if etag.len() > MAX_VALIDATOR_LEN {
             on_invalid(InvalidValidator::Oversized {
                 header: "ETag",
@@ -320,6 +321,7 @@ pub(crate) fn check_upstream_validators(
         valid
     });
     let last_modified = last_modified.filter(|lm| {
+        let lm = lm.as_ref();
         if lm.len() > MAX_VALIDATOR_LEN {
             on_invalid(InvalidValidator::Oversized {
                 header: "Last-Modified",
@@ -722,10 +724,8 @@ mod tests {
         if !supports_user_xattrs(&path) {
             return;
         }
-        let meta = UpstreamMetadata::from_upstream(
-            Some("\"abc\"".into()),
-            Some("Thu, 01 Jan 1970 00:00:00 GMT".into()),
-        );
+        let meta =
+            UpstreamMetadata::from_upstream(Some("\"abc\""), Some("Thu, 01 Jan 1970 00:00:00 GMT"));
         write_upstream_metadata(&file, &path, &meta, Some(4096), TargetFile::New);
 
         let resolved = store.resolve(&fixture_key().as_ref(), &file, &path);
@@ -795,7 +795,7 @@ mod tests {
     const STORED_LM: &str = "Thu, 01 Jan 2004 00:00:00 GMT";
 
     fn stored_validators() -> UpstreamMetadata {
-        UpstreamMetadata::from_upstream(Some(STORED_ETAG.into()), Some(STORED_LM.into()))
+        UpstreamMetadata::from_upstream(Some(STORED_ETAG), Some(STORED_LM))
     }
 
     /// A `206` answering the stored `ETag` as `If-Range` proves the first
@@ -809,16 +809,14 @@ mod tests {
             "a 206 without validators keeps both"
         );
         assert_eq!(
-            UpstreamMetadata::from_upstream(Some(STORED_ETAG.into()), None)
-                .inherit_resumed(Some(&stored)),
+            UpstreamMetadata::from_upstream(Some(STORED_ETAG), None).inherit_resumed(Some(&stored)),
             stored,
             "a 206 echoing the ETag keeps the stored Last-Modified"
         );
         let own_lm = "Fri, 02 Jan 2004 00:00:00 GMT";
         assert_eq!(
-            UpstreamMetadata::from_upstream(None, Some(own_lm.into()))
-                .inherit_resumed(Some(&stored)),
-            UpstreamMetadata::from_upstream(Some(STORED_ETAG.into()), Some(own_lm.into())),
+            UpstreamMetadata::from_upstream(None, Some(own_lm)).inherit_resumed(Some(&stored)),
+            UpstreamMetadata::from_upstream(Some(STORED_ETAG), Some(own_lm)),
             "a value the 206 carries wins; the ETag it omits is inherited"
         );
     }
@@ -830,7 +828,7 @@ mod tests {
     #[test]
     fn inherit_resumed_keeps_the_stored_date_off_a_different_etag() {
         let stored = stored_validators();
-        let other = UpstreamMetadata::from_upstream(Some("\"second\"".into()), None);
+        let other = UpstreamMetadata::from_upstream(Some("\"second\""), None);
         assert_eq!(other.clone().inherit_resumed(Some(&stored)), other);
     }
 
@@ -838,14 +836,14 @@ mod tests {
     /// they are.
     #[test]
     fn inherit_resumed_without_a_resumed_partial_is_identity() {
-        let upstream = UpstreamMetadata::from_upstream(None, Some(STORED_LM.into()));
+        let upstream = UpstreamMetadata::from_upstream(None, Some(STORED_LM));
         assert_eq!(upstream.clone().inherit_resumed(None), upstream);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn write_upstream_metadata_without_size_leaves_no_expected_size() {
         let (_dir, file, path) = fixture_file().await;
-        let meta = UpstreamMetadata::from_upstream(Some("\"abc\"".into()), None);
+        let meta = UpstreamMetadata::from_upstream(Some("\"abc\""), None);
         write_upstream_metadata(&file, &path, &meta, None, TargetFile::New);
         assert_eq!(xattr_helpers::read::<ExpectedSize>(&file, &path), None);
         assert!(xattr_helpers::read::<LastModified>(&file, &path).is_none());
@@ -857,17 +855,11 @@ mod tests {
         let key = fixture_key();
         store.set(
             &key.as_ref(),
-            Arc::new(UpstreamMetadata::from_upstream(
-                Some("\"old\"".into()),
-                None,
-            )),
+            Arc::new(UpstreamMetadata::from_upstream(Some("\"old\""), None)),
         );
         store.set(
             &key.as_ref(),
-            Arc::new(UpstreamMetadata::from_upstream(
-                Some("\"new\"".into()),
-                None,
-            )),
+            Arc::new(UpstreamMetadata::from_upstream(Some("\"new\""), None)),
         );
         let (_dir, file, path) = fixture_file().await;
         let entry = store.resolve(&key.as_ref(), &file, &path);
@@ -887,17 +879,11 @@ mod tests {
         };
         store.set(
             &pool_key.as_ref(),
-            Arc::new(UpstreamMetadata::from_upstream(
-                Some("\"pool\"".into()),
-                None,
-            )),
+            Arc::new(UpstreamMetadata::from_upstream(Some("\"pool\""), None)),
         );
         store.set(
             &flat_key.as_ref(),
-            Arc::new(UpstreamMetadata::from_upstream(
-                Some("\"flat\"".into()),
-                None,
-            )),
+            Arc::new(UpstreamMetadata::from_upstream(Some("\"flat\""), None)),
         );
         assert_eq!(store.len(), 2, "the layout discriminates the two entries");
 
@@ -1036,10 +1022,7 @@ mod tests {
         let key = fixture_key();
         store.set(
             &key.as_ref(),
-            Arc::new(UpstreamMetadata::from_upstream(
-                Some("\"abc\"".into()),
-                None,
-            )),
+            Arc::new(UpstreamMetadata::from_upstream(Some("\"abc\""), None)),
         );
         assert_eq!(store.len(), 1);
         store.invalidate(&key.as_ref());
@@ -1062,10 +1045,7 @@ mod tests {
 
         store.set(
             &key.as_ref(),
-            Arc::new(UpstreamMetadata::from_upstream(
-                Some("\"published\"".into()),
-                None,
-            )),
+            Arc::new(UpstreamMetadata::from_upstream(Some("\"published\""), None)),
         );
         assert_eq!(
             store.resolve(&key.as_ref(), &file, &path).etag.as_deref(),
@@ -1098,10 +1078,8 @@ mod tests {
 
     #[test]
     fn from_upstream_parses_last_modified() {
-        let m = UpstreamMetadata::from_upstream(
-            Some("\"abc\"".into()),
-            Some("Thu, 01 Jan 1970 00:00:00 GMT".into()),
-        );
+        let m =
+            UpstreamMetadata::from_upstream(Some("\"abc\""), Some("Thu, 01 Jan 1970 00:00:00 GMT"));
         assert_eq!(m.etag.as_deref(), Some("\"abc\""));
         let (s, _date) = m.last_modified.expect("parsed");
         assert_eq!(&*s, "Thu, 01 Jan 1970 00:00:00 GMT");
@@ -1110,8 +1088,8 @@ mod tests {
     #[test]
     fn from_upstream_drops_malformed_etag() {
         let m = UpstreamMetadata::from_upstream(
-            Some("not-an-etag".into()),
-            Some("Thu, 01 Jan 1970 00:00:00 GMT".into()),
+            Some("not-an-etag"),
+            Some("Thu, 01 Jan 1970 00:00:00 GMT"),
         );
         assert!(m.etag.is_none());
         let (s, _date) = m.last_modified.expect("valid Last-Modified is retained");
@@ -1120,7 +1098,7 @@ mod tests {
 
     #[test]
     fn from_upstream_drops_malformed_last_modified() {
-        let m = UpstreamMetadata::from_upstream(None, Some("not a date".into()));
+        let m = UpstreamMetadata::from_upstream(None, Some("not a date"));
         assert!(m.last_modified.is_none());
     }
 
@@ -1128,8 +1106,8 @@ mod tests {
     fn check_upstream_validators_keeps_well_formed_values() {
         let mut calls = 0;
         let (etag, lm) = check_upstream_validators(
-            Some("W/\"abc\"".into()),
-            Some("Thu, 01 Jan 1970 00:00:00 GMT".into()),
+            Some("W/\"abc\""),
+            Some("Thu, 01 Jan 1970 00:00:00 GMT"),
             |_invalid| calls += 1,
         );
         assert_eq!(etag.as_deref(), Some("W/\"abc\""));
@@ -1140,7 +1118,7 @@ mod tests {
     #[test]
     fn check_upstream_validators_passes_absent_values_silently() {
         let mut calls = 0;
-        let (etag, lm) = check_upstream_validators(None, None, |_invalid| calls += 1);
+        let (etag, lm) = check_upstream_validators::<&str>(None, None, |_invalid| calls += 1);
         assert_eq!(etag, None);
         assert_eq!(lm, None);
         assert_eq!(calls, 0);
@@ -1150,8 +1128,8 @@ mod tests {
     fn check_upstream_validators_discards_malformed_etag() {
         let mut expected = [InvalidValidator::ETag("not-an-etag")].into_iter();
         let (etag, lm) = check_upstream_validators(
-            Some("not-an-etag".into()),
-            Some("Thu, 01 Jan 1970 00:00:00 GMT".into()),
+            Some("not-an-etag"),
+            Some("Thu, 01 Jan 1970 00:00:00 GMT"),
             |invalid| assert_eq!(Some(invalid), expected.next()),
         );
         assert_eq!(etag, None);
@@ -1162,11 +1140,10 @@ mod tests {
     #[test]
     fn check_upstream_validators_discards_malformed_last_modified() {
         let mut expected = [InvalidValidator::LastModified("not a date")].into_iter();
-        let (etag, lm) = check_upstream_validators(
-            Some("\"abc\"".into()),
-            Some("not a date".into()),
-            |invalid| assert_eq!(Some(invalid), expected.next()),
-        );
+        let (etag, lm) =
+            check_upstream_validators(Some("\"abc\""), Some("not a date"), |invalid| {
+                assert_eq!(Some(invalid), expected.next())
+            });
         assert_eq!(etag.as_deref(), Some("\"abc\""));
         assert_eq!(lm, None);
         assert_eq!(expected.next(), None);
@@ -1215,10 +1192,9 @@ mod tests {
             InvalidValidator::LastModified("worse"),
         ]
         .into_iter();
-        let (etag, lm) =
-            check_upstream_validators(Some("bad".into()), Some("worse".into()), |invalid| {
-                assert_eq!(Some(invalid), expected.next());
-            });
+        let (etag, lm) = check_upstream_validators(Some("bad"), Some("worse"), |invalid| {
+            assert_eq!(Some(invalid), expected.next());
+        });
         assert_eq!(etag, None);
         assert_eq!(lm, None);
         assert_eq!(expected.next(), None);

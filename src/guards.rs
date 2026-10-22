@@ -1292,7 +1292,7 @@ mod tests {
                 Ok(()) | Err(_) => {}
             }
             let old_metadata = Arc::new(UpstreamMetadata::from_upstream(
-                Some(String::from("\"previous-version\"")),
+                Some("\"previous-version\""),
                 None,
             ));
             cache_metadata::store().set(&key.as_ref(), Arc::clone(&old_metadata));
@@ -1635,7 +1635,7 @@ mod tests {
         let store = cache_metadata::store();
         let key = key("kept-validators.deb");
         let metadata = Arc::new(UpstreamMetadata::from_upstream(
-            Some(String::from("\"current-version\"")),
+            Some("\"current-version\""),
             None,
         ));
         store.set(&key.as_ref(), Arc::clone(&metadata));

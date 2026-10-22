@@ -555,8 +555,8 @@ async fn prepare_cache_target(
     // removed on drop instead. A resumed `206` keeps the partial's validators
     // it does not repeat (`inherit_resumed`).
     let download_meta = cache_metadata::UpstreamMetadata::from_upstream(
-        upstream_resp.etag.clone(),
-        upstream_resp.last_modified.clone(),
+        upstream_resp.etag.as_deref(),
+        upstream_resp.last_modified.as_deref(),
     )
     .inherit_resumed(partial.resumed_validators());
     let target_file = partial.target_file();
@@ -1627,8 +1627,8 @@ async fn splice_proxy_drive(
                 &stale.file,
                 &stale.path,
                 cache_metadata::UpstreamMetadata::from_upstream(
-                    upstream_resp.etag.clone(),
-                    upstream_resp.last_modified.clone(),
+                    upstream_resp.etag.as_deref(),
+                    upstream_resp.last_modified.as_deref(),
                 ),
             );
             return serve_volatile_304_via_sendfile(

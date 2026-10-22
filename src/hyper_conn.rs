@@ -2409,13 +2409,11 @@ async fn serve_new_file_worker(
         fwd_response
             .headers()
             .get(ETAG)
-            .and_then(|hv| std::str::from_utf8(hv.as_bytes()).ok())
-            .map(String::from),
+            .and_then(|hv| std::str::from_utf8(hv.as_bytes()).ok()),
         fwd_response
             .headers()
             .get(LAST_MODIFIED)
-            .and_then(|hv| std::str::from_utf8(hv.as_bytes()).ok())
-            .map(String::from),
+            .and_then(|hv| std::str::from_utf8(hv.as_bytes()).ok()),
         |invalid| match invalid {
             InvalidValidator::ETag(etag) => warn_once_or_info!(
                 "Upstream mirror {} sent an invalid ETag `{}` for {}; discarding it",
@@ -2637,8 +2635,6 @@ async fn serve_new_file_worker(
         &conn_details.debname,
     );
 
-    let (_parts, body) = fwd_response.into_parts();
-
     let filename = Path::new(&conn_details.debname);
     assert!(
         filename.is_relative(),
@@ -2651,6 +2647,7 @@ async fn serve_new_file_worker(
         UpstreamMetadata::from_upstream(upstream_etag, upstream_last_modified)
             .inherit_resumed(partial.resumed_validators()),
     );
+    let (_parts, body) = fwd_response.into_parts();
     let target_file = partial.target_file();
 
     // Create/open the output file: partial path for permanent files, random temp for volatile.

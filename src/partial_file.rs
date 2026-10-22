@@ -1230,7 +1230,7 @@ mod tests {
         assert_eq!(
             resume.partial.resumed_validators(),
             Some(&UpstreamMetadata::from_upstream(
-                Some("\"strong\"".into()),
+                Some("\"strong\""),
                 Some(stored_lm.into())
             ))
         );
