@@ -96,7 +96,7 @@ use crate::{
         preflight_method, preflight_target, preflight_via,
     },
     response_head::{ResponseHead, WireBody},
-    static_assert, swrite,
+    static_assert,
     transfer_error::{
         CacheError, ClientError, DeliveryEnd, DeliveryFailure, InternalError, TransferOutcome,
     },
@@ -691,10 +691,12 @@ async fn write_webui_response(
     let body_len = response.body.len();
     let status = response.status;
 
-    let mut extra_headers = String::new();
-    for &(name, value) in response.extra_headers() {
-        swrite!(extra_headers, "{name}: {value}\r\n");
-    }
+    let extra_headers = std::fmt::from_fn(|f| {
+        for &(name, value) in response.extra_headers() {
+            write!(f, "{name}: {value}\r\n")?;
+        }
+        Ok(())
+    });
 
     let header = format!(
         "{conn_version} {status}\r\n\
