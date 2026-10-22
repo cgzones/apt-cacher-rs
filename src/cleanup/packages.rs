@@ -540,7 +540,13 @@ pub(super) async fn try_fetch_packages_file(
         let req = Request::builder()
             .method(Method::GET)
             .uri(uri)
-            .header(CACHE_CONTROL, "max-age=604800") // 1 week
+            .header(
+                CACHE_CONTROL,
+                format!(
+                    "max-age={}",
+                    crate::limits::VOLATILE_CACHE_MAX_AGE.as_secs()
+                ),
+            )
             .body(Empty::new())
             .expect("Request should be valid");
 

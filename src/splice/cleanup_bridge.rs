@@ -5,7 +5,7 @@
 //! `process_cache_request` would; [`process_cache_request`] is the
 //! signature-compatible entry cleanup calls in both builds.
 
-use std::{io::ErrorKind, path::Path, time::Duration};
+use std::{io::ErrorKind, path::Path, time::SystemTime};
 
 use http::{StatusCode, Uri, uri::PathAndQuery};
 use tokio::io::AsyncReadExt as _;
@@ -57,20 +57,6 @@ fn buffering_cap(path: &str) -> u64 {
         .get()
 }
 
-/// Parse the `max-age` directive from a request's `Cache-Control` header.
-fn cache_control_max_age(req: &http::Request<http_body_util::Empty<()>>) -> Option<Duration> {
-    let value = req
-        .headers()
-        .get(http::header::CACHE_CONTROL)?
-        .to_str()
-        .ok()?;
-    value
-        .split(',')
-        .find_map(|directive| directive.trim().strip_prefix("max-age="))
-        .and_then(|secs| secs.parse::<u64>().ok())
-        .map(Duration::from_secs)
-}
-
 /// Serve a cleanup index request from the already-open cache file, if fresh.
 ///
 /// Returns `None` when the cached copy is stale (or has a future mtime) and
@@ -81,6 +67,7 @@ async fn serve_cached_cleanup_file(
     mut file: tokio::fs::File,
     cache_path: &Path,
     req: &http::Request<http_body_util::Empty<()>>,
+    now: SystemTime,
 ) -> Option<http::Response<ProxyCacheBody>> {
     let mdata = match regular_file_metadata(&file, cache_path) {
         Ok(data) => data,
@@ -92,14 +79,14 @@ async fn serve_cached_cleanup_file(
     let modified = mdata
         .modified()
         .expect("Platform should support modification timestamps via setup check");
-    let Ok(elapsed) = modified.elapsed() else {
+    let Ok(elapsed) = now.duration_since(modified) else {
         warn_once_or_info!(
             "Volatile file `{}` was modified in the future; treating it as stale and refetching from upstream",
             cache_path.display()
         );
         return None;
     };
-    let max_age = cache_control_max_age(req).unwrap_or(VOLATILE_CACHE_MAX_AGE);
+    let max_age = VOLATILE_CACHE_MAX_AGE;
     if elapsed >= max_age {
         return None;
     }
@@ -146,13 +133,11 @@ async fn serve_cached_cleanup_file(
 /// Cleanup index fetch for hyper-less builds: the `process_cache_request`
 /// bridge in `main.rs` lands here.
 ///
-/// A cached copy younger than the request's `Cache-Control: max-age`
-/// (cleanup sends 1 week) is served without touching upstream. This
-/// deliberately diverges from the hyper backend, which revalidates
-/// conditionally past `VOLATILE_CACHE_MAX_AGE` (30s): without conditional
-/// refetch machinery here yet, honoring the caller-declared max-age avoids a
-/// full re-download of every index each cleanup cycle, and a stale index errs
-/// toward *keeping* cached debs — the conservative direction for cleanup.
+/// Only copies younger than `VOLATILE_CACHE_MAX_AGE` (30s) may supply
+/// references. Older named indexes can omit packages introduced since their
+/// fetch, even while clients keep current by-hash indexes cached. Fetch them
+/// upstream; request headers cannot extend freshness. This bridge performs a
+/// full fetch, while Hyper may conditionally revalidate.
 #[must_use]
 async fn splice_cleanup_request(
     conn_details: &ConnectionDetails,
@@ -161,7 +146,9 @@ async fn splice_cleanup_request(
     let cache_path = conn_details.cache_file_path();
     match tokio_nofollow_options().read(true).open(&cache_path).await {
         Ok(file) => {
-            if let Some(resp) = serve_cached_cleanup_file(file, &cache_path, req).await {
+            if let Some(resp) =
+                serve_cached_cleanup_file(file, &cache_path, req, SystemTime::now()).await
+            {
                 note_cached_index_touch(conn_details, req.uri().path(), &cache_path);
                 return resp;
             }
@@ -273,6 +260,44 @@ pub(crate) async fn process_cache_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn freshness_uses_thirty_seconds_even_with_a_week_long_request_allowance() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("Packages");
+        std::fs::write(&path, b"index").expect("index");
+        let modified = std::fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        let request = http::Request::builder()
+            .uri("http://mirror/debian/dists/sid/main/binary-amd64/Packages")
+            .header(http::header::CACHE_CONTROL, "max-age=604800")
+            .body(http_body_util::Empty::new())
+            .expect("request");
+        for (age, fresh) in [
+            (Duration::ZERO, true),
+            (Duration::from_secs(29), true),
+            (Duration::from_secs(30), false),
+            (Duration::from_hours(6 * 24), false),
+        ] {
+            let file = tokio::fs::File::open(&path).await.expect("open");
+            assert_eq!(
+                serve_cached_cleanup_file(file, &path, &request, modified + age)
+                    .await
+                    .is_some(),
+                fresh
+            );
+        }
+        let file = tokio::fs::File::open(&path).await.expect("open");
+        assert!(
+            serve_cached_cleanup_file(file, &path, &request, modified - Duration::from_secs(1))
+                .await
+                .is_none(),
+            "future mtimes are stale"
+        );
+    }
 
     #[test]
     fn buffering_cap_follows_the_index_compression() {
