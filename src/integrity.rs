@@ -42,7 +42,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 
-use hashbrown::{DefaultHashBuilder, Equivalent, HashMap, HashTable, hash_table::AbsentEntry};
+use hashbrown::{
+    DefaultHashBuilder, Equivalent, HashMap, HashTable, hash_map::EntryRef, hash_table::AbsentEntry,
+};
 use parking_lot::Mutex;
 use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use tracing::{debug, error, warn};
@@ -936,21 +938,16 @@ impl ChecksumRegistry {
             authority,
             mirror_path,
         };
-        let scope = if let Some((scope, _)) = inner.map.get_key_value(&scope_ref) {
-            Arc::clone(scope)
-        } else {
-            let scope = Arc::new(RegistryScope {
-                authority: authority.to_owned(),
-                mirror_path: mirror_path.to_owned(),
-            });
-            inner.map.insert(Arc::clone(&scope), ScopeState::default());
-            scope
+        let state = match inner.map.entry_ref(&scope_ref) {
+            EntryRef::Occupied(entry) => entry.into_mut(),
+            EntryRef::Vacant(entry) => entry.insert_with_key(
+                Arc::new(RegistryScope {
+                    authority: authority.to_owned(),
+                    mirror_path: mirror_path.to_owned(),
+                }),
+                ScopeState::default(),
+            ),
         };
-
-        let state = inner
-            .map
-            .get_mut(&scope)
-            .expect("scope was just looked up or inserted");
         let key = fingerprint(relpath);
         let kind = KeyKind::of(relpath);
         let seq = state.next_seq();
