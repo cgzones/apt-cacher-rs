@@ -285,7 +285,7 @@ pub(super) async fn standard_upstream_connect(
     // Restarted with every connect attempt: the one that connects is the
     // attempt the exchange's time to first byte counts from.
     let mut attempt_started;
-    let (mut up, scheme) = loop {
+    let mut up = loop {
         attempt_started = PreciseInstant::now();
         let err = match connect_upstream(mirror, resolved_scheme).await {
             Ok(conn) => break conn,
@@ -361,6 +361,7 @@ pub(super) async fn standard_upstream_connect(
         );
         tokio::time::sleep(delay).await;
     };
+    let scheme = up.scheme();
     if let Some(decision) = decision {
         cache_scheme(mirror, scheme);
         // Loop-exit upgrade outcome: HTTPS connected → SUCCEEDED; fell back to

@@ -648,7 +648,7 @@ const fn classify_tls_error(kind: ErrorKind) -> Transience {
 pub(super) async fn connect_upstream(
     mirror: &Mirror,
     scheme: Option<Scheme>,
-) -> Result<(UpstreamConn, Scheme), ConnectError> {
+) -> Result<UpstreamConn, ConnectError> {
     let host = mirror.host();
 
     match scheme {
@@ -656,14 +656,14 @@ pub(super) async fn connect_upstream(
             let tcp = tcp_connect(host, mirror_port(mirror, false))
                 .await
                 .map_err(ConnectError::transient)?;
-            Ok((UpstreamConn::Tcp(tcp), Scheme::Http))
+            Ok(UpstreamConn::Tcp(tcp))
         }
         Some(Scheme::Https) => {
             let tcp = tcp_connect(host, mirror_port(mirror, true))
                 .await
                 .map_err(ConnectError::transient)?;
             let tls = tls_connect(tcp, host).await?;
-            Ok((UpstreamConn::Tls(tls), Scheme::Https))
+            Ok(UpstreamConn::Tls(tls))
         }
         None => {
             // Auto mode: try HTTPS first, fall back to HTTP
@@ -676,7 +676,7 @@ pub(super) async fn connect_upstream(
                             "splice proxy: HTTPS upgrade succeeded for {}",
                             mirror.format_authority()
                         );
-                        return Ok((UpstreamConn::Tls(tls), Scheme::Https));
+                        return Ok(UpstreamConn::Tls(tls));
                     }
                     Err(err)
                         if err.certificate_rejected
@@ -723,7 +723,7 @@ pub(super) async fn connect_upstream(
             let tcp = tcp_connect(host, mirror_port(mirror, false))
                 .await
                 .map_err(ConnectError::transient)?;
-            Ok((UpstreamConn::Tcp(tcp), Scheme::Http))
+            Ok(UpstreamConn::Tcp(tcp))
         }
     }
 }
