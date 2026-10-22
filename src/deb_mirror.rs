@@ -1446,12 +1446,7 @@ mod tests {
         assert_eq!(
             result,
             Origin {
-                mirror: Mirror::new(
-                    ClientHost::new("deb.debian.org").unwrap(),
-                    None,
-                    "debian".to_string(),
-                    MirrorKind::Structured,
-                ),
+                mirror: crate::test_support::structured_mirror("deb.debian.org", "debian"),
                 fields: OriginFields {
                     distribution: "sid".to_string(),
                     component: "main".to_string(),
@@ -1540,12 +1535,7 @@ mod tests {
         assert_eq!(
             result,
             Origin {
-                mirror: Mirror::new(
-                    ClientHost::new("2001:db8::1").unwrap(),
-                    None,
-                    "debian".to_string(),
-                    MirrorKind::Structured,
-                ),
+                mirror: crate::test_support::structured_mirror("2001:db8::1", "debian"),
                 fields: OriginFields {
                     distribution: "sid".to_string(),
                     component: "main".to_string(),
@@ -2602,7 +2592,7 @@ mod tests {
         assert_eq!(
             Origin::from_path(&path, host(), None, &local_client()),
             Some(Origin {
-                mirror: Mirror::new(host(), None, String::from("debian"), MirrorKind::Structured),
+                mirror: crate::test_support::structured_mirror("deb.debian.org", "debian"),
                 fields: OriginFields {
                     distribution: String::from("sid"),
                     component: String::from("main"),
