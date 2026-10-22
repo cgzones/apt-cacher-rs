@@ -534,8 +534,6 @@ pub(crate) async fn db_loop(
                     while let Ok(cmd) = db_thread_rx.try_recv() {
                         stage(&database, &mut cache, &mut buf, cmd).await;
                     }
-                    flush_batches(&database, &mut buf, FlushReason::OnShutdown).await;
-                    flush_last_seen(&database, &mut cache).await;
                     break;
                 }
             }
@@ -548,8 +546,6 @@ pub(crate) async fn db_loop(
             count = db_thread_rx.recv_many(&mut received, receive_limit) => {
                 if count == 0 {
                     debug!("Database task channel closed, draining...");
-                    flush_batches(&database, &mut buf, FlushReason::OnShutdown).await;
-                    flush_last_seen(&database, &mut cache).await;
                     break;
                 }
 
@@ -577,6 +573,9 @@ pub(crate) async fn db_loop(
             }
         }
     }
+
+    flush_batches(&database, &mut buf, FlushReason::OnShutdown).await;
+    flush_last_seen(&database, &mut cache).await;
 
     debug!("Database task stopped");
 }
