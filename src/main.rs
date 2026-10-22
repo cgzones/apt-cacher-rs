@@ -106,6 +106,7 @@ mod upstream_retry;
 mod uri_authority;
 mod verified_marker;
 mod verify_throttle;
+mod volatile_metrics;
 mod web;
 mod write_stall;
 mod xattr_helpers;

@@ -12,6 +12,7 @@ use std::path::Path;
 use tracing::{error, warn};
 
 use crate::transfer_error::CacheError;
+use crate::volatile_metrics::Renewal;
 use crate::{error::ErrorReport, log_once::Logged, metrics, warn_once_or_debug};
 
 /// [`std::fs::OpenOptions`] with `O_NOFOLLOW` pre-set: every open of a path
@@ -243,7 +244,7 @@ pub(crate) fn regular_file_metadata(
 pub(crate) async fn touch_volatile_mtime(
     file: tokio::fs::File,
     display_path: &Path,
-) -> tokio::fs::File {
+) -> (tokio::fs::File, Renewal) {
     let mdata = match borrowed_metadata(&file) {
         Ok(m) => m,
         Err(err) => {
@@ -253,7 +254,7 @@ pub(crate) async fn touch_volatile_mtime(
                 display_path.display(),
                 ErrorReport(&err)
             );
-            return file;
+            return (file, Renewal::Failed);
         }
     };
     touch_volatile_mtime_with(file, &mdata, display_path).await
@@ -270,28 +271,42 @@ pub(crate) async fn touch_volatile_mtime_with(
     file: tokio::fs::File,
     metadata: &std::fs::Metadata,
     display_path: &Path,
-) -> tokio::fs::File {
-    // Cache entries are replaced on update, not overwritten, so the creation time (btime)
-    // represents the actual content age.  Mtime is repurposed as a "last revalidated"
-    // timestamp.  If the filesystem does not support btime, updating mtime would destroy
-    // the only content-age signal, so skip the update in that case.
-    if metadata.created().is_err() {
-        return file;
-    }
-
+) -> (tokio::fs::File, Renewal) {
+    let has_birth_time = metadata.created().is_ok();
     // Refactor when https://github.com/tokio-rs/tokio/issues/6368 is resolved
     let std_file = file.into_std().await;
-    let now = std::time::SystemTime::now();
-    let result = tokio::task::block_in_place(|| std_file.set_modified(now));
-    if let Err(err) = result {
-        metrics::CACHE_IO_FAILURE.increment();
-        error!(
-            "Failed to update the modification time of `{}`; its volatile freshness window is not reset:  {}",
-            display_path.display(),
-            ErrorReport(&err)
-        );
+    let renewal = tokio::task::block_in_place(|| {
+        renew_volatile_mtime(has_birth_time, display_path, || {
+            std_file.set_modified(std::time::SystemTime::now())
+        })
+    });
+    (tokio::fs::File::from_std(std_file), renewal)
+}
+
+/// The capability and syscall are explicit so tests can exercise a filesystem
+/// without birth time and a failed timestamp write on any test host.
+fn renew_volatile_mtime(
+    has_birth_time: bool,
+    display_path: &Path,
+    update: impl FnOnce() -> std::io::Result<()>,
+) -> Renewal {
+    // Cache entries are replaced, not overwritten. Without birth time, mtime
+    // is the only content-age signal, so preserve it instead of refreshing it.
+    if !has_birth_time {
+        return Renewal::NoBirthTime;
     }
-    tokio::fs::File::from_std(std_file)
+    match update() {
+        Ok(()) => Renewal::Renewed,
+        Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "Failed to update the modification time of `{}`; its volatile freshness window is not reset:  {}",
+                display_path.display(),
+                ErrorReport(&err)
+            );
+            Renewal::Failed
+        }
+    }
 }
 
 /// Transfers below this size don't get a readahead hint: the kernel's
@@ -608,5 +623,28 @@ mod tests {
         assert_eq!(report.matches("(os error").count(), 1, "{report}");
         assert_eq!(metrics::CACHE_IO_FAILURE.get(), before + 1);
         assert!(!DeliveryFailure::from(error).is_peer_disconnect());
+    }
+    #[test]
+    fn volatile_renewal_reports_capability_and_write_outcome() {
+        let path = Path::new("volatile-index");
+        let mut called = false;
+        assert_eq!(
+            renew_volatile_mtime(false, path, || {
+                called = true;
+                Ok(())
+            }),
+            Renewal::NoBirthTime
+        );
+        assert!(!called, "unsupported filesystems must preserve mtime");
+        assert_eq!(
+            renew_volatile_mtime(true, path, || Ok(())),
+            Renewal::Renewed
+        );
+        assert_eq!(
+            renew_volatile_mtime(true, path, || {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            }),
+            Renewal::Failed
+        );
     }
 }

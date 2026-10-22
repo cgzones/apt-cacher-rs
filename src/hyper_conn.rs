@@ -44,7 +44,9 @@ use crate::{
     },
     build_info::{APP_USER_AGENT, APP_VIA},
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
-    cache_layout::{CacheMiss, CachedFlavor, ConnectionDetails, LookupOutcome},
+    cache_layout::{
+        CacheMiss, CachedFlavor, ConnectionDetails, FetchRole, LookupOutcome, MissReason,
+    },
     cache_metadata::{
         self, InvalidValidator, UpstreamMetadata, check_upstream_validators,
         write_upstream_metadata,
@@ -1405,7 +1407,8 @@ async fn serve_volatile_file(
     // Cache volatile files for short periods to reduce up-to-date requests.
     // Compute age from the raw SystemTime — HttpDate rounds sub-second mtimes
     // up to the next whole second, which would otherwise appear to be in the future.
-    if let Ok(elapsed) = modified_system_time.elapsed() {
+    let age = modified_system_time.elapsed();
+    if let Ok(elapsed) = age {
         if elapsed < VOLATILE_CACHE_MAX_AGE {
             debug!(
                 "Volatile file `{}` age {} is within the {} freshness window, serving cached version...",
@@ -1432,19 +1435,19 @@ async fn serve_volatile_file(
     // Lookup-site parent refetch bump; dominates the VOLATILE_REFETCHED_*
     // subset bumps in `serve_new_file`. Cleanup-synthetic probes are
     // operator bookkeeping, not user traffic, and count nothing.
-    conn_details.count_lookup(LookupOutcome::Miss);
+    let reason = if age.is_err() {
+        MissReason::FutureTimestamp
+    } else {
+        MissReason::Expired
+    };
+    let miss = CacheMiss::StaleVolatile {
+        reason,
+        file,
+        size: mdata.size(),
+    };
+    conn_details.count_lookup(miss.outcome());
 
-    serve_cache_miss(
-        conn_details,
-        req,
-        file_path,
-        CacheMiss::StaleVolatile {
-            file,
-            size: mdata.size(),
-        },
-        appstate,
-    )
-    .await
+    serve_cache_miss(conn_details, req, file_path, miss, appstate).await
 }
 
 /// Fetch (or join the in-flight fetch of) a resource whose cache lookup
@@ -1469,6 +1472,7 @@ async fn serve_cache_miss(
     loop {
         return match appstate.active_downloads.register(conn_details.key()) {
             Admission::Originator(origination) => {
+                conn_details.count_fetch_role(FetchRole::Originator);
                 let cfstate = match miss {
                     CacheMiss::NotFound => {
                         trace!(
@@ -1477,7 +1481,11 @@ async fn serve_cache_miss(
                         );
                         CacheFileStat::New
                     }
-                    CacheMiss::StaleVolatile { file, size } => CacheFileStat::Volatile {
+                    CacheMiss::StaleVolatile {
+                        file,
+                        size,
+                        reason: _,
+                    } => CacheFileStat::Volatile {
                         file,
                         file_path: cache_path,
                         prev_size: size,
@@ -1486,6 +1494,7 @@ async fn serve_cache_miss(
                 serve_new_file(conn_details, origination, req, cfstate, appstate).await
             }
             Admission::LateJoiner { status } => {
+                conn_details.count_fetch_role(FetchRole::Joiner);
                 match miss {
                     CacheMiss::NotFound => {
                         trace!(
@@ -1516,7 +1525,10 @@ async fn serve_cache_miss(
                 }
                 serve_joined(joined, conn_details, &req, status, None, Role::LateJoiner).await
             }
-            Admission::AtCapacity { max } => upstream_cap_rejection(&conn_details, max),
+            Admission::AtCapacity { max } => {
+                conn_details.count_fetch_role(FetchRole::Refused);
+                upstream_cap_rejection(&conn_details, max)
+            }
         };
     }
 }
@@ -2178,6 +2190,10 @@ async fn serve_new_file_worker(
     );
     trace!("Forwarded request: {fwd_request:?}");
 
+    let mut revalidation = crate::volatile_metrics::Revalidation::new(
+        conn_details,
+        revalidate.map(|meta| (meta.etag.is_some(), meta.last_modified.is_some())),
+    );
     let mut upstream_request_sent = PreciseInstant::now();
     // The timing of the exchange whose answer is used: replaced below with
     // every followed redirect and refetch, like the response.
@@ -2185,6 +2201,7 @@ async fn serve_new_file_worker(
         match request_with_retry(&appstate.https_client, fwd_request, Traffic::Proxied).await {
             Ok((r, _parts, timing)) => (r, timing),
             Err(error) => {
+                revalidation.failed();
                 return Err(error.into_failure("request upstream response"));
             }
         };
@@ -2235,6 +2252,7 @@ async fn serve_new_file_worker(
             {
                 Ok((r, _parts, timing)) => (r, timing),
                 Err(error) => {
+                    revalidation.failed();
                     return Err(error.into_failure("request upstream response"));
                 }
             };
@@ -2349,6 +2367,7 @@ async fn serve_new_file_worker(
                 {
                     Ok((r, _parts, timing)) => (r, timing),
                     Err(error) => {
+                        revalidation.failed();
                         return Err(error.into_failure("request upstream response"));
                     }
                 };
@@ -2364,6 +2383,7 @@ async fn serve_new_file_worker(
             )
         }
     };
+    revalidation.responded(head.status.as_u16());
     // The final exchange answered with a body or a 304: its time to first
     // byte is the mirror's (splice records it at the same point).
     if plan.is_answered() && !conn_details.client.is_cleanup_synthetic() {
@@ -2421,7 +2441,8 @@ async fn serve_new_file_worker(
                 &file_path,
                 UpstreamMetadata::from_upstream(upstream_etag, upstream_last_modified),
             );
-            let file = touch_volatile_mtime(file, &file_path).await;
+            let (file, renewal) = touch_volatile_mtime(file, &file_path).await;
+            renewal.record(conn_details);
 
             let settled = ibarrier.finished(file_path.clone()).await;
 
@@ -2797,7 +2818,7 @@ pub(crate) async fn process_cache_request(
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            conn_details.count_lookup(LookupOutcome::Miss);
+            conn_details.count_lookup(LookupOutcome::Miss(MissReason::Absent));
 
             serve_cache_miss(conn_details, req, cache_path, CacheMiss::NotFound, appstate).await
         }

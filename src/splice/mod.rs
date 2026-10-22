@@ -60,7 +60,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, info, trace};
 
 use crate::cache_conditional::{RangeRequestHeaders, ServeParams};
-use crate::cache_layout::{CachedFlavor, ConnectionDetails};
+use crate::cache_layout::{CachedFlavor, ConnectionDetails, FetchRole};
 use crate::cache_quota::QuotaExceeded;
 use crate::error::ErrorReport;
 use crate::fs_open::{
@@ -197,11 +197,16 @@ pub(crate) async fn splice_proxy(
     // instead of falling all the way back to hyper. No late-joiner double
     // count, since `attach()` and `register()` are mutually exclusive paths.
     let origination = match appstate.active_downloads.register(conn_details.key()) {
-        Admission::Originator(origination) => origination,
+        Admission::Originator(origination) => {
+            conn_details.count_fetch_role(FetchRole::Originator);
+            origination
+        }
         Admission::LateJoiner { status } => {
+            conn_details.count_fetch_role(FetchRole::Joiner);
             return Ok(SpliceProxyOutcome::Concurrent { status });
         }
         Admission::AtCapacity { max } => {
+            conn_details.count_fetch_role(FetchRole::Refused);
             return Ok(SpliceProxyOutcome::AtCapacity { max });
         }
     };
@@ -254,7 +259,8 @@ async fn serve_volatile_304_via_sendfile(
         path,
         metadata,
     } = stale;
-    let file = touch_volatile_mtime_with(file, &metadata, &path).await;
+    let (file, renewal) = touch_volatile_mtime_with(file, &metadata, &path).await;
+    renewal.record(conn_details);
     let _settled = ibarrier.finished(path.clone()).await;
 
     // The pre-touch metadata serves as well as a fresh stat: the head's
@@ -1527,6 +1533,15 @@ async fn splice_proxy_drive(
             // The size a download's commit frees by replacing the stale copy,
             // read before the planner takes the copy.
             let prev_file_size = stale.as_ref().map_or(0, |copy| copy.metadata.len());
+            let mut revalidation = crate::volatile_metrics::Revalidation::new(
+                conn_details,
+                volatile_cond.as_ref().map(|headers| {
+                    (
+                        headers.if_none_match.is_some(),
+                        headers.if_modified_since.is_some(),
+                    )
+                }),
+            );
             let exchange = standard_upstream_connect(
                 &conn_details.upstream_mirror(),
                 &host_authority,
@@ -1536,7 +1551,8 @@ async fn splice_proxy_drive(
                 volatile_cond.as_ref(),
                 None,
             )
-            .await?;
+            .await
+            .inspect_err(|_| revalidation.failed())?;
             let (exchange, plan) = plan_upstream_response(
                 exchange,
                 conn_details,
@@ -1546,7 +1562,9 @@ async fn splice_proxy_drive(
                 volatile_cond.as_ref(),
                 stale,
             )
-            .await?;
+            .await
+            .inspect_err(|_| revalidation.failed())?;
+            revalidation.responded(exchange.response.status_code.as_u16());
             Ok((resume, exchange, plan, prev_file_size))
         })
         .await

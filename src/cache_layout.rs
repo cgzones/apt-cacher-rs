@@ -254,7 +254,26 @@ pub(crate) enum LookupOutcome {
     Hit,
     /// No usable file: the request fetched upstream or joined an in-flight
     /// fetch (for an index: absent or stale).
-    Miss,
+    Miss(MissReason),
+}
+
+/// Why a lookup could not use a complete cached file. In-flight attachment
+/// happens before disk inspection, so it must not claim the file is absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MissReason {
+    Absent,
+    Expired,
+    FutureTimestamp,
+    #[cfg(feature = "sendfile")]
+    InFlight,
+}
+
+/// Registration result, distinct from the earlier disk lookup.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FetchRole {
+    Originator,
+    Joiner,
+    Refused,
 }
 
 /// On-disk cache layout for a request.  Doubles as the discriminator on
@@ -418,11 +437,25 @@ pub(crate) enum CacheMiss {
     /// A volatile copy exists but is older than `VOLATILE_CACHE_MAX_AGE`
     /// (or its mtime is in the future); revalidate it upstream.
     StaleVolatile {
+        reason: MissReason,
         file: tokio::fs::File,
         /// The copy's on-disk size, for the quota reservation
         /// (`cache_quota.rs`: `prev_file_size`).
         size: u64,
     },
+}
+
+impl CacheMiss {
+    pub(crate) const fn outcome(&self) -> LookupOutcome {
+        LookupOutcome::Miss(match self {
+            Self::NotFound => MissReason::Absent,
+            Self::StaleVolatile {
+                reason,
+                file: _,
+                size: _,
+            } => *reason,
+        })
+    }
 }
 
 /// Per-request state carried across the cache pipeline.  Owns enough of the
@@ -516,21 +549,28 @@ impl ConnectionDetails {
             (LookupBucket::Package, LookupOutcome::Hit) => {
                 (&metrics::CACHE_HITS, &metrics::PACKAGE_HITS)
             }
-            (LookupBucket::Package, LookupOutcome::Miss) => {
+            (LookupBucket::Package, LookupOutcome::Miss(_)) => {
                 (&metrics::CACHE_MISSES, &metrics::PACKAGE_MISSES)
             }
             (LookupBucket::ByHash, LookupOutcome::Hit) => {
                 (&metrics::CACHE_HITS, &metrics::BYHASH_HITS)
             }
-            (LookupBucket::ByHash, LookupOutcome::Miss) => {
+            (LookupBucket::ByHash, LookupOutcome::Miss(_)) => {
                 (&metrics::CACHE_MISSES, &metrics::BYHASH_MISSES)
             }
             (LookupBucket::Index, LookupOutcome::Hit) => {
                 metrics::VOLATILE_HIT.increment();
                 return;
             }
-            (LookupBucket::Index, LookupOutcome::Miss) => {
+            (LookupBucket::Index, LookupOutcome::Miss(reason)) => {
                 metrics::VOLATILE_REFETCHED.increment();
+                match reason {
+                    MissReason::Absent => metrics::VOLATILE_ABSENT.increment(),
+                    MissReason::Expired => metrics::VOLATILE_EXPIRED.increment(),
+                    MissReason::FutureTimestamp => metrics::VOLATILE_FUTURE.increment(),
+                    #[cfg(feature = "sendfile")]
+                    MissReason::InFlight => metrics::VOLATILE_IN_FLIGHT.increment(),
+                }
                 return;
             }
         };
@@ -548,6 +588,18 @@ impl ConnectionDetails {
     #[must_use]
     pub(crate) const fn layout(&self) -> CacheLayout {
         self.resource_kind.layout()
+    }
+
+    /// The caller owns the admission decision; handoffs never repeat it.
+    pub(crate) fn count_fetch_role(&self, role: FetchRole) {
+        if self.client.is_cleanup_synthetic() || self.cached_flavor() != CachedFlavor::Volatile {
+            return;
+        }
+        match role {
+            FetchRole::Originator => metrics::VOLATILE_ORIGINATORS.increment(),
+            FetchRole::Joiner => metrics::VOLATILE_JOINERS.increment(),
+            FetchRole::Refused => metrics::VOLATILE_ADMISSION_REFUSED.increment(),
+        }
     }
 
     /// The entry identity every per-entry store keys on.

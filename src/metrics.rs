@@ -340,7 +340,8 @@ pub(crate) static CLIENT_STATUS_503: Signal = Signal::new();
 pub(crate) static CLIENT_STATUS_504: Signal = Signal::new();
 
 /// Volatile-resource hit served from cache within `VOLATILE_CACHE_MAX_AGE`.
-/// Ratio against `VOLATILE_REFETCHED` indicates whether max-age is well-tuned.
+/// Interpret with lookup reasons and renewal outcomes: sparse demand and a
+/// skipped renewal can both produce a low share against `VOLATILE_REFETCHED`.
 pub(crate) static VOLATILE_HIT: Counter = Counter::new();
 /// Volatile-resource request that found no fresh file (stale on disk or
 /// absent), so it needed upstream: it either fetched itself or joined the
@@ -357,6 +358,30 @@ pub(crate) static VOLATILE_REFETCHED: Counter = Counter::new();
 pub(crate) static VOLATILE_REFETCHED_UPTODATE: Counter = Counter::new();
 /// Subset of `VOLATILE_REFETCHED`: stale-but-present, upstream returned a fresh body.
 pub(crate) static VOLATILE_REFETCHED_OUTOFDATE: Counter = Counter::new();
+
+/// Volatile lookup misses, split at the lookup site (fresh = `VOLATILE_HIT`).
+pub(crate) static VOLATILE_ABSENT: Counter = Counter::new();
+pub(crate) static VOLATILE_EXPIRED: Counter = Counter::new();
+pub(crate) static VOLATILE_FUTURE: Counter = Counter::new();
+#[cfg(feature = "sendfile")]
+pub(crate) static VOLATILE_IN_FLIGHT: Counter = Counter::new();
+/// Admission decisions for client volatile requests, once after a miss.
+/// Originators own the fetch even when a later policy check refuses it.
+pub(crate) static VOLATILE_ORIGINATORS: Counter = Counter::new();
+pub(crate) static VOLATILE_JOINERS: Counter = Counter::new();
+pub(crate) static VOLATILE_ADMISSION_REFUSED: Counter = Counter::new();
+/// Attempts to renew freshness after a client-driven upstream 304.
+pub(crate) static VOLATILE_RENEWED: Counter = Counter::new();
+pub(crate) static VOLATILE_RENEWAL_NO_BTIME: Counter = Counter::new();
+pub(crate) static VOLATILE_RENEWAL_FAILED: Signal = Signal::new();
+/// Terminal logical revalidations: rows = `ETag` / Last-Modified / both / neither;
+/// columns = 304 / 200-or-206 head / other status / failure / interruption.
+/// Missing copies, cleanup, and joiners do not count. Retries count once.
+pub(crate) static VOLATILE_REVALIDATION: [[Counter; 5]; 4] = new_revalidation_counters();
+
+pub(crate) const fn new_revalidation_counters() -> [[Counter; 5]; 4] {
+    [const { [const { Counter::new() }; 5] }; 4]
+}
 
 /// Downloads whose content matched its expected digest before being committed
 /// to the cache.

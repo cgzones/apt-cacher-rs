@@ -261,6 +261,7 @@ pub(super) fn build_metrics_html(start_epoch: i64) -> (String, Highlights) {
     build_delivery_group(&mut g);
     build_passthrough_group(&mut g);
     build_cache_group(&mut g);
+    build_volatile_group(&mut g);
     if shown.verify_checksums {
         build_integrity_group(&mut g);
     }
@@ -767,6 +768,56 @@ impl Display for HitsMisses {
     }
 }
 
+/// Diagnostics keep lookup, admission, and completed revalidation populations
+/// separate: a joiner is a lookup miss but never another upstream exchange.
+fn build_volatile_group(g: &mut Groups) {
+    g.group("Volatile Indexes", |t| {
+        for (label, tip, counter) in [
+            ("Volatile Absent", "Lookup found no file. New indexes or cleanup can cause this; fresh hits remain in Volatile Hits.", &metrics::VOLATILE_ABSENT),
+            ("Volatile Expired", "Lookup found a file at least 30 seconds old. Compare freshness renewal outcomes before changing the freshness policy.", &metrics::VOLATILE_EXPIRED),
+            ("Volatile Future Timestamp", "Lookup found an mtime in the future and treated the file as stale. Check the host clock and cache-file timestamps.", &metrics::VOLATILE_FUTURE),
+            #[cfg(feature = "sendfile")]
+            ("Volatile Already In Flight", "Attached to an active download before disk lookup; the cached file's presence and age were not inspected. These four reasons sum to Volatile Refetches once lookups settle.", &metrics::VOLATILE_IN_FLIGHT),
+            ("Volatile Fetch Owners", "Misses admitted to own a download. Later policy checks may still refuse it; this is not a count of upstream HTTP attempts.", &metrics::VOLATILE_ORIGINATORS),
+            ("Volatile Fetch Joiners", "Misses attached to another download, including races after disk lookup. They do not revalidate upstream themselves.", &metrics::VOLATILE_JOINERS),
+            ("Volatile Admission Refused", "Misses refused at the upstream-download cap. Together with owners and joiners, accounts for admitted/refused volatile misses; see max_upstream_downloads.", &metrics::VOLATILE_ADMISSION_REFUSED),
+            ("Volatile Freshness Renewed", "Successful mtime refreshes after client-driven upstream 304 responses. New downloads are not renewals.", &metrics::VOLATILE_RENEWED),
+            ("Volatile Renewal Skipped (no birth time)", "304 responses that could not reset the freshness window because mtime is the only content-age timestamp. Immediate repeats may revalidate again; check filesystem birth-time support.", &metrics::VOLATILE_RENEWAL_NO_BTIME),
+        ] {
+            t.count_tip(label, tip, counter.get());
+        }
+        t.signal(
+            "Volatile Renewal Failed",
+            "304 freshness refreshes that failed to read metadata or write mtime. The cached body can still be served; check Cache I/O Failures and the log. Cleanup is excluded.",
+            Level::Warn,
+            &metrics::VOLATILE_RENEWAL_FAILED,
+        );
+        // Fixed labels keep the matrix bounded; no mirror or filename keys.
+        for (counters, (label, outcomes)) in metrics::VOLATILE_REVALIDATION.iter().zip([
+            ("Revalidations (ETag only)", ["ETag only: 304", "ETag only: Body (200/206)", "ETag only: Other Status", "ETag only: Failed", "ETag only: Interrupted"]),
+            ("Revalidations (Last-Modified only)", ["Last-Modified only: 304", "Last-Modified only: Body (200/206)", "Last-Modified only: Other Status", "Last-Modified only: Failed", "Last-Modified only: Interrupted"]),
+            ("Revalidations (both validators)", ["both validators: 304", "both validators: Body (200/206)", "both validators: Other Status", "both validators: Failed", "both validators: Interrupted"]),
+            ("Revalidations (no validators)", ["no validators: 304", "no validators: Body (200/206)", "no validators: Other Status", "no validators: Failed", "no validators: Interrupted"]),
+        ]) {
+            let values = counters.each_ref().map(Counter::get);
+            t.entry(label)
+                .tip("Completed client-driven fetches of an existing volatile copy, grouped by the validators sent upstream. Retries and redirects count once; joiners, new files and cleanup are excluded. Outcomes describe the final head, not body/commit success.")
+                .parts(|p| {
+                    for ((label, value), tip) in outcomes.into_iter().zip(values).zip([
+                        "Upstream confirmed the stored copy unchanged.",
+                        "Upstream returned a body-bearing head; bytes may be unchanged even with 200. Download and integrity counters describe subsequent completion.",
+                        "Upstream answered with another status, including a redirect that was not followed or a 4xx/5xx.",
+                        "The exchange failed before a final response was selected, after retries. See upstream failure metrics and logs.",
+                        "The request task ended before an outcome was recorded. This is not classified as an upstream failure.",
+                    ]) {
+                        p.count_tip(label, tip, value);
+                    }
+                })
+                .value(Count(values.iter().sum()));
+        }
+    });
+}
+
 fn build_cache_group(g: &mut Groups) {
     // The parts before their total, which is bumped first.
     let packages = HitsMisses::load(&metrics::PACKAGE_HITS, &metrics::PACKAGE_MISSES);
@@ -821,7 +872,7 @@ fn build_cache_group(g: &mut Groups) {
         share_row(
             t,
             "Volatile Hits",
-            "Index (Release/Packages/Translation/...) lookups served from the cache inside the freshness window, and their share of all index lookups (hits and the refetches below). A low share with several clients means they update at different times, more than the freshness window apart.",
+            "Index (Release/Packages/Translation/...) lookups served from the cache inside the freshness window, and their share of all index lookups (hits and the refetches below). A low share can mean requests are more than 30 seconds apart or freshness renewal was skipped; see Volatile Indexes.",
             volatile.hits,
             volatile.misses,
         );
@@ -834,8 +885,8 @@ fn build_cache_group(g: &mut Groups) {
                     refetched_uptodate,
                 );
                 p.count_tip(
-                    "Refetch Out-of-Date (200)",
-                    "Revalidations where upstream returned changed content.",
+                    "Refetch Body Returned (200/206)",
+                    "Revalidations where upstream returned a body-bearing response head (200/206). This does not prove content changed or the download committed.",
                     refetched_outofdate,
                 );
             })

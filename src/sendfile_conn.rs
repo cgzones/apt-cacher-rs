@@ -58,7 +58,9 @@ use crate::{
     },
     build_info::APP_NAME,
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
-    cache_layout::{CacheMiss, CachedFlavor, ConnectionDetails, LookupOutcome},
+    cache_layout::{
+        CacheMiss, CachedFlavor, ConnectionDetails, FetchRole, LookupOutcome, MissReason,
+    },
     cache_metadata::{self},
     client_counter,
     client_info::ClientInfo,
@@ -1290,7 +1292,8 @@ async fn try_sendfile_request(
         // fetched upstream if not for the in-flight originator.
         // `LATE_JOINERS_TOTAL` is the subset that attached; `attach()`
         // already bumped that counter.
-        conn_details.count_lookup(LookupOutcome::Miss);
+        conn_details.count_lookup(LookupOutcome::Miss(MissReason::InFlight));
+        conn_details.count_fetch_role(FetchRole::Joiner);
 
         return serve_unfinished_sendfile(
             stream,
@@ -1346,9 +1349,10 @@ async fn try_sendfile_request(
                     // A future mtime is stale, as in hyper and the cleanup
                     // bridge: counting it fresh would serve the copy until
                     // the clock caught up, freezing the index meanwhile.
-                    let fresh_age = match last_modified.elapsed() {
+                    let age = last_modified.elapsed();
+                    let fresh_age = match age {
                         Ok(elapsed) => Some(elapsed).filter(|e| *e < VOLATILE_CACHE_MAX_AGE),
-                        Err(_future @ SystemTimeError { .. }) => {
+                        Err(ref _future @ SystemTimeError { .. }) => {
                             warn_once_or_info!(
                                 "Volatile file `{}` was modified in the future; treating it as stale and refetching from upstream",
                                 cache_path.display()
@@ -1358,6 +1362,11 @@ async fn try_sendfile_request(
                     };
                     let Some(elapsed) = fresh_age else {
                         break 'cache_lookup Err(CacheMiss::StaleVolatile {
+                            reason: if age.is_err() {
+                                MissReason::FutureTimestamp
+                            } else {
+                                MissReason::Expired
+                            },
                             file,
                             size: md.size(),
                         });
@@ -1406,7 +1415,7 @@ async fn try_sendfile_request(
 
     // Cache miss or stale volatile file: a permanent file not found is a real
     // cache miss; a volatile file not found or stale is a refetch.
-    conn_details.count_lookup(LookupOutcome::Miss);
+    conn_details.count_lookup(miss.outcome());
 
     #[cfg(feature = "splice")]
     {
