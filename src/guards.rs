@@ -773,7 +773,7 @@ impl RenameBarrier {
         let plan = {
             let data = self
                 .data
-                .as_ref()
+                .as_mut()
                 .expect("every sink consumes the instance");
             RenamePlan {
                 temp_path: temp.guard.to_path_buf(),
@@ -781,7 +781,7 @@ impl RenameBarrier {
                 resource_kind: data.resource_kind,
                 debname: data.lease.key.debname.clone(),
                 mirror: data.lease.key.mirror.clone(),
-                raw_uri_path: data.raw_uri_path.clone(),
+                raw_uri_path: std::mem::take(&mut data.raw_uri_path),
                 streamed_digest,
             }
         };
