@@ -15,9 +15,7 @@ use crate::{metrics::Signal, swrite};
 
 use crate::humanfmt::HumanFmt;
 
-use super::fmt::{
-    Count, HtmlEscape, HtmlEscaped, Level, Nonzero, RelTime, StackBar, Unit, now_epoch,
-};
+use super::fmt::{Count, HtmlEscaped, Level, Nonzero, RelTime, StackBar, Unit, now_epoch};
 
 // ---------------------------------------------------------------------------
 // Table builders — append rows directly via `swrite!`. `Table::cell` needs to
@@ -267,6 +265,16 @@ pub(super) struct DetailsList {
 /// quotation mark), a separator no label contains.
 const SCOPE_SEPARATOR: &str = " \u{203a} ";
 
+/// A counter's path, borrowed until rendered; nested lists own their scope.
+fn series_path<'a>(scope: &'a str, label: &'a str) -> impl Display + 'a {
+    fmt::from_fn(move |f| {
+        if !scope.is_empty() {
+            write!(f, "{scope}{SCOPE_SEPARATOR}")?;
+        }
+        f.write_str(label)
+    })
+}
+
 /// Rows painted as alerts or warnings, for the Metrics section's badge.
 ///
 /// A row counts once, at its worst level, its parts included: a status
@@ -355,15 +363,6 @@ impl DetailsList {
     pub(super) fn scoped(mut self, scope: &'static str) -> Self {
         scope.clone_into(&mut self.scope);
         self
-    }
-
-    /// `label`'s path under this list's scope.
-    fn path(&self, label: &str) -> String {
-        if self.scope.is_empty() {
-            label.to_owned()
-        } else {
-            format!("{}{SCOPE_SEPARATOR}{label}", self.scope)
-        }
     }
 
     pub(super) fn row(&mut self, label: &'static str, value: impl Display) {
@@ -522,7 +521,7 @@ impl Entry<'_> {
     /// would land beside it, or on the next line under an unrelated cell.
     pub(super) fn parts(mut self, build: impl FnOnce(&mut DetailsList)) -> Self {
         let mut parts = DetailsList::open("parts", self.list.now);
-        parts.scope = self.list.path(self.label);
+        parts.scope = series_path(&self.list.scope, self.label).to_string();
         build(&mut parts);
         self.parts = Some(parts.finish());
         self
@@ -599,12 +598,11 @@ impl Entry<'_> {
             figure,
             polled,
         } = self;
-        let series = figure.map(|(value, unit)| (list.path(label), value, unit));
         let DetailsList {
             out,
             now,
             highlights,
-            scope: _,
+            scope,
         } = list;
         let row_start = out.len();
         out.push_str("<div");
@@ -614,11 +612,11 @@ impl Entry<'_> {
             (false, Some(kind)) => swrite!(out, " class=\"{kind}\""),
             (true, Some(kind)) => swrite!(out, " class=\"whole {kind}\""),
         }
-        if let Some((key, value, unit)) = series {
+        if let Some((value, unit)) = figure {
             swrite!(
                 out,
                 " data-series=\"{}\" data-v=\"{value}\"",
-                HtmlEscape(&key)
+                HtmlEscaped(series_path(scope, label))
             );
             if unit == Unit::Bytes {
                 out.push_str(" data-unit=\"B\"");
@@ -951,6 +949,27 @@ mod tests {
             "<div data-series=\"Upstream \u{203a} 2xx \u{203a} 200 OK\" data-v=\"1\"><dt>200 OK</dt>",
         ] {
             assert!(html.contains(needle), "{needle}: {html}");
+        }
+    }
+
+    #[test]
+    fn series_keys_escape_scopes_and_nested_labels() {
+        for (scope, prefix) in [("", ""), ("Up<&\"'", "Up&lt;&amp;&quot;&#x27; › ")] {
+            let mut list = DetailsList::with_now(0).scoped(scope);
+            list.entry("Total&")
+                .parts(|p| p.count("Child<\"'", 1))
+                .figure(1)
+                .value(Count(1));
+            let html = list.finish();
+            for key in [
+                format!("{prefix}Total&amp;"),
+                format!("{prefix}Total&amp; › Child&lt;&quot;&#x27;"),
+            ] {
+                assert!(
+                    html.contains(&format!("data-series=\"{key}\" data-v=\"1\"")),
+                    "{html}"
+                );
+            }
         }
     }
 
