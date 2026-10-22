@@ -875,7 +875,7 @@ async fn plan_upstream_response(
             conn_details,
             upstream_path,
             resume.offset,
-            resume.if_range.as_deref(),
+            resume.partial.if_range(),
             volatile_cond,
         ))
         .await?
@@ -900,7 +900,7 @@ async fn plan_upstream_response(
         ResumeState::new(
             resume.offset,
             resume.expected_total,
-            resume.if_range.as_deref(),
+            resume.partial.if_range(),
         ),
         conn_details.cached_flavor(),
         stale,
@@ -1547,7 +1547,7 @@ async fn splice_proxy_drive(
                 &host_authority,
                 upstream_path,
                 resume.offset,
-                resume.if_range.as_deref(),
+                resume.partial.if_range(),
                 volatile_cond.as_ref(),
                 None,
             )

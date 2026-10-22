@@ -111,6 +111,12 @@ impl PartialDownload {
         }
     }
 
+    /// Strong ETag authorizing a resume, absent once the partial is discarded.
+    pub(crate) fn if_range(&self) -> Option<&str> {
+        self.resumed_validators()
+            .and_then(|meta| meta.etag.as_deref())
+    }
+
     /// The partial a quota reservation for this download accounts (see
     /// `cache_quota`'s module doc): `None` for a volatile scratch file, which
     /// is never kept; a `Resumable` partial's `resume_offset` bytes are
@@ -188,12 +194,11 @@ impl PartialDownload {
 }
 
 /// Outcome of [`prepare_partial_resume`]: byte offset, expected total size
-/// from xattr, `If-Range` validator, and the file-handle/path state to thread
+/// from xattr and the file-handle/path state (including validators) to thread
 /// into the download body.
 pub(crate) struct PartialResume {
     pub(crate) offset: u64,
     pub(crate) expected_total: Option<u64>,
-    pub(crate) if_range: Option<String>,
     pub(crate) partial: PartialDownload,
 }
 
@@ -204,7 +209,6 @@ impl PartialResume {
         Self {
             offset: 0,
             expected_total: None,
-            if_range: None,
             partial: PartialDownload::Fresh(guard),
         }
     }
@@ -215,7 +219,6 @@ impl PartialResume {
         Self {
             offset: 0,
             expected_total: None,
-            if_range: None,
             partial: PartialDownload::Volatile,
         }
     }
@@ -324,7 +327,7 @@ async fn prepare_partial_resume_at(
                     .map(LastModified::into_parts)
                     .map(|(raw, time)| (Arc::from(raw), time));
                 let stored = UpstreamMetadata {
-                    etag: Some(Arc::from(if_range.as_str())),
+                    etag: Some(Arc::from(if_range)),
                     last_modified,
                 };
                 let expected_total =
@@ -351,7 +354,6 @@ async fn prepare_partial_resume_at(
                 Ok(PartialResume {
                     offset: size,
                     expected_total,
-                    if_range: Some(if_range),
                     partial: PartialDownload::Resumable {
                         file,
                         guard,
@@ -1144,7 +1146,7 @@ mod tests {
         .expect("a discarded partial is a fresh download");
         assert_eq!(resume.offset, 0);
         assert_eq!(resume.expected_total, None);
-        assert_eq!(resume.if_range, None);
+        assert_eq!(resume.partial.if_range(), None);
         let guard = expect_fresh(resume.partial, "no ETag means no resume");
         assert!(!path.exists(), "the stale partial is unlinked");
         assert_eq!(&*guard, path.as_path(), "the guard still reserves the path");
@@ -1177,7 +1179,8 @@ mod tests {
         .expect("a discarded partial is a fresh download");
         assert_eq!(resume.offset, 0);
         assert_eq!(
-            resume.if_range, None,
+            resume.partial.if_range(),
+            None,
             "a weak tag must never be sent as If-Range"
         );
         assert!(
@@ -1220,7 +1223,7 @@ mod tests {
         .expect("the partial reopens");
         assert_eq!(resume.offset, 13);
         assert_eq!(resume.expected_total, None, "no expected-size xattr");
-        assert_eq!(resume.if_range.as_deref(), Some("\"strong\""));
+        assert_eq!(resume.partial.if_range(), Some("\"strong\""));
         assert!(
             matches!(resume.partial, PartialDownload::Resumable { .. }),
             "a strong ETag makes the partial resumable"
@@ -1230,7 +1233,7 @@ mod tests {
             resume.partial.resumed_validators(),
             Some(&UpstreamMetadata::from_upstream(
                 Some("\"strong\""),
-                Some(stored_lm.into())
+                Some(stored_lm)
             ))
         );
 
@@ -1285,7 +1288,7 @@ mod tests {
             Some(4096),
             "the stored total is what lets a resume detect an upstream size change"
         );
-        assert_eq!(resume.if_range.as_deref(), Some("\"strong\""));
+        assert_eq!(resume.partial.if_range(), Some("\"strong\""));
     }
 
     /// Every explicit unlink of a kept partial releases its bytes from the

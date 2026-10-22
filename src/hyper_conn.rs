@@ -2153,7 +2153,6 @@ async fn serve_new_file_worker(
     let partial_file::PartialResume {
         offset: resume_offset,
         expected_total: resume_expected_total,
-        if_range: resume_if_range,
         mut partial,
     } = if conn_details.cached_flavor() == CachedFlavor::Permanent
         && matches!(cfstate, CacheFileStat::New)
@@ -2181,7 +2180,7 @@ async fn serve_new_file_worker(
         &host,
         revalidate,
         resume_offset,
-        resume_if_range.as_deref(),
+        partial.if_range(),
     );
     trace!("Forwarded request: {fwd_request:?}");
 
@@ -2230,7 +2229,7 @@ async fn serve_new_file_worker(
                 &host,
                 revalidate,
                 resume_offset,
-                resume_if_range.as_deref(),
+                partial.if_range(),
             );
 
             trace!("Forwarded redirected request: {redirected_request:?}");
@@ -2296,11 +2295,7 @@ async fn serve_new_file_worker(
 
     let plan = match plan_download(
         &head,
-        ResumeState::new(
-            resume_offset,
-            resume_expected_total,
-            resume_if_range.as_deref(),
-        ),
+        ResumeState::new(resume_offset, resume_expected_total, partial.if_range()),
         conn_details.cached_flavor(),
         cached,
         config.max_object_size,
