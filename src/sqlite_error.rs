@@ -226,9 +226,12 @@ mod tests {
 
     #[tokio::test]
     async fn database_error_renders_once_with_its_name() {
-        let (_dir, db) = crate::database::Database::temp().await;
+        use sqlx::Connection as _;
+        let mut db = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("memory database");
         let err = sqlx::query("SELECT * FROM no_such_table")
-            .execute(db.pool())
+            .execute(&mut db)
             .await
             .expect_err("missing table");
 
