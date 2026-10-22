@@ -187,7 +187,7 @@
         toolbar(section);
       }
     },
-    enhance: function () {
+    refreshed: function () {
       if (ACR.page() === "logs" && shown) {
         apply();
       }
