@@ -276,13 +276,9 @@ async fn task_cleanup_impl(appstate: &AppState) {
     // every mirror.  Rows are canonical (alias-resolved at dispatch, legacy rows
     // folded at startup), so the row host *is* the `<cache>/<host>/…` tree the
     // nesting bucket must follow.
-    let host_keys: Vec<(&CacheHost, Option<NonZero<u16>>)> = mirrors
-        .iter()
-        .map(|entry| (entry.host.as_cache_host(), entry.port()))
-        .collect();
-
     let mut paths_by_host: HashMap<(&CacheHost, Option<NonZero<u16>>), Vec<&str>> = HashMap::new();
-    for (entry, &key) in mirrors.iter().zip(&host_keys) {
+    for entry in &mirrors {
+        let key = (entry.host.as_cache_host(), entry.port());
         paths_by_host
             .entry(key)
             .or_default()
@@ -297,8 +293,8 @@ async fn task_cleanup_impl(appstate: &AppState) {
     // `mirrors` in the per-future move below.
     let nested_per_mirror: Vec<Vec<String>> = mirrors
         .iter()
-        .zip(&host_keys)
-        .map(|(mirror, &key)| {
+        .map(|mirror| {
+            let key = (mirror.host.as_cache_host(), mirror.port());
             let host_paths = paths_by_host.get(&key).map_or_default(Vec::as_slice);
             derive_nested_paths(&mirror.path, host_paths)
         })
