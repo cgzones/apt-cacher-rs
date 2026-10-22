@@ -106,7 +106,7 @@ static RELEASE_WALK: WalkContext = WalkContext {
 pub(super) async fn build_byhash_reference_set(
     release_dir: &Path,
     layout: CacheLayout,
-    expected_dists: &[String],
+    expected_dists: &[&str],
 ) -> Option<ByHashReferenceSet> {
     let mut walker = Walker::new(release_dir, &RELEASE_WALK, OnMissing::Tolerate, ());
 
@@ -202,7 +202,7 @@ pub(super) async fn build_byhash_reference_set(
     // Reference mode reconciles the whole union `by-hash/` tree at once, so an
     // expected dist with no Release present would have its files orphaned. Bail
     // to age-based retention rather than reconcile against an incomplete union.
-    for dist in expected_dists {
+    for &dist in expected_dists {
         if !coverage.contains_key(dist) {
             debug!(
                 "by-hash reconciliation for `{}`: Release for distribution `{dist}` is absent; falling back to age-based retention",
@@ -241,12 +241,12 @@ pub(super) async fn build_byhash_reference_set(
 /// reference mode orphan its by-hash files). `Some(vec![])` is a genuine "no
 /// active origins", distinct from the error case.
 #[must_use]
-pub(super) fn active_origin_distributions(origins: Option<&[OriginEntry]>) -> Option<Vec<String>> {
+pub(super) fn active_origin_distributions(origins: Option<&[OriginEntry]>) -> Option<Vec<&str>> {
     let now: Duration = Clock::now_since_epoch().into();
-    let mut dists: Vec<String> = origins?
+    let mut dists: Vec<&str> = origins?
         .iter()
         .filter(|origin| origin.is_active(now))
-        .map(|origin| origin.distribution.clone())
+        .map(|origin| origin.distribution.as_str())
         .collect();
     dists.sort_unstable();
     dists.dedup();
@@ -296,7 +296,7 @@ mod tests {
         ];
         assert_eq!(
             active_origin_distributions(Some(&origins)),
-            Some(vec!["sid".to_owned(), "trixie".to_owned()])
+            Some(vec!["sid", "trixie"])
         );
     }
 
@@ -510,7 +510,7 @@ mod tests {
         std::fs::write(dir.path().join("sid_InRelease"), release_with_sha256(&[a]))
             .expect("write sid");
 
-        let expected = ["sid".to_owned(), "trixie".to_owned()];
+        let expected = ["sid", "trixie"];
         assert!(
             build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &expected)
                 .await
@@ -519,7 +519,7 @@ mod tests {
         );
 
         // With only `sid` expected -- the one present -- reference mode holds.
-        let only_sid = ["sid".to_owned()];
+        let only_sid = ["sid"];
         let set = build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &only_sid)
             .await
             .expect("reference set built when every expected dist is present");
@@ -534,7 +534,7 @@ mod tests {
         let a = [0xccu8; 32];
         std::fs::write(dir.path().join("sid_Release"), release_with_sha256(&[a]))
             .expect("write sid");
-        let expected = ["sid".to_owned()];
+        let expected = ["sid"];
         assert!(
             build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &expected)
                 .await
