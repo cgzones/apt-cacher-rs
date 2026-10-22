@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO origins (mirror_id, distribution, component, architecture, first_seen, last_seen)\n                                SELECT ?, distribution, component, architecture, first_seen, last_seen\n                                FROM origins WHERE mirror_id = ?\n                                ON CONFLICT (mirror_id, distribution, component, architecture)\n                                DO UPDATE SET first_seen = MIN(origins.first_seen, excluded.first_seen),\n                                              last_seen = MAX(origins.last_seen, excluded.last_seen);",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "c2051cc161110e9e9b6710ac10ab4700be6afd150c01f15be3a5a28e48c33b0d"
+}

@@ -1378,7 +1378,8 @@ impl Database {
 
     /// Fold mirror rows written under a configured alias host into the row of
     /// the alias' main host: origins, downloads and deliveries are re-pointed
-    /// (an origin the main row already has is dropped), and an alias row with
+    /// (duplicate origins retain the earliest `first_seen` and latest `last_seen`),
+    /// and an alias row with
     /// no main counterpart is simply renamed.  Rows are canonical from
     /// `decide_request` on; this runs at startup for rows an earlier version
     /// wrote, and after an alias is added to the configuration.  Without it
@@ -1423,7 +1424,12 @@ impl Database {
                         }
                         Some(main_row) => {
                             query!(
-                                r"UPDATE OR IGNORE origins SET mirror_id = ? WHERE mirror_id = ?;",
+                                r"INSERT INTO origins (mirror_id, distribution, component, architecture, first_seen, last_seen)
+                                SELECT ?, distribution, component, architecture, first_seen, last_seen
+                                FROM origins WHERE mirror_id = ?
+                                ON CONFLICT (mirror_id, distribution, component, architecture)
+                                DO UPDATE SET first_seen = MIN(origins.first_seen, excluded.first_seen),
+                                              last_seen = MAX(origins.last_seen, excluded.last_seen);",
                                 main_row.id,
                                 alias_row.id
                             )
@@ -1756,6 +1762,68 @@ mod retention_tests {
                 ("ubuntu".to_owned(), "noble".to_owned()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn alias_origin_merge_preserves_activity_in_either_order() {
+        for reverse in [false, true] {
+            let (_dir, db) = Database::temp().await;
+            let hosts = ["main.example", "alias.example", "other.example"];
+            for (index, host) in hosts.iter().enumerate() {
+                let id = db.insert_mirror_host(host, "debian").await;
+                db.batch_upsert_origins(&[origin(id, "sid"), origin(id, host)])
+                    .await
+                    .expect("origins");
+                let times = if reverse {
+                    [(30, 90), (20, 80), (10, 70)]
+                } else {
+                    [(10, 70), (20, 80), (30, 90)]
+                };
+                query("UPDATE origins SET first_seen = ?, last_seen = ? WHERE mirror_id = ?")
+                    .bind(times[index].0)
+                    .bind(times[index].1)
+                    .bind(id)
+                    .execute(&db.conn)
+                    .await
+                    .expect("timestamps");
+            }
+            let mut members = vec![
+                ClientHost::new(hosts[1]).expect("host"),
+                ClientHost::new(hosts[2]).expect("host"),
+            ];
+            if reverse {
+                members.reverse();
+            }
+            let aliases = [Alias {
+                main: ClientHost::new(hosts[0]).expect("host").into_cache_host(),
+                aliases: members,
+            }];
+            assert_eq!(db.merge_alias_rows(&aliases).await.expect("merge"), 2);
+            assert_eq!(db.merge_alias_rows(&aliases).await.expect("repeat"), 0);
+            let times: (i64, i64) =
+                query_as("SELECT first_seen, last_seen FROM origins WHERE distribution = 'sid'")
+                    .fetch_one(&db.conn)
+                    .await
+                    .expect("merged timestamps");
+            assert_eq!(times, (10, 90));
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM origins")
+                .fetch_one(&db.conn)
+                .await
+                .expect("scopes");
+            assert_eq!(count, 4);
+            assert_eq!(
+                db.delete_stale_origins(Duration::from_secs(85))
+                    .await
+                    .expect("prune"),
+                2
+            );
+            let surviving: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM origins WHERE distribution = 'sid'")
+                    .fetch_one(&db.conn)
+                    .await
+                    .expect("active scope");
+            assert_eq!(surviving, 1, "recent alias activity must survive pruning");
+        }
     }
 
     #[tokio::test]
