@@ -107,7 +107,7 @@
         headers[i].removeAttribute("aria-sort");
       }
     }
-    let rows = original.slice();
+    let rows = original;
     if (dir !== null) {
       const sign = dir === "ascending" ? 1 : -1;
       const keyed = rows.map(function (row, index) {
