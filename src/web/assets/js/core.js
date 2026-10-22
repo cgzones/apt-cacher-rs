@@ -91,7 +91,7 @@ const ACR = (function () {
   }
 
   function all(scope, selector) {
-    return Array.prototype.slice.call(scope.querySelectorAll(selector));
+    return scope.querySelectorAll(selector);
   }
 
   /* The block a node belongs to: the top-level element carrying
@@ -195,7 +195,7 @@ const ACR = (function () {
   /* Section keys in page order, so `open=` reads the same as the server
    * renders it. */
   function sectionOrder() {
-    return all(document, "[data-section]").map(function (node) {
+    return Array.from(all(document, "[data-section]"), function (node) {
       return node.getAttribute("data-section");
     });
   }
