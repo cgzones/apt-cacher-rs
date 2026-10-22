@@ -16,6 +16,10 @@ use crate::{deb_mirror, warn_once_or_info};
 ///   `application/vnd.debian.binary-package`;
 /// - `application/x-gzip`, the non-standard alias for the IANA-registered
 ///   `application/gzip` (RFC 6713).
+///
+/// Text repository indexes also accept `application/octet-stream`: some
+/// mirrors (including GitHub CLI) serve these files as generic downloads.
+/// This exception does not apply to packages, compressed indexes or signatures.
 #[must_use]
 fn content_type_matches(upstream: &str, expected: &str) -> bool {
     if upstream.eq_ignore_ascii_case(expected)
@@ -23,12 +27,13 @@ fn content_type_matches(upstream: &str, expected: &str) -> bool {
     {
         return true;
     }
-    let legacy_alias = match expected {
+    let accepted_alias = match expected {
+        "text/plain" => "application/octet-stream",
         "application/vnd.debian.binary-package" => "application/x-deb",
         "application/gzip" => "application/x-gzip",
         _ => return false,
     };
-    upstream.eq_ignore_ascii_case(legacy_alias)
+    upstream.eq_ignore_ascii_case(accepted_alias)
 }
 
 /// Warn (once) if the upstream `Content-Type` is not one
@@ -83,10 +88,28 @@ mod tests {
     use super::{content_type_for_cached_file, content_type_matches};
 
     #[test]
-    fn content_type_matches_accepts_case_and_legacy_aliases() {
+    fn content_type_matches_accepts_case_and_scoped_aliases() {
         // Exact, and case-insensitively so (RFC 9110 section 8.3).
         assert!(content_type_matches("text/plain", "text/plain"));
         assert!(content_type_matches("TEXT/PLAIN", "text/plain"));
+
+        // Generic downloads are accepted for text repository indexes only.
+        assert!(content_type_matches(
+            "application/octet-stream",
+            "text/plain"
+        ));
+        assert!(content_type_matches(
+            "Application/Octet-Stream",
+            "text/plain"
+        ));
+        assert!(!content_type_matches(
+            "application/octet-stream",
+            "application/vnd.debian.binary-package"
+        ));
+        assert!(!content_type_matches(
+            "application/octet-stream",
+            "application/pgp-signature"
+        ));
 
         // The non-standard catch-all every Debian mirror emits.
         assert!(content_type_matches("binary/octet-stream", "text/plain"));
