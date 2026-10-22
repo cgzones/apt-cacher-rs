@@ -1983,3 +1983,7 @@ mod retention_tests {
         assert_eq!(windows.week, (0, 0));
     }
 }
+
+#[cfg(test)]
+#[path = "database_migration_tests.rs"]
+mod migration_tests;
