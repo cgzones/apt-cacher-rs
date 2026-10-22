@@ -32,10 +32,7 @@ use crate::{
 };
 
 use super::{
-    fmt::{
-        Count, FmtLastSeenHealth, Freshness, HtmlEscape, HtmlEscaped, Level, Nonzero, RelTime,
-        as_size,
-    },
+    fmt::{Count, FmtLastSeenHealth, Freshness, HtmlEscape, Level, Nonzero, RelTime, as_size},
     table::{Table, tr, when, write_section_error},
 };
 
@@ -775,7 +772,7 @@ pub(super) async fn build_mirror_table(
                     verdict,
                     aliases: &aliases,
                 },
-                uri = HtmlEscaped(mirror.uri())
+                uri = HtmlEscape(key.as_str())
             ) => Some(key.as_str()),
             FmtLastSeenHealth {
                 last_seen: mirror.last_seen,
@@ -947,7 +944,7 @@ pub(super) fn render_origin_table(
         tr!(
             marked Freshness::of(origin.last_seen, now_epoch).row_class(),
             table,
-            HtmlEscaped(origin.mirror_uri()),
+            HtmlEscape(key.as_str()),
             HtmlEscape(&origin.distribution),
             HtmlEscape(&origin.component),
             HtmlEscape(&origin.architecture),
