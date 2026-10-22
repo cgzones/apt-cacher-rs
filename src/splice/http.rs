@@ -98,23 +98,27 @@ pub(super) fn format_http_request(
     resume_if_range: Option<&str>,
     volatile_cond: Option<&VolatileCondHeaders>,
 ) -> String {
-    let range_header = if resume_offset > 0 {
-        format!(
-            "Range: bytes={resume_offset}-\r\n{}",
-            OptHeader("If-Range", resume_if_range)
-        )
-    } else {
-        String::new()
-    };
-
-    let volatile_headers = match volatile_cond {
-        Some(vc) => format!(
-            "{}Cache-Control: max-age=300\r\n{}",
-            OptHeader("If-Modified-Since", vc.if_modified_since.as_deref()),
-            OptHeader("If-None-Match", vc.if_none_match.as_deref())
-        ),
-        None => String::new(),
-    };
+    let range_header = std::fmt::from_fn(|f| {
+        if resume_offset > 0 {
+            write!(
+                f,
+                "Range: bytes={resume_offset}-\r\n{}",
+                OptHeader("If-Range", resume_if_range)
+            )?;
+        }
+        Ok(())
+    });
+    let volatile_headers = std::fmt::from_fn(|f| {
+        if let Some(vc) = volatile_cond {
+            write!(
+                f,
+                "{}Cache-Control: max-age=300\r\n{}",
+                OptHeader("If-Modified-Since", vc.if_modified_since.as_deref()),
+                OptHeader("If-None-Match", vc.if_none_match.as_deref())
+            )?;
+        }
+        Ok(())
+    });
 
     format!(
         "GET {path} HTTP/1.1\r\n\
