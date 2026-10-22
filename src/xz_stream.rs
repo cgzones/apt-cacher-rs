@@ -507,7 +507,7 @@ mod tests {
         out.extend_from_slice(&flags);
         out.extend_from_slice(&crc32(&flags).to_le_bytes());
         let mut header = vec![0x02, 0x00, 0x21, 0x01, dict_prop, 0x00, 0x00, 0x00];
-        header.extend_from_slice(&crc32(&header.clone()).to_le_bytes());
+        header.extend_from_slice(&crc32(&header).to_le_bytes());
         for _ in 0..blocks {
             out.extend_from_slice(&header);
             out.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
@@ -522,7 +522,7 @@ mod tests {
         while index.len() % 4 != 0 {
             index.push(0x00);
         }
-        index.extend_from_slice(&crc32(&index.clone()).to_le_bytes());
+        index.extend_from_slice(&crc32(&index).to_le_bytes());
         let backward_size = u32::try_from(index.len() / 4 - 1).expect("small index");
         out.extend_from_slice(&index);
         let mut footer_body = backward_size.to_le_bytes().to_vec();
