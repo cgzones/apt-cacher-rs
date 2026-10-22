@@ -84,8 +84,9 @@ pub(crate) struct ConnectReject {
 /// Admission owns both the optional per-IP slot and the unconditional count.
 /// Backends retain this permit through upgrade, dialing, and the whole relay.
 pub(crate) struct TunnelPermit {
-    _slot: Option<TunnelGuard>,
+    // Match the backend guards' teardown: stop counting active, then free the slot.
     _active: ActiveTunnelGuard,
+    _slot: Option<TunnelGuard>,
 }
 
 /// Acquire the configured per-client tunnel slot, recording any refusal.
@@ -448,12 +449,16 @@ mod tests {
         let mut config = Config::default();
         let client = local_client();
         let before = tunnel_limiter::active_tunnels();
-        let uncapped = admit(&config, &client).unwrap_or_else(|_| panic!("uncapped admission"));
+        let uncapped = admit(&config, &client)
+            .map_err(|rejection| rejection.status)
+            .expect("uncapped admission");
         assert_eq!(tunnel_limiter::active_tunnels(), before + 1);
         drop(uncapped);
         assert_eq!(tunnel_limiter::active_tunnels(), before);
         config.https_tunnel_max_connections_per_client = NonZero::new(1);
-        let capped = admit(&config, &client).unwrap_or_else(|_| panic!("first slot"));
+        let capped = admit(&config, &client)
+            .map_err(|rejection| rejection.status)
+            .expect("first slot");
         assert!(admit(&config, &client).is_err());
         assert_eq!(tunnel_limiter::active_tunnels(), before + 1);
         drop(capped);
