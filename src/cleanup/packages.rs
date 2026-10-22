@@ -608,6 +608,7 @@ mod tests {
         limits::{MAX_COMPRESSED_PACKAGES_SIZE, MAX_METADATA_LINE_LEN},
         nonzero,
         proxy_body::full_body,
+        test_support::structured_mirror,
     };
 
     /// A candidate map for the reduce tests: every entry is `Deb`-class and
@@ -1089,20 +1090,13 @@ mod tests {
     /// list is left untouched rather than reconciled against nothing.
     #[tokio::test]
     async fn reduce_file_list_rejects_empty_compressed_index() {
-        use std::num::NonZero;
-
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("Packages.gz");
         tokio::fs::write(&path, b"").await.expect("write empty");
         let file = tokio::fs::File::open(&path).await.expect("open empty");
 
         let config = Config::default();
-        let mirror = Mirror::new(
-            ClientHost::new("example.com").expect("valid host"),
-            None::<NonZero<u16>>,
-            "debian".to_owned(),
-            MirrorKind::Structured,
-        );
+        let mirror = structured_mirror("example.com", "debian");
         let mut file_list = cands(&["keep-me.deb"]);
         let mut tally = UnitStats::default();
         let mut ctx = ReduceContext {
@@ -1136,8 +1130,6 @@ mod tests {
 
     #[tokio::test]
     async fn reduce_file_list_skips_overlong_line_and_keeps_parsing() {
-        use std::num::NonZero;
-
         use sha2::{Digest as _, Sha256};
 
         use crate::index_parser::hex_encode;
@@ -1168,12 +1160,7 @@ mod tests {
         let file = tokio::fs::File::open(&path).await.expect("open fixture");
 
         let config = Config::default();
-        let mirror = Mirror::new(
-            ClientHost::new("example.com").expect("valid host"),
-            None::<NonZero<u16>>,
-            "debian".to_owned(),
-            MirrorKind::Structured,
-        );
+        let mirror = structured_mirror("example.com", "debian");
         // `dummy_1.0_amd64.deb` is the structured-lookup-key (basename) of
         // the Filename: above; reaching `StanzaStream::complete` with the stanza
         // intact removes the entry from the candidate list, proving the
@@ -1217,20 +1204,13 @@ mod tests {
     /// must not abort the per-mirror cleanup.
     #[tokio::test]
     async fn reduce_file_list_accepts_empty_raw_packages() {
-        use std::num::NonZero;
-
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("Packages");
         tokio::fs::write(&path, b"").await.expect("write empty");
         let file = tokio::fs::File::open(&path).await.expect("open empty");
 
         let config = Config::default();
-        let mirror = Mirror::new(
-            ClientHost::new("example.com").expect("valid host"),
-            None::<NonZero<u16>>,
-            "debian".to_owned(),
-            MirrorKind::Structured,
-        );
+        let mirror = structured_mirror("example.com", "debian");
         let mut file_list = cands(&["keep-me.deb"]);
         let mut tally = UnitStats::default();
         let mut ctx = ReduceContext {
