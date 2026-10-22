@@ -691,7 +691,7 @@ mod tests {
         let fixture = Fixture::new().await;
         let (tx, rx) = mpsc::channel(128);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let task = fixture.spawn(rx, shutdown_rx, 4096, StdDuration::from_millis(10));
+        let task = fixture.spawn(rx, shutdown_rx, 2, StdDuration::from_secs(3600));
 
         tx.send(origin_cmd("binary-i386", OriginSighting::CacheHit))
             .await
@@ -700,13 +700,8 @@ mod tests {
             .await
             .expect("send verified");
 
-        timeout(TEST_TIMEOUT, async {
-            while fixture.origins().await != 1 {
-                sleep(StdDuration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("the upstream-verified origin is flushed");
+        ping(&tx).await;
+        assert_eq!(fixture.origins().await, 1, "the verified origin is flushed");
 
         let rows = fixture.database.get_origins().await.expect("origins");
         assert_eq!(
@@ -730,18 +725,13 @@ mod tests {
         let fixture = Fixture::new().await;
         let (tx, rx) = mpsc::channel(128);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let task = fixture.spawn(rx, shutdown_rx, 4096, StdDuration::from_millis(10));
+        let task = fixture.spawn(rx, shutdown_rx, 1, StdDuration::from_secs(3600));
 
         tx.send(origin_cmd("binary-amd64", OriginSighting::Upstream))
             .await
             .expect("send verified");
-        timeout(TEST_TIMEOUT, async {
-            while fixture.origins().await != 1 {
-                sleep(StdDuration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("the upstream-verified origin is flushed");
+        ping(&tx).await;
+        assert_eq!(fixture.origins().await, 1, "the verified origin is flushed");
 
         sqlx::query("UPDATE origins SET last_seen = 1000")
             .execute(fixture.database.pool())
@@ -751,17 +741,13 @@ mod tests {
         tx.send(origin_cmd("binary-amd64", OriginSighting::CacheHit))
             .await
             .expect("send cache hit");
-        timeout(TEST_TIMEOUT, async {
-            loop {
-                let rows = fixture.database.get_origins().await.expect("origins");
-                if rows.first().expect("row exists").last_seen != 1000 {
-                    break;
-                }
-                sleep(StdDuration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("the cache hit refreshes last_seen");
+        ping(&tx).await;
+        let rows = fixture.database.get_origins().await.expect("origins");
+        assert_ne!(
+            rows.first().expect("row exists").last_seen,
+            1000,
+            "the cache hit refreshes last_seen",
+        );
 
         assert_eq!(fixture.origins().await, 1, "no second row was minted");
 
