@@ -627,41 +627,34 @@ fn build_client_delivery_group(g: &mut Groups, shown: Shown) {
     });
 }
 
-/// The bytes each compiled-in delivery path moved, passthrough relays
-/// included, for the Delivery Paths group's bar.
-fn delivery_bytes() -> Vec<Segment> {
-    let mut segments = Vec::with_capacity(5);
-    if SENDFILE {
-        segments.push(Segment {
+fn build_delivery_group(g: &mut Groups) {
+    // Sample the compiled-in paths in display order before rendering the group.
+    let bytes = [
+        #[cfg(feature = "sendfile")]
+        Segment {
             name: "sendfile",
             value: metrics::BYTES_SERVED_SENDFILE.get(),
-        });
-    }
-    if SPLICE {
-        segments.push(Segment {
+        },
+        #[cfg(feature = "splice")]
+        Segment {
             name: "splice",
             value: metrics::BYTES_SERVED_SPLICE.get(),
-        });
-    }
-    if HYPER {
-        segments.push(Segment {
+        },
+        #[cfg(feature = "hyper")]
+        Segment {
             name: "copy",
             value: metrics::BYTES_SERVED_COPY.get(),
-        });
-        segments.push(Segment {
+        },
+        #[cfg(feature = "hyper")]
+        Segment {
             name: "channel",
             value: metrics::BYTES_SERVED_CHANNEL.get(),
-        });
-    }
-    segments.push(Segment {
-        name: "passthrough",
-        value: metrics::BYTES_SERVED_PASSTHROUGH.get(),
-    });
-    segments
-}
-
-fn build_delivery_group(g: &mut Groups) {
-    let bytes = delivery_bytes();
+        },
+        Segment {
+            name: "passthrough",
+            value: metrics::BYTES_SERVED_PASSTHROUGH.get(),
+        },
+    ];
     g.group("Delivery Paths", |t| {
         t.bar(&StackBar {
             label: "Bytes by Delivery Path",
