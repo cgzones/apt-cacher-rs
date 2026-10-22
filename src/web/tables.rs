@@ -1138,24 +1138,18 @@ pub(super) fn render_top_packages_table(
 
     for pkg in packages {
         let pkg_size = as_size(pkg.package_size);
-        match view {
-            TopPackagesView::ByCount => tr!(
-                table,
-                HtmlEscape(&pkg.debname),
-                Count::db(pkg.delivery_count) => Some(as_size(pkg.delivery_count)),
-                HumanFmt::Size(pkg_size) => Some(pkg_size),
-            ),
-            TopPackagesView::BySize => {
-                let total = as_size(pkg.total_delivered);
-                tr!(
-                    table,
-                    HtmlEscape(&pkg.debname),
-                    HumanFmt::Size(total) => Some(total),
-                    Count::db(pkg.delivery_count) => Some(as_size(pkg.delivery_count)),
-                    HumanFmt::Size(pkg_size) => Some(pkg_size),
-                );
-            }
+        table.start_row();
+        table.cell(HtmlEscape(&pkg.debname));
+        if matches!(view, TopPackagesView::BySize) {
+            let total = as_size(pkg.total_delivered);
+            table.cell_keyed(HumanFmt::Size(total), Some(total));
         }
+        table.cell_keyed(
+            Count::db(pkg.delivery_count),
+            Some(as_size(pkg.delivery_count)),
+        );
+        table.cell_keyed(HumanFmt::Size(pkg_size), Some(pkg_size));
+        table.end_row();
     }
 
     Section {
