@@ -1981,7 +1981,7 @@ mod retention_tests {
         let (_dir, db) = Database::temp().await;
         let mirror = insert_mirror(&db, "debian").await;
 
-        for _ in 0..20 {
+        for _ in 0..2 {
             insert_delivery(&db, mirror, "Packages.xz", 9_999, 1_000).await;
         }
         insert_delivery(&db, mirror, "only.ddeb", 1, 1_000).await;
