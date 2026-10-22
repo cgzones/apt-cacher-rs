@@ -410,7 +410,15 @@ pub(crate) enum RejectReason {
     /// chunked or close-delimited).  Volatile files stream or buffer such
     /// bodies instead.
     NoContentLength,
-    /// `Content-Length: 0`: the cache cannot hold an empty object.
+    /// `Content-Length: 0`.  An empty index is well-formed, but the Debian
+    /// and Ubuntu archives never serve one: their `Release` files list empty
+    /// uncompressed indexes (the empty-file digest) only so apt can verify
+    /// what it decompressed, while that URL and its by-hash twin answer 404
+    /// and apt fetches the non-empty `.xz`/`.gz`.  An empty 200 is therefore
+    /// an upstream fault, neither cached nor relayed.  An unknown-length body
+    /// that turns out empty gets the same rule where it is detected: splice's
+    /// buffered volatile path answers 502 `zero-length body`, hyper's download
+    /// worker fails the download at the end of the body.
     ZeroContentLength,
     /// The body bytes that arrived in the same read as the head already
     /// exceed the declared `Content-Length`.  Relaying them would hand the

@@ -1586,13 +1586,22 @@ async fn download_file_worker(
             barrier.ping_batched(count);
         }
     }
-    if let ContentLength::Exact(size) = content_length
-        && *bytes != size.get()
-    {
-        return Err(UpstreamError::protocol(format!(
-            "body length mismatch (received {bytes}, expected {size})"
-        ))
-        .into());
+    match content_length {
+        ContentLength::Exact(size) if *bytes != size.get() => {
+            return Err(UpstreamError::protocol(format!(
+                "body length mismatch (received {bytes}, expected {size})"
+            ))
+            .into());
+        }
+        // The unknown-length twin of the planner's `Content-Length: 0`
+        // reject (`RejectReason::ZeroContentLength` carries the rationale),
+        // only detectable here at the end of the body: fail the download
+        // rather than commit a 0-byte file. The 200 head is already out, so
+        // the client sees an aborted transfer, not splice's 502.
+        ContentLength::Unknown(_) if *bytes == 0 => {
+            return Err(UpstreamError::protocol("empty body without Content-Length").into());
+        }
+        ContentLength::Exact(_) | ContentLength::Unknown(_) => {}
     }
     let upstream_done = PreciseInstant::now();
     writer.flush().await?;
