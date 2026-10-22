@@ -132,10 +132,7 @@ impl Body for ChannelBody {
 mod tests {
     use super::*;
     use crate::nonzero;
-
-    async fn next(body: &mut ChannelBody) -> Option<Result<Frame<Bytes>, DeliveryFailure>> {
-        std::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx)).await
-    }
+    use http_body_util::BodyExt as _;
 
     #[tokio::test]
     async fn unknown_length_requires_explicit_completion() {
@@ -145,13 +142,13 @@ mod tests {
             .await
             .unwrap();
         drop(tx);
-        assert!(next(&mut body).await.unwrap().is_ok());
+        assert!(body.frame().await.unwrap().is_ok());
         assert!(matches!(
-            next(&mut body).await,
+            body.frame().await,
             Some(Err(DeliveryFailure::Cancelled))
         ));
         assert!(body.is_end_stream());
-        assert!(next(&mut body).await.is_none());
+        assert!(body.frame().await.is_none());
     }
 
     #[tokio::test]
@@ -162,9 +159,9 @@ mod tests {
             .await
             .unwrap();
         tx.send(ChannelEvent::Finished(Ok(()))).await.unwrap();
-        assert!(next(&mut body).await.unwrap().is_ok());
+        assert!(body.frame().await.unwrap().is_ok());
         assert!(!body.is_end_stream());
-        assert!(next(&mut body).await.is_none());
+        assert!(body.frame().await.is_none());
         assert!(body.is_end_stream());
     }
 
@@ -175,9 +172,9 @@ mod tests {
         tx.send(ChannelEvent::Data(Bytes::from_static(b"abcd")))
             .await
             .unwrap();
-        assert!(next(&mut body).await.unwrap().is_ok());
+        assert!(body.frame().await.unwrap().is_ok());
         assert!(body.is_end_stream());
-        assert!(next(&mut body).await.is_none());
+        assert!(body.frame().await.is_none());
     }
 
     #[tokio::test]
@@ -188,12 +185,12 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            next(&mut body).await,
+            body.frame().await,
             Some(Err(DeliveryFailure::Cache(_)))
         ));
         assert_eq!(body.received, 0);
         assert!(body.is_end_stream());
-        assert!(next(&mut body).await.is_none());
+        assert!(body.frame().await.is_none());
     }
 
     #[tokio::test]
@@ -208,11 +205,11 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            next(&mut body).await,
+            body.frame().await,
             Some(Err(DeliveryFailure::Cache(_)))
         ));
         assert!(body.is_end_stream());
-        assert!(next(&mut body).await.is_none());
+        assert!(body.frame().await.is_none());
     }
 
     #[tokio::test]
@@ -221,7 +218,7 @@ mod tests {
         let mut body = ChannelBody::new(rx, ContentLength::Exact(nonzero!(4)));
         tx.send(ChannelEvent::Finished(Ok(()))).await.unwrap();
         assert!(matches!(
-            next(&mut body).await,
+            body.frame().await,
             Some(Err(DeliveryFailure::Cache(_)))
         ));
     }

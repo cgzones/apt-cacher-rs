@@ -276,6 +276,7 @@ mod tests {
         upstream_head::ContentLength,
     };
     use bytes::Bytes;
+    use http_body_util::BodyExt as _;
 
     fn subject(size: Option<u64>) -> Subject {
         Subject::Cached {
@@ -285,12 +286,6 @@ mod tests {
             role: Role::LateJoiner,
             partial: false,
         }
-    }
-
-    async fn next(
-        body: &mut AccountedBody<ChannelBody>,
-    ) -> Option<Result<Frame<Bytes>, DeliveryFailure>> {
-        std::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx)).await
     }
 
     /// A single test owns the process-global DB queue and channel metric deltas.
@@ -319,7 +314,7 @@ mod tests {
             ChannelBody::new(rx, ContentLength::Exact(nonzero!(4))),
             subject(Some(4)),
         );
-        assert!(next(&mut body).await.unwrap().is_ok());
+        assert!(body.frame().await.unwrap().is_ok());
         drop(body);
         assert_eq!(metrics::SERVED_CHANNEL.get(), served_before);
         assert_eq!(metrics::BYTES_SERVED_CHANNEL.get(), bytes_before + 2);
@@ -334,7 +329,7 @@ mod tests {
             ChannelBody::new(rx, ContentLength::Exact(nonzero!(4))),
             subject(Some(4)),
         );
-        assert!(next(&mut body).await.unwrap().is_ok());
+        assert!(body.frame().await.unwrap().is_ok());
         drop(body);
         assert_eq!(metrics::SERVED_CHANNEL.get(), served_before + 1);
         assert!(matches!(db_rx.try_recv(), Ok(DatabaseCommand::Transfer(cmd)) if cmd.size == 4));
@@ -350,9 +345,9 @@ mod tests {
             ChannelBody::new(rx, ContentLength::Unknown(nonzero!(100))),
             subject(None),
         );
-        assert!(next(&mut body).await.unwrap().is_ok());
-        assert!(next(&mut body).await.unwrap().is_err());
-        assert!(next(&mut body).await.is_none());
+        assert!(body.frame().await.unwrap().is_ok());
+        assert!(body.frame().await.unwrap().is_err());
+        assert!(body.frame().await.is_none());
         drop(body);
         assert_eq!(metrics::SERVED_CHANNEL.get(), served_before + 1);
         assert!(db_rx.try_recv().is_err());
@@ -370,8 +365,8 @@ mod tests {
             ChannelBody::new(rx, ContentLength::Unknown(nonzero!(100))),
             subject(None),
         );
-        assert!(next(&mut body).await.unwrap().is_err());
-        assert!(next(&mut body).await.is_none());
+        assert!(body.frame().await.unwrap().is_err());
+        assert!(body.frame().await.is_none());
         drop(body);
         assert_eq!(metrics::SERVED_CHANNEL.get(), served_before + 1);
         assert!(db_rx.try_recv().is_err());
@@ -385,8 +380,8 @@ mod tests {
             ChannelBody::new(rx, ContentLength::Unknown(nonzero!(100))),
             subject(None),
         );
-        assert!(next(&mut body).await.unwrap().is_ok());
-        assert!(next(&mut body).await.is_none());
+        assert!(body.frame().await.unwrap().is_ok());
+        assert!(body.frame().await.is_none());
         drop(body);
         assert_eq!(metrics::SERVED_CHANNEL.get(), served_before + 2);
         assert_eq!(metrics::BYTES_SERVED_CHANNEL.get(), bytes_before + 12);
@@ -424,7 +419,7 @@ mod tests {
                 partial: false,
             },
         );
-        assert!(next(&mut body).await.unwrap().is_ok());
+        assert!(body.frame().await.unwrap().is_ok());
         drop(body);
 
         assert_eq!(metrics::REQUESTS_CHANNEL.get(), requests_before);
