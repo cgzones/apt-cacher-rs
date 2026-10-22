@@ -33,8 +33,8 @@ use crate::cleanup::model::{
     SourceGroup, SweepAction, SweepReason, decide_sweep,
 };
 use crate::cleanup::packages::{
-    DebnameKind, FetchFailure, KeyMapper, PackagesLayout, ReduceContext, ReduceError,
-    body_is_incomplete, packages_body_to_memfd, reduce_file_list, try_fetch_packages_file,
+    DebnameKind, FetchFailure, KeyMapper, ReduceContext, ReduceError, body_is_incomplete,
+    packages_body_to_memfd, reduce_file_list, try_fetch_packages_file,
 };
 use crate::cleanup::partials::cleanup_tmp_dir;
 use crate::cleanup::refs::{
@@ -220,8 +220,7 @@ pub(super) struct FetchPlan<'a> {
     // candidate debs live under the original sub-path mirror.
     pub owner_mirror: Mirror,
     pub base_uri: String,
-    pub layout: PackagesLayout,
-    // deb-cache layout for metadata invalidation; distinct from the Packages fetch `layout`
+    // deb-cache layout for metadata invalidation; distinct from the fetched index's layout
     pub cache_layout: CacheLayout,
     pub debname: DebnameKind,
     pub keymap: KeyMapper<'a>,
@@ -268,7 +267,6 @@ async fn reduce_against(
     let (mut response, pkgfmt) = match try_fetch_packages_file(
         &plan.mirror,
         &plan.base_uri,
-        plan.layout,
         &plan.debname,
         appstate,
     )
@@ -363,7 +361,6 @@ fn flat_root_fetch_plan<'a>(mirror: &Mirror, seg: &str, prefix: &'a str) -> Fetc
         // The debs live under the original sub-path `mirror`, not the flat-repo
         // root, so metadata invalidation must key by `mirror`, not `root_mirror`.
         owner_mirror: mirror.clone(),
-        layout: PackagesLayout::Flat,
         cache_layout: CacheLayout::Flat,
         debname: DebnameKind::Flat,
         keymap: KeyMapper::RelpathUnderPrefix { prefix },
@@ -1058,7 +1055,6 @@ fn origin_fetch_plan<'a>(
         mirror: fetch_mirror.clone(),
         owner_mirror: owner_mirror.clone(),
         base_uri: origin.uri(),
-        layout: PackagesLayout::Dists,
         cache_layout,
         debname: DebnameKind::OriginScoped {
             distribution: origin.distribution.clone(),
@@ -1269,7 +1265,6 @@ async fn resolve_flat_colocated(
         mirror: mirror.clone(),
         owner_mirror: mirror.clone(),
         base_uri: flat_packages_base_uri(mirror),
-        layout: PackagesLayout::Flat,
         cache_layout: CacheLayout::Flat,
         debname: DebnameKind::Flat,
         keymap: KeyMapper::Relpath,

@@ -404,27 +404,6 @@ pub(super) async fn reduce_file_list(
     }
 }
 
-/// The only two resource kinds that can be a `Packages` index. A two-variant
-/// projection onto [`ResourceKind`] rather than the kind itself, so a fetch
-/// plan cannot name a `Pool` or `ByHash` kind; the cache layout of the
-/// fetched index derives from the kind through [`ResourceKind::layout`], the
-/// same table the serve path uses, so cleanup cannot cache an index under a
-/// tree the serve path never reads.
-#[derive(Clone, Copy)]
-pub(super) enum PackagesLayout {
-    Dists,
-    Flat,
-}
-
-impl PackagesLayout {
-    pub(super) const fn resource_kind(self) -> ResourceKind {
-        match self {
-            Self::Dists => ResourceKind::Packages,
-            Self::Flat => ResourceKind::FlatMetadata,
-        }
-    }
-}
-
 /// Which `Packages` index a fetch targets, and therefore how its cached/buffered
 /// file is named. `cache_name` is the on-disk debname under which the fetched
 /// index is cached (capital-P `Packages`); `memfd_name` is the throwaway
@@ -439,6 +418,14 @@ pub(super) enum DebnameKind {
 }
 
 impl DebnameKind {
+    /// The fetched index's resource kind also determines its cache layout.
+    pub(super) const fn resource_kind(&self) -> ResourceKind {
+        match self {
+            Self::OriginScoped { .. } => ResourceKind::Packages,
+            Self::Flat => ResourceKind::FlatMetadata,
+        }
+    }
+
     fn cache_name(&self, fmt: PackagesCompression) -> String {
         match self {
             Self::OriginScoped {
@@ -507,16 +494,14 @@ fn prefer_missing_status(best: Option<StatusCode>, seen: StatusCode) -> StatusCo
 
 /// Try each of `.xz`, `.gz`, raw in turn — first format that returns 200 wins.
 /// Each request is a self-issued `process_cache_request` against `base_uri` +
-/// extension; `debname` names the cache entry each format lands in and `layout`
-/// picks the layout it is cached under.
+/// extension; `debname` determines the cache entry name and resource kind.
 pub(super) async fn try_fetch_packages_file(
     mirror: &Mirror,
     base_uri: &str,
-    layout: PackagesLayout,
     debname: &DebnameKind,
     appstate: &AppState,
 ) -> Result<(Response<ProxyCacheBody>, PackagesCompression), FetchFailure> {
-    let resource_kind = layout.resource_kind();
+    let resource_kind = debname.resource_kind();
 
     let mut uri_buffer = String::with_capacity(base_uri.len() + 3);
     // Remember a representative missing-ish status to surface after every
@@ -659,23 +644,25 @@ mod tests {
     }
 
     #[test]
-    fn packages_layout_maps_resource_kind_and_derives_its_layout() {
+    fn debname_kind_maps_resource_kind_and_derives_its_layout() {
+        let origin = DebnameKind::OriginScoped {
+            distribution: "bookworm".to_owned(),
+            component: "main".to_owned(),
+            architecture: "amd64".to_owned(),
+        };
+        assert!(matches!(origin.resource_kind(), ResourceKind::Packages));
         assert!(matches!(
-            PackagesLayout::Dists.resource_kind(),
-            ResourceKind::Packages
-        ));
-        assert!(matches!(
-            PackagesLayout::Flat.resource_kind(),
+            DebnameKind::Flat.resource_kind(),
             ResourceKind::FlatMetadata
         ));
         // The index is cached under the layout the serve path derives for the
         // same kind: `Dists` for a structured index, the flat tree otherwise.
         assert!(matches!(
-            PackagesLayout::Dists.resource_kind().layout(),
+            origin.resource_kind().layout(),
             CacheLayout::Dists
         ));
         assert!(matches!(
-            PackagesLayout::Flat.resource_kind().layout(),
+            DebnameKind::Flat.resource_kind().layout(),
             CacheLayout::Flat
         ));
     }
