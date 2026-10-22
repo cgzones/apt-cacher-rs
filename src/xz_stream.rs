@@ -537,20 +537,6 @@ mod tests {
     /// tests cheap, and the per-block cost scales with it either way.
     const DICT_1MIB: u8 = 0x10;
 
-    /// Counts the bytes the decoder pulled from its input.
-    struct CountingReader<'a> {
-        inner: Cursor<&'a [u8]>,
-        read: usize,
-    }
-
-    impl io::Read for CountingReader<'_> {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            let n = io::Read::read(&mut self.inner, buf)?;
-            self.read += n;
-            Ok(n)
-        }
-    }
-
     #[test]
     fn empty_blocks_decode_to_nothing_within_the_budget() {
         // The fixture itself is a valid stream: what stops the tests below
@@ -573,34 +559,28 @@ mod tests {
         // never engage, and setting up 100k dictionaries takes far longer
         // than the budget.
         let xz = empty_blocks_xz(100_000, DICT_1MIB);
-        let mut input = CountingReader {
-            inner: Cursor::new(&xz[..]),
-            read: 0,
-        };
+        let mut input = Cursor::new(&xz[..]);
         let mut out = Vec::new();
         let err = decode_stream(&mut input, &mut out, Duration::from_millis(20), || false)
             .expect_err("an output-free stream must not outlive its CPU budget");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
         assert_eq!(out, [] as [u8; 0]);
         assert!(
-            input.read < xz.len(),
+            input.position() < xz.len() as u64,
             "the decode must stop early, read {} of {} bytes",
-            input.read,
+            input.position(),
             xz.len()
         );
     }
 
     #[test]
     fn abandoned_decode_stops_before_reading() {
-        let mut input = CountingReader {
-            inner: Cursor::new(HELLO_XZ),
-            read: 0,
-        };
+        let mut input = Cursor::new(HELLO_XZ);
         let mut out = Vec::new();
         let err = decode_stream(&mut input, &mut out, MAX_XZ_DECODE_CPU, || true)
             .expect_err("a decode nobody reads must stop");
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{err}");
-        assert_eq!(input.read, 0);
+        assert_eq!(input.position(), 0);
         assert_eq!(out, [] as [u8; 0]);
     }
 
