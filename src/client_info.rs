@@ -1,5 +1,5 @@
 //! The peer identity a request carries through the proxy: the client's
-//! socket address plus the marker that tells cleanup's in-process index
+//! canonical IP address plus the marker that tells cleanup's in-process index
 //! fetches apart from a real client.
 
 use std::{
@@ -9,7 +9,7 @@ use std::{
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct ClientInfo {
-    addr: SocketAddr,
+    ip: IpAddr,
     is_cleanup: bool,
 }
 
@@ -24,7 +24,7 @@ impl ClientInfo {
     #[must_use]
     pub(crate) fn new(addr: SocketAddr) -> Self {
         Self {
-            addr,
+            ip: addr.ip().to_canonical(),
             is_cleanup: false,
         }
     }
@@ -32,7 +32,7 @@ impl ClientInfo {
     #[must_use]
     pub(crate) fn new_cleanup() -> Self {
         Self {
-            addr: CLEANUP_CLIENT_ADDR,
+            ip: CLEANUP_CLIENT_ADDR.ip(),
             is_cleanup: true,
         }
     }
@@ -40,7 +40,7 @@ impl ClientInfo {
     #[must_use]
     #[inline]
     pub(crate) fn ip(&self) -> IpAddr {
-        self.addr.ip().to_canonical()
+        self.ip
     }
 
     /// `true` when this client is the in-process sentinel used by
