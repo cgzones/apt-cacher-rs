@@ -3980,12 +3980,10 @@ mod tests {
     async fn cached_file_body_frames_small_files_whole() {
         use super::{CachedFileBody, SINGLE_FRAME_MAX};
         use http_body_util::BodyExt as _;
-        use std::io::Write as _;
 
         async fn frame_lengths(len: usize, buffer_size: usize) -> Vec<usize> {
-            let mut file = tempfile::tempfile().unwrap();
-            file.write_all(&vec![b'x'; len]).unwrap();
-            std::io::Seek::rewind(&mut file).unwrap();
+            let file = tempfile::tempfile().unwrap();
+            file.set_len(len as u64).unwrap();
             let mut body = CachedFileBody::new(
                 tokio::fs::File::from_std(file),
                 len as u64,
