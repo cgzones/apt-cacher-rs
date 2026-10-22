@@ -101,7 +101,10 @@ impl RateChecker {
                     HumanFmt::Size(bytes as u64),
                     HumanFmt::Rate(bytes as u64, elapsed.into())
                 );
-                for _ in 1..elapsed_secs {
+                // The current sample replaces the final slot; older padding
+                // cannot survive beyond the retained window.
+                let padding = (elapsed_secs - 1).min((self.buf.capacity().get() - 1) as u64);
+                for _ in 0..padding {
                     self.buf.push(0);
                 }
             }
@@ -199,6 +202,50 @@ mod tests {
         assert_eq!(fail.transferred, 1);
         assert_eq!(fail.timeframe, nonzero!(3));
         assert_eq!(fail.min_rate, nonzero!(100));
+    }
+
+    #[test]
+    fn sampling_gaps_retain_only_the_window_and_advance_the_full_time() {
+        for capacity in [1, 3, 31] {
+            for gap in [1, capacity - 1, capacity, 1_000_000] {
+                let mut rc = RateChecker::with_timeframe(
+                    nonzero!(1000),
+                    std::num::NonZero::new(capacity).expect("nonzero window"),
+                );
+                for _ in 0..capacity {
+                    rc.add_at(10, rc.last + Duration::from_secs(1));
+                }
+                let now = rc.last + Duration::from_secs(gap as u64);
+                rc.add_at(7, now);
+                assert_eq!(rc.last, now, "full sampling gap must be consumed");
+                let retained = if gap == 0 {
+                    capacity * 10 + 7
+                } else {
+                    capacity.saturating_sub(gap) * 10 + 7
+                };
+                assert_eq!(
+                    rc.check_fail().expect("below minimum").transferred,
+                    retained
+                );
+                rc.add_at(2, now);
+                assert_eq!(
+                    rc.check_fail().expect("below minimum").transferred,
+                    retained + 2
+                );
+                rc.add_at(3, now + Duration::from_secs(1));
+                let evicted = if capacity == 1 {
+                    retained + 2
+                } else if gap < capacity {
+                    10
+                } else {
+                    0
+                };
+                assert_eq!(
+                    rc.check_fail().expect("below minimum").transferred,
+                    retained + 2 + 3 - evicted
+                );
+            }
+        }
     }
 
     /// `transferred / timeframe >= min_rate` passes at exactly the minimum
