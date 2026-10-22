@@ -447,6 +447,11 @@ mod tests {
             Ok(socket) => socket,
             Err(err) => {
                 assert!(is_missing_ipv6(&err), "unexpected IPv6 bind failure: {err}");
+                assert!(
+                    std::env::var_os("APT_CACHER_RS_REQUIRE_IPV6").as_deref()
+                        != Some(std::ffi::OsStr::new("1")),
+                    "IPv6 is required by CI: {err}"
+                );
                 return;
             }
         };
@@ -477,6 +482,11 @@ mod tests {
             Ok(listener) => listener,
             Err(err) => {
                 assert!(is_missing_ipv6(&err), "unexpected IPv6 bind failure: {err}");
+                assert!(
+                    std::env::var_os("APT_CACHER_RS_REQUIRE_IPV6").as_deref()
+                        != Some(std::ffi::OsStr::new("1")),
+                    "IPv6 is required by CI: {err}"
+                );
                 return;
             }
         };
