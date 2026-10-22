@@ -44,12 +44,11 @@ pub(crate) fn connection_details(debname: &str) -> ConnectionDetails {
 /// sinks pick their level from `DeliveryFailure::severity`, so a test asserts
 /// the policy by reading the levels back off the subscriber.
 pub(crate) fn levels_during(f: impl FnOnce()) -> Vec<tracing::Level> {
-    use std::{fmt, sync::Arc};
+    use std::sync::Arc;
 
     use parking_lot::Mutex;
     use tracing::{
         Event, Metadata, Subscriber,
-        field::Visit,
         span::{Attributes, Id, Record},
     };
 
@@ -64,11 +63,6 @@ pub(crate) fn levels_during(f: impl FnOnce()) -> Vec<tracing::Level> {
         fn record(&self, _: &Id, _: &Record<'_>) {}
         fn record_follows_from(&self, _: &Id, _: &Id) {}
         fn event(&self, event: &Event<'_>) {
-            struct Noop;
-            impl Visit for Noop {
-                fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn fmt::Debug) {}
-            }
-            event.record(&mut Noop);
             self.0.lock().push(*event.metadata().level());
         }
         fn enter(&self, _: &Id) {}
