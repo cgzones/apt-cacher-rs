@@ -1583,40 +1583,46 @@ mod tests {
             format!("SHA256:\n {first} 1 Packages\n"),
         )
         .expect("valid sibling Release");
-        std::fs::write(
-            releases.path().join("sid_Release"),
-            format!("SHA256:\n {first} 1 first/Packages\n{unindented} 1 second/Packages\n {following} 1 third/Packages\n"),
-        )
-        .expect("malformed Release");
-        for digest in [&unindented, &following] {
-            std::fs::write(files.path().join(digest), b"x").expect("cached index");
-        }
-        let references = build_byhash_reference_set(
-            releases.path(),
-            CacheLayout::DistsByHash,
-            &["stable".into(), "sid".into()],
-        )
-        .await;
-        assert!(references.is_none(), "malformed references force age mode");
-
-        // Birthtime cannot be backdated; advance the sweep's injected clock.
-        let now = SystemTime::now();
-        for (age_days, expected_removed) in [(10, 0), (91, 2)] {
-            let outcome = sweep_byhash_dir(
-                files.path(),
-                references.as_ref(),
-                Duration::from_secs(3 * DAY),
-                Duration::from_secs(90 * DAY),
-                now + Duration::from_secs(age_days * DAY),
-                &byhash_test_mirror(),
-                CacheLayout::DistsByHash,
+        for boundary in [
+            format!("{unindented} 1 second/Packages"),
+            "-broken: value".to_owned(),
+            "#broken: value".to_owned(),
+        ] {
+            std::fs::write(
+                releases.path().join("sid_Release"),
+                format!("SHA256:\n {first} 1 first/Packages\n{boundary}\n {following} 1 third/Packages\n"),
             )
-            .await
-            .expect("sweep");
-            assert_eq!(outcome.removed, expected_removed);
-            assert_eq!(outcome.removed_unreferenced, 0);
+            .expect("malformed Release");
             for digest in [&unindented, &following] {
-                assert_eq!(files.path().join(digest).exists(), age_days < 90);
+                std::fs::write(files.path().join(digest), b"x").expect("cached index");
+            }
+            let references = build_byhash_reference_set(
+                releases.path(),
+                CacheLayout::DistsByHash,
+                &["stable".into(), "sid".into()],
+            )
+            .await;
+            assert!(references.is_none(), "malformed references force age mode");
+
+            // Birthtime cannot be backdated; advance the sweep's injected clock.
+            let now = SystemTime::now();
+            for (age_days, expected_removed) in [(10, 0), (91, 2)] {
+                let outcome = sweep_byhash_dir(
+                    files.path(),
+                    references.as_ref(),
+                    Duration::from_secs(3 * DAY),
+                    Duration::from_secs(90 * DAY),
+                    now + Duration::from_secs(age_days * DAY),
+                    &byhash_test_mirror(),
+                    CacheLayout::DistsByHash,
+                )
+                .await
+                .expect("sweep");
+                assert_eq!(outcome.removed, expected_removed);
+                assert_eq!(outcome.removed_unreferenced, 0);
+                for digest in [&unindented, &following] {
+                    assert_eq!(files.path().join(digest).exists(), age_days < 90);
+                }
             }
         }
     }

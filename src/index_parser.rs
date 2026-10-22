@@ -531,7 +531,8 @@ enum ReleaseHashSection {
 /// section (`MD5Sum:`, `SHA1:`, ... switch out). A non-field line ending a
 /// supported section emits an error before switching out, so strict cleanup
 /// rejects incomplete references while tolerant ingestion keeps its recovery
-/// behavior. Tokens are separated by
+/// behavior. Field names follow deb822 syntax, including its ban on initial
+/// `#` and `-` characters. Tokens are separated by
 /// ASCII whitespace only -- the format never uses anything else, and the
 /// Unicode-aware split walks every line char by char. A 4th token means the
 /// path contained a space, so the entry is rejected. This iterator validates
@@ -556,7 +557,9 @@ fn release_hash_entries(
         if !indented {
             let malformed = section.is_some()
                 && !split_field(line).is_some_and(|(name, _)| {
-                    !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_graphic())
+                    !name.is_empty()
+                        && !name.starts_with(['#', '-'])
+                        && name.bytes().all(|byte| byte.is_ascii_graphic())
                 });
             section = match line.trim_end() {
                 "SHA256:" => Some(ReleaseHashSection::Sha256),
@@ -1276,6 +1279,8 @@ mod tests {
                 "not a field".to_owned(),
                 "Bad field: value".to_owned(),
                 ": empty field name".to_owned(),
+                "-broken: value".to_owned(),
+                "#broken: value".to_owned(),
             ] {
                 let content = format!(
                     "{algorithm}:\n {first} 1 first/Packages\n{malformed}\n {third} 3 third/Packages\nSHA256:\n {} 4 recovered/Packages\n",
@@ -1300,7 +1305,7 @@ mod tests {
     fn release_checksum_sections_allow_real_fields_and_ascii_blank_lines() {
         let digest = hex_encode(&[0xaa; 32]);
         let content = format!(
-            "SHA256:\n {digest} 1 first/Packages\n\t \x0c\n\x0c\n {digest} 2 second/Packages\nDescription: extension field\n continuation\nMD5Sum:\n ignored 1 Packages\nSHA512:\n {} 3 third/Packages\n-----BEGIN PGP SIGNATURE-----\nnot a field\n",
+            "SHA256:\n {digest} 1 first/Packages\n\t \x0c\n\x0c\n {digest} 2 second/Packages\nX-Description#1: extension field\n continuation\nMD5Sum:\n ignored 1 Packages\nSHA512:\n {} 3 third/Packages\n-----BEGIN PGP SIGNATURE-----\nnot a field\n",
             hex_encode(&[0xbb; 64]),
         );
         let parsed = parse_release_byhash_digests(&content).expect("valid field transitions");
