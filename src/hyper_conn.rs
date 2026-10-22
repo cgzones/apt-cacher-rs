@@ -1054,24 +1054,6 @@ async fn serve_unfinished_file(
     response
 }
 
-/// A wrapper around [`UpstreamMetadata`] that supports borrowed and
-/// shared references.
-enum UpstreamMetadataView<'a> {
-    Borrowed(&'a UpstreamMetadata),
-    Arc(Arc<UpstreamMetadata>),
-}
-
-impl std::ops::Deref for UpstreamMetadataView<'_> {
-    type Target = UpstreamMetadata;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Borrowed(meta) => meta,
-            Self::Arc(meta) => meta,
-        }
-    }
-}
-
 #[must_use]
 async fn serve_cached_file(
     conn_details: ConnectionDetails,
@@ -1105,14 +1087,17 @@ async fn serve_cached_file(
 
     // Caller pre-resolves on the stale-volatile revalidation path;
     // otherwise fall back to the post-flight cache (lazy-loads xattr on miss).
-    let resolved_meta = match prefetched_upstream_metadata {
-        Some(meta) => UpstreamMetadataView::Borrowed(meta),
-        None => UpstreamMetadataView::Arc(
-            cache_metadata::store().resolve(&cache_key, &file, &file_path),
-        ),
+    let cache_info = {
+        let resolved;
+        let meta = match prefetched_upstream_metadata {
+            Some(meta) => meta,
+            None => {
+                resolved = cache_metadata::store().resolve(&cache_key, &file, &file_path);
+                &resolved
+            }
+        };
+        CacheInfo::with_meta(&mdata, meta)
     };
-
-    let cache_info = CacheInfo::with_meta(&mdata, &resolved_meta);
     let headers = RangeRequestHeaders::from_http(req.headers(), &conn_details.client);
 
     let params = match cache_info.plan(file_size, &headers, &conn_details.client) {
@@ -1350,11 +1335,8 @@ async fn serve_joined(
             drop(status);
             // A caller-supplied snapshot (the stale-volatile revalidation
             // path) wins over what the status carried.
-            let meta = match (prefetched_upstream_metadata, meta) {
-                (Some(meta), _) => Some(UpstreamMetadataView::Borrowed(meta)),
-                (None, meta) => meta.map(UpstreamMetadataView::Arc),
-            };
-            serve_cached_file(conn_details, req, file, path, meta.as_deref(), None).await
+            let borrowed = prefetched_upstream_metadata.or(meta.as_deref());
+            serve_cached_file(conn_details, req, file, path, borrowed, None).await
         }
         Err(failure) => {
             drop(status);
