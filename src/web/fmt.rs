@@ -444,17 +444,19 @@ impl StackBar<'_> {
             segments,
             unit: _,
         } = self;
-        let values: Vec<u128> = segments
+        let total: u128 = segments
             .iter()
             .map(|segment| u128::from(segment.value))
-            .collect();
-        let total: u128 = values.iter().sum();
+            .sum();
         if total == 0 {
             return None;
         }
-        let mut shares: Vec<(u128, u128)> = values
+        let mut shares: Vec<(u128, u128)> = segments
             .iter()
-            .map(|value| (value * 1000 / total, value * 1000 % total))
+            .map(|segment| {
+                let value = u128::from(segment.value);
+                (value * 1000 / total, value * 1000 % total)
+            })
             .collect();
         let floor: u128 = shares.iter().map(|(share, _)| share).sum();
         let mut order: Vec<usize> = (0..shares.len()).collect();
