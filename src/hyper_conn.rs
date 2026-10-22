@@ -1770,7 +1770,11 @@ async fn download_file(
 /// leave nothing but a bare "failed with code 302" further down. `source` and
 /// `what` only name the mirror and resource for the log line.
 #[must_use]
-fn parse_redirect_location<B>(response: &Response<B>, source: &str, what: &str) -> Option<Uri> {
+fn parse_redirect_location<B>(
+    response: &Response<B>,
+    source: &(impl fmt::Display + ?Sized),
+    what: &str,
+) -> Option<Uri> {
     let status = response.status();
     let Some(location) = response.headers().get(LOCATION) else {
         warn_once_or_debug!(
@@ -2223,11 +2227,9 @@ async fn serve_new_file_worker(
             | StatusCode::FOUND
             | StatusCode::TEMPORARY_REDIRECT
             | StatusCode::PERMANENT_REDIRECT
-    ) && let Some(moved_uri) = parse_redirect_location(
-        &fwd_response,
-        &conn_details.mirror.to_string(),
-        &conn_details.debname,
-    ) {
+    ) && let Some(moved_uri) =
+        parse_redirect_location(&fwd_response, &conn_details.mirror, &conn_details.debname)
+    {
         debug!("Requested URI: {}, Moved URI: {moved_uri:?}", req.uri());
 
         if moved_uri.scheme().is_some_and(|scheme| {
