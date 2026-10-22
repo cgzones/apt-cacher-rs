@@ -3289,10 +3289,10 @@ mod tests {
         let new_hex = "11".repeat(32);
         let old_hex = "22".repeat(32);
         let key = "debian/dists/sid/main/binary-amd64/Packages.xz";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inrelease = release_file(&dir, "InRelease", Some(newer), &new_hex);
+        let release = release_file(&dir, "Release", Some(older), &old_hex);
         for newer_first in [true, false] {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let inrelease = release_file(&dir, "InRelease", Some(newer), &new_hex);
-            let release = release_file(&dir, "Release", Some(older), &old_hex);
             let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
             let ingest_order = if newer_first {
                 [&inrelease, &release]
