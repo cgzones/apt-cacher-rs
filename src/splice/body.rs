@@ -963,12 +963,7 @@ impl<'a> BodyTransfer<'a> {
     /// A client checker tripped after progress: the cache already has the
     /// bytes, so hand off to [`Self::maybe_demote`] for adjudication.
     fn request_demote(&mut self, client: &'a TcpStream, trigger: DemoteTrigger) {
-        self.client_status = ClientStatus::DemoteRequested {
-            client,
-            client_file_pos: self.client_file_pos,
-            client_remaining: self.client_remaining,
-            trigger,
-        };
+        self.client_status = ClientStatus::DemoteRequested { client, trigger };
     }
 
     /// Only this delivery stops; upstream and cache progress retain their
@@ -982,13 +977,8 @@ impl<'a> BodyTransfer<'a> {
         // `Demoted`: the spawned file-serve task writes through a dup of this
         // socket and `shutdown(2)` is socket-wide, so it would cut off a
         // delivery that is still running.
-        if let ClientStatus::Active(client)
-        | ClientStatus::DemoteRequested {
-            client,
-            client_file_pos: _,
-            client_remaining: _,
-            trigger: _,
-        } = self.client_status
+        if let ClientStatus::Active(client) | ClientStatus::DemoteRequested { client, trigger: _ } =
+            self.client_status
         {
             shutdown_client_write(client);
         }
@@ -1019,18 +1009,14 @@ impl<'a> BodyTransfer<'a> {
     /// loop's next iteration would run anyway: the floor never ends a
     /// download the upstream checker would have let go on.
     fn maybe_demote(&mut self) -> Result<(), DownloadFailure> {
-        let ClientStatus::DemoteRequested {
-            client,
-            client_file_pos: demote_pos,
-            client_remaining: demote_remaining,
-            trigger,
-        } = self.client_status
-        else {
+        let ClientStatus::DemoteRequested { client, trigger } = self.client_status else {
             return Ok(());
         };
 
         self.check_upstream_rate()?;
 
+        let demote_pos = self.client_file_pos;
+        let demote_remaining = self.client_remaining;
         let client_total = self.range_filter.send;
         #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
         let demote_remaining_percent = 100.0 * demote_remaining as f32 / client_total as f32;
@@ -1070,12 +1056,7 @@ impl<'a> BodyTransfer<'a> {
             // that raised it, so a body cannot end in it -- and if one ever
             // did, the bytes it still owes would have no sender: a short
             // response, concluded like any other.
-            ClientStatus::DemoteRequested {
-                client,
-                client_file_pos: _,
-                client_remaining: _,
-                trigger: _,
-            } => {
+            ClientStatus::DemoteRequested { client, trigger: _ } => {
                 shutdown_client_write(client);
                 ClientEnd::Aborted(
                     self.conclude_delivery(
@@ -2234,11 +2215,6 @@ enum ClientStatus<'a> {
     DemoteRequested {
         /// The socket the spawned file-serve task takes over.
         client: &'a TcpStream,
-        /// Absolute cache file offset of the next byte the client expects.
-        client_file_pos: u64,
-        /// Bytes still owed to the client (matches the response Content-Length
-        /// minus what was already written before/during the splice loop).
-        client_remaining: u64,
         /// Which client checker asked for the demotion, for its log line.
         trigger: DemoteTrigger,
     },
@@ -2246,7 +2222,7 @@ enum ClientStatus<'a> {
     /// and is now responsible for the client. Subsequent iterations of the
     /// splice loop treat this identically to `Aborted` (cache-only
     /// path), and the byte counts the spawned task needs were already
-    /// passed in via the preceding `DemoteRequested`.
+    /// supplied by the transfer owner when it adjudicated the demotion.
     Demoted(DemotedDelivery),
 }
 
@@ -3041,7 +3017,7 @@ mod tests {
         let mut barrier = cache_barrier(&scratch.path).await;
         let mut writer = CacheWriter::new(
             scratch.file,
-            0,
+            7,
             CacheWriteMode::Kernel,
             &barrier,
             &scratch.path,
@@ -3063,7 +3039,7 @@ mod tests {
             BodyClient::Attached(&client, local_client()),
             &mut writer,
             &mut barrier,
-            SpliceRangeFilter { skip: 0, send: 1 },
+            SpliceRangeFilter { skip: 2, send: 1 },
             &scratch.path,
             1,
             None,
@@ -3077,6 +3053,9 @@ mod tests {
         starved.add(0);
         let trigger = DemoteTrigger::MinRate(starved.check_fail().expect("0 B in a 1 s window"));
         xfer.request_demote(&client, trigger);
+        assert_eq!(xfer.client_file_pos, 9);
+        assert_eq!(xfer.client_remaining, 1);
+        assert!(xfer.client_status.client_to_write().is_none());
         let err = xfer
             .maybe_demote()
             .expect_err("a starved upstream must win over the demote");
@@ -3089,8 +3068,6 @@ mod tests {
                 xfer.client_status,
                 ClientStatus::DemoteRequested {
                     client: _,
-                    client_file_pos: 0,
-                    client_remaining: 1,
                     trigger: DemoteTrigger::MinRate(_),
                 }
             ),
