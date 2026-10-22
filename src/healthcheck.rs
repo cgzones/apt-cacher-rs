@@ -429,7 +429,7 @@ pub(crate) async fn cached_health_report() -> HealthReport {
     let previous_failure = cache
         .as_ref()
         .filter(|(_at, prev)| !prev.healthy())
-        .map(|(_at, prev)| prev.to_json());
+        .map(|(_at, prev)| prev);
     let config = global_config();
     let report = run_healthcheck(
         global_cache_quota(),
@@ -445,7 +445,7 @@ pub(crate) async fn cached_health_report() -> HealthReport {
     } else if let Some(previous) = previous_failure {
         // Without this the log records only that the daemon went unhealthy,
         // never that it came back -- leaving the failure looking open-ended.
-        info!("Health check recovered, was: {previous}");
+        info!("Health check recovered, was: {}", previous.to_json());
     }
     *cache = Some((Instant::now(), report.clone()));
     report
