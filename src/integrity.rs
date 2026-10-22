@@ -724,7 +724,7 @@ impl ChecksumRegistry {
         self.insert_many(authority, mirror_path, [(relpath, digest)]);
     }
 
-    /// [`Self::insert`] for several entries of one scope under one lock.
+    /// Insert several entries of one scope under one lock.
     fn insert_many<'k>(
         &self,
         authority: &str,
@@ -1900,6 +1900,31 @@ impl IngestResult {
     }
 }
 
+/// Registry identity of an already-classified URI path. Routing validates
+/// fields before this boundary; decode each segment once, after collapsing
+/// redundant separators and dot segments. Release metadata paths are literal
+/// filesystem names and must never pass through this URI-only helper.
+fn registry_path_from_uri(raw_uri_path: &str) -> Cow<'_, str> {
+    let normalized = normalize_uri_path(raw_uri_path);
+    if normalized.contains('%') {
+        Cow::Owned(
+            normalized
+                .trim_start_matches('/')
+                .split('/')
+                .map(|segment| {
+                    urlencoding::decode(segment).expect("classified URI segment is valid UTF-8")
+                })
+                .collect::<Vec<_>>()
+                .join("/"),
+        )
+    } else {
+        match normalized {
+            Cow::Borrowed(path) => Cow::Borrowed(path.trim_start_matches('/')),
+            Cow::Owned(path) => Cow::Owned(path.trim_start_matches('/').to_owned()),
+        }
+    }
+}
+
 /// The host-relative directory a `dists/.../Release` file lives in, derived
 /// from the raw URI path (the parent directory of the `Release` leaf),
 /// normalized like the cache path (`//` runs and `.` segments collapse), so
@@ -1910,9 +1935,8 @@ impl IngestResult {
 /// ingest, so it's excluded — routing it here would just waste a file open
 /// and a `read_to_string` of opaque bytes.
 fn release_dir_from_uri_path(raw_uri_path: &str) -> Option<String> {
-    let normalized = normalize_uri_path(raw_uri_path);
-    let trimmed = normalized.trim_start_matches('/');
-    let (dir, leaf) = trimmed.rsplit_once('/')?;
+    let normalized = registry_path_from_uri(raw_uri_path);
+    let (dir, leaf) = normalized.rsplit_once('/')?;
     if !matches!(leaf, "Release" | "InRelease") {
         return None;
     }
@@ -1940,10 +1964,7 @@ fn registry_lookup_key<'a>(
         // Layer C: the full host-relative URI path, normalized like the
         // `release_dir` `ingest_release_file` inserted it under
         // ("<release_dir>/<rel>").
-        ResourceKind::Packages => Some(match normalize_uri_path(raw_uri_path) {
-            Cow::Borrowed(path) => Cow::Borrowed(path.trim_start_matches('/')),
-            Cow::Owned(path) => Cow::Owned(path.trim_start_matches('/').to_owned()),
-        }),
+        ResourceKind::Packages => Some(registry_path_from_uri(raw_uri_path)),
         ResourceKind::ByHash(..)
         | ResourceKind::FlatByHash(..)
         | ResourceKind::Release
@@ -3182,6 +3203,27 @@ mod tests {
         let (algo, digest) = resolved.expect("a matching algorithm/digest pair must be verifiable");
         assert_eq!(algo, HashAlgo::Sha256);
         assert_eq!(index_parser::hex_encode(&digest), HELLO_SHA256);
+    }
+
+    #[test]
+    fn registry_uri_identity_decodes_validated_segments_exactly_once() {
+        for path in [
+            "/debian/dists/sid/main/binary-amd64/Packages",
+            "/%64ebian//dists/./%73id/%6dain/binary-%61md64/Packages",
+        ] {
+            assert_eq!(
+                registry_lookup_key(ResourceKind::Packages, "Packages", path).as_deref(),
+                Some("debian/dists/sid/main/binary-amd64/Packages")
+            );
+        }
+        assert_eq!(
+            release_dir_from_uri_path("/%64ebian/dists/%73id/Release").as_deref(),
+            Some("debian/dists/sid")
+        );
+        assert_eq!(
+            registry_path_from_uri("/debian/dists/%2573id/Release"),
+            "debian/dists/%73id/Release"
+        );
     }
 
     #[test]
