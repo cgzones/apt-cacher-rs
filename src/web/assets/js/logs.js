@@ -48,17 +48,12 @@
       return;
     }
     split(pre);
-    const terms = view.text.toLowerCase().split(/\s+/).filter(function (word) {
-      return word !== "";
-    });
+    const terms = ACR.words(view.text);
     const entries = ACR.all(pre, "span.entry");
     let visible = 0;
     for (const entry of entries) {
-      const text = entry.textContent.toLowerCase();
       const keep = (view.level === "" || entry.classList.contains(view.level)) &&
-        terms.every(function (term) {
-          return text.indexOf(term) >= 0;
-        });
+        (terms.length === 0 || ACR.matches(entry.textContent, terms));
       entry.hidden = !keep;
       if (keep) {
         visible += 1;

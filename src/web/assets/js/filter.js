@@ -17,19 +17,6 @@
   const tableTerms = new Map();
   const metrics = { text: "", highlighted: false, nonzero: false };
 
-  function words(text) {
-    return text.toLowerCase().split(/\s+/).filter(function (word) {
-      return word !== "";
-    });
-  }
-
-  function matches(haystack, terms) {
-    const lower = haystack.toLowerCase();
-    return terms.every(function (term) {
-      return lower.indexOf(term) >= 0;
-    });
-  }
-
   function setHidden(node, hidden) {
     if (node.hidden !== hidden) {
       node.hidden = hidden;
@@ -63,11 +50,11 @@
   /* ---- Row tables -------------------------------------------------------- */
 
   function filterTable(table, box, shown) {
-    const terms = words(box.value);
+    const terms = ACR.words(box.value);
     const rows = table.tBodies[0] ? Array.prototype.slice.call(table.tBodies[0].rows) : [];
     let visible = 0;
     for (const row of rows) {
-      const keep = terms.length === 0 || matches(row.textContent, terms);
+      const keep = terms.length === 0 || ACR.matches(row.textContent, terms);
       setHidden(row, !keep);
       if (keep) {
         visible += 1;
@@ -120,14 +107,14 @@
   }
 
   function filterMetrics(body, shown) {
-    const terms = words(metrics.text);
+    const terms = ACR.words(metrics.text);
     let total = 0;
     let visible = 0;
     for (const list of ACR.all(body, "dl.details")) {
       let listVisible = 0;
       for (const row of ACR.all(list, ":scope > div")) {
         total += 1;
-        const keep = (terms.length === 0 || matches(rowText(row), terms)) &&
+        const keep = (terms.length === 0 || ACR.matches(rowText(row), terms)) &&
           (!metrics.highlighted || row.querySelector(".warn, .alert") !== null) &&
           (!metrics.nonzero || !isZero(row));
         setHidden(row, !keep);

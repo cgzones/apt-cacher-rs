@@ -94,6 +94,19 @@ const ACR = (function () {
     return scope.querySelectorAll(selector);
   }
 
+  function words(text) {
+    return text.toLowerCase().split(/\s+/).filter(function (word) {
+      return word !== "";
+    });
+  }
+
+  function matches(haystack, terms) {
+    const lower = haystack.toLowerCase();
+    return terms.every(function (term) {
+      return lower.indexOf(term) >= 0;
+    });
+  }
+
   /* The block a node belongs to: the top-level element carrying
    * data-section, which the background refresh swaps as a whole. */
   function sectionOf(node) {
@@ -341,6 +354,8 @@ const ACR = (function () {
     el: el,
     svg: svg,
     all: all,
+    words: words,
+    matches: matches,
     sectionOf: sectionOf,
     keepScroll: keepScroll,
     state: state,
