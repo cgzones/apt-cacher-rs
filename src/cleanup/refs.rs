@@ -116,9 +116,8 @@ pub(super) async fn build_byhash_reference_set(
         complete_sha256: false,
         complete_sha512: false,
     };
-    let mut found = false;
-    // Distributions whose Release was present and parsed, to check against
-    // `expected_dists` below. Only populated when there is something to check.
+    // Every parsed Release contributes algorithm coverage, including the flat
+    // layout's empty distribution key. Also checked against `expected_dists`.
     let mut coverage: HashMap<String, (bool, bool)> = HashMap::new();
 
     while let Some(entry) = walker.next().await {
@@ -169,7 +168,6 @@ pub(super) async fn build_byhash_reference_set(
                 return None;
             }
         };
-        found = true;
         let dist = if layout.is_flat() {
             ""
         } else {
@@ -214,7 +212,7 @@ pub(super) async fn build_byhash_reference_set(
         }
     }
 
-    if !found {
+    if coverage.is_empty() {
         // The by-hash tree exists but no Release names it, so the whole tree
         // drops to the age backstop instead of the 3-day grace. That is a
         // deliberate degradation, hence warn on first sight; repeats are
