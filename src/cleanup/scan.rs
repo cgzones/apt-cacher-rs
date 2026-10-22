@@ -137,6 +137,11 @@ pub(super) async fn scan_candidates(
                             continue;
                         }
 
+                        if boundaries.is_empty() {
+                            entry.descend(());
+                            continue;
+                        }
+
                         // Translate the on-disk position back to a
                         // mirror-path equivalent (`<mirror_path>/<rel>`) so
                         // it can be compared against the registered nested
