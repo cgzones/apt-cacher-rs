@@ -470,10 +470,14 @@ impl<'q> sqlx::Encode<'q, sqlx::Sqlite> for DomainName {
         &self,
         buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer,
     ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
-        // The owned copy is unavoidable: SQLite's argument buffer requires
-        // 'q-lived text and `self` only lives for this call. Encodes happen
-        // on the batched DB task, not per request.
-        <String as sqlx::Encode<'q, sqlx::Sqlite>>::encode(self.as_str().to_owned(), buf)
+        // SQLx retains the cloned Arc in its argument buffer. The consuming
+        // encoder preserves this storage; Arc's encode_by_ref copies the text.
+        let text = match &self.0 {
+            DomainNameInner::Dns(text)
+            | DomainNameInner::Ipv4(text, _)
+            | DomainNameInner::Ipv6(text, _) => std::sync::Arc::clone(text),
+        };
+        <std::sync::Arc<str> as sqlx::Encode<'q, sqlx::Sqlite>>::encode(text, buf)
     }
 }
 
@@ -481,8 +485,8 @@ impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for DomainName {
     fn decode(
         value: <sqlx::Sqlite as sqlx::Database>::ValueRef<'r>,
     ) -> Result<Self, sqlx::error::BoxDynError> {
-        let s = <String as sqlx::Decode<'r, sqlx::Sqlite>>::decode(value)?;
-        Self::new(&s).map_err(|err| {
+        let s = <&str as sqlx::Decode<'r, sqlx::Sqlite>>::decode(value)?;
+        Self::new(s).map_err(|err| {
             format!("Invalid domain in database `{}`: {err}", s.escape_debug()).into()
         })
     }
@@ -2465,6 +2469,41 @@ mod test {
                 "input `{input}`: {err}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn sqlite_hosts_keep_owned_arguments_and_decode_canonical_text() {
+        use sqlx::Connection as _;
+
+        let mut conn = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        for (input, expected) in [
+            ("DEB.Debian.ORG", "deb.debian.org"),
+            ("192.0.2.1", "192.0.2.1"),
+            ("[2001:0DB8:0:0::1]", "2001:db8::1"),
+        ] {
+            let host = DomainName::new(input).expect("valid host");
+            let query = sqlx::query_as::<_, (String, DomainName, ClientHost)>("SELECT ?1, ?1, ?2")
+                .bind(host.clone())
+                .bind(ClientHost(host.clone()));
+            drop(host);
+
+            let (stored, decoded, client) = query.fetch_one(&mut conn).await.expect("roundtrip");
+            assert_eq!(stored, expected);
+            assert_eq!(decoded.as_str(), expected);
+            assert_eq!(client.as_str(), expected);
+        }
+
+        let error = sqlx::query_scalar::<_, DomainName>("SELECT 'invalid/host'")
+            .fetch_one(&mut conn)
+            .await
+            .expect_err("invalid database host");
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid domain in database `invalid/host`")
+        );
     }
 
     #[test]
