@@ -1686,7 +1686,7 @@ async fn run_ingest_job(
     let (authority, mirror_path) = (mirror.format_authority(), mirror.path());
     loop {
         let result = ingest_once(registry, &kind, &mirror, &dest, buffer_size).await;
-        let outcome = result.outcome();
+        let outcome = ingest_outcome(&result);
         log_ingest_result(&result, outcome, authority, mirror_path, &dest);
         if !claim.finish(outcome, registry.scope_epoch(authority, mirror_path)) {
             return;
@@ -1703,9 +1703,9 @@ async fn ingest_once(
     mirror: &Mirror,
     dest: &Path,
     buffer_size: usize,
-) -> IngestResult {
+) -> std::io::Result<()> {
     let (authority, mirror_path) = (mirror.format_authority(), mirror.path());
-    let result = match kind {
+    match kind {
         IngestKind::Packages { compression } => {
             with_decode_permit(
                 &PACKAGES_INGEST_PERMITS,
@@ -1745,22 +1745,18 @@ async fn ingest_once(
                     mirror_indexes::record(mirror, release_dir, seen);
                 })
         }
-    };
-    match result {
-        Ok(()) => IngestResult::Done,
-        Err(err) => IngestResult::Failed(err),
     }
 }
 
 fn log_ingest_result(
-    result: &IngestResult,
+    result: &std::io::Result<()>,
     outcome: Outcome,
     authority: &str,
     mirror_path: &str,
     dest: &Path,
 ) {
     match (result, outcome) {
-        (IngestResult::Failed(err), Outcome::Failed) => {
+        (Err(err), Outcome::Failed) => {
             metrics::INGEST_FAILED_MARKED.increment();
             warn_once_or_debug!(
                 "Failed to ingest index `{}` for host {authority} mirror {mirror_path}; not retried until the file changes:  {}",
@@ -1768,13 +1764,13 @@ fn log_ingest_result(
                 ErrorReport(err),
             );
         }
-        (IngestResult::Failed(err), Outcome::Ingested | Outcome::Retry) => warn_once_or_debug!(
+        (Err(err), Outcome::Ingested | Outcome::Retry) => warn_once_or_debug!(
             "Failed to ingest index `{}` for host {authority} mirror {mirror_path}; retrying on its next request:  {}",
             dest.display(),
             ErrorReport(err),
         ),
         // Sync point for `wait_for_log("Index ingestion completed")`; keep the wording stable.
-        (IngestResult::Done, _) => debug!("Index ingestion completed for `{}`", dest.display()),
+        (Ok(()), _) => debug!("Index ingestion completed for `{}`", dest.display()),
     }
 }
 
@@ -1881,25 +1877,16 @@ fn ingest_kind(file: &IndexFile<'_>) -> Option<IngestKind> {
     kind
 }
 
-/// How one ingest run ended (a run is only started once admitted, so
-/// "no slot" is not a result; see [`admit`]).
-enum IngestResult {
-    Done,
-    Failed(std::io::Error),
-}
-
-impl IngestResult {
-    /// The ledger outcome. An error carrying an OS errno is the file system
-    /// failing (or cleanup removing the file) and may pass; every other
-    /// error was built by the decode pipeline itself -- a size or bomb cap,
-    /// a corrupt stream, the xz CPU budget, an over-cap or non-UTF-8
-    /// `Release` -- and repeats on the same bytes.
-    fn outcome(&self) -> Outcome {
-        match self {
-            Self::Done => Outcome::Ingested,
-            Self::Failed(err) if err.raw_os_error().is_some() => Outcome::Retry,
-            Self::Failed(_) => Outcome::Failed,
-        }
+/// The ledger outcome of one admitted ingest run. An error carrying an OS
+/// errno is the file system failing (or cleanup removing the file) and may
+/// pass; every other error was built by the decode pipeline itself -- a size
+/// or bomb cap, a corrupt stream, the xz CPU budget, an over-cap or non-UTF-8
+/// `Release` -- and repeats on the same bytes.
+fn ingest_outcome(result: &std::io::Result<()>) -> Outcome {
+    match result {
+        Ok(()) => Outcome::Ingested,
+        Err(err) if err.raw_os_error().is_some() => Outcome::Retry,
+        Err(_) => Outcome::Failed,
     }
 }
 
@@ -3567,7 +3554,7 @@ mod tests {
         };
 
         let result = ingest_once(&reg, &kind, &mirror, f.path(), 64 * 1024).await;
-        assert!(matches!(result, IngestResult::Done), "ingest ok");
+        result.expect("ingest ok");
         assert_eq!(
             reg.lookup("deb.debian.org:8080", "debian", "a_1_amd64.deb"),
             Some(sha)
@@ -3852,11 +3839,11 @@ mod tests {
         let cap = limits::check_packages_file_size(PackagesCompression::Xz, u64::MAX)
             .expect_err("over the cap");
         let budget = std::io::Error::new(std::io::ErrorKind::TimedOut, "xz budget");
-        assert_eq!(IngestResult::Failed(os).outcome(), Outcome::Retry);
-        assert_eq!(IngestResult::Failed(gone).outcome(), Outcome::Retry);
-        assert_eq!(IngestResult::Failed(cap).outcome(), Outcome::Failed);
-        assert_eq!(IngestResult::Failed(budget).outcome(), Outcome::Failed);
-        assert_eq!(IngestResult::Done.outcome(), Outcome::Ingested);
+        assert_eq!(ingest_outcome(&Err(os)), Outcome::Retry);
+        assert_eq!(ingest_outcome(&Err(gone)), Outcome::Retry);
+        assert_eq!(ingest_outcome(&Err(cap)), Outcome::Failed);
+        assert_eq!(ingest_outcome(&Err(budget)), Outcome::Failed);
+        assert_eq!(ingest_outcome(&Ok(())), Outcome::Ingested);
     }
 
     /// Admission happens before the spawn: with every slot taken a claim is
