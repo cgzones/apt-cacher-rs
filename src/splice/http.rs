@@ -1389,6 +1389,107 @@ async fn read_dechunk_body_to_vec(
 mod tests {
     use super::*;
 
+    #[test]
+    fn request_wire_preserves_optional_header_conditions_and_order() {
+        let empty = VolatileCondHeaders {
+            if_modified_since: None,
+            if_none_match: None,
+        };
+        let modified = VolatileCondHeaders {
+            if_modified_since: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
+            if_none_match: None,
+        };
+        let tagged = VolatileCondHeaders {
+            if_modified_since: None,
+            if_none_match: Some("\"index-v2\"".into()),
+        };
+        let both = VolatileCondHeaders {
+            if_modified_since: modified.if_modified_since.clone(),
+            if_none_match: tagged.if_none_match.clone(),
+        };
+        let preamble = format!(
+            "GET /debian/dists/stable/InRelease?mirror=1 HTTP/1.1\r\n\
+             Host: [2001:db8::1]:8080\r\n\
+             User-Agent: {APP_USER_AGENT}\r\n\
+             Via: {APP_VIA}\r\n\
+             Accept-Encoding: identity\r\n\
+             Connection: keep-alive\r\n"
+        );
+        for (case, offset, if_range, volatile, headers) in [
+            ("fresh", 0, None, None, ""),
+            (
+                "resume without validator",
+                7,
+                None,
+                None,
+                "Range: bytes=7-\r\n",
+            ),
+            (
+                "resume with validator",
+                7,
+                Some("\"resume-v1\""),
+                None,
+                "Range: bytes=7-\r\nIf-Range: \"resume-v1\"\r\n",
+            ),
+            (
+                "zero offset ignores validator",
+                0,
+                Some("\"resume-v1\""),
+                None,
+                "",
+            ),
+            (
+                "volatile without validators",
+                0,
+                None,
+                Some(&empty),
+                "Cache-Control: max-age=300\r\n",
+            ),
+            (
+                "volatile modified only",
+                0,
+                None,
+                Some(&modified),
+                "If-Modified-Since: Wed, 21 Oct 2015 07:28:00 GMT\r\n\
+                 Cache-Control: max-age=300\r\n",
+            ),
+            (
+                "volatile tag only",
+                0,
+                None,
+                Some(&tagged),
+                "Cache-Control: max-age=300\r\nIf-None-Match: \"index-v2\"\r\n",
+            ),
+            (
+                "volatile both validators",
+                0,
+                None,
+                Some(&both),
+                "If-Modified-Since: Wed, 21 Oct 2015 07:28:00 GMT\r\n\
+                 Cache-Control: max-age=300\r\nIf-None-Match: \"index-v2\"\r\n",
+            ),
+            (
+                "resume before volatile headers",
+                7,
+                Some("\"resume-v1\""),
+                Some(&both),
+                "Range: bytes=7-\r\nIf-Range: \"resume-v1\"\r\n\
+                 If-Modified-Since: Wed, 21 Oct 2015 07:28:00 GMT\r\n\
+                 Cache-Control: max-age=300\r\nIf-None-Match: \"index-v2\"\r\n",
+            ),
+        ] {
+            let request = format_http_request(
+                "/debian/dists/stable/InRelease?mirror=1",
+                "[2001:db8::1]:8080",
+                offset,
+                if_range,
+                volatile,
+            );
+            let expected = format!("{preamble}{headers}\r\n");
+            assert_eq!(request.as_bytes(), expected.as_bytes(), "{case}");
+        }
+    }
+
     #[tokio::test]
     async fn chunked_relay_write_failure_keeps_client_side_and_os_error() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
