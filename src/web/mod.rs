@@ -33,8 +33,9 @@
 //! # The markup the scripts rely on
 //!
 //! No test runs the scripts, so renaming one of these hooks breaks a
-//! feature silently; treat them as an interface. The integration test
-//! `the_markup_carries_every_script_hook` renders them all.
+//! feature silently; treat them as an interface. Table and page tests pin
+//! individual hooks, asset tests check script policy, and CI checks script
+//! syntax; these do not exercise the complete browser interface.
 //!
 //! - `<body data-page="dashboard|logs">`: which page the script runs on.
 //! - `<link rel="stylesheet">` and `<script src>` in `<head>`: compared
