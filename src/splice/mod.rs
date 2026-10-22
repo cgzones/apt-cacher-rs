@@ -1911,7 +1911,7 @@ async fn splice_proxy_drive(
     // wake-up a demoted file-serve task may be parked on. No I/O yet.
     let tail = CommitTail::new(
         target.begin_rename().await,
-        conn_details,
+        conn_details.clone(),
         conn_label,
         CompletionBytes {
             total: total_content_length,

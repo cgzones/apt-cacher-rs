@@ -250,14 +250,14 @@ async fn receive_client_report(
 impl CommitTail {
     pub(super) fn new(
         target: Committable,
-        conn_details: &ConnectionDetails,
+        conn_details: ConnectionDetails,
         conn_label: ConnLabel,
         bytes: CompletionBytes,
         start: PreciseInstant,
     ) -> Self {
         Self {
             target,
-            conn_details: conn_details.clone(),
+            conn_details,
             conn_label,
             bytes,
             start,

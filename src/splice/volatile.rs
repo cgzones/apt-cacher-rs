@@ -180,7 +180,7 @@ pub(super) async fn handle_volatile_buffered_download(
         Ok(target) => Some(
             CommitTail::new(
                 target.begin_rename().await,
-                conn_details,
+                conn_details.clone(),
                 conn_label,
                 CompletionBytes {
                     total: total_content_length,

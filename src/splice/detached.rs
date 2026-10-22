@@ -155,7 +155,7 @@ impl DetachedDownload {
         // `BYTES_SERVED_SPLICE` bump and no `Delivery` row.
         CommitTail::new(
             target.begin_rename().await,
-            &conn_details,
+            conn_details,
             conn_label,
             CompletionBytes {
                 total: total_content_length,
