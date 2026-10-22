@@ -96,7 +96,7 @@ use crate::{
     scheme_cache::{self, SchemeDecision, canonical_upstream_authority},
     static_assert,
     transfer_error::{CacheError, DeliveryFailure, DownloadFailure, InternalError, UpstreamError},
-    tunnel_limiter, upstream_dial,
+    upstream_dial,
     upstream_head::{
         ContentLength, DownloadPlan, RejectGates, RelayedHeaders, ResumeAnomaly, ResumeState,
         UpstreamHead, plan_download, plan_fresh_download, resolve_body_framing,
@@ -2877,17 +2877,11 @@ fn connect_response(
         Err(ConnectReject { status, msg }) => return quick_response_closing(status, msg),
     };
 
-    // Account for the active tunnel regardless of whether the per-IP cap
-    // is configured, so `CONNECT_TUNNEL_ACTIVE_PEAK` and the dashboard's
-    // active count stay accurate on unlimited deployments.
-    let active_tunnel_guard = tunnel_limiter::ActiveTunnelGuard::new();
-
     metrics::TUNNEL_CONNECTS_TOTAL.increment();
     info!("Using uncached tunnel for client {client} to {target}");
 
     tokio::task::spawn(async move {
         let _tunnel_guard = tunnel_guard;
-        let _active_tunnel_guard = active_tunnel_guard;
         let _hold = hold;
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {

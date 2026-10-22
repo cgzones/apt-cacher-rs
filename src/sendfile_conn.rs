@@ -100,7 +100,7 @@ use crate::{
     transfer_error::{
         CacheError, ClientError, DeliveryEnd, DeliveryFailure, InternalError, TransferOutcome,
     },
-    tunnel_limiter, upstream_dial,
+    upstream_dial,
     upstream_head::ContentLength,
     warn_once, warn_once_or_debug, warn_once_or_info,
     web::{WebResponse, serve_web_interface},
@@ -193,8 +193,7 @@ pub(crate) enum ZeroCopyResult {
     /// The guards are held for the tunnel's lifetime.
     Tunnel {
         target: TunnelTarget,
-        tunnel_guard: Option<tunnel_limiter::TunnelGuard>,
-        active_guard: tunnel_limiter::ActiveTunnelGuard,
+        tunnel_guard: crate::connect_tunnel::TunnelPermit,
     },
 
     /// Sending a message to the client failed.
@@ -443,7 +442,6 @@ pub(crate) async fn handle_sendfile_connection(
             ZeroCopyResult::Tunnel {
                 target,
                 tunnel_guard,
-                active_guard,
             } => {
                 // CONNECT tunnel consumes the whole connection.
                 run_connect_tunnel(
@@ -454,7 +452,6 @@ pub(crate) async fn handle_sendfile_connection(
                     client,
                     target,
                     tunnel_guard,
-                    active_guard,
                 )
                 .await;
                 return;
@@ -873,14 +870,9 @@ fn handle_connect(client: ClientInfo, target: &str) -> ZeroCopyResult {
         }
     };
 
-    // Account for the active tunnel regardless of whether the per-IP cap is
-    // configured, so the dashboard's active/peak counts stay accurate.
-    let active_guard = tunnel_limiter::ActiveTunnelGuard::new();
-
     ZeroCopyResult::Tunnel {
         target,
         tunnel_guard,
-        active_guard,
     }
 }
 
@@ -926,10 +918,6 @@ async fn write_tunnel_upstream_error(
 /// `TUNNEL_CONNECTS_TOTAL` is bumped up front (the CONNECT was accepted), so a
 /// connect failure's `TUNNEL_TRANSFER_FAILED` bump stays a subset of it — the
 /// invariant documented on those counters in `metrics.rs`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "tunnel relay threads the stream, buffered prefix, target and guards through one call"
-)]
 async fn run_connect_tunnel(
     stream: TcpStream,
     buf: BytesMut,
@@ -937,11 +925,9 @@ async fn run_connect_tunnel(
     conn_version: ConnectionVersion,
     client: ClientInfo,
     target: TunnelTarget,
-    tunnel_guard: Option<tunnel_limiter::TunnelGuard>,
-    active_guard: tunnel_limiter::ActiveTunnelGuard,
+    tunnel_guard: crate::connect_tunnel::TunnelPermit,
 ) {
     let _tunnel_guard = tunnel_guard;
-    let _active_guard = active_guard;
 
     let config = global_config();
 

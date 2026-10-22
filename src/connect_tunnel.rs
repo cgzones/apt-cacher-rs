@@ -40,7 +40,7 @@ use crate::{
     error::{ErrorReport, is_peer_disconnect},
     humanfmt::HumanFmt,
     limits, metrics,
-    tunnel_limiter::{self, TunnelGuard},
+    tunnel_limiter::{self, ActiveTunnelGuard, TunnelGuard},
     uri_authority, warn_once_or_info,
     write_stall::is_client_write_stall,
 };
@@ -81,29 +81,37 @@ pub(crate) struct ConnectReject {
     pub msg: &'static str,
 }
 
+/// Admission owns both the optional per-IP slot and the unconditional count.
+/// Backends retain this permit through upgrade, dialing, and the whole relay.
+pub(crate) struct TunnelPermit {
+    _slot: Option<TunnelGuard>,
+    _active: ActiveTunnelGuard,
+}
+
 /// Acquire the configured per-client tunnel slot, recording any refusal.
-/// The caller separately holds an active-tunnel guard even with no cap.
-pub(crate) fn admit(
-    config: &Config,
-    client: &ClientInfo,
-) -> Result<Option<TunnelGuard>, ConnectReject> {
-    let Some(max) = config.https_tunnel_max_connections_per_client else {
-        return Ok(None);
+pub(crate) fn admit(config: &Config, client: &ClientInfo) -> Result<TunnelPermit, ConnectReject> {
+    let slot = if let Some(max) = config.https_tunnel_max_connections_per_client {
+        let Some(guard) =
+            tunnel_limiter::try_acquire(client.ip(), max, config.client_ipv6_prefix_len)
+        else {
+            info!(
+                "Rejecting https tunnel request for client {client}, concurrent connection limit ({max}) reached"
+            );
+            metrics::TUNNEL_REJECTED_CAPACITY.increment();
+            client_trouble::record(client, Trouble::CapRefused);
+            return Err(ConnectReject {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                msg: "Too many concurrent HTTPS tunnel connections",
+            });
+        };
+        Some(guard)
+    } else {
+        None
     };
-    let Some(guard) = tunnel_limiter::try_acquire(client.ip(), max, config.client_ipv6_prefix_len)
-    else {
-        info!(
-            "Rejecting https tunnel request for client {client}, \
-             concurrent connection limit ({max}) reached"
-        );
-        metrics::TUNNEL_REJECTED_CAPACITY.increment();
-        client_trouble::record(client, Trouble::CapRefused);
-        return Err(ConnectReject {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            msg: "Too many concurrent HTTPS tunnel connections",
-        });
-    };
-    Ok(Some(guard))
+    Ok(TunnelPermit {
+        _slot: slot,
+        _active: ActiveTunnelGuard::new(),
+    })
 }
 
 /// Validate a CONNECT request's authority against tunnel policy.
@@ -434,6 +442,24 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for IdleTracked<'_, S> {
 mod tests {
     use super::*;
     use crate::test_support::local_client;
+
+    #[test]
+    fn admission_counts_uncapped_tunnels_and_releases_capped_slots() {
+        let mut config = Config::default();
+        let client = local_client();
+        let before = tunnel_limiter::active_tunnels();
+        let uncapped = admit(&config, &client).unwrap_or_else(|_| panic!("uncapped admission"));
+        assert_eq!(tunnel_limiter::active_tunnels(), before + 1);
+        drop(uncapped);
+        assert_eq!(tunnel_limiter::active_tunnels(), before);
+        config.https_tunnel_max_connections_per_client = NonZero::new(1);
+        let capped = admit(&config, &client).unwrap_or_else(|_| panic!("first slot"));
+        assert!(admit(&config, &client).is_err());
+        assert_eq!(tunnel_limiter::active_tunnels(), before + 1);
+        drop(capped);
+        assert_eq!(tunnel_limiter::active_tunnels(), before);
+        assert!(admit(&config, &client).is_ok());
+    }
 
     fn tunnel_config(allowed: &[&str]) -> Config {
         let mut mirrors: Vec<DomainName> = allowed
