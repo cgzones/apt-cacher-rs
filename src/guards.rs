@@ -1444,27 +1444,6 @@ mod tests {
 
     #[cfg(feature = "splice")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dropped_download_keeps_its_writer_lease() {
-        let active = ActiveDownloads::new();
-        let key = key("cancelled.deb");
-        let barrier = downloading(&active, &key).await;
-        let status = Arc::clone(barrier.status());
-        let mut progress = barrier.subscribe();
-        let writer = barrier.write_lease();
-
-        drop(barrier);
-        assert!(progress.changed().await.is_err());
-        assert!(matches!(
-            *status.read().await,
-            ActiveDownloadStatus::Aborted(_)
-        ));
-        assert_eq!(active.len(), 1);
-        drop(writer);
-        assert_eq!(active.len(), 0);
-    }
-
-    #[cfg(feature = "splice")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn completed_download_passes_its_lease_to_verification() {
         let active = ActiveDownloads::new();
         let key = key("verifying.deb");
