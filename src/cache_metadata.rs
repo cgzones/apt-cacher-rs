@@ -226,7 +226,7 @@ pub(crate) fn write_upstream_metadata(
     // One blocking section for all three attributes: writing them through
     // the `tokio::fs::File` target would demote the worker once per
     // attribute, and every fresh download writes up to three.
-    tokio::task::block_in_place(|| {
+    let write = || {
         let file = &xattr_helpers::XattrFile(file);
         match etag {
             Some(etag) => {
@@ -267,7 +267,13 @@ pub(crate) fn write_upstream_metadata(
         if let Some(size) = expected_size {
             xattr_helpers::write(file, display_path, &ExpectedSize(size));
         }
-    });
+    };
+    if xattr_helpers::xattr_supported() {
+        tokio::task::block_in_place(write);
+    } else {
+        // Keep defensive validation warnings, but the disabled helpers perform no I/O.
+        write();
+    }
 }
 
 /// A malformed upstream validator discarded by [`check_upstream_validators`],
@@ -1075,6 +1081,19 @@ mod tests {
         let again = store.resolve(&key.as_ref(), &file, &path);
         assert!(Arc::ptr_eq(&entry, &again), "the negative entry is reused");
         assert_eq!(store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn disabled_xattrs_do_not_require_a_blocking_runtime() {
+        let (_dir, file, path) = fixture_file().await;
+        xattr_helpers::set_xattr_supported(false);
+        let meta = UpstreamMetadata::from_upstream(Some("\"abc\""), None);
+        write_upstream_metadata(&file, &path, &meta, Some(12), TargetFile::Resumed);
+        let malformed = UpstreamMetadata {
+            etag: Some(Arc::from("bad")),
+            last_modified: Some((Arc::from("bad"), HttpDate::UNIX_EPOCH)),
+        };
+        write_upstream_metadata(&file, &path, &malformed, None, TargetFile::New);
     }
 
     #[test]
