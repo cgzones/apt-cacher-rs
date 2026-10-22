@@ -218,11 +218,11 @@ pub(super) struct FetchPlan<'a> {
     // co-located flat plans, but differs for the flat-root and strict-flat-pool
     // fallbacks where `mirror` is the (truncated) Packages-fetch mirror while the
     // candidate debs live under the original sub-path mirror.
-    pub owner_mirror: Mirror,
+    pub owner_mirror: &'a Mirror,
     pub base_uri: String,
     // deb-cache layout for metadata invalidation; distinct from the fetched index's layout
     pub cache_layout: CacheLayout,
-    pub debname: DebnameKind,
+    pub debname: DebnameKind<'a>,
     pub keymap: KeyMapper<'a>,
 }
 
@@ -310,7 +310,7 @@ async fn reduce_against(
 
     let mut reduce_ctx = ReduceContext {
         root: tree_root,
-        mirror: &plan.owner_mirror,
+        mirror: plan.owner_mirror,
         layout: plan.cache_layout,
         tally,
         keymap: plan.keymap,
@@ -348,7 +348,7 @@ fn flat_packages_base_uri(mirror: &Mirror) -> String {
 /// in-mirror `prefix` (trailing `/`) from `Filename:` values so a root index
 /// reconciles a sub-path mirror's cached debs. Shared by the root-first fast
 /// path and the co-located cascade's Step 2 fallback.
-fn flat_root_fetch_plan<'a>(mirror: &Mirror, seg: &str, prefix: &'a str) -> FetchPlan<'a> {
+fn flat_root_fetch_plan<'a>(mirror: &'a Mirror, seg: &str, prefix: &'a str) -> FetchPlan<'a> {
     let root_mirror = Mirror::new(
         mirror.host().clone(),
         mirror.port(),
@@ -360,7 +360,7 @@ fn flat_root_fetch_plan<'a>(mirror: &Mirror, seg: &str, prefix: &'a str) -> Fetc
         mirror: root_mirror,
         // The debs live under the original sub-path `mirror`, not the flat-repo
         // root, so metadata invalidation must key by `mirror`, not `root_mirror`.
-        owner_mirror: mirror.clone(),
+        owner_mirror: mirror,
         cache_layout: CacheLayout::Flat,
         debname: DebnameKind::Flat,
         keymap: KeyMapper::RelpathUnderPrefix { prefix },
@@ -1046,20 +1046,20 @@ async fn gate_on_row(
 /// `cache_metadata` invalidation, so it is the reconciled mirror in both.
 fn origin_fetch_plan<'a>(
     fetch_mirror: &Mirror,
-    owner_mirror: &Mirror,
-    origin: &OriginEntry,
+    owner_mirror: &'a Mirror,
+    origin: &'a OriginEntry,
     cache_layout: CacheLayout,
     keymap: KeyMapper<'a>,
 ) -> FetchPlan<'a> {
     FetchPlan {
         mirror: fetch_mirror.clone(),
-        owner_mirror: owner_mirror.clone(),
+        owner_mirror,
         base_uri: origin.uri(),
         cache_layout,
         debname: DebnameKind::OriginScoped {
-            distribution: origin.distribution.clone(),
-            component: origin.component.clone(),
-            architecture: origin.architecture.clone(),
+            distribution: &origin.distribution,
+            component: &origin.component,
+            architecture: &origin.architecture,
         },
         keymap,
     }
@@ -1263,7 +1263,7 @@ async fn resolve_flat_colocated(
 
     let plan = FetchPlan {
         mirror: mirror.clone(),
-        owner_mirror: mirror.clone(),
+        owner_mirror: mirror,
         base_uri: flat_packages_base_uri(mirror),
         cache_layout: CacheLayout::Flat,
         debname: DebnameKind::Flat,
@@ -1455,7 +1455,7 @@ mod tests {
             MirrorKind::Flat,
         );
         let plan = flat_root_fetch_plan(&owner, "apt", "amd64/");
-        assert_eq!(plan.owner_mirror, owner);
+        assert_eq!(plan.owner_mirror, &owner);
         assert_eq!(plan.owner_mirror.path(), "apt/amd64");
         // The fetch mirror is the truncated flat-repo root, distinct from owner.
         assert_ne!(plan.mirror, owner);

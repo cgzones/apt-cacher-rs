@@ -408,16 +408,16 @@ pub(super) async fn reduce_file_list(
 /// file is named. `cache_name` is the on-disk debname under which the fetched
 /// index is cached (capital-P `Packages`); `memfd_name` is the throwaway
 /// in-memory buffer name (lowercase-p `packages`).
-pub(super) enum DebnameKind {
+pub(super) enum DebnameKind<'a> {
     OriginScoped {
-        distribution: String,
-        component: String,
-        architecture: String,
+        distribution: &'a str,
+        component: &'a str,
+        architecture: &'a str,
     },
     Flat,
 }
 
-impl DebnameKind {
+impl DebnameKind<'_> {
     /// The fetched index's resource kind also determines its cache layout.
     pub(super) const fn resource_kind(&self) -> ResourceKind {
         match self {
@@ -498,7 +498,7 @@ fn prefer_missing_status(best: Option<StatusCode>, seen: StatusCode) -> StatusCo
 pub(super) async fn try_fetch_packages_file(
     mirror: &Mirror,
     base_uri: &str,
-    debname: &DebnameKind,
+    debname: &DebnameKind<'_>,
     appstate: &AppState,
 ) -> Result<(Response<ProxyCacheBody>, PackagesCompression), FetchFailure> {
     let resource_kind = debname.resource_kind();
@@ -621,9 +621,9 @@ mod tests {
     #[test]
     fn debname_kind_derives_cache_and_memfd_names() {
         let o = DebnameKind::OriginScoped {
-            distribution: "bookworm".to_owned(),
-            component: "main".to_owned(),
-            architecture: "amd64".to_owned(),
+            distribution: "bookworm",
+            component: "main",
+            architecture: "amd64",
         };
         assert_eq!(
             o.cache_name(PackagesCompression::Xz),
@@ -646,9 +646,9 @@ mod tests {
     #[test]
     fn debname_kind_maps_resource_kind_and_derives_its_layout() {
         let origin = DebnameKind::OriginScoped {
-            distribution: "bookworm".to_owned(),
-            component: "main".to_owned(),
-            architecture: "amd64".to_owned(),
+            distribution: "bookworm",
+            component: "main",
+            architecture: "amd64",
         };
         assert!(matches!(origin.resource_kind(), ResourceKind::Packages));
         assert!(matches!(
