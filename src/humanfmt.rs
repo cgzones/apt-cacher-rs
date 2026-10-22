@@ -155,38 +155,14 @@ impl std::fmt::Display for HumanFmt {
                 let time = time / 24;
                 let days = time;
 
-                let days_fmt = if days != 0 {
-                    format_args!("{days}d")
-                } else {
-                    format_args!("")
-                };
-
-                let hours_fmt = if hours != 0 {
-                    format_args!("{}{hours}h", if days == 0 { "" } else { " " })
-                } else {
-                    format_args!("")
-                };
-
-                let mins_fmt = if mins != 0 {
-                    format_args!("{}{mins}m", if hours == 0 && days == 0 { "" } else { " " })
-                } else {
-                    format_args!("")
-                };
-
-                let secs_fmt = if secs != 0 {
-                    format_args!(
-                        "{}{secs}s",
-                        if mins == 0 && hours == 0 && days == 0 {
-                            ""
-                        } else {
-                            " "
-                        }
-                    )
-                } else {
-                    format_args!("")
-                };
-
-                write!(f, "{days_fmt}{hours_fmt}{mins_fmt}{secs_fmt}")
+                let mut separator = "";
+                for (value, unit) in [(days, 'd'), (hours, 'h'), (mins, 'm'), (secs, 's')] {
+                    if value != 0 {
+                        write!(f, "{separator}{value}{unit}")?;
+                        separator = " ";
+                    }
+                }
+                Ok(())
             }
         }
     }
