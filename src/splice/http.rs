@@ -267,18 +267,19 @@ impl BodyFraming {
         self,
         status: StatusCode,
         client: ConnectionVersion,
-    ) -> Option<String> {
-        if is_bodyless_status(status) {
-            return None;
-        }
-        match self {
-            Self::ContentLength(len) => Some(format!("Content-Length: {len}\r\n")),
-            Self::Chunked => match ChunkedRelay::for_client(client) {
-                ChunkedRelay::Raw => Some("Transfer-Encoding: chunked\r\n".to_owned()),
-                ChunkedRelay::Decoded => None,
-            },
-            Self::CloseDelimited => None,
-        }
+    ) -> impl std::fmt::Display {
+        std::fmt::from_fn(move |f| {
+            if is_bodyless_status(status) {
+                return Ok(());
+            }
+            match self {
+                Self::ContentLength(len) => write!(f, "Content-Length: {len}\r\n"),
+                Self::Chunked if matches!(ChunkedRelay::for_client(client), ChunkedRelay::Raw) => {
+                    f.write_str("Transfer-Encoding: chunked\r\n")
+                }
+                Self::Chunked | Self::CloseDelimited => Ok(()),
+            }
+        })
     }
 
     /// Relay the response body to a `client_stream` speaking HTTP version

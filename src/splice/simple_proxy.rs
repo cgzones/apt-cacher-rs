@@ -66,11 +66,10 @@ pub(super) fn rewrite_simple_proxy_headers(
 
     let relayed = RelayedHeaders::new(parsed.headers.iter().map(|h| (h.name, h.value)));
 
+    let framing_header = framing.header_line(status_code, conn_version);
     let mut buf =
-        format!("{conn_version} {status_code}\r\nConnection: {conn_action}\r\n").into_bytes();
-    if let Some(line) = framing.header_line(status_code, conn_version) {
-        buf.extend_from_slice(line.as_bytes());
-    }
+        format!("{conn_version} {status_code}\r\nConnection: {conn_action}\r\n{framing_header}")
+            .into_bytes();
     for h in parsed.headers.iter() {
         if !relayed.keeps(h.name) {
             continue;
