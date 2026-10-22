@@ -302,7 +302,7 @@ mod tests {
 
     /// The motivating case: a blackholed IPv6 address does not hold up the
     /// IPv4 one past the fallback delay.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_hanging_preferred_family_falls_back_after_the_delay() {
         let fake = Fake::new(&[(V6_A, Behaviour::Hangs), (V4_A, Behaviour::Connects)]);
         let start = Instant::now();
@@ -322,7 +322,7 @@ mod tests {
 
     /// A refused preferred family hands over at once instead of waiting out
     /// the delay.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_failed_preferred_family_falls_back_immediately() {
         let fake = Fake::new(&[(V6_A, Behaviour::Refuses), (V4_A, Behaviour::Connects)]);
         let start = Instant::now();
@@ -359,7 +359,7 @@ mod tests {
 
     /// Within one family a hanging address gets only its share of the
     /// timeout, so the next one is still tried.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_hanging_address_leaves_time_for_the_rest_of_its_family() {
         let fake = Fake::new(&[(V6_A, Behaviour::Hangs), (V6_B, Behaviour::Connects)]);
         let winner = run(
@@ -375,7 +375,7 @@ mod tests {
 
     /// A failed dial names every address it tried, and takes its kind from a
     /// real failure over a timeout.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_failed_dial_reports_every_attempt() {
         let fake = Fake::new(&[
             (V6_A, Behaviour::Hangs),
@@ -407,7 +407,7 @@ mod tests {
     }
 
     /// Only a dial on which every attempt ran out of time is a timeout.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_dial_of_only_timeouts_is_a_timeout() {
         let fake = Fake::new(&[(V6_A, Behaviour::Hangs), (V4_A, Behaviour::Hangs)]);
         let err = run(

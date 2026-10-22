@@ -186,7 +186,7 @@ mod tests {
 
     use super::{WriteStallTimeout, is_client_write_stall};
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_write_the_client_never_reads_times_out() {
         let (_client, server) = tokio::io::duplex(64);
         let mut server = WriteStallTimeout::new(server, Duration::from_millis(50));
@@ -200,7 +200,7 @@ mod tests {
 
     /// Every write that makes progress disarms the deadline: a slow reader
     /// taking far longer than the timeout in total is not cut off.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_slowly_reading_client_is_not_timed_out() {
         let (mut client, server) = tokio::io::duplex(64);
         let mut server = WriteStallTimeout::new(server, Duration::from_millis(200));
