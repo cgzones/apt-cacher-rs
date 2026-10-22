@@ -2203,21 +2203,7 @@ async fn sendfile_chunk_loop(
                     .unwrap_or(MAX_PER_SYSCALL);
                 let mut off = *file_offset;
                 match socket.try_io(Interest::WRITABLE, || {
-                    loop {
-                        match sendfile(
-                            fds.socket.as_fd(),
-                            fds.file.as_fd(),
-                            Some(&mut off),
-                            chunk_size,
-                        ) {
-                            Ok(n) => return Ok(n),
-                            Err(nix::errno::Errno::EAGAIN) => {
-                                return Err(std::io::Error::from(ErrorKind::WouldBlock));
-                            }
-                            Err(nix::errno::Errno::EINTR) => {}
-                            Err(errno) => return Err(std::io::Error::from(errno)),
-                        }
-                    }
+                    sendfile_once(fds.socket.as_fd(), fds.file.as_fd(), &mut off, chunk_size)
                 }) {
                     Ok(0) => {
                         warn_once_or_debug!(
@@ -2253,6 +2239,24 @@ async fn sendfile_chunk_loop(
     }
 
     Ok((ChunkLoopOutcome::Complete, fds))
+}
+
+/// A readiness probe must execute the syscall inside `try_io`, so EAGAIN
+/// clears only the readiness tick that the actual syscall observed.
+fn sendfile_once(
+    socket: std::os::fd::BorrowedFd<'_>,
+    file: std::os::fd::BorrowedFd<'_>,
+    offset: &mut nix::libc::off_t,
+    count: usize,
+) -> std::io::Result<usize> {
+    loop {
+        match sendfile(socket, file, Some(&mut *offset), count) {
+            Ok(n) => return Ok(n),
+            Err(nix::errno::Errno::EAGAIN) => return Err(ErrorKind::WouldBlock.into()),
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(errno) => return Err(errno.into()),
+        }
+    }
 }
 
 /// Perform an async sendfile(2) operation, transferring `count` bytes from `file`
@@ -2312,16 +2316,7 @@ async fn sendfile_transfer(
         )]
         let want = count as usize;
         match socket.try_io(Interest::WRITABLE, || {
-            loop {
-                match sendfile(socket.as_fd(), file.as_fd(), Some(&mut file_offset), want) {
-                    Ok(n) => return Ok(n),
-                    Err(nix::errno::Errno::EAGAIN) => {
-                        return Err(std::io::Error::from(ErrorKind::WouldBlock));
-                    }
-                    Err(nix::errno::Errno::EINTR) => {}
-                    Err(errno) => return Err(std::io::Error::from(errno)),
-                }
-            }
+            sendfile_once(socket.as_fd(), file.as_fd(), &mut file_offset, want)
         }) {
             Ok(0) => {
                 return Err(CacheError::invalid(
