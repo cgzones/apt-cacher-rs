@@ -9,7 +9,7 @@
 //! both agree on where a mirror's tree ends) and which hold partial
 //! downloads (`tmp/`). Those are tallied like cached files: `cache_quota`
 //! counts the kept partials a failed download leaves behind, which cleanup
-//! reaps only once they age out. The cache root's own `tmp/` (volatile
+//! reaps only once they age out. The cache root's `.apt-cacher-rs.tmp/` (volatile
 //! scratch files, purged at startup) is not counted.
 //!
 //! The scan only counts.  Anything the layout does not allow is reported
@@ -27,7 +27,9 @@ use hashbrown::HashMap;
 use tracing::{debug, error, trace};
 
 use crate::{
-    cache_paths::{CachePaths, KNOWN_MIRROR_SUBDIRS, SUBDIR_FLAT_BYHASH, SUBDIR_TMP},
+    cache_paths::{
+        CachePaths, KNOWN_MIRROR_SUBDIRS, SUBDIR_FLAT_BYHASH, SUBDIR_SCRATCH, SUBDIR_TMP,
+    },
     cache_quota::accounted_size,
     cache_walk::{
         AnomalyLevel, DirFailure, Entry, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker,
@@ -246,7 +248,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
             EntryKind::Dir => {}
         }
 
-        if entry.name() == SUBDIR_TMP {
+        if entry.name() == SUBDIR_SCRATCH {
             continue;
         }
 

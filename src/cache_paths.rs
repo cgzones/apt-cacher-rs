@@ -14,7 +14,7 @@
 //! # Layout
 //!
 //! ```text
-//! {root}/tmp/                                        scratch_dir / scratch_file
+//! {root}/.apt-cacher-rs.tmp/                         scratch_dir / scratch_file
 //! {root}/{host[:port]}/                              host_dir
 //! {root}/{host[:port]}/{mirror_path}/                mirror_dir  = entry_dir(StructuredPool)
 //! {root}/{host[:port]}/{mirror_path}/dists/          entry_dir(Dists)
@@ -84,11 +84,12 @@ pub(crate) const SUBDIR_FLAT_BYHASH: &str = "by-hash";
 
 /// Partial-download scratch directory.  Lives per-mirror at
 /// `{cache}/{host}/{mirror_path}/tmp/` (structured) and
-/// `{cache}/{host}/flat/{mirror_path}/tmp/` (flat), and once more directly
-/// under the cache root for volatile downloads ([`CachePaths::scratch_dir`]).
-/// Files here are owned by `cleanup_tmp_dir`, never tallied in the
-/// cache-size sweep.
+/// `{cache}/{host}/flat/{mirror_path}/tmp/` (flat). Kept partials count
+/// towards quota and are reaped by `cleanup_tmp_dir`.
 pub(crate) const SUBDIR_TMP: &str = "tmp";
+
+/// Root-only volatile scratch space, disjoint from valid hostnames.
+pub(crate) const SUBDIR_SCRATCH: &str = ".apt-cacher-rs.tmp";
 
 /// Layout subdirectory names that may legitimately appear under each
 /// `{cache_directory}/{host}/{mirror_path}/` directory.  The startup cache
@@ -97,8 +98,7 @@ pub(crate) const SUBDIR_TMP: &str = "tmp";
 ///
 /// `tmp/` is intentionally **not** listed here: it is partial-download
 /// scratch space (not part of the served cache layout), is handled
-/// separately by `task_cache_scan` with its own skip branch, and is reaped
-/// by `cleanup_tmp_dir` rather than tallied.
+/// separately by `task_cache_scan`, and is reaped by `cleanup_tmp_dir`.
 pub(crate) const KNOWN_MIRROR_SUBDIRS: &[&str] = &[SUBDIR_DISTS];
 
 /// The host-level anchor a path hangs off: the mirror directory itself, or
@@ -194,17 +194,17 @@ impl<'a> CachePaths<'a> {
         self.root
     }
 
-    /// `{root}/tmp/`: scratch space for volatile downloads, which are
+    /// `{root}/.apt-cacher-rs.tmp/`: scratch space for volatile downloads, which are
     /// written to a random temp file rather than a per-mirror `.partial`.
     #[must_use]
     pub(crate) fn scratch_dir(self) -> PathBuf {
-        self.assemble([Some(Path::new(SUBDIR_TMP))])
+        self.assemble([Some(Path::new(SUBDIR_SCRATCH))])
     }
 
-    /// `{root}/tmp/{leaf}`.
+    /// `{root}/.apt-cacher-rs.tmp/{leaf}`.
     #[must_use]
     pub(crate) fn scratch_file(self, leaf: &Path) -> PathBuf {
-        self.assemble([Some(Path::new(SUBDIR_TMP)), Some(leaf)])
+        self.assemble([Some(Path::new(SUBDIR_SCRATCH)), Some(leaf)])
     }
 
     /// `{root}/{host[:port]}/`: the directory holding every structured
@@ -471,10 +471,17 @@ mod tests {
 
     #[test]
     fn scratch_paths_live_directly_under_the_root() {
-        assert_eq!(PATHS().scratch_dir(), PathBuf::from("/cache/tmp"));
+        assert!(
+            ClientHost::new(SUBDIR_SCRATCH).is_err(),
+            "scratch must be disjoint from valid hosts and alias targets"
+        );
+        assert_eq!(
+            PATHS().scratch_dir(),
+            PathBuf::from("/cache/.apt-cacher-rs.tmp")
+        );
         assert_eq!(
             PATHS().scratch_file(Path::new("sid_InRelease")),
-            PathBuf::from("/cache/tmp/sid_InRelease")
+            PathBuf::from("/cache/.apt-cacher-rs.tmp/sid_InRelease")
         );
         assert_eq!(PATHS().root(), Path::new("/cache"));
     }

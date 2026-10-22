@@ -29,7 +29,7 @@
 //!   partial guard and its [`ReservedPartial`] are gone; cleanup reaps only
 //!   unclaimed partials (`partial_claim`), so a partial is released by the
 //!   reap or by the reservation that adopted it, never by both. The random
-//!   scratch files of volatile downloads live in the cache root's `tmp/`,
+//!   scratch files of volatile downloads live in the cache root's `.apt-cacher-rs.tmp/`,
 //!   are unlinked with their download and purged at startup, and are never
 //!   counted.
 //! - `inflight_reserved` / `inflight_replaced`: what the live reservations

@@ -62,7 +62,7 @@ pub(crate) const LOCK_FILENAME: &str = ".apt-cacher-rs.lock";
 
 /// Take an exclusive advisory `flock(2)` on the cache-directory lock file,
 /// refusing startup when another instance holds it: a second instance
-/// sharing the cache would purge `tmp/` under live downloads, double-count
+/// sharing the cache would purge `.apt-cacher-rs.tmp/` under live downloads, double-count
 /// the quota, and run cleanup against files the other is serving.
 fn lock_cache_dir(cache_path: &Path) -> Result<Flock<std::fs::File>, SetupError> {
     let lock_path = cache_path.join(LOCK_FILENAME);
@@ -151,7 +151,7 @@ fn prepare_cache_dir(cache_path: &Path) -> Result<Flock<std::fs::File>, SetupErr
     }
 
     // Locked before anything below mutates the cache (the xattr probe write,
-    // the `tmp/` purge — destructive to a live instance's partial downloads).
+    // the `.apt-cacher-rs.tmp/` purge — destructive to a live instance's partial downloads).
     let cache_lock = lock_cache_dir(cache_path)?;
     mdata.modified().map_err(SetupError::NoMtimeSupport)?;
     if let Err(err) = mdata.created() {
