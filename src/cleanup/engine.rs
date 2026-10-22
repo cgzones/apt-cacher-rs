@@ -1545,6 +1545,8 @@ mod tests {
         let mut set = ByHashReferenceSet {
             sha256: HashSet::new(),
             sha512: HashSet::new(),
+            complete_sha256: true,
+            complete_sha512: false,
         };
         set.sha256.insert(referenced);
 
@@ -1607,6 +1609,8 @@ mod tests {
         let mut set = ByHashReferenceSet {
             sha256: HashSet::new(),
             sha512: HashSet::new(),
+            complete_sha256: true,
+            complete_sha512: false,
         };
         set.sha256.insert([0x09u8; 32]);
 

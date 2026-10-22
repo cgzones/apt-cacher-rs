@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use coarsetime::Clock;
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 use tracing::{debug, warn};
 
 use crate::cache_layout::CacheLayout;
@@ -26,17 +26,19 @@ use super::engine::CleanupUnitError;
 pub(super) struct ByHashReferenceSet {
     pub(super) sha256: HashSet<[u8; 32]>,
     pub(super) sha512: HashSet<[u8; 64]>,
+    pub(super) complete_sha256: bool,
+    pub(super) complete_sha512: bool,
 }
 
 impl ByHashReferenceSet {
-    /// Whether any current Release listed digests of `algo`. A by-hash file
+    /// Whether every distribution has usable digests of `algo`. A by-hash file
     /// whose algorithm is *not* covered (e.g. a SHA512 file against a
     /// SHA256-only Debian Release) can't be reconciled and falls to the age
     /// backstop instead of being treated as unreferenced.
     pub(super) fn covers(&self, algo: HashAlgo) -> bool {
         match algo {
-            HashAlgo::Sha256 => !self.sha256.is_empty(),
-            HashAlgo::Sha512 => !self.sha512.is_empty(),
+            HashAlgo::Sha256 => self.complete_sha256,
+            HashAlgo::Sha512 => self.complete_sha512,
         }
     }
 
@@ -62,22 +64,23 @@ impl ByHashReferenceSet {
 /// Whether `name` is a top-level `Release`/`InRelease` index for `layout`.
 ///
 /// Structured releases are flattened as `<dist>_InRelease` /
-/// `<dist>[_<component>...]_Release`; flat releases sit at the flat root as
+/// `<dist>_Release`; flat releases sit at the flat root as
 /// literal `Release`/`InRelease`. Detached signatures (`*.gpg`) are excluded -
 /// they carry no checksum sections.
 fn is_release_filename(name: &str, layout: CacheLayout) -> bool {
     if layout.is_flat() {
         name == "InRelease" || name == "Release"
     } else {
-        name.ends_with("_InRelease") || name.ends_with("_Release")
+        name.split_once('_')
+            .is_some_and(|(dist, leaf)| !dist.is_empty() && matches!(leaf, "Release" | "InRelease"))
     }
 }
 
 static RELEASE_WALK: WalkContext = WalkContext {
     what: "a Release directory",
     dir_failure: DirFailure::Abort("falling back to age-based retention for its by-hash tree"),
-    entry_failure: "ignoring it for by-hash reconciliation",
-    non_regular: "ignoring it for by-hash reconciliation",
+    entry_failure: "falling back to age-based retention for its by-hash tree",
+    non_regular: "ignoring it for by-hash reconciliation (a Release entry forces age-based retention)",
     anomalies: AnomalyLevel::Warn,
 };
 
@@ -110,36 +113,29 @@ pub(super) async fn build_byhash_reference_set(
     let mut set = ByHashReferenceSet {
         sha256: HashSet::new(),
         sha512: HashSet::new(),
+        complete_sha256: false,
+        complete_sha512: false,
     };
     let mut found = false;
     // Distributions whose Release was present and parsed, to check against
     // `expected_dists` below. Only populated when there is something to check.
-    let mut seen_dists: HashSet<String> = HashSet::new();
+    let mut coverage: HashMap<String, (bool, bool)> = HashMap::new();
 
     while let Some(entry) = walker.next().await {
         // `by-hash/` (and any flat URL-dir) sits next to the Release files;
         // a non-regular entry was reported by the walker and is left to the
         // metadata sweep.
-        if entry.kind() != EntryKind::File {
-            continue;
-        }
         let Some(name) = entry.name().to_str() else {
             continue;
         };
         if !is_release_filename(name, layout) {
             continue;
         }
-        found = true;
-        if !expected_dists.is_empty() {
-            // Recover the dist from the flattened `<dist>_{In,}Release` name
-            // (the two suffixes are mutually exclusive: `<dist>_InRelease` does
-            // not end with `_Release`).
-            if let Some(dist) = name
-                .strip_suffix("_InRelease")
-                .or_else(|| name.strip_suffix("_Release"))
-            {
-                seen_dists.insert(dist.to_owned());
+        if entry.kind() != EntryKind::File {
+            if entry.kind() == EntryKind::Dir {
+                entry.report_unexpected("falling back to age-based retention for its by-hash tree");
             }
+            return None;
         }
         let path = entry.path();
         let content = match read_release_to_string(&path).await {
@@ -163,7 +159,26 @@ pub(super) async fn build_byhash_reference_set(
                 return None;
             }
         };
-        for digest in parse_release_byhash_digests(&content) {
+        let parsed = match parse_release_byhash_digests(&content) {
+            Ok(parsed) => parsed,
+            Err(reason) => {
+                warn!(
+                    "Failed to parse Release file `{}` for by-hash reconciliation; falling back to age-based retention: {reason}",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        found = true;
+        let dist = if layout.is_flat() {
+            ""
+        } else {
+            name.split_once('_').expect("top-level Release name").0
+        };
+        let algorithms = coverage.entry(dist.to_owned()).or_default();
+        algorithms.0 |= parsed.sha256;
+        algorithms.1 |= parsed.sha512;
+        for digest in parsed.digests {
             match digest {
                 ByHashRef::Sha256(d) => {
                     set.sha256.insert(d);
@@ -175,6 +190,9 @@ pub(super) async fn build_byhash_reference_set(
         }
     }
 
+    if walker.io_failures() != 0 {
+        return None;
+    }
     match walker.finish() {
         WalkOutcome::Complete => {}
         // An absent directory has no Release files by definition; an
@@ -187,7 +205,7 @@ pub(super) async fn build_byhash_reference_set(
     // expected dist with no Release present would have its files orphaned. Bail
     // to age-based retention rather than reconcile against an incomplete union.
     for dist in expected_dists {
-        if !seen_dists.contains(dist) {
+        if !coverage.contains_key(dist) {
             debug!(
                 "by-hash reconciliation for `{}`: Release for distribution `{dist}` is absent; falling back to age-based retention",
                 release_dir.display()
@@ -207,6 +225,8 @@ pub(super) async fn build_byhash_reference_set(
         );
         return None;
     }
+    set.complete_sha256 = coverage.values().all(|algorithms| algorithms.0);
+    set.complete_sha512 = coverage.values().all(|algorithms| algorithms.1);
     Some(set)
 }
 
@@ -314,7 +334,7 @@ mod tests {
             CacheLayout::DistsByHash
         ));
         assert!(is_release_filename("sid_Release", CacheLayout::DistsByHash));
-        assert!(is_release_filename(
+        assert!(!is_release_filename(
             "trixie_main_binary-amd64_Release",
             CacheLayout::DistsByHash
         ));
@@ -342,6 +362,8 @@ mod tests {
         let mut set = ByHashReferenceSet {
             sha256: HashSet::new(),
             sha512: HashSet::new(),
+            complete_sha256: true,
+            complete_sha512: false,
         };
         set.sha256.insert(referenced);
 
@@ -368,6 +390,87 @@ mod tests {
         assert_eq!(set.classify("not-a-digest"), None);
         assert_eq!(set.classify(&"z".repeat(64)), None);
 
+        assert!(set.covers(HashAlgo::Sha256));
+        assert!(!set.covers(HashAlgo::Sha512));
+    }
+
+    #[tokio::test]
+    async fn malformed_sibling_release_abandons_reference_cleanup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let valid = release_with_sha256(&[[0xaa; 32]]);
+        std::fs::write(dir.path().join("stable_Release"), &valid).expect("stable");
+        for malformed in [
+            "Origin: No checksums\n".to_owned(),
+            "SHA256:\n".to_owned(),
+            "SHA256:\n broken-digest 123 Packages\n".to_owned(),
+            format!("{valid} broken-digest 123 Packages\n"),
+            format!("SHA256:\n {} nope Packages\n", hex_encode(&[0xbb; 32])),
+            format!("SHA256:\n {} 1 Packages extra\n", hex_encode(&[0xbb; 32])),
+        ] {
+            std::fs::write(dir.path().join("sid_Release"), malformed).expect("sid");
+            assert!(
+                build_byhash_reference_set(
+                    dir.path(),
+                    CacheLayout::DistsByHash,
+                    &["stable".into(), "sid".into()]
+                )
+                .await
+                .is_none(),
+                "a valid sibling cannot hide malformed references"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_release_sibling_cannot_be_hidden_by_a_valid_release() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("sid_Release"),
+            release_with_sha256(&[[0xaa; 32]]),
+        )
+        .expect("Release");
+        std::os::unix::fs::symlink(dir.path().join("absent"), dir.path().join("sid_InRelease"))
+            .expect("symlink");
+        assert!(
+            build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &["sid".into()])
+                .await
+                .is_none(),
+            "unreadable signed sibling forces age retention"
+        );
+    }
+
+    #[tokio::test]
+    async fn algorithm_coverage_requires_every_distribution() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("sid_Release"),
+            release_with_sha256(&[[0xaa; 32]]),
+        )
+        .expect("sid");
+        std::fs::write(dir.path().join("stable_InRelease"), format!("-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\nSHA512:\n {} 1 Packages\n-----BEGIN PGP SIGNATURE-----\nSHA256:\n bad\n", hex_encode(&[0xbb; 64]))).expect("stable");
+        // Component Release files legitimately lack checksums and cannot establish coverage.
+        std::fs::write(
+            dir.path().join("sid_main_binary-amd64_Release"),
+            "Archive: sid\n",
+        )
+        .expect("component");
+        let set = build_byhash_reference_set(
+            dir.path(),
+            CacheLayout::DistsByHash,
+            &["sid".into(), "stable".into()],
+        )
+        .await
+        .expect("valid distributions");
+        assert!(!set.covers(HashAlgo::Sha256));
+        assert!(!set.covers(HashAlgo::Sha512));
+        std::fs::write(
+            dir.path().join("stable_Release"),
+            release_with_sha256(&[[0xcc; 32]]),
+        )
+        .expect("additional complete algorithm");
+        let set = build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &[])
+            .await
+            .expect("set");
         assert!(set.covers(HashAlgo::Sha256));
         assert!(!set.covers(HashAlgo::Sha512));
     }

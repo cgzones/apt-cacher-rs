@@ -531,11 +531,11 @@ enum ReleaseHashSection {
 /// section (`MD5Sum:`, `SHA1:`, ... switch out). Tokens are separated by
 /// ASCII whitespace only -- the format never uses anything else, and the
 /// Unicode-aware split walks every line char by char. A 4th token means the
-/// path contained a space, so the entry is rejected. The `<size>` field and
-/// the algorithm/length of `hex` are validated by the callers.
+/// path contained a space, so the entry is rejected. This iterator validates
+/// the unsigned `<size>`; callers validate the algorithm/length of `hex`.
 fn release_hash_entries(
     content: &str,
-) -> impl Iterator<Item = (ReleaseHashSection, &str, &str)> + '_ {
+) -> impl Iterator<Item = Result<(ReleaseHashSection, &str, &str), &'static str>> + '_ {
     let mut section: Option<ReleaseHashSection> = None;
     let mut terminated = sticky::Bool::new();
     content.lines().filter_map(move |line| {
@@ -558,13 +558,20 @@ fn release_hash_entries(
         let section = section?;
         // Indented entry: " <hex> <size> <path>".
         let mut parts = line.split_ascii_whitespace();
-        let hex = parts.next()?;
-        let _size = parts.next()?;
-        let path = parts.next()?;
+        let hex = parts.next()?; // Blank lines are harmless.
+        let Some(size) = parts.next() else {
+            return Some(Err("missing checksum size"));
+        };
+        let Some(path) = parts.next() else {
+            return Some(Err("missing checksum path"));
+        };
         if parts.next().is_some() {
-            return None;
+            return Some(Err("extra checksum fields"));
         }
-        Some((section, hex, path))
+        if !size.bytes().all(|byte| byte.is_ascii_digit()) || size.parse::<u64>().is_err() {
+            return Some(Err("invalid checksum size"));
+        }
+        Some(Ok((section, hex, path)))
     })
 }
 
@@ -586,7 +593,11 @@ pub(crate) fn parse_release_checksums<'a>(
     content: &'a str,
     mut wanted: impl FnMut(&str) -> bool + 'a,
 ) -> impl Iterator<Item = (&'a str, [u8; 32])> + 'a {
-    release_hash_entries(content).filter_map(move |(section, hex, path)| {
+    release_hash_entries(content).filter_map(move |entry| {
+        // Integrity ingestion tolerates bad rows; destructive cleanup does not.
+        let Ok((section, hex, path)) = entry else {
+            return None;
+        };
         if section != ReleaseHashSection::Sha256 {
             return None;
         }
@@ -659,7 +670,7 @@ pub(crate) enum ByHashRef {
     Sha512([u8; 64]),
 }
 
-/// Iterate the by-hash digests referenced by a Debian `Release`/`InRelease`,
+/// Check the by-hash digests referenced by a Debian `Release`/`InRelease`,
 /// from BOTH the `SHA256:` and `SHA512:` sections, tagged by algorithm.
 ///
 /// Unlike [`parse_release_checksums`] (SHA256-only, consumed by the integrity
@@ -669,11 +680,41 @@ pub(crate) enum ByHashRef {
 /// ...) has a corresponding by-hash file, and only the digest -- not the path --
 /// is content-addressed, so the path is unused here. Stops at the PGP signature
 /// boundary like its sibling.
-pub(crate) fn parse_release_byhash_digests(content: &str) -> impl Iterator<Item = ByHashRef> + '_ {
-    release_hash_entries(content).filter_map(|(section, hex, _path)| match section {
-        ReleaseHashSection::Sha256 => hex_decode_exact::<32>(hex).map(ByHashRef::Sha256),
-        ReleaseHashSection::Sha512 => hex_decode_exact::<64>(hex).map(ByHashRef::Sha512),
-    })
+#[derive(Debug)]
+pub(crate) struct ReleaseByHashReferences {
+    pub(crate) digests: Vec<ByHashRef>,
+    pub(crate) sha256: bool,
+    pub(crate) sha512: bool,
+}
+
+pub(crate) fn parse_release_byhash_digests(
+    content: &str,
+) -> Result<ReleaseByHashReferences, &'static str> {
+    let mut parsed = ReleaseByHashReferences {
+        digests: Vec::new(),
+        sha256: false,
+        sha512: false,
+    };
+    for entry in release_hash_entries(content) {
+        let (section, hex, _path) = entry?;
+        let digest = match section {
+            ReleaseHashSection::Sha256 => {
+                let digest = hex_decode_exact::<32>(hex).ok_or("invalid SHA256 digest")?;
+                parsed.sha256 = true;
+                ByHashRef::Sha256(digest)
+            }
+            ReleaseHashSection::Sha512 => {
+                let digest = hex_decode_exact::<64>(hex).ok_or("invalid SHA512 digest")?;
+                parsed.sha512 = true;
+                ByHashRef::Sha512(digest)
+            }
+        };
+        parsed.digests.push(digest);
+    }
+    if parsed.digests.is_empty() {
+        return Err("no usable SHA256 or SHA512 checksum entries");
+    }
+    Ok(parsed)
 }
 
 /// What a `StreamHasher` (splice-only, below) computed, as handed to
@@ -1192,6 +1233,28 @@ mod tests {
     }
 
     #[test]
+    fn strict_release_parser_rejects_malformed_entries_but_ingestion_keeps_valid_rows() {
+        let good = format!(
+            " {} 1 main/binary-amd64/Packages\n",
+            hex_encode(&[0xaa; 32])
+        );
+        for bad in [
+            " bad 1 Packages\n",
+            " bad\n",
+            " bad -1 Packages\n",
+            " bad 18446744073709551616 Packages\n",
+            " bad 1 Packages extra\n",
+        ] {
+            let content = format!("SHA256:\n{good}{bad}");
+            assert!(parse_release_byhash_digests(&content).is_err());
+            assert_eq!(
+                parse_release_checksums(&content, |_| true).collect::<Vec<_>>(),
+                [("main/binary-amd64/Packages", [0xaa; 32])]
+            );
+        }
+    }
+
+    #[test]
     fn release_byhash_digests_sha256_only_ignores_md5() {
         // Debian's `InRelease` carries `MD5Sum:` + `SHA256:` (no SHA512).
         let a = hex_encode(&[0xaa; 32]);
@@ -1205,7 +1268,9 @@ mod tests {
              {b} 333 main/Contents-amd64\n",
             md5 = hex_encode(&[0xcc; 16]),
         );
-        let got: Vec<ByHashRef> = parse_release_byhash_digests(&content).collect();
+        let got: Vec<ByHashRef> = parse_release_byhash_digests(&content)
+            .expect("valid Release")
+            .digests;
         assert_eq!(
             got,
             vec![ByHashRef::Sha256([0xaa; 32]), ByHashRef::Sha256([0xbb; 32])]
@@ -1220,7 +1285,9 @@ mod tests {
             "SHA256:\n {s256} 10 main/binary-amd64/Packages\n\
              SHA512:\n {s512} 10 main/binary-amd64/Packages\n",
         );
-        let got: Vec<ByHashRef> = parse_release_byhash_digests(&content).collect();
+        let got: Vec<ByHashRef> = parse_release_byhash_digests(&content)
+            .expect("valid Release")
+            .digests;
         assert_eq!(
             got,
             vec![ByHashRef::Sha256([0x11; 32]), ByHashRef::Sha512([0x22; 64])]
@@ -1237,7 +1304,9 @@ mod tests {
              SHA256:\n {after} 10 evil/Packages\n\
              -----END PGP SIGNATURE-----\n",
         );
-        let got: Vec<ByHashRef> = parse_release_byhash_digests(&content).collect();
+        let got: Vec<ByHashRef> = parse_release_byhash_digests(&content)
+            .expect("valid Release")
+            .digests;
         assert_eq!(got, vec![ByHashRef::Sha256([0x33; 32])]);
     }
 
@@ -1245,7 +1314,9 @@ mod tests {
     fn release_byhash_digests_accepts_tab_indent() {
         let d = hex_encode(&[0x55; 32]);
         let content = format!("SHA256:\n\t{d} 10 main/binary-amd64/Packages\n");
-        let got: Vec<ByHashRef> = parse_release_byhash_digests(&content).collect();
+        let got: Vec<ByHashRef> = parse_release_byhash_digests(&content)
+            .expect("valid Release")
+            .digests;
         assert_eq!(got, vec![ByHashRef::Sha256([0x55; 32])]);
     }
 
@@ -1254,7 +1325,7 @@ mod tests {
         let d = hex_encode(&[0x66; 32]);
         // A 4th whitespace-separated token means the path had a space.
         let content = format!("SHA256:\n {d} 10 main/with space/Packages\n");
-        assert!(parse_release_byhash_digests(&content).next().is_none());
+        assert!(parse_release_byhash_digests(&content).is_err());
     }
 
     #[test]
@@ -1265,7 +1336,9 @@ mod tests {
         let d = hex_encode(&[0x77; 32]);
         let content = format!("SHA256:\n {d} 10 main/a\u{a0}b/Packages\n");
         assert_eq!(
-            parse_release_byhash_digests(&content).collect::<Vec<_>>(),
+            parse_release_byhash_digests(&content)
+                .expect("valid Release")
+                .digests,
             vec![ByHashRef::Sha256([0x77; 32])]
         );
     }
