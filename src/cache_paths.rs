@@ -163,7 +163,11 @@ impl std::fmt::Display for MirrorSite<'_> {
     /// the host level, for log lines naming a mirror by where it is cached.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self { host, port, path } = self;
-        write!(f, "{}/{path}", host.format_authority(*port))
+        host.fmt(f)?;
+        if let Some(port) = port {
+            write!(f, ":{port}")?;
+        }
+        write!(f, "/{path}")
     }
 }
 
