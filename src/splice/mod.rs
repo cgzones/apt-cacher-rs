@@ -105,6 +105,8 @@ use crate::{
     warn_once_or_debug, warn_once_or_info, warn_once_or_info_logged,
 };
 
+pub(crate) use upstream::UpstreamEndpoint;
+
 use acquire::{
     UpstreamExchange, discard_partial_and_retry, follow_redirect, standard_upstream_connect,
     warn_upstream_reject,
@@ -939,12 +941,12 @@ async fn plan_upstream_response(
                 // After a redirect the discard-and-retry talks to the
                 // redirect target, not to the original mirror with the
                 // redirected path.
-                let dial_mirror = conn_details.upstream_mirror();
-                let (upstream_mirror, host_authority, upstream_path) = redirect.as_ref().map_or(
-                    (&dial_mirror, host_authority, upstream_path),
+                let dial_endpoint = conn_details.upstream_endpoint();
+                let (upstream_endpoint, host_authority, upstream_path) = redirect.as_ref().map_or(
+                    (dial_endpoint, host_authority, upstream_path),
                     |target| {
                         (
-                            &target.mirror,
+                            target.endpoint(),
                             target.authority.as_str(),
                             target.path.as_str(),
                         )
@@ -952,7 +954,7 @@ async fn plan_upstream_response(
                 );
                 exchange = Box::pin(discard_partial_and_retry(
                     &mut resume.partial,
-                    upstream_mirror,
+                    upstream_endpoint,
                     host_authority,
                     upstream_path,
                     exchange,
@@ -1540,7 +1542,7 @@ async fn splice_proxy_drive(
                 }),
             );
             let exchange = standard_upstream_connect(
-                &conn_details.upstream_mirror(),
+                conn_details.upstream_endpoint(),
                 &host_authority,
                 upstream_path,
                 resume.offset,

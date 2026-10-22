@@ -15,7 +15,7 @@ use bytes::BytesMut;
 use tracing::debug;
 
 use crate::cache_layout::ConnectionDetails;
-use crate::deb_mirror::{Mirror, MirrorKind};
+use crate::config::ClientHost;
 use crate::error::ErrorReport;
 use crate::mirror_perf::HeadTiming;
 use crate::partial_file;
@@ -33,8 +33,8 @@ use crate::{
 use super::VolatileCondHeaders;
 use super::http::{HeadError, MAX_ERROR_BODY_DRAIN, UpstreamResponse, send_and_read_headers};
 use super::upstream::{
-    ConnLabel, PoolCheckout, ResponseBody, Transience, UpstreamConn, connect_upstream, mirror_port,
-    pool_checkout,
+    ConnLabel, PoolCheckout, ResponseBody, Transience, UpstreamConn, UpstreamEndpoint,
+    connect_upstream, endpoint_port, pool_checkout,
 };
 use crate::transfer_error::UpstreamError;
 
@@ -62,14 +62,14 @@ impl UpstreamExchange {
     /// exchange; dropping it closes the connection until body completion.
     fn new(
         conn: UpstreamConn,
-        mirror: &Mirror,
+        endpoint: UpstreamEndpoint<'_>,
         port: u16,
         (response, header_buf, header_end): (UpstreamResponse, BytesMut, usize),
         (reused, attempt_started): (bool, PreciseInstant),
     ) -> Self {
         let poolable = !response.connection_close;
         Self {
-            conn: ResponseBody::new(conn, mirror.host().clone(), port, poolable),
+            conn: ResponseBody::new(conn, endpoint.host.clone(), port, poolable),
             response,
             header_buf,
             header_end,
@@ -162,12 +162,12 @@ impl UpstreamExchange {
     }
 }
 
-/// Update the scheme cache for a mirror after successful connection.
-fn cache_scheme(mirror: &Mirror, scheme: Scheme) {
-    if scheme_cache::record_success(mirror.into(), scheme) {
+/// Update the scheme cache for an endpoint after successful connection.
+fn cache_scheme(endpoint: UpstreamEndpoint<'_>, scheme: Scheme) {
+    if scheme_cache::record_success(endpoint.into(), scheme) {
         debug!(
             "splice proxy: cached {scheme} scheme for {}",
-            mirror.format_authority()
+            endpoint.format_authority()
         );
     }
 }
@@ -177,7 +177,7 @@ fn cache_scheme(mirror: &Mirror, scheme: Scheme) {
 ///
 /// Times out after the configured HTTP timeout.
 pub(super) async fn standard_upstream_connect(
-    mirror: &Mirror,
+    endpoint: UpstreamEndpoint<'_>,
     host_authority: &str,
     upstream_path: &str,
     resume_offset: u64,
@@ -193,7 +193,7 @@ pub(super) async fn standard_upstream_connect(
     let (resolved_scheme, decision) = if let Some(scheme) = scheme_override {
         (Some(scheme), None)
     } else {
-        let decision = scheme_cache::resolve(mirror.into(), global_config());
+        let decision = scheme_cache::resolve(endpoint.into(), global_config());
         // `None` = Auto upgrade, i.e. try HTTPS then fall back to HTTP.
         (decision.fixed_scheme(), Some(decision))
     };
@@ -204,8 +204,8 @@ pub(super) async fn standard_upstream_connect(
     // `POOL_NEW ≈ sum(POOL_MISS_*)` then holds for first connections too.
     if let Some(scheme) = resolved_scheme {
         let is_tls = matches!(scheme, Scheme::Https);
-        let port = mirror_port(mirror, is_tls);
-        match pool_checkout(mirror.host(), port, is_tls) {
+        let port = endpoint_port(endpoint, is_tls);
+        match pool_checkout(endpoint.host, port, is_tls) {
             PoolCheckout::Live(mut pooled) => {
                 let attempt_started = PreciseInstant::now();
                 match send_and_read_headers(
@@ -222,7 +222,7 @@ pub(super) async fn standard_upstream_connect(
                         metrics::POOL_REUSED.increment();
                         return Ok(UpstreamExchange::new(
                             pooled,
-                            mirror,
+                            endpoint,
                             port,
                             head,
                             (true, attempt_started),
@@ -287,7 +287,7 @@ pub(super) async fn standard_upstream_connect(
     let mut attempt_started;
     let mut up = loop {
         attempt_started = PreciseInstant::now();
-        let err = match connect_upstream(mirror, resolved_scheme).await {
+        let err = match connect_upstream(endpoint, resolved_scheme).await {
             Ok(conn) => break conn,
             Err(err) => err,
         };
@@ -313,10 +313,10 @@ pub(super) async fn standard_upstream_connect(
                         // falling back (mirroring the hyper backend).
                         warn_once_or_info!(
                             "splice proxy: HTTPS certificate of host {} failed verification; not falling back to plain HTTP since {} (list the host in `http_only_mirrors` to fetch it over plain HTTP, or fix the mirror's certificate)",
-                            mirror.format_authority(),
+                            endpoint.format_authority(),
                             scheme_cache::no_fallback_reason(global_config().https_upgrade_mode)
                         );
-                    } else if let Some(scheme) = scheme_cache::record_failure(mirror.into()) {
+                    } else if let Some(scheme) = scheme_cache::record_failure(endpoint.into()) {
                         // Evict a stale cached scheme so the next request
                         // re-resolves, mirroring the hyper backend. A learned
                         // scheme is sticky, so losing it silently changes
@@ -325,7 +325,7 @@ pub(super) async fn standard_upstream_connect(
                         // under Auto mode).
                         warn_once_or_info!(
                             "splice proxy: evicted cached {scheme} scheme for host {} after connect failure; the next request re-decides the scheme",
-                            mirror.format_authority()
+                            endpoint.format_authority()
                         );
                     }
                     if decision.is_upgrade_attempt() {
@@ -363,7 +363,7 @@ pub(super) async fn standard_upstream_connect(
     };
     let scheme = up.scheme();
     if let Some(decision) = decision {
-        cache_scheme(mirror, scheme);
+        cache_scheme(endpoint, scheme);
         // Loop-exit upgrade outcome: HTTPS connected → SUCCEEDED; fell back to
         // HTTP → REVERTED.
         if decision.is_upgrade_attempt() {
@@ -388,23 +388,33 @@ pub(super) async fn standard_upstream_connect(
             .with_target(format!("{scheme}://{host_authority}{upstream_path}"))
     })?;
 
-    let port = mirror_port(mirror, up.is_tls());
+    let port = endpoint_port(endpoint, up.is_tls());
     Ok(UpstreamExchange::new(
         up,
-        mirror,
+        endpoint,
         port,
         head,
         (false, attempt_started),
     ))
 }
 
-/// Where a followed redirect landed: the mirror the retry/resume logic must
+/// Where a followed redirect landed: the endpoint the retry/resume logic must
 /// keep talking to, its `Host` authority and the redirected path.
 pub(super) struct RedirectTarget {
     /// Used only for upstream dispatch/formatting; never persisted.
-    pub(super) mirror: Mirror,
+    host: ClientHost,
+    port: Option<NonZero<u16>>,
     pub(super) authority: String,
     pub(super) path: String,
+}
+
+impl RedirectTarget {
+    pub(super) fn endpoint(&self) -> UpstreamEndpoint<'_> {
+        UpstreamEndpoint {
+            host: &self.host,
+            port: self.port,
+        }
+    }
 }
 
 /// Follow a 3xx redirect if the Location target is valid and allowed.
@@ -519,10 +529,10 @@ pub(super) async fn follow_redirect(
         },
         NonZero::get,
     );
-    let dial_mirror = conn_details.upstream_mirror();
-    let original_port_effective = mirror_port(&dial_mirror, exchange.conn.is_tls());
+    let dial_endpoint = conn_details.upstream_endpoint();
+    let original_port_effective = endpoint_port(dial_endpoint, exchange.conn.is_tls());
     if redirect_scheme == exchange.conn.scheme()
-        && moved_domain == *dial_mirror.host()
+        && moved_domain == *dial_endpoint.host
         && moved_port_effective == original_port_effective
         && moved_path == original_path
     {
@@ -541,14 +551,12 @@ pub(super) async fn follow_redirect(
     // stays on this host (a path rewrite, a `by-hash` bounce) then reuses it.
     exchange.dispose("splice proxy:").await;
 
-    // Redirect Mirror: used only for upstream dispatch/formatting; never persisted.
-    let redirect_mirror = Mirror::new(
-        moved_domain,
-        uri_authority::normalize_http_port(moved_port, moved_uri.scheme()),
-        String::new(),
-        MirrorKind::Structured,
-    );
-    let redirect_authority = redirect_mirror.format_authority();
+    let redirect_port = uri_authority::normalize_http_port(moved_port, moved_uri.scheme());
+    let endpoint = UpstreamEndpoint {
+        host: &moved_domain,
+        port: redirect_port,
+    };
+    let redirect_authority = endpoint.format_authority().into_owned();
 
     // An `https://` target is fetched over TLS whatever the policy says. An
     // `http://` one is decided like any upstream (scheme cache,
@@ -560,8 +568,8 @@ pub(super) async fn follow_redirect(
         Scheme::Http => None,
     };
     let exchange = standard_upstream_connect(
-        &redirect_mirror,
-        redirect_authority,
+        endpoint,
+        &redirect_authority,
         moved_path,
         resume_offset,
         resume_if_range,
@@ -579,9 +587,10 @@ pub(super) async fn follow_redirect(
     Ok((
         exchange,
         Some(RedirectTarget {
-            authority: redirect_authority.to_owned(),
+            authority: redirect_authority,
             path: moved_path.to_owned(),
-            mirror: redirect_mirror,
+            host: moved_domain,
+            port: redirect_port,
         }),
     ))
 }
@@ -612,7 +621,7 @@ pub(super) fn warn_upstream_reject(reason: RejectReason, conn_details: &Connecti
 /// (`ResumeAnomaly::needs_refetch`).
 pub(super) async fn discard_partial_and_retry(
     partial: &mut partial_file::PartialDownload,
-    mirror: &Mirror,
+    endpoint: UpstreamEndpoint<'_>,
     host_authority: &str,
     upstream_path: &str,
     exchange: UpstreamExchange,
@@ -627,7 +636,7 @@ pub(super) async fn discard_partial_and_retry(
     exchange.dispose("splice proxy:").await;
     partial.discard_resume().await;
     let mut exchange = standard_upstream_connect(
-        mirror,
+        endpoint,
         host_authority,
         upstream_path,
         0,

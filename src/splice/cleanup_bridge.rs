@@ -177,27 +177,34 @@ async fn cleanup_upstream_fetch(
         .path_and_query()
         .map_or_else(|| upstream_uri.path(), PathAndQuery::as_str);
     let host_authority = mirror.format_authority();
-    let exchange =
-        match standard_upstream_connect(mirror, host_authority, upstream_path, 0, None, None, None)
-            .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                // Cleanup fetches run without a download runner: conclude the
-                // upstream failure here; cleanup's decision log reports the
-                // cause from the extension.
-                let reported = err.conclude(Some(mirror), |_err| {
-                    Logged::debug(format_args!(
-                        "splice cleanup request to {upstream_path} failed to connect/read headers"
-                    ))
-                });
-                let mut resp = cleanup_response(StatusCode::BAD_GATEWAY);
-                resp.extensions_mut().insert(UpstreamFetchError {
-                    reason: ErrorReport(reported.get()).to_string(),
-                });
-                return resp;
-            }
-        };
+    let exchange = match standard_upstream_connect(
+        mirror.into(),
+        host_authority,
+        upstream_path,
+        0,
+        None,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            // Cleanup fetches run without a download runner: conclude the
+            // upstream failure here; cleanup's decision log reports the
+            // cause from the extension.
+            let reported = err.conclude(Some(mirror), |_err| {
+                Logged::debug(format_args!(
+                    "splice cleanup request to {upstream_path} failed to connect/read headers"
+                ))
+            });
+            let mut resp = cleanup_response(StatusCode::BAD_GATEWAY);
+            resp.extensions_mut().insert(UpstreamFetchError {
+                reason: ErrorReport(reported.get()).to_string(),
+            });
+            return resp;
+        }
+    };
 
     let status = exchange.response.status_code;
 

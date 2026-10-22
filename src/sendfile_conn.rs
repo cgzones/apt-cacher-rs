@@ -1190,9 +1190,8 @@ async fn try_sendfile_request(
                 request_received_at,
             } => {
                 use crate::{
-                    deb_mirror::{Mirror, MirrorKind},
                     passthrough_limiter,
-                    splice::splice_simple_proxy,
+                    splice::{UpstreamEndpoint, splice_simple_proxy},
                 };
 
                 let Some(_relay_slot) = passthrough_limiter::admit(
@@ -1212,20 +1211,16 @@ async fn try_sendfile_request(
                     reason.label()
                 );
 
-                // Simple-proxy path: this Mirror is used only for upstream
-                // dispatch/formatting and is never persisted; kind is arbitrary.
-                let mirror = Mirror::new(
-                    requested_host,
-                    requested_port,
-                    String::new(),
-                    MirrorKind::Structured,
-                );
+                let endpoint = UpstreamEndpoint {
+                    host: &requested_host,
+                    port: requested_port,
+                };
 
                 return match splice_simple_proxy(
                     stream,
                     *conn_version,
                     conn_action,
-                    &mirror,
+                    endpoint,
                     canonical_host,
                     path_and_query,
                     client,
@@ -1238,7 +1233,7 @@ async fn try_sendfile_request(
                         err,
                         &client,
                         "simple proxy",
-                        format_args!("{uri_path} from host {}", mirror.format_authority()),
+                        format_args!("{uri_path} from host {}", endpoint.format_authority()),
                     ),
                 };
             }

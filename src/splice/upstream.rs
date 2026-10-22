@@ -191,10 +191,41 @@ fn upstream_pool() -> &'static parking_lot::Mutex<hashbrown::HashMap<PoolKey, Ve
     UPSTREAM_POOL.get_or_init(|| parking_lot::Mutex::new(hashbrown::HashMap::new()))
 }
 
-/// Resolve the port for a mirror, defaulting to 80 or 443 based on TLS.
-pub(super) fn mirror_port(mirror: &Mirror, is_tls: bool) -> u16 {
-    mirror
-        .port()
+/// Validated transport destination, independent of cache paths and identity.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UpstreamEndpoint<'a> {
+    pub(crate) host: &'a ClientHost,
+    pub(crate) port: Option<NonZero<u16>>,
+}
+
+impl<'a> UpstreamEndpoint<'a> {
+    pub(crate) fn format_authority(self) -> std::borrow::Cow<'a, str> {
+        self.host.format_authority(self.port)
+    }
+}
+
+impl<'a> From<&'a Mirror> for UpstreamEndpoint<'a> {
+    fn from(mirror: &'a Mirror) -> Self {
+        Self {
+            host: mirror.host(),
+            port: mirror.port(),
+        }
+    }
+}
+
+impl<'a> From<UpstreamEndpoint<'a>> for scheme_cache::SchemeKeyRef<'a> {
+    fn from(endpoint: UpstreamEndpoint<'a>) -> Self {
+        Self {
+            host: endpoint.host.as_str(),
+            port: endpoint.port.map(NonZero::get),
+        }
+    }
+}
+
+/// Resolve the dial port, defaulting to 80 or 443 based on TLS.
+pub(super) fn endpoint_port(endpoint: UpstreamEndpoint<'_>, is_tls: bool) -> u16 {
+    endpoint
+        .port
         .map_or(if is_tls { 443 } else { 80 }, NonZero::get)
 }
 
@@ -646,20 +677,20 @@ const fn classify_tls_error(kind: ErrorKind) -> Transience {
 ///
 /// Times out after the configured HTTP timeout.
 pub(super) async fn connect_upstream(
-    mirror: &Mirror,
+    endpoint: UpstreamEndpoint<'_>,
     scheme: Option<Scheme>,
 ) -> Result<UpstreamConn, ConnectError> {
-    let host = mirror.host();
+    let host = endpoint.host;
 
     match scheme {
         Some(Scheme::Http) => {
-            let tcp = tcp_connect(host, mirror_port(mirror, false))
+            let tcp = tcp_connect(host, endpoint_port(endpoint, false))
                 .await
                 .map_err(ConnectError::transient)?;
             Ok(UpstreamConn::Tcp(tcp))
         }
         Some(Scheme::Https) => {
-            let tcp = tcp_connect(host, mirror_port(mirror, true))
+            let tcp = tcp_connect(host, endpoint_port(endpoint, true))
                 .await
                 .map_err(ConnectError::transient)?;
             let tls = tls_connect(tcp, host).await?;
@@ -669,22 +700,22 @@ pub(super) async fn connect_upstream(
             // Auto mode: try HTTPS first, fall back to HTTP
             // (the fallback is remembered for `HTTP_SCHEME_TTL` only, after
             // which the next request probes HTTPS again).
-            match tcp_connect(host, mirror_port(mirror, true)).await {
+            match tcp_connect(host, endpoint_port(endpoint, true)).await {
                 Ok(tcp) => match tls_connect(tcp, host).await {
                     Ok(tls) => {
                         debug!(
                             "splice proxy: HTTPS upgrade succeeded for {}",
-                            mirror.format_authority()
+                            endpoint.format_authority()
                         );
                         return Ok(UpstreamConn::Tls(tls));
                     }
                     Err(err)
                         if err.certificate_rejected
-                            && scheme_cache::https_verified_before(mirror.into()) =>
+                            && scheme_cache::https_verified_before(endpoint.into()) =>
                     {
                         debug!(
                             "splice proxy: TLS certificate of {} rejected although HTTPS to it verified before; not falling back to HTTP",
-                            mirror.format_authority()
+                            endpoint.format_authority()
                         );
                         return Err(err);
                     }
@@ -696,13 +727,13 @@ pub(super) async fn connect_upstream(
                         if err.certificate_rejected {
                             warn_once_or_info!(
                                 "splice proxy: HTTPS certificate of host {} failed verification; falling back to plain HTTP (list the host in `http_only_mirrors` to silence this, or fix the mirror's certificate):  {}",
-                                mirror.format_authority(),
+                                endpoint.format_authority(),
                                 ErrorReport(&err.err)
                             );
                         } else {
                             debug!(
                                 "splice proxy: TLS handshake failed for {}, trying HTTP:  {}",
-                                mirror.format_authority(),
+                                endpoint.format_authority(),
                                 ErrorReport(&err.err)
                             );
                         }
@@ -711,7 +742,7 @@ pub(super) async fn connect_upstream(
                 Err(err) => {
                     debug!(
                         "splice proxy: HTTPS connect to {} failed, trying HTTP:  {}",
-                        mirror.format_authority(),
+                        endpoint.format_authority(),
                         ErrorReport(&err)
                     );
                 }
@@ -720,7 +751,7 @@ pub(super) async fn connect_upstream(
             // The fallback dial is another connect attempt, counted like
             // hyper's Auto-mode revert iteration.
             metrics::UPSTREAM_RETRIES.increment();
-            let tcp = tcp_connect(host, mirror_port(mirror, false))
+            let tcp = tcp_connect(host, endpoint_port(endpoint, false))
                 .await
                 .map_err(ConnectError::transient)?;
             Ok(UpstreamConn::Tcp(tcp))
@@ -1174,7 +1205,7 @@ mod tests {
                 };
                 let is_tls = scheme == Scheme::Https;
                 assert_eq!(
-                    mirror_port(&mirror, is_tls),
+                    endpoint_port((&mirror).into(), is_tls),
                     if is_tls { expected_tls } else { expected_http },
                     "{uri_text} with {mode:?}"
                 );
@@ -1183,26 +1214,40 @@ mod tests {
     }
 
     #[test]
-    fn test_mirror_port_defaults() {
+    fn alias_endpoint_preserves_canonical_cache_identity() {
+        let mut details = crate::test_support::connection_details("package.deb");
+        details.upstream_host = ClientHost::new("[2001:db8::1]").unwrap();
+        let endpoint = details.upstream_endpoint();
+        assert_eq!(endpoint.host.as_str(), "2001:db8::1");
+        assert_eq!(endpoint.format_authority(), "[2001:db8::1]");
+        assert_eq!(endpoint_port(endpoint, true), 443);
+        let key: scheme_cache::SchemeKeyRef<'_> = endpoint.into();
+        assert_eq!(key.host, "2001:db8::1");
+        assert_eq!(key.port, None);
+        assert_eq!(details.key().mirror.host().as_str(), "fixture.test");
+    }
+
+    #[test]
+    fn test_endpoint_port_defaults() {
         let mirror = Mirror::new(
             ClientHost::new("example.com").unwrap(),
             None,
             String::new(),
             MirrorKind::Structured,
         );
-        assert_eq!(mirror_port(&mirror, false), 80);
-        assert_eq!(mirror_port(&mirror, true), 443);
+        assert_eq!(endpoint_port((&mirror).into(), false), 80);
+        assert_eq!(endpoint_port((&mirror).into(), true), 443);
     }
 
     #[test]
-    fn test_mirror_port_explicit() {
+    fn test_endpoint_port_explicit() {
         let mirror = Mirror::new(
             ClientHost::new("example.com").unwrap(),
             Some(NonZero::new(8080).unwrap()),
             String::new(),
             MirrorKind::Structured,
         );
-        assert_eq!(mirror_port(&mirror, false), 8080);
-        assert_eq!(mirror_port(&mirror, true), 8080);
+        assert_eq!(endpoint_port((&mirror).into(), false), 8080);
+        assert_eq!(endpoint_port((&mirror).into(), true), 8080);
     }
 }

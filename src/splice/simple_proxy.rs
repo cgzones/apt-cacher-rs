@@ -9,9 +9,10 @@ use http::StatusCode;
 use tokio::net::TcpStream;
 use tracing::{debug, info, trace};
 
+use super::UpstreamEndpoint;
 use crate::config::ClientHost;
 use crate::database_task::{DatabaseCommand, send_db_command};
-use crate::deb_mirror::{Mirror, Origin, OriginSighting};
+use crate::deb_mirror::{Origin, OriginSighting};
 use crate::error::ErrorReport;
 use crate::http_helpers::{
     ConnectionAction, ConnectionVersion, WritePhase, write_all_to_stream, write_invalid_response,
@@ -101,7 +102,7 @@ pub(super) fn rewrite_simple_proxy_headers(
 /// Returns what becomes of the client connection: `conn_action`, unless the
 /// relayed body was close-delimited and the connection has to close.
 ///
-/// `mirror` is the upstream the client named and is dialled; a 2xx answer's
+/// `endpoint` is the upstream the client named and is dialled; a 2xx answer's
 /// `Origin` row is recorded under `canonical_host`, the alias' main host the
 /// dispatcher resolved.
 #[expect(
@@ -112,13 +113,13 @@ pub(crate) async fn splice_simple_proxy(
     client_stream: &TcpStream,
     conn_version: ConnectionVersion,
     conn_action: ConnectionAction,
-    mirror: &Mirror,
+    endpoint: UpstreamEndpoint<'_>,
     canonical_host: ClientHost,
     upstream_path: &str,
     client: ClientInfo,
     request_received_at: PreciseInstant,
 ) -> Result<ConnectionAction, SpliceProxyError> {
-    let host_authority = mirror.format_authority();
+    let host_authority = endpoint.format_authority();
     // Strip the query so cache identity (registry keys, Origin rows) stays
     // path-only; the query still rides on the upstream GET line via
     // `upstream_path`. Matches the hyper backend.
@@ -141,7 +142,7 @@ pub(crate) async fn splice_simple_proxy(
         reused: _,
         // A passthrough records no time to first byte (`mirror_perf`).
         attempt_started: _,
-    } = standard_upstream_connect(mirror, host_authority, upstream_path, 0, None, None, None)
+    } = standard_upstream_connect(endpoint, &host_authority, upstream_path, 0, None, None, None)
         .await
         .map_err(|err| {
             // The report names the attempted target itself.
@@ -221,7 +222,7 @@ pub(crate) async fn splice_simple_proxy(
     // resolved, not the dialled `mirror`.
     if resp.status_code.is_success()
         && let Some(origin) =
-            Origin::from_path(original_uri_path, canonical_host, mirror.port(), &client)
+            Origin::from_path(original_uri_path, canonical_host, endpoint.port, &client)
     {
         let cmd = DatabaseCommand::Origin(origin, OriginSighting::Upstream);
         send_db_command(cmd).await;

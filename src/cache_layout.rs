@@ -627,18 +627,14 @@ impl ConnectionDetails {
         self.upstream_host.format_authority(self.mirror.port())
     }
 
-    /// The mirror to dial for an upstream fetch: the canonical mirror with
-    /// the client-named host swapped in.  Only for upstream dispatch and
-    /// formatting; never persisted or used as a key.
+    /// Dial the client-named host while retaining the canonical cache identity.
     #[cfg(feature = "splice")]
     #[must_use]
-    pub(crate) fn upstream_mirror(&self) -> Mirror {
-        Mirror::new(
-            self.upstream_host.clone(),
-            self.mirror.port(),
-            self.mirror.path().to_owned(),
-            self.mirror.kind(),
-        )
+    pub(crate) fn upstream_endpoint(&self) -> crate::splice::UpstreamEndpoint<'_> {
+        crate::splice::UpstreamEndpoint {
+            host: &self.upstream_host,
+            port: self.mirror.port(),
+        }
     }
 
     /// Log suffix naming the alias the client used, empty when the request
