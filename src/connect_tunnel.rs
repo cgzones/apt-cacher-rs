@@ -69,7 +69,7 @@ impl std::fmt::Display for TunnelTarget {
     /// The URI authority, `host:port` or `[v6]:port`, for log lines.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self { host, port } = self;
-        f.write_str(&host.format_authority(Some(*port)))
+        write!(f, "{host}:{port}")
     }
 }
 
