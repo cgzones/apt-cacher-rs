@@ -630,16 +630,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn early_drop_does_not_panic() {
-        // Spawn a decode, read one byte, drop the wrapper. The blocking task
-        // should observe BrokenPipe on its next write and exit cleanly without
-        // panicking the runtime.
+    async fn consumer_can_drop_after_reading_one_byte() {
+        // A consumer may stop after one byte. This small output fits in
+        // the pipe; worker cancellation is exercised separately above.
         let mut decoder = xz_decoder(Cursor::new(HELLO_XZ));
         let mut one = [0u8; 1];
         let n = decoder.read(&mut one).await.expect("first byte ok");
         assert_eq!(n, 1);
         assert_eq!(one[0], b'h');
         drop(decoder);
-        tokio::task::yield_now().await;
     }
 }
