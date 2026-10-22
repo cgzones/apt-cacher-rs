@@ -359,7 +359,9 @@ pub(crate) mod tests {
 
     /// Whether `V`'s key is present on the file, read raw.
     pub(crate) fn raw_present<V: XattrValue>(file: &std::fs::File) -> bool {
-        matches!(file.get_xattr(V::KEY), Ok(Some(_)))
+        file.get_xattr(V::KEY)
+            .expect("read raw attribute after scrub")
+            .is_some()
     }
 
     /// The scrub-on-malformed contract every value type inherits: a stored
