@@ -1695,33 +1695,16 @@ mod tests {
         let grace = Duration::from_secs(3 * DAY);
         let backstop = Duration::from_secs(90 * DAY);
 
-        // Past the backstop with no reference set -> aged out, not "unreferenced".
-        let now = SystemTime::now() + Duration::from_secs(91 * DAY);
-        let outcome = sweep_byhash_dir(
-            dir.path(),
-            None,
-            grace,
-            backstop,
-            now,
-            &byhash_test_mirror(),
-            CacheLayout::DistsByHash,
-        )
-        .await
-        .expect("sweep ok");
-        assert_eq!(outcome.removed, 2);
-        assert_eq!(outcome.removed_unreferenced, 0);
+        let now = SystemTime::now();
 
-        // Recreate and verify young files are kept in fallback mode.
-        for d in [[0x21u8; 32], [0x22u8; 32]] {
-            std::fs::write(dir.path().join(hex_encode(&d)), b"x").expect("write");
-        }
-        let now = SystemTime::now() + Duration::from_secs(DAY);
+        // Young files are kept in fallback mode.
+        let young = now + Duration::from_secs(DAY);
         let outcome = sweep_byhash_dir(
             dir.path(),
             None,
             grace,
             backstop,
-            now,
+            young,
             &byhash_test_mirror(),
             CacheLayout::DistsByHash,
         )
@@ -1729,5 +1712,21 @@ mod tests {
         .expect("sweep ok");
         assert_eq!(outcome.removed, 0);
         assert_eq!(outcome.retained, 2);
+
+        // Past the backstop with no reference set -> aged out, not "unreferenced".
+        let old = now + Duration::from_secs(91 * DAY);
+        let outcome = sweep_byhash_dir(
+            dir.path(),
+            None,
+            grace,
+            backstop,
+            old,
+            &byhash_test_mirror(),
+            CacheLayout::DistsByHash,
+        )
+        .await
+        .expect("sweep ok");
+        assert_eq!(outcome.removed, 2);
+        assert_eq!(outcome.removed_unreferenced, 0);
     }
 }
