@@ -51,21 +51,13 @@ pub(crate) const MAX_SUITES: usize = 64;
 /// sync failure every week.
 pub(crate) const BEHIND_AFTER_SECS: u64 = 14 * 24 * 60 * 60;
 
-/// What one parsed `Release`/`InRelease` said about its age.
+/// One suite's newest parsed `Release`/`InRelease` and its confirmation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ReleaseSeen {
+pub(crate) struct SuiteIndex {
     /// Its `Date:` (a far-future one already clamped to absent) and
     /// `Valid-Until:`.
     pub(crate) header: ReleaseHeader,
     /// When the mirror served or confirmed it, unix seconds.
-    pub(crate) confirmed_at: i64,
-}
-
-/// One suite's newest index.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SuiteIndex {
-    pub(crate) date: Option<i64>,
-    pub(crate) valid_until: Option<i64>,
     pub(crate) confirmed_at: i64,
 }
 
@@ -81,14 +73,17 @@ impl SuiteIndex {
     /// reads as no lag.
     #[must_use]
     pub(crate) fn lag(self) -> Option<u64> {
-        self.date.map(|date| lag_between(date, self.confirmed_at))
+        self.header
+            .date
+            .map(|date| lag_between(date, self.confirmed_at))
     }
 
     /// Whether the mirror served the index past its `Valid-Until:`, which
     /// makes apt refuse it.
     #[must_use]
     pub(crate) fn expired(self) -> bool {
-        self.valid_until
+        self.header
+            .valid_until
             .is_some_and(|valid_until| valid_until < self.confirmed_at)
     }
 }
@@ -132,7 +127,7 @@ impl MirrorIndexes {
             index.confirmed_at = index.confirmed_at.max(at);
         }
         if let Some((_, slot)) = self.suites.iter_mut().find(|(name, _)| **name == *suite) {
-            let same_index = slot.date == index.date && slot.valid_until == index.valid_until;
+            let same_index = slot.header == index.header;
             let confirmed_at = if same_index {
                 slot.confirmed_at.max(index.confirmed_at)
             } else {
@@ -216,7 +211,7 @@ pub(crate) fn assess(indexes: &MirrorIndexes) -> Option<IndexAge> {
     let confirmed_at = suites().map(|index| index.confirmed_at).max()?;
     // The newest `Date:`, with the latest confirmation of a suite carrying it.
     let newest = suites()
-        .filter_map(|index| Some((index.date?, index.confirmed_at)))
+        .filter_map(|index| Some((index.header.date?, index.confirmed_at)))
         .max();
     let freshest_lag = newest.map(|(date, _)| lag_between(date, confirmed_at));
     let state = if suites().any(SuiteIndex::expired) {
@@ -252,24 +247,11 @@ static INDEXES: MirrorRegistry<MirrorIndexes> = MirrorRegistry::new(MAX_MIRRORS)
 
 /// Record what an ingested `Release` in `release_dir` (host-relative, as the
 /// ingest derives it) of `mirror` (canonical) said.
-pub(crate) fn record(mirror: &Mirror, release_dir: &str, seen: ReleaseSeen) {
+pub(crate) fn record(mirror: &Mirror, release_dir: &str, index: SuiteIndex) {
     let Some(suite) = suite_of(mirror.path(), release_dir) else {
         return;
     };
-    let ReleaseSeen {
-        header: ReleaseHeader { date, valid_until },
-        confirmed_at,
-    } = seen;
-    INDEXES.update(mirror, |indexes| {
-        indexes.record(
-            suite,
-            SuiteIndex {
-                date,
-                valid_until,
-                confirmed_at,
-            },
-        );
-    });
+    INDEXES.update(mirror, |indexes| indexes.record(suite, index));
 }
 
 /// The mirror confirmed the `Release` in `release_dir` unchanged (an
@@ -312,8 +294,7 @@ mod tests {
 
     fn index(date: Option<i64>, valid_until: Option<i64>, confirmed_at: i64) -> SuiteIndex {
         SuiteIndex {
-            date,
-            valid_until,
+            header: ReleaseHeader { date, valid_until },
             confirmed_at,
         }
     }
@@ -552,11 +533,11 @@ mod tests {
         ]);
         structured.merge(&flat);
         assert_eq!(
-            structured.suite("sid").and_then(|i| i.date),
+            structured.suite("sid").and_then(|i| i.header.date),
             Some(NOW - DAY)
         );
         assert_eq!(
-            structured.suite("stable").and_then(|i| i.date),
+            structured.suite("stable").and_then(|i| i.header.date),
             Some(NOW - DAY)
         );
         assert!(structured.suite("testing").is_some());

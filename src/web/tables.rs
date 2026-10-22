@@ -478,11 +478,11 @@ mod mirror_cells {
             let mut sep = "";
             for (suite, index) in indexes.suites() {
                 write!(f, "{sep}{}: ", HtmlEscape(suite))?;
-                match index.date {
+                match index.header.date {
                     Some(date) => write!(f, "dated {}", UtcText(date))?,
                     None => f.write_str("undated")?,
                 }
-                if let Some(valid_until) = index.valid_until {
+                if let Some(valid_until) = index.header.valid_until {
                     write!(f, ", valid until {}", UtcText(valid_until))?;
                 }
                 write!(f, ", last served {}", UtcText(index.confirmed_at))?;
@@ -940,7 +940,7 @@ pub(super) fn render_origin_table(
         let index_date = indexes
             .get(key.as_str())
             .and_then(|indexes| indexes.suite(&origin.distribution))
-            .and_then(|index| index.date);
+            .and_then(|index| index.header.date);
         tr!(
             marked Freshness::of(origin.last_seen, now_epoch).row_class(),
             table,

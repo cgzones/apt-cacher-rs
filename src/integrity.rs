@@ -62,7 +62,7 @@ use crate::{
     guards::DownloadWriteLease,
     index_parser::{self, HashAlgo, ReleaseHeader, StanzaStream, StreamedDigest},
     metrics,
-    mirror_indexes::{self, ReleaseSeen},
+    mirror_indexes::{self, SuiteIndex},
     partial_file::TempPath,
     verified_marker::{self, FileIdentity},
 };
@@ -2247,7 +2247,7 @@ async fn ingest_release_file(
     mirror_path: &str,
     path: &Path,
     release_dir: &str,
-) -> std::io::Result<ReleaseSeen> {
+) -> std::io::Result<SuiteIndex> {
     let (content, mtime) = read_release(path).await?;
     let header = index_parser::parse_release_header(&content);
     let date = clamp_future_release_date(header.date);
@@ -2273,7 +2273,7 @@ async fn ingest_release_file(
             path.display(),
         );
     }
-    Ok(ReleaseSeen {
+    Ok(SuiteIndex {
         header: ReleaseHeader {
             date,
             valid_until: header.valid_until,
@@ -3359,7 +3359,7 @@ mod tests {
             .expect("ingest");
         assert_eq!(
             seen,
-            ReleaseSeen {
+            SuiteIndex {
                 header: ReleaseHeader {
                     date: Some(1_789_894_413),
                     valid_until: Some(1_789_894_413 + 7 * 86_400),
