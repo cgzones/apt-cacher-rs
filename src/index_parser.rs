@@ -6,7 +6,7 @@
 //! `cleanup` sweep (and its tests). Cold-path only; the helpers
 //! stay free of hot-path-specific coupling.
 
-use std::io;
+use std::{borrow::Cow, io};
 
 use tokio::io::AsyncBufRead;
 
@@ -669,9 +669,10 @@ pub(crate) fn parse_release_header(content: &str) -> ReleaseHeader {
 fn parse_release_timestamp(value: &str) -> Option<i64> {
     use time::format_description::well_known::Rfc2822;
     let value = value.trim();
-    let normalized = value
-        .strip_suffix(" UTC")
-        .map_or_else(|| value.to_owned(), |head| format!("{head} +0000"));
+    let normalized = value.strip_suffix(" UTC").map_or_else(
+        || Cow::Borrowed(value),
+        |head| Cow::Owned(format!("{head} +0000")),
+    );
     time::OffsetDateTime::parse(&normalized, &Rfc2822)
         .ok()
         .map(time::OffsetDateTime::unix_timestamp)
