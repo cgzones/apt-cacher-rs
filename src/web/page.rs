@@ -422,10 +422,10 @@ pub(super) fn build_nav_html(page: Page, options: QueryOptions) -> String {
                     ..options
                 },
             };
-            let label = match options.refresh_secs {
-                Some(secs) => format!("Stop auto-refresh ({secs}s)"),
-                None => format!("Auto-refresh ({AUTO_REFRESH_SECS}s)"),
-            };
+            let label = fmt::from_fn(|f| match options.refresh_secs {
+                Some(secs) => write!(f, "Stop auto-refresh ({secs}s)"),
+                None => write!(f, "Auto-refresh ({AUTO_REFRESH_SECS}s)"),
+            });
             swrite!(
                 html,
                 "<a data-action=\"refresh-toggle\" data-secs=\"{AUTO_REFRESH_SECS}\" href=\"{target}\">{label}</a>"

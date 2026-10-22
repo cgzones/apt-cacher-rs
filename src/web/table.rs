@@ -9,7 +9,7 @@
 //! sections by `data-section`; sorting remembers its order per
 //! `data-table`), so a key is stable once shipped.
 
-use std::fmt::Display;
+use std::fmt::{self, Display};
 
 use crate::{metrics::Signal, swrite};
 
@@ -194,7 +194,7 @@ pub(super) enum SortKey<'a> {
 }
 
 impl Display for SortKey<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::Number(number) => Display::fmt(&number, f),
             Self::Text(text) => Display::fmt(&HtmlEscaped(text), f),
@@ -299,7 +299,7 @@ impl Highlights {
 impl Display for Highlights {
     /// `2 alerts / 5 warnings`, each figure painted at its level once
     /// non-zero.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { alerts, warnings } = *self;
         let plural = |n: usize| if n == 1 { "" } else { "s" };
         if alerts > 0 {
@@ -704,11 +704,12 @@ pub(super) fn write_collapsible_details_badged(
     let open_attr = if open { " open" } else { "" };
     let mut badge_html = String::new();
     swrite!(badge_html, "{badge}");
-    let badge_wrapped = if badge_html.is_empty() {
-        String::new()
-    } else {
-        format!(" <span class=\"count\">{badge_html}</span>")
-    };
+    let badge_wrapped = fmt::from_fn(|f| {
+        if !badge_html.is_empty() {
+            write!(f, " <span class=\"count\">{badge_html}</span>")?;
+        }
+        Ok(())
+    });
     swrite!(
         out,
         "<div class=\"section\" data-section=\"{key}\"><details{open_attr}>\
@@ -745,10 +746,10 @@ pub(super) fn write_collapsible_section(
         total: total_count,
     } = rows;
     let open_attr = if row_count > 0 || pinned { " open" } else { "" };
-    let total_count_fmt = match total_count {
-        Some(total) => format!(" / {total}"),
-        None => String::new(),
-    };
+    let total_count_fmt = fmt::from_fn(|f| match total_count {
+        Some(total) => write!(f, " / {total}"),
+        None => Ok(()),
+    });
     swrite!(
         out,
         "<div class=\"section\" data-section=\"{key}\"><details{open_attr}>\
@@ -772,7 +773,7 @@ struct EmptyOr<'a> {
 }
 
 impl Display for EmptyOr<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.body.is_empty() {
             write!(f, "<p class=\"empty\">{}</p>", self.note)
         } else {
