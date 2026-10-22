@@ -1375,10 +1375,16 @@ mod tests {
         (dir, path)
     }
 
-    /// Fill the partial at `path` with `blocks` whole blocks.
+    /// Set the partial's apparent length to `blocks` whole blocks.
     fn write_len(path: &Path, blocks: u64) {
-        let len = usize::try_from(b(blocks)).expect("small test file");
-        std::fs::write(path, vec![0u8; len]).expect("write partial");
+        crate::fs_open::nofollow_options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .expect("create partial")
+            .set_len(b(blocks))
+            .expect("set partial length");
     }
 
     /// The partial at `path`, claimed as its download would, adopting
