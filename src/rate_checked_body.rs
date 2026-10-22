@@ -10,7 +10,7 @@ use crate::{
     transfer_error::{ClientError, DeliveryFailure},
 };
 
-/// Error type for `RateCheckedBody` operations.
+/// Error type for optional rate-checking operations.
 pub(crate) enum RateCheckedBodyErr<E> {
     /// The download rate is below the minimum threshold.
     RateTimeout(InsufficientRate),
@@ -18,15 +18,15 @@ pub(crate) enum RateCheckedBodyErr<E> {
     Inner(E),
 }
 
-/// A `Body` wrapper that checks the download rate against a minimum threshold.
+/// A body with optional minimum-rate checking and a shared error type.
 #[pin_project]
-pub(crate) struct RateCheckedBody<B>
+pub(crate) struct MaybeRated<B>
 where
     B: Body,
 {
     #[pin]
     inner: B,
-    rchecker: RateChecker,
+    rchecker: Option<RateChecker>,
     /// Set once the rate breach has been surfaced, so a consumer that polls
     /// on sees the body end rather than a second breach. Counting is not this
     /// body's: the owner that ends the transfer concludes the failure once
@@ -35,22 +35,26 @@ where
     rate_failed: sticky::Bool,
 }
 
-impl<B> RateCheckedBody<B>
+impl<B> MaybeRated<B>
 where
     B: Body,
 {
-    /// Creates a new `RateCheckedBody` that wraps the given `body` and checks the download rate against the given `min_download_rate` over the given `timeframe`.
+    /// Check the body rate only when a minimum is configured.
     #[must_use]
-    fn new(body: B, min_download_rate: NonZero<usize>, timeframe: NonZero<usize>) -> Self {
+    pub(crate) fn new(
+        body: B,
+        min_download_rate: Option<NonZero<usize>>,
+        timeframe: NonZero<usize>,
+    ) -> Self {
         Self {
             inner: body,
-            rchecker: RateChecker::with_timeframe(min_download_rate, timeframe),
+            rchecker: min_download_rate.map(|rate| RateChecker::with_timeframe(rate, timeframe)),
             rate_failed: sticky::Bool::new(),
         }
     }
 }
 
-impl<B> Body for RateCheckedBody<B>
+impl<B> Body for MaybeRated<B>
 where
     B: Body,
 {
@@ -77,7 +81,9 @@ where
         if self_mut.rate_failed.get() {
             return std::task::Poll::Ready(None);
         }
-        if let Some(download_rate_err) = self_mut.rchecker.check_fail() {
+        if let Some(download_rate_err) =
+            self_mut.rchecker.as_ref().and_then(RateChecker::check_fail)
+        {
             self_mut.rate_failed.set();
             return std::task::Poll::Ready(Some(Err(Box::new(RateCheckedBodyErr::RateTimeout(
                 download_rate_err,
@@ -88,87 +94,12 @@ where
 
         if let std::task::Poll::Ready(Some(Ok(ref frame))) = msg
             && let Some(data) = frame.data_ref()
+            && let Some(rchecker) = self_mut.rchecker
         {
-            self_mut.rchecker.add(data.remaining());
+            rchecker.add(data.remaining());
         }
 
         msg.map_err(|e| Box::new(RateCheckedBodyErr::Inner(e)))
-    }
-}
-
-/// A `Body` that is optionally wrapped in a [`RateCheckedBody`].
-///
-/// Lets call sites express "rate-check this body if `min_download_rate` is
-/// configured, otherwise pass it through" without manually picking between
-/// two body shapes — the unified `Error` (`Box<RateCheckedBodyErr<B::Error>>`)
-/// matches the rated case so downstream error mapping is identical.
-#[pin_project(project = MaybeRatedProj)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "RateCheckedBody embeds an inline SumRingBuffer sized for the \
-              default rate_check_timeframe (30 entries) so rated requests \
-              skip the per-request heap allocation; boxing the variant \
-              would re-introduce exactly the alloc we're avoiding"
-)]
-pub(crate) enum MaybeRated<B>
-where
-    B: Body,
-{
-    Plain(#[pin] B),
-    Rated(#[pin] RateCheckedBody<B>),
-}
-
-impl<B> MaybeRated<B>
-where
-    B: Body,
-{
-    #[must_use]
-    pub(crate) fn new(
-        body: B,
-        min_download_rate: Option<NonZero<usize>>,
-        timeframe: NonZero<usize>,
-    ) -> Self {
-        match min_download_rate {
-            Some(rate) => Self::Rated(RateCheckedBody::new(body, rate, timeframe)),
-            None => Self::Plain(body),
-        }
-    }
-}
-
-impl<B> Body for MaybeRated<B>
-where
-    B: Body,
-{
-    type Data = B::Data;
-    type Error = Box<RateCheckedBodyErr<B::Error>>;
-
-    #[inline]
-    fn size_hint(&self) -> SizeHint {
-        match self {
-            Self::Plain(body) => body.size_hint(),
-            Self::Rated(body) => body.size_hint(),
-        }
-    }
-
-    #[inline]
-    fn is_end_stream(&self) -> bool {
-        match self {
-            Self::Plain(body) => body.is_end_stream(),
-            Self::Rated(body) => body.is_end_stream(),
-        }
-    }
-
-    #[inline]
-    fn poll_frame(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        match self.project() {
-            MaybeRatedProj::Plain(body) => body
-                .poll_frame(cx)
-                .map_err(|e| Box::new(RateCheckedBodyErr::Inner(e))),
-            MaybeRatedProj::Rated(body) => body.poll_frame(cx),
-        }
     }
 }
 
@@ -234,15 +165,15 @@ mod tests {
 
     /// A body whose one-second rate window is already full and below the
     /// threshold, so the very next poll must fail the rate check.
-    fn breaching_body() -> RateCheckedBody<Full<bytes::Bytes>> {
-        let mut body = RateCheckedBody::new(
+    fn breaching_body() -> MaybeRated<Full<bytes::Bytes>> {
+        let mut body = MaybeRated::new(
             Full::new(bytes::Bytes::from_static(b"payload")),
-            nonzero!(1000),
+            Some(nonzero!(1000)),
             nonzero!(1),
         );
         // A single sample fills the one-second window: 1 B/s, far below the
         // 1000 B/s minimum.
-        body.rchecker.add(1);
+        body.rchecker.as_mut().expect("rated body").add(1);
         body
     }
 
@@ -284,7 +215,7 @@ mod tests {
             transfer_error::DeliveryFailure,
         };
         let body = ClientBody {
-            inner: MaybeRated::Rated(breaching_body()),
+            inner: breaching_body(),
         };
         let mut body = AccountedBody::new(
             body,
@@ -315,6 +246,38 @@ mod tests {
         assert_eq!(crate::metrics::RATE_LIMIT_CLIENT.get(), before + 1);
     }
 
+    #[test]
+    fn non_data_frames_preserve_pending_trailers_and_inner_errors() {
+        for minimum in [None, Some(nonzero!(1000))] {
+            let mut frames = [
+                Poll::Pending,
+                Poll::Ready(Some(Ok(Frame::<bytes::Bytes>::trailers(
+                    http::HeaderMap::new(),
+                )))),
+                Poll::Ready(Some(Err("source failed"))),
+                Poll::Ready(None),
+            ]
+            .into_iter();
+            let source =
+                http_body_util::StreamBody::new(futures_util::stream::poll_fn(move |_| {
+                    frames.next().expect("one poll per scripted frame")
+                }));
+            let mut body = MaybeRated::new(source, minimum, nonzero!(1));
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(Pin::new(&mut body).poll_frame(&mut cx).is_pending());
+            assert!(
+                matches!(Pin::new(&mut body).poll_frame(&mut cx), Poll::Ready(Some(Ok(frame))) if frame.is_trailers())
+            );
+            assert!(
+                matches!(Pin::new(&mut body).poll_frame(&mut cx), Poll::Ready(Some(Err(error))) if matches!(*error, RateCheckedBodyErr::Inner("source failed")))
+            );
+            assert!(matches!(
+                Pin::new(&mut body).poll_frame(&mut cx),
+                Poll::Ready(None)
+            ));
+        }
+    }
+
     /// Without a configured minimum rate the wrapper is a pass-through: the
     /// inner body's frames arrive unchanged, only re-boxed into the common
     /// error type.
@@ -325,7 +288,7 @@ mod tests {
             None,
             nonzero!(1),
         );
-        assert!(matches!(body, MaybeRated::Plain(_)));
+        assert!(body.rchecker.is_none());
 
         let waker = std::task::Waker::noop();
         let mut cx = Context::from_waker(waker);
