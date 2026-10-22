@@ -242,15 +242,9 @@ impl Stanza {
 
     /// A stanza whose consumer only reads SHA256 (see `want_sha512`).
     pub(crate) const fn new_sha256_only() -> Self {
-        Self {
-            filename: String::new(),
-            sha256: None,
-            sha512: None,
-            seen: 0,
-            repeated: None,
-            want_sha512: false,
-            source: None,
-        }
+        let mut stanza = Self::new();
+        stanza.want_sha512 = false;
+        stanza
     }
 
     /// Name the index being parsed, so a rejected `Filename:` value points
