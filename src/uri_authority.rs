@@ -8,6 +8,16 @@ use http::uri::Authority;
 /// no port (RFC 3986 §6.2.3).
 pub(crate) const HTTP_DEFAULT_PORT: u16 = 80;
 
+/// Canonical optional port for an upstream URI, before HTTPS upgrade policy.
+/// Only HTTP's explicit default is erased; HTTPS and nondefault ports retain
+/// their meaning in scheme-cache and connection-pool identities.
+pub(crate) fn normalize_http_port(
+    port: Option<NonZero<u16>>,
+    scheme: Option<&http::uri::Scheme>,
+) -> Option<NonZero<u16>> {
+    port.filter(|port| scheme != Some(&http::uri::Scheme::HTTP) || port.get() != HTTP_DEFAULT_PORT)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("port must be a decimal number between 1 and 65535")]
 pub(crate) struct InvalidPort;
@@ -40,6 +50,26 @@ pub(crate) fn port(authority: &Authority) -> Result<Option<NonZero<u16>>, Invali
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_port_normalization_preserves_https_and_nondefault_ports() {
+        for scheme in [
+            None,
+            Some(&http::uri::Scheme::HTTP),
+            Some(&http::uri::Scheme::HTTPS),
+        ] {
+            for number in [None, Some(80), Some(443), Some(8080)] {
+                let port = number.and_then(NonZero::new);
+                let normalized = normalize_http_port(port, scheme);
+                let expected = if scheme == Some(&http::uri::Scheme::HTTP) && number == Some(80) {
+                    None
+                } else {
+                    port
+                };
+                assert_eq!(normalized, expected);
+            }
+        }
+    }
 
     #[test]
     fn ports_are_validated_after_the_whole_host() {

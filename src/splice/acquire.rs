@@ -542,7 +542,7 @@ pub(super) async fn follow_redirect(
     // Redirect Mirror: used only for upstream dispatch/formatting; never persisted.
     let redirect_mirror = Mirror::new(
         moved_domain,
-        moved_port,
+        uri_authority::normalize_http_port(moved_port, moved_uri.scheme()),
         String::new(),
         MirrorKind::Structured,
     );

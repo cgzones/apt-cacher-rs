@@ -143,15 +143,14 @@ pub(crate) fn canonical_authority(auth: &Authority) -> Option<Authority> {
 #[cfg(feature = "hyper")]
 #[must_use]
 pub(crate) fn canonical_upstream_authority(uri: &http::Uri) -> Option<Authority> {
-    let default_port = (uri.scheme() == Some(&http::uri::Scheme::HTTP))
-        .then_some(uri_authority::HTTP_DEFAULT_PORT);
-    canonicalize(uri.authority()?, default_port)
+    canonicalize(uri.authority()?, uri.scheme())
 }
 
-/// [`canonical_authority`], dropping an explicit port equal to `default_port`.
-fn canonicalize(auth: &Authority, default_port: Option<u16>) -> Option<Authority> {
+/// [`canonical_authority`], applying the URI scheme's default-port policy.
+fn canonicalize(auth: &Authority, scheme: Option<&http::uri::Scheme>) -> Option<Authority> {
     let port = uri_authority::port(auth).ok()?;
-    let default_named = port.is_some_and(|port| Some(port.get()) == default_port);
+    let normalized_port = uri_authority::normalize_http_port(port, scheme);
+    let default_named = normalized_port != port;
     let host = auth.host();
     // Fast path, no allocation: a lowercase DNS name or an IPv4 address
     // (whose parser admits only the canonical dotted quad) is canonical.
@@ -159,7 +158,7 @@ fn canonicalize(auth: &Authority, default_port: Option<u16>) -> Option<Authority
         return None;
     }
     let canonical = DomainName::new(host).ok()?;
-    let rendered = canonical.format_authority(port.filter(|_| !default_named));
+    let rendered = canonical.format_authority(normalized_port);
     if rendered == auth.as_str() {
         return None;
     }

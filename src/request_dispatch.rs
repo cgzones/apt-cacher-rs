@@ -454,7 +454,7 @@ pub(crate) fn preflight_target<'a, 'h>(
         // same resource as none (RFC 3986 §6.2.3): `host:80` and `host` are
         // one mirror, with one cache tree and one database row, and an
         // HTTPS upgrade dials 443 instead of TLS on port 80.
-        Ok(port) => port.filter(|port| port.get() != uri_authority::HTTP_DEFAULT_PORT),
+        Ok(port) => uri_authority::normalize_http_port(port, Some(&http::uri::Scheme::HTTP)),
         Err(err) => {
             warn_once_or_info!(
                 "Unsupported request port in `{authority}` from client {client} ({err}); returning 400"

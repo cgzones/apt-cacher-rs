@@ -1136,6 +1136,53 @@ mod tests {
     }
 
     #[test]
+    fn canonical_redirect_ports_follow_upgrade_policy() {
+        use crate::config::{Config, HttpsUpgradeMode};
+        use crate::uri_authority;
+        for mode in [
+            HttpsUpgradeMode::Never,
+            HttpsUpgradeMode::Auto,
+            HttpsUpgradeMode::Always,
+        ] {
+            let mut config = Config::default();
+            config.https_upgrade_mode = mode;
+            for (uri_text, expected_http, expected_tls) in [
+                ("http://redirect-port-policy.invalid/package", 80, 443),
+                ("http://redirect-port-policy.invalid:80/package", 80, 443),
+                (
+                    "http://redirect-port-policy.invalid:8080/package",
+                    8080,
+                    8080,
+                ),
+                ("https://redirect-port-policy.invalid:80/package", 80, 80),
+                ("https://redirect-port-policy.invalid:443/package", 443, 443),
+            ] {
+                let uri: http::Uri = uri_text.parse().expect("URI");
+                let port = uri_authority::port(uri.authority().expect("authority")).expect("port");
+                let mirror = Mirror::new(
+                    ClientHost::new("redirect-port-policy.invalid").expect("host"),
+                    uri_authority::normalize_http_port(port, uri.scheme()),
+                    String::new(),
+                    MirrorKind::Structured,
+                );
+                let scheme = if uri.scheme() == Some(&http::uri::Scheme::HTTPS) {
+                    Scheme::Https
+                } else {
+                    scheme_cache::resolve((&mirror).into(), &config)
+                        .fixed_scheme()
+                        .unwrap_or(Scheme::Https)
+                };
+                let is_tls = scheme == Scheme::Https;
+                assert_eq!(
+                    mirror_port(&mirror, is_tls),
+                    if is_tls { expected_tls } else { expected_http },
+                    "{uri_text} with {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_mirror_port_defaults() {
         let mirror = Mirror::new(
             ClientHost::new("example.com").unwrap(),
