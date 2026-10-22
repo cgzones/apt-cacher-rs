@@ -1382,7 +1382,7 @@ fn build_cleanup_group(g: &mut Groups) {
         );
         t.count_tip(
             "Checksum Skips",
-            "Digest verifications skipped because the file was already verified in an earlier cleanup cycle and is unchanged (same inode, size and expected digest).",
+            "Digest verifications skipped because the file was already verified in an earlier cleanup cycle and is unchanged (same inode, size, modification time and expected digest).",
             metrics::CLEANUP_CHECKSUM_SKIPS.get(),
         );
         // Loaded first: it is set after the figures, so finding it set means

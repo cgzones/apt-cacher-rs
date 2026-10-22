@@ -5,7 +5,7 @@ use crate::fs_open::{
 };
 use crate::index_parser::{HashAlgo, hash_open_file};
 use crate::metrics;
-use crate::verified_marker::{has_valid_marker, stamp};
+use crate::verified_marker::{FileIdentity, has_valid_marker, stamp};
 
 /// Outcome of verifying a cache file against an expected digest.
 #[derive(Debug)]
@@ -13,11 +13,12 @@ pub(super) enum Verdict {
     /// Computed digest equals the expected one.
     Match,
     /// Computed digest differs from the expected one and the underlying file
-    /// did not change inode/size during hashing. `size` is the on-disk size
+    /// kept its [`FileIdentity`] during hashing. `size` is the on-disk size
     /// observed before hashing, which the caller bills to the eviction.
     Mismatch { computed: Vec<u8>, size: u64 },
-    /// The file's `(inode, size)` changed between hash start and finish, so a
-    /// concurrent writer raced us; the cleanup leaves the file alone.
+    /// The file's [`FileIdentity`] (inode, size, mtime) changed between hash
+    /// start and finish, so a concurrent writer raced us; the cleanup leaves
+    /// the file alone.
     Raced,
     /// The path is no longer a regular file — a type swap since the scan
     /// classified it. Counted as `CACHE_NON_REGULAR` here; the caller retains
@@ -30,11 +31,9 @@ pub(super) enum Verdict {
     IoError(std::io::Error),
 }
 
-/// Blocking digest-and-compare with an inode/size race check after hashing.
-/// Runs on the blocking pool via [`verify_cache_file`].
+/// Blocking digest-and-compare with a [`FileIdentity`] race check after
+/// hashing. Runs on the blocking pool via [`verify_cache_file`].
 fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> Verdict {
-    use std::os::unix::fs::MetadataExt as _;
-
     let mut file = match nofollow_nonblock_options().read(true).open(path) {
         Ok(f) => f,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Verdict::Vanished,
@@ -59,12 +58,13 @@ fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> Verdict {
             return Verdict::IoError(err);
         }
     };
-    let pre_ino = pre_meta.ino();
+    let pre_identity = FileIdentity::of(&pre_meta);
     let pre_size = pre_meta.len();
 
     // Memoized fast path: verified in an earlier cycle and unchanged since
-    // (same inode/size, same expected digest) — skip the full read+hash.
-    if has_valid_marker(&file, path, pre_ino, pre_size, algo, expected) {
+    // (same inode/size/mtime, same expected digest) — skip the full
+    // read+hash.
+    if has_valid_marker(&file, path, pre_identity, algo, expected) {
         metrics::CLEANUP_CHECKSUM_SKIPS.increment();
         return Verdict::Match;
     }
@@ -91,24 +91,25 @@ fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> Verdict {
     release_page_cache(&file, path);
 
     if computed.as_slice() == expected {
-        // Only stamp when the file is still the one we hashed — a swap
-        // mid-hash must not mark the *new* content as verified.
+        // Only stamp when the file is still the one we hashed — a swap or
+        // an in-place rewrite mid-hash must not mark the *new* content as
+        // verified.
         match std::fs::symlink_metadata(path) {
-            Ok(post_meta) if post_meta.ino() == pre_ino && post_meta.len() == pre_size => {
-                stamp(&file, path, pre_ino, pre_size, algo, expected);
+            Ok(post_meta) if FileIdentity::of(&post_meta) == pre_identity => {
+                stamp(&file, path, pre_identity, algo, expected);
             }
             Ok(_) | Err(_) => {}
         }
         return Verdict::Match;
     }
 
-    // Race check: a fresh download finishing mid-hash either replaces the
-    // file via rename (different inode) or rewrites it in place (size change).
-    // Either way our digest is for content no longer at `path`, so bail.
-    // Use `symlink_metadata` (lstat): a hostile symlink planted at `path`
-    // after the open could otherwise point at a file whose inode/size
-    // happen to match `pre_ino` / `pre_size`, masking the race.  lstat
-    // compares the symlink itself, so a swap is always detected.
+    // Race check: a fresh download finishing mid-hash replaces the file via
+    // rename (different inode), and an in-place rewrite moves its size or
+    // mtime. Either way our digest is for content no longer at `path`, so
+    // bail. Use `symlink_metadata` (lstat): a hostile symlink planted at
+    // `path` after the open could otherwise point at a file whose identity
+    // happens to match `pre_identity`, masking the race.  lstat compares the
+    // symlink itself, so a swap is always detected.
     //
     // A stat failure here (e.g. another cleanup task already unlinked the
     // file, or EACCES) is treated like the pre-hash stat failure: bump and
@@ -116,9 +117,7 @@ fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> Verdict {
     // through to `Verdict::Mismatch` would emit a false checksum-corruption
     // warn and then attempt a doomed `remove_file` on the missing path.
     match std::fs::symlink_metadata(path) {
-        Ok(post_meta) if post_meta.ino() != pre_ino || post_meta.len() != pre_size => {
-            Verdict::Raced
-        }
+        Ok(post_meta) if FileIdentity::of(&post_meta) != pre_identity => Verdict::Raced,
         Ok(_) => Verdict::Mismatch {
             computed,
             size: pre_size,
@@ -234,7 +233,6 @@ mod tests {
     #[test]
     fn verified_marker_memoizes_and_binds_expected_digest() {
         use std::io::Write as _;
-        use std::os::unix::fs::MetadataExt as _;
 
         use crate::xattr_helpers::tests::supports_user_xattrs;
         use sha2::Digest as _;
@@ -259,8 +257,7 @@ mod tests {
             assert!(has_valid_marker(
                 &file,
                 &path,
-                meta.ino(),
-                meta.len(),
+                FileIdentity::of(&meta),
                 HashAlgo::Sha256,
                 &expected,
             ));
@@ -285,5 +282,70 @@ mod tests {
             verify_file_sync(&path, HashAlgo::Sha256, &wrong),
             Verdict::Mismatch { .. }
         ));
+    }
+
+    /// A verified file rewritten in place with different bytes of the same
+    /// length keeps its inode and size; the mtime it gains must void the
+    /// marker, so the next cycle re-hashes it and finds the mismatch.
+    #[test]
+    fn verified_marker_does_not_cover_a_same_size_rewrite_in_place() {
+        use std::io::{Seek as _, Write as _};
+        use std::os::unix::fs::MetadataExt as _;
+
+        use crate::fs_open::nofollow_options;
+        use crate::xattr_helpers::tests::supports_user_xattrs;
+        use sha2::Digest as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cache.deb");
+        let payload = b"original package payload";
+        std::fs::write(&path, payload).expect("write");
+        if !supports_user_xattrs(&path) {
+            return;
+        }
+        let expected = sha2::Sha256::digest(payload).to_vec();
+        assert!(matches!(
+            verify_file_sync(&path, HashAlgo::Sha256, &expected),
+            Verdict::Match
+        ));
+        let stamped = std::fs::metadata(&path).expect("stat");
+        {
+            let file = std::fs::File::open(&path).expect("open");
+            assert!(
+                has_valid_marker(
+                    &file,
+                    &path,
+                    FileIdentity::of(&stamped),
+                    HashAlgo::Sha256,
+                    &expected
+                ),
+                "the first verification must stamp the marker"
+            );
+        }
+
+        // Rewrite in place: same inode, same length, different bytes. Pin a
+        // later mtime explicitly so a coarse timestamp tick cannot hide it.
+        {
+            let mut file = nofollow_options()
+                .write(true)
+                .open(&path)
+                .expect("open for rewrite");
+            file.rewind().expect("rewind");
+            file.write_all(&payload.map(|_| b'X')).expect("rewrite");
+        }
+        filetime::set_file_mtime(
+            &path,
+            filetime::FileTime::from_unix_time(stamped.mtime() + 60, 0),
+        )
+        .expect("set mtime");
+        let rewritten = std::fs::metadata(&path).expect("stat");
+        assert_eq!(rewritten.ino(), stamped.ino(), "rewritten in place");
+        assert_eq!(rewritten.len(), stamped.len(), "same length");
+
+        let verdict = verify_file_sync(&path, HashAlgo::Sha256, &expected);
+        assert!(
+            matches!(verdict, Verdict::Mismatch { .. }),
+            "the stale marker must not vouch for rewritten content, got {verdict:?}"
+        );
     }
 }

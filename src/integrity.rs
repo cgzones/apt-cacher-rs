@@ -62,7 +62,7 @@ use crate::{
     metrics,
     mirror_indexes::{self, ReleaseSeen},
     partial_file::TempPath,
-    verified_marker,
+    verified_marker::{self, FileIdentity},
 };
 use crate::{
     global_checksum_registry, global_config, info_once, warn_once_or_debug,
@@ -321,17 +321,16 @@ fn hash_file(file: &std::fs::File, path: &Path, algo: HashAlgo) -> std::io::Resu
 /// matched, so the first cleanup cycle after this download does not re-read
 /// and re-hash it cold from disk.
 ///
-/// Stamped before the rename: `rename(2)` keeps the inode and the size is
-/// final, so the marker is valid for the destination path cleanup will read
-/// it from. Unlike `cleanup/verify.rs`, no post-hash inode/size recheck is
-/// needed — the temp file is exclusively owned by this download and no other
-/// writer can reach it. Best-effort: a stat or xattr failure only means the
-/// next cleanup cycle hashes the file, so it is not worth failing a commit.
+/// Stamped before the rename: `rename(2)` keeps the inode and the mtime, and
+/// the size is final (the last write already landed), so the marker is valid
+/// for the destination path cleanup will read it from. Unlike
+/// `cleanup/verify.rs`, no post-hash identity recheck is needed — the temp
+/// file is exclusively owned by this download and no other writer can reach
+/// it. Best-effort: a stat or xattr failure only means the next cleanup cycle
+/// hashes the file, so it is not worth failing a commit.
 fn stamp_verified(file: &std::fs::File, path: &Path, algo: HashAlgo, expected: &[u8]) {
-    use std::os::unix::fs::MetadataExt as _;
-
     match file.metadata() {
-        Ok(meta) => verified_marker::stamp(file, path, meta.ino(), meta.len(), algo, expected),
+        Ok(meta) => verified_marker::stamp(file, path, FileIdentity::of(&meta), algo, expected),
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
@@ -3710,7 +3709,6 @@ mod tests {
     #[test]
     fn verify_temp_file_stamps_the_cleanup_marker_on_a_registry_match() {
         use std::io::Write as _;
-        use std::os::unix::fs::MetadataExt as _;
 
         use crate::verified_marker::has_valid_marker;
 
@@ -3749,8 +3747,7 @@ mod tests {
             has_valid_marker(
                 &file,
                 &temp_path,
-                meta.ino(),
-                meta.len(),
+                FileIdentity::of(&meta),
                 HashAlgo::Sha256,
                 &digest,
             ),

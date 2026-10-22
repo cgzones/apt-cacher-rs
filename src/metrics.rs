@@ -1110,9 +1110,9 @@ pub(crate) static CLEANUP_BYHASH_UNREFERENCED: Accumulator = Accumulator::new();
 /// the same `Filename:` under a different content.
 pub(crate) static CLEANUP_CHECKSUM_MISMATCHES: Signal = Signal::new();
 /// Cleanup digest verifications skipped because the file carries a valid
-/// verified-marker xattr from an earlier cycle (same inode, size, algorithm
-/// and expected digest) — the daily re-hash then scales with churn instead
-/// of total cache size.
+/// verified-marker xattr from an earlier cycle (same inode, size, mtime,
+/// algorithm and expected digest) — the daily re-hash then scales with churn
+/// instead of total cache size.
 pub(crate) static CLEANUP_CHECKSUM_SKIPS: Counter = Counter::new();
 
 /// Last cleanup run of this process: when it finished (Unix seconds; 0
