@@ -1335,6 +1335,7 @@ async fn serve_joined(
             drop(status);
             // A caller-supplied snapshot (the stale-volatile revalidation
             // path) wins over what the status carried.
+            let meta = meta.filter(|_| prefetched_upstream_metadata.is_none());
             let borrowed = prefetched_upstream_metadata.or(meta.as_deref());
             serve_cached_file(conn_details, req, file, path, borrowed, None).await
         }
