@@ -1659,8 +1659,10 @@ mod tests {
         // unsafe-path gate), so a path that triggers both is rejected as a
         // DiffRequest.  This locks in precedence: future refactors that move
         // the pdiff gate after the unsafe-path gate will fail this test.
-        let decision =
-            decide_default("/debian/dists/sid/main/binary-amd64/Packages.diff/T-../escape");
+        let path = "/debian/dists/sid/main/binary-amd64/Packages.diff/T-example/../escape";
+        assert!(is_diff_request_path(path));
+        assert!(is_unsafe_proxy_path(path));
+        let decision = decide_default(path);
         assert!(
             matches!(decision, DispatchOutcome::Reject(RejectReason::DiffRequest)),
             "expected DiffRequest reject, got {decision:?}"
