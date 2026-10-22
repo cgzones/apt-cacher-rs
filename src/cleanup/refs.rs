@@ -410,7 +410,7 @@ mod tests {
                 build_byhash_reference_set(
                     dir.path(),
                     CacheLayout::DistsByHash,
-                    &["stable".into(), "sid".into()]
+                    &["stable", "sid"]
                 )
                 .await
                 .is_none(),
@@ -430,7 +430,7 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("absent"), dir.path().join("sid_InRelease"))
             .expect("symlink");
         assert!(
-            build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &["sid".into()])
+            build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &["sid"])
                 .await
                 .is_none(),
             "unreadable signed sibling forces age retention"
@@ -452,13 +452,10 @@ mod tests {
             "Archive: sid\n",
         )
         .expect("component");
-        let set = build_byhash_reference_set(
-            dir.path(),
-            CacheLayout::DistsByHash,
-            &["sid".into(), "stable".into()],
-        )
-        .await
-        .expect("valid distributions");
+        let set =
+            build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &["sid", "stable"])
+                .await
+                .expect("valid distributions");
         assert!(!set.covers(HashAlgo::Sha256));
         assert!(!set.covers(HashAlgo::Sha512));
         std::fs::write(

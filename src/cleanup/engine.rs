@@ -1595,7 +1595,7 @@ mod tests {
             let references = build_byhash_reference_set(
                 releases.path(),
                 CacheLayout::DistsByHash,
-                &["stable".into(), "sid".into()],
+                &["stable", "sid"],
             )
             .await;
             assert!(references.is_none(), "malformed references force age mode");
