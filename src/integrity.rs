@@ -212,10 +212,14 @@ fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
     let algo = *algo;
 
     let reused = reuse_streamed_digest(input.streamed.as_ref(), algo, input.file, input.temp_path);
+    let fallback;
     let computed = match reused {
         Some(reused) => reused,
         None => match hash_file(input.file, input.temp_path, algo) {
-            Ok(c) => c,
+            Ok(c) => {
+                fallback = c;
+                fallback.as_slice()
+            }
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
@@ -229,7 +233,7 @@ fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
         },
     };
 
-    if computed == *expected {
+    if computed == expected.as_slice() {
         metrics::CHECKSUM_VERIFIED.increment();
         stamp_verified(input.file, input.temp_path, algo, expected);
         VerifyOutcome::Proceed
@@ -263,12 +267,12 @@ fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
 ///
 /// A failed `fstat` is logged here: the re-read that follows would not
 /// report it, as it never stats the file.
-fn reuse_streamed_digest(
-    streamed: Option<&StreamedDigest>,
+fn reuse_streamed_digest<'a>(
+    streamed: Option<&'a StreamedDigest>,
     algo: HashAlgo,
     file: &std::fs::File,
     path: &Path,
-) -> Option<Vec<u8>> {
+) -> Option<&'a [u8]> {
     let streamed = streamed?;
     if streamed.algo != algo {
         return None;
@@ -296,7 +300,7 @@ fn reuse_streamed_digest(
         );
         return None;
     }
-    Some(streamed.digest.clone())
+    Some(streamed.digest.as_slice())
 }
 
 /// Rewind the already-open temp file, hint sequential read, and hash it --
