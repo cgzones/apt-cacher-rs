@@ -548,51 +548,46 @@ fn release_hash_entries(
     content: &str,
 ) -> impl Iterator<Item = Result<(HashAlgo, &str, &str), &'static str>> + '_ {
     let mut section: Option<HashAlgo> = None;
-    let mut terminated = sticky::Bool::new();
-    content.lines().filter_map(move |line| {
-        if terminated.get() {
-            return None;
-        }
-        if line.starts_with("-----BEGIN PGP SIGNATURE-----") {
-            terminated.set();
-            return None;
-        }
-        if line.trim_ascii().is_empty() {
-            return None;
-        }
-        let indented = line.starts_with(' ') || line.starts_with('\t');
-        if !indented {
-            let malformed = section.is_some()
-                && !split_field(line).is_some_and(|(name, _)| {
-                    !name.is_empty()
-                        && !name.starts_with(['#', '-'])
-                        && name.bytes().all(|byte| byte.is_ascii_graphic())
-                });
-            section = match line.trim_end() {
-                "SHA256:" => Some(HashAlgo::Sha256),
-                "SHA512:" => Some(HashAlgo::Sha512),
-                _ => None,
+    content
+        .lines()
+        .take_while(|line| !line.starts_with("-----BEGIN PGP SIGNATURE-----"))
+        .filter_map(move |line| {
+            if line.trim_ascii().is_empty() {
+                return None;
+            }
+            let indented = line.starts_with(' ') || line.starts_with('\t');
+            if !indented {
+                let malformed = section.is_some()
+                    && !split_field(line).is_some_and(|(name, _)| {
+                        !name.is_empty()
+                            && !name.starts_with(['#', '-'])
+                            && name.bytes().all(|byte| byte.is_ascii_graphic())
+                    });
+                section = match line.trim_end() {
+                    "SHA256:" => Some(HashAlgo::Sha256),
+                    "SHA512:" => Some(HashAlgo::Sha512),
+                    _ => None,
+                };
+                return malformed.then_some(Err("unindented checksum entry or malformed field"));
+            }
+            let section = section?;
+            // Indented entry: " <hex> <size> <path>".
+            let mut parts = line.split_ascii_whitespace();
+            let hex = parts.next()?; // Blank lines are harmless.
+            let Some(size) = parts.next() else {
+                return Some(Err("missing checksum size"));
             };
-            return malformed.then_some(Err("unindented checksum entry or malformed field"));
-        }
-        let section = section?;
-        // Indented entry: " <hex> <size> <path>".
-        let mut parts = line.split_ascii_whitespace();
-        let hex = parts.next()?; // Blank lines are harmless.
-        let Some(size) = parts.next() else {
-            return Some(Err("missing checksum size"));
-        };
-        let Some(path) = parts.next() else {
-            return Some(Err("missing checksum path"));
-        };
-        if parts.next().is_some() {
-            return Some(Err("extra checksum fields"));
-        }
-        if !size.bytes().all(|byte| byte.is_ascii_digit()) || size.parse::<u64>().is_err() {
-            return Some(Err("invalid checksum size"));
-        }
-        Some(Ok((section, hex, path)))
-    })
+            let Some(path) = parts.next() else {
+                return Some(Err("missing checksum path"));
+            };
+            if parts.next().is_some() {
+                return Some(Err("extra checksum fields"));
+            }
+            if !size.bytes().all(|byte| byte.is_ascii_digit()) || size.parse::<u64>().is_err() {
+                return Some(Err("invalid checksum size"));
+            }
+            Some(Ok((section, hex, path)))
+        })
 }
 
 /// Iterate the `(repo-relative path, SHA256 digest)` entries from a Debian
