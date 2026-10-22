@@ -37,7 +37,7 @@ use crate::cache_layout::ConnectionDetails;
 use crate::http_helpers::{
     ConnectionAction, ConnectionVersion, OptHeader, find_header, find_header_end,
 };
-use crate::http_range::parse_content_range;
+use crate::http_range::{ContentRange, parse_content_range};
 use crate::humanfmt::HumanFmt;
 use crate::limits::{MAX_UPSTREAM_HEADER_SIZE, MAX_UPSTREAM_HEADERS};
 use crate::precise_instant::PreciseInstant;
@@ -396,7 +396,7 @@ pub(super) struct UpstreamResponse {
     pub(super) content_type: Option<String>,
     pub(super) last_modified: Option<String>,
     pub(super) etag: Option<String>,
-    content_range: Option<String>,
+    content_range: Option<ContentRange>,
     pub(super) location: Option<String>,
     pub(super) connection_close: bool,
     /// Instant the upstream request was sent - start of the upstream-rate
@@ -462,7 +462,7 @@ impl UpstreamResponse {
         UpstreamHead {
             status: self.status_code,
             content_length: self.content_length(),
-            content_range: self.content_range.as_deref().and_then(parse_content_range),
+            content_range: self.content_range,
             etag: well_formed_etag(self.etag.as_deref()),
         }
     }
@@ -558,7 +558,7 @@ pub(super) fn parse_upstream_response(
 
     let etag = find_header(headers, &ETAG).map(String::from);
 
-    let content_range = find_header(headers, &CONTENT_RANGE).map(String::from);
+    let content_range = find_header(headers, &CONTENT_RANGE).and_then(parse_content_range);
 
     let location = find_header(headers, &LOCATION).map(String::from);
 
@@ -1658,7 +1658,11 @@ mod tests {
         let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
             .expect("should parse");
         assert_eq!(resp.status_code, 206);
-        assert_eq!(resp.content_range.as_deref(), Some("bytes 100-599/1000"));
+        assert_eq!(
+            resp.content_range
+                .map(|r| (r.start(), r.span().get(), r.total().get())),
+            Some((100, 500, 1000))
+        );
     }
 
     #[test]
@@ -1763,7 +1767,11 @@ mod tests {
             Some("Sat, 15 Mar 2025 12:00:00 GMT")
         );
         assert_eq!(resp.etag.as_deref(), Some("\"full-test\""));
-        assert_eq!(resp.content_range.as_deref(), Some("bytes 0-998/999"));
+        assert_eq!(
+            resp.content_range
+                .map(|r| (r.start(), r.span().get(), r.total().get())),
+            Some((0, 999, 999))
+        );
         assert!(resp.connection_close);
     }
 
