@@ -3954,7 +3954,7 @@ mod tests {
     #[tokio::test]
     async fn cached_file_truncation_is_a_cache_failure() {
         use super::{Body as _, CachedFileBody, metrics};
-        use std::pin::Pin;
+        use http_body_util::BodyExt as _;
         let before = metrics::CACHE_IO_FAILURE.get();
         let file = tempfile::tempfile().unwrap();
         let mut body = CachedFileBody::new(
@@ -3963,10 +3963,7 @@ mod tests {
             4096,
             "truncated-cache-file".into(),
         );
-        let error = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
-            .await
-            .unwrap()
-            .unwrap_err();
+        let error = body.frame().await.unwrap().unwrap_err();
         assert!(error.to_string().contains("file shorter than promised"));
         assert_eq!(
             metrics::CACHE_IO_FAILURE.get(),
@@ -3974,20 +3971,16 @@ mod tests {
             "a short file is a consistency anomaly, not a failed syscall"
         );
         assert!(body.is_end_stream());
-        assert!(
-            std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
-                .await
-                .is_none()
-        );
+        assert!(body.frame().await.is_none());
     }
 
     /// A body up to `SINGLE_FRAME_MAX` goes out as one frame (one read);
     /// a bigger one in `buffer_size` frames, so its reads overlap the writes.
     #[tokio::test]
     async fn cached_file_body_frames_small_files_whole() {
-        use super::{Body as _, CachedFileBody, SINGLE_FRAME_MAX};
+        use super::{CachedFileBody, SINGLE_FRAME_MAX};
+        use http_body_util::BodyExt as _;
         use std::io::Write as _;
-        use std::pin::Pin;
 
         async fn frame_lengths(len: usize, buffer_size: usize) -> Vec<usize> {
             let mut file = tempfile::tempfile().unwrap();
@@ -4000,9 +3993,7 @@ mod tests {
                 "cached-file".into(),
             );
             let mut lengths = Vec::new();
-            while let Some(frame) =
-                std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
-            {
+            while let Some(frame) = body.frame().await {
                 lengths.push(frame.unwrap().into_data().unwrap().len());
             }
             lengths
