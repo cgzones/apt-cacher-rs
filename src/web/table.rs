@@ -954,7 +954,7 @@ mod tests {
 
     #[test]
     fn series_keys_escape_scopes_and_nested_labels() {
-        for (scope, prefix) in [("", ""), ("Up<&\"'", "Up&lt;&amp;&quot;&#x27; › ")] {
+        for (scope, prefix) in [("", ""), ("Up<&\"'", "Up&lt;&amp;&quot;&#x27; \u{203a} ")] {
             let mut list = DetailsList::with_now(0).scoped(scope);
             list.entry("Total&")
                 .parts(|p| p.count("Child<\"'", 1))
@@ -963,7 +963,7 @@ mod tests {
             let html = list.finish();
             for key in [
                 format!("{prefix}Total&amp;"),
-                format!("{prefix}Total&amp; › Child&lt;&quot;&#x27;"),
+                format!("{prefix}Total&amp; \u{203a} Child&lt;&quot;&#x27;"),
             ] {
                 assert!(
                     html.contains(&format!("data-series=\"{key}\" data-v=\"1\"")),
