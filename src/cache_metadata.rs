@@ -1130,8 +1130,8 @@ mod tests {
             Some("Thu, 01 Jan 1970 00:00:00 GMT"),
             |_invalid| calls += 1,
         );
-        assert_eq!(etag.as_deref(), Some("W/\"abc\""));
-        assert_eq!(lm.as_deref(), Some("Thu, 01 Jan 1970 00:00:00 GMT"));
+        assert_eq!(etag, Some("W/\"abc\""));
+        assert_eq!(lm, Some("Thu, 01 Jan 1970 00:00:00 GMT"));
         assert_eq!(calls, 0);
     }
 
@@ -1153,7 +1153,7 @@ mod tests {
             |invalid| assert_eq!(Some(invalid), expected.next()),
         );
         assert_eq!(etag, None);
-        assert_eq!(lm.as_deref(), Some("Thu, 01 Jan 1970 00:00:00 GMT"));
+        assert_eq!(lm, Some("Thu, 01 Jan 1970 00:00:00 GMT"));
         assert_eq!(expected.next(), None);
     }
 
@@ -1164,7 +1164,7 @@ mod tests {
             check_upstream_validators(Some("\"abc\""), Some("not a date"), |invalid| {
                 assert_eq!(Some(invalid), expected.next())
             });
-        assert_eq!(etag.as_deref(), Some("\"abc\""));
+        assert_eq!(etag, Some("\"abc\""));
         assert_eq!(lm, None);
         assert_eq!(expected.next(), None);
     }
