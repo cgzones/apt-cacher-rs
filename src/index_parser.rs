@@ -851,21 +851,13 @@ mod tests {
     #[test]
     fn hash_open_file_matches_one_shot_across_buffer_boundaries() {
         use sha2::Digest as _;
-        use std::io::Write as _;
 
         // Larger than the 1 MiB read buffer, and not a multiple of it.
         let payload: Vec<u8> = (0..(1024 * 1024 + 4096))
             .map(|i: u32| u8::try_from(i % 251).expect("i % 251 is in 0..251, fits in u8"))
             .collect();
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("big.bin");
-        {
-            let mut f = std::fs::File::create(&path).expect("create");
-            f.write_all(&payload).expect("write");
-        }
-
-        let mut file = std::fs::File::open(&path).expect("open");
+        let mut file = io::Cursor::new(&payload);
         let streamed = hash_open_file::<sha2::Sha256>(&mut file).expect("hash");
 
         assert_eq!(streamed, sha2::Sha256::digest(&payload).to_vec());
