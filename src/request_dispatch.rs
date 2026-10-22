@@ -1220,6 +1220,19 @@ mod tests {
         false
     }
 
+    fn decide_default(path: &str) -> DispatchOutcome {
+        decide_request(
+            path,
+            fake_host(),
+            None,
+            &local_client(),
+            &[],
+            true,
+            never_flat_blocked,
+            PreciseInstant::now(),
+        )
+    }
+
     /// The details of a `Cache` decision; any other decision fails the test.
     fn expect_cache(decision: DispatchOutcome) -> ConnectionDetails {
         assert!(
@@ -1236,16 +1249,7 @@ mod tests {
 
     #[test]
     fn cache_outcome_for_pool_deb() {
-        let decision = decide_request(
-            "/debian/pool/main/f/firefox/firefox_1.0_amd64.deb",
-            fake_host(),
-            None,
-            &local_client(),
-            &[],
-            true,
-            never_flat_blocked,
-            PreciseInstant::now(),
-        );
+        let decision = decide_default("/debian/pool/main/f/firefox/firefox_1.0_amd64.deb");
         let conn_details = expect_cache(decision);
         assert_eq!(conn_details.layout(), CacheLayout::StructuredPool);
         assert_eq!(conn_details.debname, "firefox_1.0_amd64.deb");
@@ -1254,16 +1258,7 @@ mod tests {
 
     #[test]
     fn cache_outcome_packages_with_real_arch_records_origin() {
-        let decision = decide_request(
-            "/debian/dists/sid/main/binary-amd64/Packages.gz",
-            fake_host(),
-            None,
-            &local_client(),
-            &[],
-            true,
-            never_flat_blocked,
-            PreciseInstant::now(),
-        );
+        let decision = decide_default("/debian/dists/sid/main/binary-amd64/Packages.gz");
         let conn_details = expect_cache(decision);
         assert_eq!(conn_details.layout(), CacheLayout::Dists);
         let origin = conn_details
@@ -1354,16 +1349,7 @@ mod tests {
 
     #[test]
     fn passthrough_unrecognized_when_parser_declines() {
-        let decision = decide_request(
-            "/foo/bar.txt",
-            fake_host(),
-            None,
-            &local_client(),
-            &[],
-            true,
-            never_flat_blocked,
-            PreciseInstant::now(),
-        );
+        let decision = decide_default("/foo/bar.txt");
         assert!(
             matches!(
                 decision,
@@ -1385,16 +1371,7 @@ mod tests {
             "/debian/dists/sid/main/binary-amd64/Packages.gz?",
             "/apt/Packages.gz?a=b&c=d",
         ] {
-            let decision = decide_request(
-                target,
-                fake_host(),
-                None,
-                &local_client(),
-                &[],
-                true,
-                never_flat_blocked,
-                PreciseInstant::now(),
-            );
+            let decision = decide_default(target);
             assert!(
                 matches!(
                     decision,
@@ -1408,16 +1385,7 @@ mod tests {
         }
 
         // The query does not change the verdict for anything uncacheable.
-        let decision = decide_request(
-            "/foo/bar.txt?x=1",
-            fake_host(),
-            None,
-            &local_client(),
-            &[],
-            true,
-            never_flat_blocked,
-            PreciseInstant::now(),
-        );
+        let decision = decide_default("/foo/bar.txt?x=1");
         assert!(
             matches!(
                 decision,
@@ -1432,16 +1400,7 @@ mod tests {
 
     #[test]
     fn passthrough_underscore_in_a_joined_field() {
-        let decision = decide_request(
-            "/debian/dists/sid_main_binary-amd64/Release",
-            fake_host(),
-            None,
-            &local_client(),
-            &[],
-            true,
-            never_flat_blocked,
-            PreciseInstant::now(),
-        );
+        let decision = decide_default("/debian/dists/sid_main_binary-amd64/Release");
         assert!(
             matches!(
                 decision,
@@ -1456,16 +1415,7 @@ mod tests {
 
     #[test]
     fn passthrough_packages_index_outside_an_architecture() {
-        let decision = decide_request(
-            "/debian/dists/sid/main/Translation-en/Packages",
-            fake_host(),
-            None,
-            &local_client(),
-            &[],
-            true,
-            never_flat_blocked,
-            PreciseInstant::now(),
-        );
+        let decision = decide_default("/debian/dists/sid/main/Translation-en/Packages");
         assert!(
             matches!(
                 decision,
@@ -1483,18 +1433,6 @@ mod tests {
     /// one at the limit still caches.
     #[test]
     fn passthrough_cache_name_too_long() {
-        let decide = |path: &str| {
-            decide_request(
-                path,
-                fake_host(),
-                None,
-                &local_client(),
-                &[],
-                true,
-                never_flat_blocked,
-                PreciseInstant::now(),
-            )
-        };
         // Each field within its own cap, the joined name far past NAME_MAX.
         let joined = format!(
             "/debian/dists/{}/{}/binary-{}/Release",
@@ -1507,7 +1445,7 @@ mod tests {
             format!("/debian/pool/main/f/foo/{stem}_1_all.deb")
         };
         for path in [joined, pool_at(MAX_DEBNAME_LEN + 1), pool_at(255)] {
-            let decision = decide(&path);
+            let decision = decide_default(&path);
             assert!(
                 matches!(
                     decision,
@@ -1519,7 +1457,7 @@ mod tests {
                 "{path}: expected NameTooLong passthrough, got {decision:?}"
             );
         }
-        let decision = decide(&pool_at(MAX_DEBNAME_LEN));
+        let decision = decide_default(&pool_at(MAX_DEBNAME_LEN));
         assert!(
             matches!(decision, DispatchOutcome::Cache(_)),
             "expected Cache at the limit, got {decision:?}"
@@ -1528,16 +1466,7 @@ mod tests {
 
     #[test]
     fn passthrough_non_deb_pool_for_pool_with_text_filename() {
-        let decision = decide_request(
-            "/debian/pool/main/f/foo/README.txt",
-            fake_host(),
-            None,
-            &local_client(),
-            &[],
-            true,
-            never_flat_blocked,
-            PreciseInstant::now(),
-        );
+        let decision = decide_default("/debian/pool/main/f/foo/README.txt");
         assert!(
             matches!(
                 decision,
@@ -1559,16 +1488,7 @@ mod tests {
             "/flat/x/pool/main/f/foo/foo_1.0_amd64.deb",
             "/flat/dists/sid/InRelease",
         ] {
-            let decision = decide_request(
-                path,
-                fake_host(),
-                None,
-                &local_client(),
-                &[],
-                true,
-                never_flat_blocked,
-                PreciseInstant::now(),
-            );
+            let decision = decide_default(path);
             assert!(
                 matches!(
                     decision,
@@ -1580,16 +1500,7 @@ mod tests {
                 "{path}: expected FlatAnchoredMirror passthrough, got {decision:?}"
             );
         }
-        let decision = decide_request(
-            "/flatter/pool/main/f/foo/foo_1.0_amd64.deb",
-            fake_host(),
-            None,
-            &local_client(),
-            &[],
-            true,
-            never_flat_blocked,
-            PreciseInstant::now(),
-        );
+        let decision = decide_default("/flatter/pool/main/f/foo/foo_1.0_amd64.deb");
         assert!(
             matches!(decision, DispatchOutcome::Cache(_)),
             "only the `flat` segment itself is reserved, got {decision:?}"
@@ -1622,16 +1533,7 @@ mod tests {
 
     #[test]
     fn flat_request_caches_when_blocklist_does_not_hit() {
-        let decision = decide_request(
-            "/apt/Packages.gz",
-            fake_host(),
-            None,
-            &local_client(),
-            &[],
-            true,
-            never_flat_blocked,
-            PreciseInstant::now(),
-        );
+        let decision = decide_default("/apt/Packages.gz");
         assert!(
             matches!(decision, DispatchOutcome::Cache(_)),
             "expected Cache, got {decision:?}"
@@ -1640,16 +1542,7 @@ mod tests {
 
     #[test]
     fn reject_pdiff_request_when_configured() {
-        let decision = decide_request(
-            "/debian/dists/sid/main/binary-amd64/Packages.diff/T-12345",
-            fake_host(),
-            None,
-            &local_client(),
-            &[],
-            true,
-            never_flat_blocked,
-            PreciseInstant::now(),
-        );
+        let decision = decide_default("/debian/dists/sid/main/binary-amd64/Packages.diff/T-12345");
         assert!(
             matches!(decision, DispatchOutcome::Reject(RejectReason::DiffRequest)),
             "expected DiffRequest reject, got {decision:?}"
@@ -1685,16 +1578,7 @@ mod tests {
 
     #[test]
     fn reject_unsafe_traversal_path() {
-        let decision = decide_request(
-            "/foo/../etc/passwd",
-            fake_host(),
-            None,
-            &local_client(),
-            &[],
-            true,
-            never_flat_blocked,
-            PreciseInstant::now(),
-        );
+        let decision = decide_default("/foo/../etc/passwd");
         assert!(
             matches!(decision, DispatchOutcome::Reject(RejectReason::UnsafePath)),
             "expected UnsafePath reject, got {decision:?}"
@@ -1711,16 +1595,7 @@ mod tests {
             "/debian/pool/main/%2e%2e/%2e%2e/victim_1.0_amd64.deb",
             "/debian/dists/../../evil/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
         ] {
-            let decision = decide_request(
-                path,
-                fake_host(),
-                None,
-                &local_client(),
-                &[],
-                true,
-                never_flat_blocked,
-                PreciseInstant::now(),
-            );
+            let decision = decide_default(path);
             assert!(
                 matches!(
                     decision,
@@ -1735,16 +1610,7 @@ mod tests {
     fn reject_bad_encoding_in_pool_filename() {
         // `%ff%fe` survives `parse_request_path` (percent-escapes are kept
         // raw there) and fails UTF-8 validation in `classify_request`.
-        let decision = decide_request(
-            "/debian/pool/main/f/foo/foo%ff%fe_1.0_amd64.deb",
-            fake_host(),
-            None,
-            &local_client(),
-            &[],
-            true,
-            never_flat_blocked,
-            PreciseInstant::now(),
-        );
+        let decision = decide_default("/debian/pool/main/f/foo/foo%ff%fe_1.0_amd64.deb");
         assert!(
             matches!(decision, DispatchOutcome::Reject(RejectReason::BadEncoding)),
             "expected BadEncoding reject, got {decision:?}"
@@ -1756,16 +1622,7 @@ mod tests {
         // `%2F` decodes to `/`, which `valid_filename` refuses; the decode
         // happens per field, so the structural parse above it still succeeds.
         let unsafe_before = metrics::UNSAFE_PATH_REJECTED.get();
-        let decision = decide_request(
-            "/debian/pool/main/f/foo/foo%2Fbar_1.0_amd64.deb",
-            fake_host(),
-            None,
-            &local_client(),
-            &[],
-            true,
-            never_flat_blocked,
-            PreciseInstant::now(),
-        );
+        let decision = decide_default("/debian/pool/main/f/foo/foo%2Fbar_1.0_amd64.deb");
         assert!(
             matches!(
                 decision,
@@ -1785,16 +1642,7 @@ mod tests {
         // Decoded, `public%2Fubuntu` would name the same cache file as
         // `public/ubuntu` while the upstream is asked for the `%2F` form.
         let unsafe_before = metrics::UNSAFE_PATH_REJECTED.get();
-        let decision = decide_request(
-            "/public%2Fubuntu/dists/noble/InRelease",
-            fake_host(),
-            None,
-            &local_client(),
-            &[],
-            true,
-            never_flat_blocked,
-            PreciseInstant::now(),
-        );
+        let decision = decide_default("/public%2Fubuntu/dists/noble/InRelease");
         assert!(
             matches!(
                 decision,
@@ -1811,16 +1659,8 @@ mod tests {
         // unsafe-path gate), so a path that triggers both is rejected as a
         // DiffRequest.  This locks in precedence: future refactors that move
         // the pdiff gate after the unsafe-path gate will fail this test.
-        let decision = decide_request(
-            "/debian/dists/sid/main/binary-amd64/Packages.diff/T-../escape",
-            fake_host(),
-            None,
-            &local_client(),
-            &[],
-            true,
-            never_flat_blocked,
-            PreciseInstant::now(),
-        );
+        let decision =
+            decide_default("/debian/dists/sid/main/binary-amd64/Packages.diff/T-../escape");
         assert!(
             matches!(decision, DispatchOutcome::Reject(RejectReason::DiffRequest)),
             "expected DiffRequest reject, got {decision:?}"
