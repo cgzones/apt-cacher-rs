@@ -314,7 +314,7 @@ mod tests {
 
     // A partial is reaped through `block_in_place`, which needs the
     // multi-thread runtime.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn partials_are_reaped_when_past_partial_max_age() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tmp = dir.path();
@@ -341,7 +341,7 @@ mod tests {
     /// reservation -- and goes with the first cycle after the claim ends.
     // A partial is reaped through `block_in_place`, which needs the
     // multi-thread runtime.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn a_claimed_partial_is_reaped_only_once_released() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tmp = dir.path();
@@ -370,7 +370,7 @@ mod tests {
     /// written to since, or replaced by a new file at the same path, stays.
     // `reap_partial` runs `block_in_place`, which needs the multi-thread
     // runtime.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn reap_partial_rechecks_the_file_the_walk_judged() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tmp = dir.path();
@@ -415,7 +415,7 @@ mod tests {
     /// the finished download's rename fail with `ENOENT`.
     // A partial is reaped through `block_in_place`, which needs the
     // multi-thread runtime.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn empty_partials_are_reaped_only_past_their_minimum_age() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tmp = dir.path();
@@ -521,7 +521,7 @@ mod tests {
     /// the failure, so cleanup's last-run result names the failed step.
     // A partial is reaped through `block_in_place`, which needs the
     // multi-thread runtime.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn an_unremovable_stale_partial_is_reported_as_a_failure() {
         use std::os::unix::fs::PermissionsExt as _;
 
