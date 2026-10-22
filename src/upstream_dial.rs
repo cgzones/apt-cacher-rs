@@ -154,7 +154,7 @@ where
     Fut: Future<Output = io::Result<S>> + Send,
 {
     let mut failure = DialFailure {
-        attempts: Vec::with_capacity(addrs.len()),
+        attempts: Vec::new(),
     };
     for (index, &addr) in addrs.iter().enumerate() {
         let untried = u32::try_from(addrs.len() - index).unwrap_or(u32::MAX);
