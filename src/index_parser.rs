@@ -152,6 +152,26 @@ impl HashAlgo {
         }
     }
 
+    /// Length of the digest in hexadecimal characters.
+    pub(crate) const fn digest_len(self) -> usize {
+        match self {
+            Self::Sha256 => 64,
+            Self::Sha512 => 128,
+        }
+    }
+
+    /// Validate the digest's shape without allocating or decoding it.
+    pub(crate) fn matches_digest(self, digest: &str) -> bool {
+        digest.len() == self.digest_len() && digest.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    /// Infer a supported algorithm from a hexadecimal digest's shape.
+    pub(crate) fn for_digest(digest: &str) -> Option<Self> {
+        [Self::Sha256, Self::Sha512]
+            .into_iter()
+            .find(|algo| algo.matches_digest(digest))
+    }
+
     /// Inverse of [`Self::as_str`]; `None` for anything else.
     pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
@@ -505,13 +525,6 @@ pub(crate) fn registry_key_from_filename_field(filename_field: &str) -> Option<&
     (key.len() <= MAX_REGISTRY_KEY_COMPONENT_LEN).then_some(key)
 }
 
-/// A `SHA256:` / `SHA512:` section of a Debian `Release`/`InRelease` file.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ReleaseHashSection {
-    Sha256,
-    Sha512,
-}
-
 /// Iterate the `(section, hex, path)` triples of every indented
 /// `<hex> <size> <path>` entry inside a `SHA256:`/`SHA512:` section of a Debian
 /// `Release`/`InRelease` file. Shared skeleton behind [`parse_release_checksums`]
@@ -533,8 +546,8 @@ enum ReleaseHashSection {
 /// the unsigned `<size>`; callers validate the algorithm/length of `hex`.
 fn release_hash_entries(
     content: &str,
-) -> impl Iterator<Item = Result<(ReleaseHashSection, &str, &str), &'static str>> + '_ {
-    let mut section: Option<ReleaseHashSection> = None;
+) -> impl Iterator<Item = Result<(HashAlgo, &str, &str), &'static str>> + '_ {
+    let mut section: Option<HashAlgo> = None;
     let mut terminated = sticky::Bool::new();
     content.lines().filter_map(move |line| {
         if terminated.get() {
@@ -556,8 +569,8 @@ fn release_hash_entries(
                         && name.bytes().all(|byte| byte.is_ascii_graphic())
                 });
             section = match line.trim_end() {
-                "SHA256:" => Some(ReleaseHashSection::Sha256),
-                "SHA512:" => Some(ReleaseHashSection::Sha512),
+                "SHA256:" => Some(HashAlgo::Sha256),
+                "SHA512:" => Some(HashAlgo::Sha512),
                 _ => None,
             };
             return malformed.then_some(Err("unindented checksum entry or malformed field"));
@@ -605,7 +618,7 @@ pub(crate) fn parse_release_checksums<'a>(
         let Ok((section, hex, path)) = entry else {
             return None;
         };
-        if section != ReleaseHashSection::Sha256 {
+        if section != HashAlgo::Sha256 {
             return None;
         }
         let path = strip_leading_dot_segments(path);
@@ -705,12 +718,12 @@ pub(crate) fn parse_release_byhash_digests(
     for entry in release_hash_entries(content) {
         let (section, hex, _path) = entry?;
         let digest = match section {
-            ReleaseHashSection::Sha256 => {
+            HashAlgo::Sha256 => {
                 let digest = hex_decode_exact::<32>(hex).ok_or("invalid SHA256 digest")?;
                 parsed.sha256 = true;
                 ByHashRef::Sha256(digest)
             }
-            ReleaseHashSection::Sha512 => {
+            HashAlgo::Sha512 => {
                 let digest = hex_decode_exact::<64>(hex).ok_or("invalid SHA512 digest")?;
                 parsed.sha512 = true;
                 ByHashRef::Sha512(digest)

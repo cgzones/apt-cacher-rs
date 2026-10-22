@@ -999,94 +999,23 @@ fn is_unsafe_segment(seg: &str) -> bool {
     seg == "." || seg == ".." || seg.bytes().any(|b| b.is_ascii_control())
 }
 
-/// A digest algorithm the Debian repository format names as a
-/// `by-hash/<ALGO>/` directory.
-///
-/// The directory name and the digest length are two views of the same
-/// choice, so they live in one table: pairing `SHA256` with a 128-hex digest
-/// (or `SHA512` with a 64-hex one) fails [`Self::matches_digest`].  Spelt-out
-/// spec names only — non-spec or weaker algorithms (`MD5Sum`, `SHA1`,
-/// `SHA224`, `SHA384`, lowercase spellings) have no variant and so can never
-/// parse.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum ByHashAlgorithm {
-    Sha256,
-    Sha512,
-}
-
-impl ByHashAlgorithm {
-    /// Every supported algorithm; both lookups below scan it, so adding one
-    /// is a single variant plus its two table rows.
-    const ALL: [Self; 2] = [Self::Sha256, Self::Sha512];
-
-    /// The `by-hash/<ALGO>/` directory segment naming this algorithm.
-    #[must_use]
-    const fn dir_name(self) -> &'static str {
-        match self {
-            Self::Sha256 => "SHA256",
-            Self::Sha512 => "SHA512",
-        }
-    }
-
-    /// Length of this algorithm's digest, in hex characters.
-    #[must_use]
-    const fn digest_len(self) -> usize {
-        match self {
-            Self::Sha256 => 64,
-            Self::Sha512 => 128,
-        }
-    }
-
-    /// The algorithm a `by-hash/<ALGO>/` directory segment names, if any.
-    #[must_use]
-    fn from_dir_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|algo| algo.dir_name() == name)
-    }
-
-    /// Whether `digest` is a hex string of this algorithm's digest length.
-    #[must_use]
-    fn matches_digest(self, digest: &str) -> bool {
-        digest.len() == self.digest_len() && digest.bytes().all(|b| b.is_ascii_hexdigit())
-    }
-
-    /// The algorithm `digest` could belong to, judged on shape alone (the
-    /// algorithm directory is not in hand yet).
-    #[must_use]
-    fn for_digest(digest: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|algo| algo.matches_digest(digest))
-    }
-
-    /// The digest this algorithm names, as the verifier hashes with it.
-    #[must_use]
-    const fn hash_algo(self) -> HashAlgo {
-        match self {
-            Self::Sha256 => HashAlgo::Sha256,
-            Self::Sha512 => HashAlgo::Sha512,
-        }
-    }
-}
-
 /// Whether `s` has the shape of a by-hash digest tail: a hex string of one
 /// of the supported digest lengths. Used as the fast disambiguator in the
 /// parser, where the algorithm directory has not been read yet; the
 /// cross-check against it lives in [`byhash_pair`].
 #[must_use]
 fn is_byhash_digest_shape(s: &str) -> bool {
-    ByHashAlgorithm::for_digest(s).is_some()
+    HashAlgo::for_digest(s).is_some()
 }
 
 /// The algorithm of a supported by-hash pair, `None` for any other: `algo`
-/// names a [`ByHashAlgorithm`] and `digest` is a hex string of that
+/// names a [`HashAlgo`] and `digest` is a hex string of that
 /// algorithm's digest length.  What the parser hands on, so verification
 /// hashes with the algorithm this check accepted rather than re-reading one
 /// from the path.
 #[must_use]
 fn byhash_pair(algo: &str, digest: &str) -> Option<HashAlgo> {
-    ByHashAlgorithm::from_dir_name(algo)
-        .filter(|algo| algo.matches_digest(digest))
-        .map(ByHashAlgorithm::hash_algo)
+    HashAlgo::parse(algo).filter(|algo| algo.matches_digest(digest))
 }
 
 /// The `Release` family: the archive-level index and its two signature
@@ -3382,26 +3311,26 @@ mod tests {
         let sha512 = "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba\
                       4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba";
         for (algo, name, digest) in [
-            (ByHashAlgorithm::Sha256, "SHA256", sha256),
-            (ByHashAlgorithm::Sha512, "SHA512", sha512),
+            (HashAlgo::Sha256, "SHA256", sha256),
+            (HashAlgo::Sha512, "SHA512", sha512),
         ] {
-            assert_eq!(algo.dir_name(), name, "{algo:?} directory name");
+            assert_eq!(algo.as_str(), name, "{algo:?} directory name");
             assert_eq!(algo.digest_len(), digest.len(), "{algo:?} digest length");
-            assert_eq!(ByHashAlgorithm::from_dir_name(name), Some(algo));
-            assert_eq!(ByHashAlgorithm::for_digest(digest), Some(algo));
+            assert_eq!(HashAlgo::parse(name), Some(algo));
+            assert_eq!(HashAlgo::for_digest(digest), Some(algo));
             assert!(algo.matches_digest(digest), "{algo:?} accepts its digest");
         }
 
         // Cross-pairing is rejected in both directions.
-        assert!(!ByHashAlgorithm::Sha256.matches_digest(sha512));
-        assert!(!ByHashAlgorithm::Sha512.matches_digest(sha256));
+        assert!(!HashAlgo::Sha256.matches_digest(sha512));
+        assert!(!HashAlgo::Sha512.matches_digest(sha256));
 
         // Unsupported / mis-spelt algorithm directories have no variant.
         for name in [
             "MD5Sum", "SHA1", "SHA224", "SHA384", "sha256", "", "SHA256 ",
         ] {
             assert_eq!(
-                ByHashAlgorithm::from_dir_name(name),
+                HashAlgo::parse(name),
                 None,
                 "{name} must not name an algorithm"
             );
