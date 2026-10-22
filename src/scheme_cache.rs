@@ -162,7 +162,7 @@ fn canonicalize(auth: &Authority, scheme: Option<&http::uri::Scheme>) -> Option<
     if rendered == auth.as_str() {
         return None;
     }
-    Authority::try_from(rendered.as_ref()).ok()
+    Authority::try_from(rendered.into_owned()).ok()
 }
 
 impl Equivalent<SchemeKey> for SchemeKeyRef<'_> {

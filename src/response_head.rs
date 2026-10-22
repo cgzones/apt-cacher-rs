@@ -267,7 +267,7 @@ impl ResponseHead<'_> {
         if let Some(content_range) = content_range {
             builder = builder.header(
                 CONTENT_RANGE,
-                HeaderValue::try_from(&*content_range).expect("content range is valid"),
+                HeaderValue::try_from(content_range.into_owned()).expect("content range is valid"),
             );
         }
         if let Some(last_modified) = last_modified {
