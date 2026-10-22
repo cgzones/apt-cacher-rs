@@ -589,27 +589,39 @@ mod tests {
     struct DropSignal<R> {
         inner: R,
         _dropped: oneshot::Sender<()>,
+        first_read: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
     }
 
     impl<R: io::Read> io::Read for DropSignal<R> {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if let Some((started, release)) = self.first_read.take() {
+                let _ = started.send(());
+                let _ = release.blocking_recv();
+            }
             self.inner.read(buf)
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn dropping_the_decoder_stops_an_output_free_decode() {
         // The blocking decode never writes, so before the hang-up check it
         // only noticed a dropped reader once the whole stream (or the CPU
         // budget) was spent.
         let (tx, rx) = oneshot::channel();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
         let input = DropSignal {
             inner: Cursor::new(empty_blocks_xz(100_000, DICT_1MIB)),
             _dropped: tx,
+            first_read: Some((started_tx, release_rx)),
         };
         let decoder = xz_decoder(input);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(Duration::from_secs(10), started_rx)
+            .await
+            .expect("blocking decoder starts")
+            .expect("first read signalled");
         drop(decoder);
+        release_tx.send(()).expect("blocking reader awaits release");
         let closed = tokio::time::timeout(Duration::from_secs(10), rx).await;
         assert!(
             matches!(closed, Ok(Err(_))),
