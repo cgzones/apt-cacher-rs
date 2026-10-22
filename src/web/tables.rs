@@ -1188,19 +1188,19 @@ mod tests {
 
     /// Dashboard loads that find the same entry stale share one walk: the
     /// others wait for it and read its result.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn concurrent_refreshes_of_one_directory_walk_it_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = Path::new("concurrent_refreshes_of_one_directory_walk_it_once");
         let walks = Arc::new(AtomicUsize::new(0));
         let results = futures_util::future::join_all(
-            std::iter::repeat_with(|| cached_dir_stats(dir.path(), counted_walk(&walks))).take(5),
+            std::iter::repeat_with(|| cached_dir_stats(dir, counted_walk(&walks))).take(5),
         )
         .await;
         assert!(results.iter().all(|stats| stats.files() == 7));
         assert_eq!(walks.load(Ordering::SeqCst), 1);
-        DIR_STATS_CACHE.lock().remove(dir.path());
+        DIR_STATS_CACHE.lock().remove(dir);
     }
 
     /// A load cancelled mid-walk leaves the walk running: the next load
@@ -1209,12 +1209,12 @@ mod tests {
     async fn a_cancelled_refresh_still_publishes_its_walk() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = Path::new("a_cancelled_refresh_still_publishes_its_walk");
         let walks = Arc::new(AtomicUsize::new(0));
         let (started_tx, mut started) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
         let walk_count = Arc::clone(&walks);
-        let mut load = Box::pin(cached_dir_stats(dir.path(), move |_path| async move {
+        let mut load = Box::pin(cached_dir_stats(dir, move |_path| async move {
             walk_count.fetch_add(1, Ordering::SeqCst);
             started_tx.send(()).expect("caller waits for the walk");
             released.await.expect("test releases the walk");
@@ -1233,14 +1233,14 @@ mod tests {
         release
             .send(())
             .expect("cancelled caller left the walk alive");
-        let stats = cached_dir_stats(dir.path(), counted_walk(&walks)).await;
+        let stats = cached_dir_stats(dir, counted_walk(&walks)).await;
         assert_eq!(stats.files(), 7);
         assert_eq!(
             walks.load(Ordering::SeqCst),
             1,
             "the cancelled walk was kept"
         );
-        DIR_STATS_CACHE.lock().remove(dir.path());
+        DIR_STATS_CACHE.lock().remove(dir);
     }
 
     #[test]
