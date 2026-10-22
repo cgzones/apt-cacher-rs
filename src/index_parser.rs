@@ -527,8 +527,11 @@ enum ReleaseHashSection {
 /// Latches off at the `-----BEGIN PGP SIGNATURE-----` boundary: nothing past it
 /// is signed, so a later section header in the (unsigned) signature block must
 /// not re-open a section. Entry lines are indented with spaces or tabs (tabs
-/// accepted for non-canonical mirrors); a non-indented, non-empty line switches
-/// section (`MD5Sum:`, `SHA1:`, ... switch out). Tokens are separated by
+/// accepted for non-canonical mirrors); a non-indented field switches
+/// section (`MD5Sum:`, `SHA1:`, ... switch out). A non-field line ending a
+/// supported section emits an error before switching out, so strict cleanup
+/// rejects incomplete references while tolerant ingestion keeps its recovery
+/// behavior. Tokens are separated by
 /// ASCII whitespace only -- the format never uses anything else, and the
 /// Unicode-aware split walks every line char by char. A 4th token means the
 /// path contained a space, so the entry is rejected. This iterator validates
@@ -546,14 +549,21 @@ fn release_hash_entries(
             terminated.set();
             return None;
         }
+        if line.trim_ascii().is_empty() {
+            return None;
+        }
         let indented = line.starts_with(' ') || line.starts_with('\t');
-        if !indented && !line.is_empty() {
+        if !indented {
+            let malformed = section.is_some()
+                && !split_field(line).is_some_and(|(name, _)| {
+                    !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_graphic())
+                });
             section = match line.trim_end() {
                 "SHA256:" => Some(ReleaseHashSection::Sha256),
                 "SHA512:" => Some(ReleaseHashSection::Sha512),
                 _ => None,
             };
-            return None;
+            return malformed.then_some(Err("unindented checksum entry or malformed field"));
         }
         let section = section?;
         // Indented entry: " <hex> <size> <path>".
@@ -1252,6 +1262,50 @@ mod tests {
                 [("main/binary-amd64/Packages", [0xaa; 32])]
             );
         }
+    }
+
+    #[test]
+    fn strict_release_parser_rejects_unindented_rows_without_changing_tolerant_recovery() {
+        for (algorithm, width) in [("SHA256", 32), ("SHA512", 64)] {
+            let first = hex_encode(&vec![0xaa; width]);
+            let second = hex_encode(&vec![0xbb; width]);
+            let third = hex_encode(&vec![0xcc; width]);
+            for malformed in [
+                format!("{second} 2 second/Packages"),
+                format!("{second} 2 colon:path/Packages"),
+                "not a field".to_owned(),
+                "Bad field: value".to_owned(),
+                ": empty field name".to_owned(),
+            ] {
+                let content = format!(
+                    "{algorithm}:\n {first} 1 first/Packages\n{malformed}\n {third} 3 third/Packages\nSHA256:\n {} 4 recovered/Packages\n",
+                    hex_encode(&[0xdd; 32]),
+                );
+                assert!(parse_release_byhash_digests(&content).is_err());
+                let mut expected = Vec::new();
+                if algorithm == "SHA256" {
+                    expected.push(("first/Packages", [0xaa; 32]));
+                }
+                expected.push(("recovered/Packages", [0xdd; 32]));
+                assert_eq!(
+                    parse_release_checksums(&content, |_| true).collect::<Vec<_>>(),
+                    expected,
+                    "tolerant ingestion resumes at the next supported section"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn release_checksum_sections_allow_real_fields_and_ascii_blank_lines() {
+        let digest = hex_encode(&[0xaa; 32]);
+        let content = format!(
+            "SHA256:\n {digest} 1 first/Packages\n\t \x0c\n\x0c\n {digest} 2 second/Packages\nDescription: extension field\n continuation\nMD5Sum:\n ignored 1 Packages\nSHA512:\n {} 3 third/Packages\n-----BEGIN PGP SIGNATURE-----\nnot a field\n",
+            hex_encode(&[0xbb; 64]),
+        );
+        let parsed = parse_release_byhash_digests(&content).expect("valid field transitions");
+        assert!(parsed.sha256 && parsed.sha512);
+        assert_eq!(parsed.digests.len(), 3);
     }
 
     #[test]
