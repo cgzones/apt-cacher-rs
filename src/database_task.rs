@@ -299,9 +299,7 @@ async fn stage(
             };
             let row = OriginRow {
                 mirror_id,
-                distribution: origin.fields.distribution,
-                component: origin.fields.component,
-                architecture: origin.fields.architecture,
+                fields: origin.fields,
                 create: sighting == OriginSighting::Upstream,
             };
             // Dedup within the batch: every Packages request for an origin

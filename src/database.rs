@@ -19,7 +19,7 @@ use crate::{
     cache_paths::MirrorSite,
     client_info::CLEANUP_CLIENT_ADDR,
     config::{Alias, ClientHost, DomainName},
-    deb_mirror::{Mirror, MirrorKind},
+    deb_mirror::{Mirror, MirrorKind, OriginFields},
     error::ErrorReport,
     flat_blocklist,
     humanfmt::HumanFmt,
@@ -364,9 +364,7 @@ pub(crate) struct OrphanMirror {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct OriginRow {
     pub(crate) mirror_id: i64,
-    pub(crate) distribution: String,
-    pub(crate) component: String,
-    pub(crate) architecture: String,
+    pub(crate) fields: OriginFields,
     /// Whether this sighting may create the row, or only refresh an existing
     /// one's `last_seen`; `false` for a cache hit. See
     /// [`crate::deb_mirror::OriginSighting`].
@@ -377,10 +375,7 @@ impl OriginRow {
     /// Whether two rows name the same origin, ignoring [`Self::create`].
     #[must_use]
     pub(crate) fn same_scope(&self, other: &Self) -> bool {
-        self.mirror_id == other.mirror_id
-            && self.distribution == other.distribution
-            && self.component == other.component
-            && self.architecture == other.architecture
+        self.mirror_id == other.mirror_id && self.fields == other.fields
     }
 }
 
@@ -1181,9 +1176,9 @@ impl Database {
                     DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP);
                 ",
                     row.mirror_id,
-                    row.distribution,
-                    row.component,
-                    row.architecture,
+                    row.fields.distribution,
+                    row.fields.component,
+                    row.fields.architecture,
                 )
                 .execute(&mut *tx)
                 .await?;
@@ -1198,9 +1193,9 @@ impl Database {
                       AND architecture = ?;
                 ",
                     row.mirror_id,
-                    row.distribution,
-                    row.component,
-                    row.architecture,
+                    row.fields.distribution,
+                    row.fields.component,
+                    row.fields.architecture,
                 )
                 .execute(&mut *tx)
                 .await?;
@@ -1642,9 +1637,11 @@ mod retention_tests {
     fn origin(mirror_id: i64, distribution: &str) -> OriginRow {
         OriginRow {
             mirror_id,
-            distribution: distribution.to_owned(),
-            component: "main".to_owned(),
-            architecture: "amd64".to_owned(),
+            fields: OriginFields {
+                distribution: distribution.to_owned(),
+                component: "main".to_owned(),
+                architecture: "amd64".to_owned(),
+            },
             create: true,
         }
     }
@@ -1862,9 +1859,11 @@ mod retention_tests {
         let mirror_id = insert_mirror(&db, "ubuntu").await;
         let row = |architecture: &str| OriginRow {
             mirror_id,
-            distribution: "noble".to_owned(),
-            component: "main".to_owned(),
-            architecture: architecture.to_owned(),
+            fields: OriginFields {
+                distribution: "noble".to_owned(),
+                component: "main".to_owned(),
+                architecture: architecture.to_owned(),
+            },
             create: true,
         };
         db.batch_upsert_origins(&[row("binary-amd64"), row("cnf"), row("binary-")])
