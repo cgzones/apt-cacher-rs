@@ -3374,17 +3374,17 @@ mod tests {
     /// I/O failure for it) rather than being truncated at the cap.
     #[tokio::test]
     async fn read_release_refuses_a_file_over_the_cap() {
-        let cap = usize::try_from(limits::MAX_RELEASE_SIZE.get()).expect("cap fits usize");
-        let mut content = vec![b'a'; cap];
-        let at_cap = temp_file_with(&content);
-        let read = read_release_to_string(at_cap.path())
+        let cap = limits::MAX_RELEASE_SIZE.get();
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        file.as_file().set_len(cap).expect("size file at cap");
+        let read = read_release_to_string(file.path())
             .await
             .expect("a file at the cap reads");
-        assert_eq!(read.len(), cap);
+        assert_eq!(read.len(), usize::try_from(cap).expect("cap fits usize"));
+        drop(read);
 
-        content.push(b'a');
-        let over_cap = temp_file_with(&content);
-        let err = read_release_to_string(over_cap.path())
+        file.as_file().set_len(cap + 1).expect("size file over cap");
+        let err = read_release_to_string(file.path())
             .await
             .expect_err("a file over the cap fails");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
