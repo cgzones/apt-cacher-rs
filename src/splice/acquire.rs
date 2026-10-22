@@ -502,7 +502,7 @@ pub(super) async fn follow_redirect(
         return Ok((exchange, None));
     }
 
-    // Reject self-redirects: if the target (host, port, path) matches the request
+    // Reject self-redirects: if the target (scheme, host, port, path) matches the request
     // we just made, following it would just repeat the same request and create
     // unnecessary load (and potentially loop on a misconfigured mirror).
     let moved_path = moved_uri
@@ -520,7 +520,8 @@ pub(super) async fn follow_redirect(
     );
     let dial_mirror = conn_details.upstream_mirror();
     let original_port_effective = mirror_port(&dial_mirror, exchange.conn.is_tls());
-    if moved_domain == *dial_mirror.host()
+    if redirect_scheme == exchange.conn.scheme()
+        && moved_domain == *dial_mirror.host()
         && moved_port_effective == original_port_effective
         && moved_path == original_path
     {
