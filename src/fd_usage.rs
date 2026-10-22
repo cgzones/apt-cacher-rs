@@ -106,7 +106,7 @@ pub(crate) async fn sampler() {
     loop {
         interval.tick().await;
         // An unreadable `/proc` is logged once and leaves the peak alone.
-        let _ = sample();
+        let _open_fds = sample();
     }
 }
 

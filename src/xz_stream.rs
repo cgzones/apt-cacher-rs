@@ -595,8 +595,8 @@ mod tests {
     impl<R: io::Read> io::Read for DropSignal<R> {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             if let Some((started, release)) = self.first_read.take() {
-                let _ = started.send(());
-                let _ = release.blocking_recv();
+                let _started = started.send(());
+                let _released = release.blocking_recv();
             }
             self.inner.read(buf)
         }
