@@ -2679,7 +2679,7 @@ mod tests {
         assert_eq!(payload, b"suffix");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn demotion_reads_unlinked_volatile_file_without_retaining_the_write_lease() {
         let dir = tempfile::tempdir().unwrap();
         let (file, path) = crate::partial_file::tokio_tempfile(&dir.path().join("volatile"), 0o640)
@@ -2958,7 +2958,7 @@ mod tests {
             .1
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn cache_prefix_error_reaches_shared_status_without_worker_registration() {
         let scratch = ScratchFile::new();
         let barrier = cache_barrier(&scratch.path).await;
@@ -3042,7 +3042,7 @@ mod tests {
     /// is the root cause and surfaces as the typed upstream-rate failure,
     /// the client stays `DemoteRequested` (never `Demoted`), and `finish`
     /// then concludes the un-served remainder as an internal failure.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn slow_upstream_wins_over_demotion() {
         use crate::nonzero;
 
@@ -3148,7 +3148,7 @@ mod tests {
     /// Both client checkers see every delivered byte; the floor asks for a
     /// demotion on its own, and `min_download_rate` names the trigger when
     /// both trip.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn client_bytes_feed_the_demotion_floor() {
         use crate::nonzero;
 
@@ -3233,7 +3233,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn cache_writer_orders_pending_tee_before_direct_writes_at_resume_offset() {
         let scratch = ScratchFile::new();
         std::fs::write(&scratch.path, b"resume-").unwrap();
@@ -3288,7 +3288,7 @@ mod tests {
     /// Cache-only batches join `pipe_B` and land under the batch policy:
     /// the first at once, later ones when `pipe_B` fills or at the exit
     /// flush, in body order.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn cache_only_batches_join_the_pipe_b_batch() {
         let scratch = ScratchFile::new();
         let mut barrier = cache_barrier(&scratch.path).await;
@@ -3348,7 +3348,7 @@ mod tests {
         assert_eq!(std::fs::read(&scratch.path).unwrap(), expected);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn cache_writer_keeps_small_batches_after_the_first_flush() {
         let scratch = ScratchFile::new();
         let barrier = cache_barrier(&scratch.path).await;
@@ -3374,7 +3374,7 @@ mod tests {
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"firstsecond");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn cache_writer_hashes_prefix_and_userspace_body_once() {
         use crate::index_parser::HashAlgo;
         use sha2::Digest as _;
@@ -3406,7 +3406,7 @@ mod tests {
     /// the only path that lands a batch from a non-zero `landed`) and
     /// full-buffer recycling. The cache file and the streamed digest must
     /// each cover every byte exactly once, in order.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn buffer_sink_lands_and_hashes_every_byte_once_across_batches() {
         use crate::index_parser::HashAlgo;
         use sha2::Digest as _;
@@ -3493,7 +3493,7 @@ mod tests {
         assert_eq!(digest.digest, sha2::Sha256::digest(&expected).to_vec());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn cache_writer_prefix_uses_resume_offset_without_hashing_the_suffix() {
         let scratch = ScratchFile::new();
         std::fs::write(&scratch.path, b"resume-").unwrap();
@@ -3519,7 +3519,7 @@ mod tests {
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"resume-prefix-body");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn cache_writer_finishes_a_prefix_only_digest() {
         use sha2::Digest as _;
 
@@ -3542,7 +3542,7 @@ mod tests {
         assert_eq!(digest.digest, sha2::Sha256::digest(b"whole body").to_vec());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn cache_writer_waits_for_buffered_writes_before_raw_append() {
         use tokio::io::AsyncWriteExt as _;
         let mut scratch = ScratchFile::new();
@@ -3582,7 +3582,7 @@ mod tests {
         pipes.discard_duplicate().await.unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn salvage_does_not_land_a_batch_that_was_already_teed() {
         let scratch = ScratchFile::new();
         let mut pipes = SplicePipes::new().unwrap();
@@ -3598,7 +3598,7 @@ mod tests {
         assert_eq!(offset, 8);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn salvage_keeps_unique_tail_after_partial_tee_and_client_write() {
         let scratch = ScratchFile::new();
         let mut pipes = SplicePipes::new().unwrap();
@@ -3614,7 +3614,7 @@ mod tests {
         assert_eq!(offset, 8);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn salvage_lands_accumulated_bytes_after_the_pending_batch_on_eof() {
         let scratch = ScratchFile::new();
         let mut pipes = SplicePipes::new().unwrap();
@@ -3632,7 +3632,7 @@ mod tests {
         assert_eq!(offset, 8);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn salvage_leaves_a_tail_without_its_extracted_head_alone() {
         let scratch = ScratchFile::new();
         let mut pipes = SplicePipes::new().unwrap();

@@ -1069,7 +1069,7 @@ mod tests {
     /// reach the new download.
     // The xattr read runs through `block_in_place`, which needs the
     // multi-thread runtime.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn create_partial_file_replaces_a_leftover_instead_of_truncating_it() {
         use std::os::unix::fs::MetadataExt as _;
 
@@ -1125,7 +1125,7 @@ mod tests {
 
     // The xattr read runs through `block_in_place`, which needs the
     // multi-thread runtime.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn prepare_partial_resume_discards_a_partial_without_etag() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = partial_path(&dir);
@@ -1152,7 +1152,7 @@ mod tests {
 
     // The xattr read runs through `block_in_place`, which needs the
     // multi-thread runtime.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn prepare_partial_resume_discards_a_partial_with_a_weak_etag() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = partial_path(&dir);
@@ -1189,7 +1189,7 @@ mod tests {
 
     // The xattr read runs through `block_in_place`, which needs the
     // multi-thread runtime.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn prepare_partial_resume_resumes_a_partial_with_etag() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = partial_path(&dir);
@@ -1251,7 +1251,7 @@ mod tests {
 
     // The xattr reads run through `block_in_place`, which needs the
     // multi-thread runtime.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn prepare_partial_resume_reports_the_expected_total_from_xattr() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = partial_path(&dir);
@@ -1293,7 +1293,7 @@ mod tests {
     /// alike.
     // The xattr read runs through `block_in_place`, which needs the
     // multi-thread runtime.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn removing_a_kept_partial_releases_its_bytes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = partial_path(&dir);

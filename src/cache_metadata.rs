@@ -1016,8 +1016,8 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn invalidate_drops_entry() {
+    #[test]
+    fn invalidate_drops_entry() {
         let store = CacheMetadataStore::new();
         let key = fixture_key();
         store.set(
