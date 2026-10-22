@@ -368,8 +368,7 @@ impl CacheWriter {
         if bytes.is_empty() {
             return Ok(());
         }
-        self.write_cache_chunk(&mut bytes.to_vec(), bytes.len())
-            .await
+        self.write_cache_chunk(&mut bytes.to_vec()).await
     }
 
     /// [`Self::write_prefix`] for a buffer the caller owns: it moves into the
@@ -380,8 +379,7 @@ impl CacheWriter {
         if buf.is_empty() {
             return Ok(());
         }
-        let len = buf.len();
-        self.write_cache_chunk(buf, len).await
+        self.write_cache_chunk(buf).await
     }
 
     /// Only a drained writer can hand its file and whole-file digest to commit.
@@ -440,11 +438,8 @@ impl CacheWriter {
     /// `pwrite` a userspace chunk to the cache file at the current offset,
     /// after the batched bytes that precede it. The transfer owner publishes
     /// its progress.
-    async fn write_cache_chunk(
-        &mut self,
-        buf: &mut Vec<u8>,
-        got: usize,
-    ) -> Result<(), DownloadFailure> {
+    async fn write_cache_chunk(&mut self, buf: &mut Vec<u8>) -> Result<(), DownloadFailure> {
+        let got = buf.len();
         self.flush().await?;
         pwrite_buf_to_file(&self.file, buf, 0..got, self.file_offset, &mut self.hasher)
             .await
@@ -860,13 +855,9 @@ impl<'a> BodyTransfer<'a> {
         Ok(())
     }
 
-    async fn write_cache_chunk(
-        &mut self,
-        buf: &mut Vec<u8>,
-        got: usize,
-    ) -> Result<(), DownloadFailure> {
+    async fn write_cache_chunk(&mut self, buf: &mut Vec<u8>) -> Result<(), DownloadFailure> {
         let before = self.cache.position();
-        self.cache.write_cache_chunk(buf, got).await?;
+        self.cache.write_cache_chunk(buf).await?;
         self.publish_cache_progress(before);
         Ok(())
     }
@@ -1331,7 +1322,7 @@ async fn drive_batches(
             // see progress without being gated on the first client's send speed.
             // The pwrite lands at `file_offset`, so the batched `pipe_B` bytes
             // (which come earlier in the body) have to be there already.
-            xfer.write_cache_chunk(&mut buf, got).await?;
+            xfer.write_cache_chunk(&mut buf).await?;
 
             let client_slice = range_slice(&buf, chunk.start, range_filter.skip, range_filter.send);
             if !client_slice.is_empty() {
@@ -3262,7 +3253,7 @@ mod tests {
         // Model an earlier teed batch whose client bytes have been delivered.
         queue_cache(xfer.cache.pipes_mut(), b"queued-").await;
         let mut boundary = b"boundary-".to_vec();
-        xfer.write_cache_chunk(&mut boundary, 9).await.unwrap();
+        xfer.write_cache_chunk(&mut boundary).await.unwrap();
         assert_eq!(xfer.cache.file_offset, 23);
         assert!(receiver.has_changed().unwrap());
         receiver.borrow_and_update();
@@ -3391,7 +3382,7 @@ mod tests {
         .unwrap();
         writer.write_prefix(b"prefix-").await.unwrap();
         let mut body = b"body".to_vec();
-        writer.write_cache_chunk(&mut body, 4).await.unwrap();
+        writer.write_cache_chunk(&mut body).await.unwrap();
         let (_file, digest) = writer.finish();
         let digest = digest.unwrap();
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"prefix-body");
@@ -3511,7 +3502,7 @@ mod tests {
         .unwrap();
         writer.write_prefix(b"prefix-").await.unwrap();
         writer
-            .write_cache_chunk(&mut b"body".to_vec(), 4)
+            .write_cache_chunk(&mut b"body".to_vec())
             .await
             .unwrap();
         let (_file, digest) = writer.finish();
