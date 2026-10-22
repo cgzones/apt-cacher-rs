@@ -573,7 +573,7 @@ impl CacheWriter {
     /// as downloaded when they arrived, whether or not `note_chunk` got to
     /// run. A failed salvage is reported here and does not replace the
     /// transfer's own error.
-    pub(super) async fn salvage(&mut self, cache_path: &Path) {
+    pub(super) async fn salvage(&mut self) {
         let landed = if let Some(pipes) = self.pipes.take() {
             pipes.salvage_into(&self.file, &mut self.file_offset).await
         } else {
@@ -582,7 +582,7 @@ impl CacheWriter {
         if let Err(err) = landed {
             let _logged = Logged::cache_io_failure(format_args!(
                 "splice proxy: failed to land the last received bytes of `{}` in the partial file; a later attempt resumes from a shorter partial:  {}",
-                cache_path.display(),
+                self.path.display(),
                 ErrorReport(&err)
             ));
         }
@@ -753,7 +753,6 @@ pub(super) struct BodyTransfer<'a> {
     /// Bytes still owed to the client.
     client_remaining: u64,
     range_filter: SpliceRangeFilter,
-    cache_path: &'a Path,
     /// Who the delivery is for: a client-side failure counts against it
     /// (`client_trouble`), here and in a demoted file-serve task. `None`
     /// for a client-less transfer.
@@ -773,16 +772,11 @@ impl<'a> BodyTransfer<'a> {
     /// upstream; the cache writer supplies its starting file offset.
     /// `mirror_peak` is the mirror's peak throughput, the reference of the
     /// [`DemotionFloor`] an attached client gets.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the body geometry, its borrowed owners and the rate references; a parameter struct would only be unpacked here"
-    )]
     pub(super) fn new(
         client: BodyClient<'a>,
         cache: &'a mut CacheWriter,
         barrier: &'a mut DownloadBarrier,
         range_filter: SpliceRangeFilter,
-        cache_path: &'a Path,
         content_length: u64,
         mirror_peak: Option<NonZero<u64>>,
         config: &crate::config::Config,
@@ -822,7 +816,6 @@ impl<'a> BodyTransfer<'a> {
             client_file_pos: file_start_offset + range_filter.skip,
             client_remaining: range_filter.send,
             range_filter,
-            cache_path,
             peer,
         }
     }
@@ -990,7 +983,7 @@ impl<'a> BodyTransfer<'a> {
         let client_sent = client_total - self.client_remaining;
         failure.conclude(self.peer.as_ref(), format_args!(
             "splice proxy: delivery of `{}` stopped after {} of the {} streamed past the body prefix; continuing cache-only",
-            self.cache_path.display(),
+            self.cache.path.display(),
             HumanFmt::Size(client_sent),
             HumanFmt::Size(client_total),
         ))
@@ -1022,7 +1015,7 @@ impl<'a> BodyTransfer<'a> {
         let demote_remaining_percent = 100.0 * demote_remaining as f32 / client_total as f32;
         info!(
             "splice proxy: demoting slow client to file-serve of `{}` at cache offset {} with {} remaining out of {} ({:.1}%): {trigger}",
-            self.cache_path.display(),
+            self.cache.path.display(),
             HumanFmt::Size(demote_pos),
             HumanFmt::Size(demote_remaining),
             HumanFmt::Size(client_total),
@@ -1032,7 +1025,7 @@ impl<'a> BodyTransfer<'a> {
         let prepared = prepare_file_serve(
             client,
             &self.cache.tempfile,
-            self.cache_path,
+            &self.cache.path,
             demote_pos,
             demote_remaining,
             self.barrier.subscribe(),
@@ -1083,7 +1076,6 @@ impl<'a> BodyTransfer<'a> {
             client_file_pos: _,
             client_remaining,
             range_filter,
-            cache_path: _,
             peer: _,
         } = self;
         debug_assert_eq!(
@@ -2955,7 +2947,7 @@ mod tests {
         batch.sink.buf.extend_from_slice(b"salvage-tail");
         batch.queue(batch.sink.buf.len());
         writer.buffer = Some(batch);
-        writer.salvage(&scratch.path).await;
+        writer.salvage().await;
         assert!(
             metrics::CACHE_IO_FAILURE.get() > before_cleanup,
             "failed cleanup emits its separate cache diagnostic"
@@ -3040,7 +3032,6 @@ mod tests {
             &mut writer,
             &mut barrier,
             SpliceRangeFilter { skip: 2, send: 1 },
-            &scratch.path,
             1,
             None,
             &config,
@@ -3150,7 +3141,6 @@ mod tests {
             &mut writer,
             &mut barrier,
             filter,
-            &scratch.path,
             4_000,
             NonZero::new(8 * 1_000_000),
             &config,
@@ -3181,7 +3171,6 @@ mod tests {
             &mut writer,
             &mut barrier,
             filter,
-            &scratch.path,
             4_000,
             NonZero::new(8 * 1_000_000),
             &config,
@@ -3221,7 +3210,6 @@ mod tests {
             &mut writer,
             &mut barrier,
             SpliceRangeFilter { skip: 0, send: 0 },
-            &scratch.path,
             1,
             None,
             &crate::config::Config::default(),
@@ -3275,7 +3263,6 @@ mod tests {
             &mut writer,
             &mut barrier,
             filter,
-            &scratch.path,
             1,
             None,
             &crate::config::Config::default(),

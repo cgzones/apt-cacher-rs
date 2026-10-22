@@ -1441,7 +1441,6 @@ async fn transfer_body(
                 &mut writer,
                 barrier,
                 range_filter,
-                &temppath,
                 splice_count,
                 mirror_peak,
                 global_config(),
@@ -1462,9 +1461,7 @@ async fn transfer_body(
     ) = match outcome {
         Ok(outcome) => outcome,
         Err(failed) => {
-            return Err(failed
-                .salvage(async || writer.salvage(&temppath).await)
-                .await);
+            return Err(failed.salvage(async || writer.salvage().await).await);
         }
     };
     let target = CacheTarget {
