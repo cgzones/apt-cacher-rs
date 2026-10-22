@@ -106,9 +106,7 @@ pub(crate) async fn sampler() {
     loop {
         interval.tick().await;
         // An unreadable `/proc` is logged once and leaves the peak alone.
-        if let Some(open) = open_fds() {
-            metrics::OPEN_FDS_PEAK.update(open);
-        }
+        let _ = sample();
     }
 }
 
