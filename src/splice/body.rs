@@ -3081,6 +3081,96 @@ mod tests {
         assert_eq!(outcome.client_bytes, 0);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn successful_demotion_serves_only_the_remaining_range_after_client_progress() {
+        use crate::nonzero;
+        use tokio::io::AsyncWriteExt as _;
+
+        // The spawned sendfile task reads the process-wide configuration.
+        crate::RUNTIMEDETAILS
+            .set(crate::RuntimeDetails {
+                start_time: time::OffsetDateTime::UNIX_EPOCH,
+                config: crate::config::Config::default(),
+                cache_quota: crate::cache_quota::CacheQuota::new(0, None),
+                checksum_registry: crate::integrity::ChecksumRegistry::new(nonzero!(1)),
+                verify_throttle: crate::verify_throttle::VerifyThrottle::new(
+                    Duration::ZERO,
+                    Duration::ZERO,
+                ),
+                webif_hosts: crate::web::host_gate::WebifHosts::NONE,
+            })
+            .unwrap();
+        let scratch = ScratchFile::new();
+        std::fs::write(&scratch.path, b"resume-").unwrap();
+        let mut barrier = cache_barrier(&scratch.path).await;
+        let mut writer = CacheWriter::new(
+            scratch.file,
+            7,
+            CacheWriteMode::Kernel,
+            &barrier,
+            &scratch.path,
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut client, _) = listener.accept().await.unwrap();
+        client.write_all(b"sent").await.unwrap();
+        let mut delivered = [0; 4];
+        peer.read_exact(&mut delivered).await.unwrap();
+        assert_eq!(&delivered, b"sent");
+
+        let mut config = crate::config::Config::default();
+        config.min_download_rate = Some(nonzero!(10));
+        config.rate_check_timeframe = nonzero!(1);
+        let mut xfer = BodyTransfer::new(
+            BodyClient::Attached(&client, local_client()),
+            &mut writer,
+            &mut barrier,
+            SpliceRangeFilter { skip: 2, send: 10 },
+            20,
+            None,
+            &config,
+        );
+        // The range excludes both "xx" and "-outside" from the resumed body.
+        xfer.write_cache_chunk(&mut b"xxsentsuffix-outside".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(xfer.note_chunk(20), 0..20);
+        let trigger = xfer
+            .note_client_bytes(4)
+            .expect("4 client bytes fall below the 10 B/s floor");
+        assert_eq!(xfer.client_file_pos, 13);
+        assert_eq!(xfer.client_remaining, 6);
+        xfer.check_upstream_rate()
+            .expect("20 upstream bytes exceed the 10 B/s floor");
+        xfer.request_demote(&client, trigger);
+        assert!(xfer.client_status.client_to_write().is_none());
+        xfer.maybe_demote().unwrap();
+        assert!(xfer.counter.is_none(), "client accounting was handed off");
+        let outcome = xfer.finish();
+        assert_eq!(outcome.client_bytes, 4);
+        let ClientEnd::Demoted(handle) = outcome.client else {
+            unreachable!("a healthy upstream permits the demotion handoff");
+        };
+        drop(client);
+
+        let delivery = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the cached remainder needs no further upstream progress")
+            .unwrap();
+        assert!(matches!(delivery.end, DeliveryEnd::Complete));
+        assert_eq!(delivery.transferred, 6);
+        let mut suffix = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), peer.read_to_end(&mut suffix))
+            .await
+            .expect("the completed file-serve task releases its socket")
+            .unwrap();
+        assert_eq!(suffix, b"suffix");
+    }
+
     /// The floor exists only with a known peak, and only where it sits above
     /// `min_download_rate`; a disabled `min_download_rate` leaves it armed.
     #[test]
