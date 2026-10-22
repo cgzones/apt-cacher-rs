@@ -77,7 +77,7 @@ impl ReconcileFacet {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum CleanupUnit {
     /// Scan a tree into a candidate map, reduce it against ordered index
-    /// sources, sweep what survives. The only shape carrying [`SourceGroup`]s.
+    /// sources, sweep what survives. The only shape carrying [`IndexSource`]s.
     Reconcile(ReconcileUnit),
     /// Sweep a by-hash tree against an on-disk `Release` digest set. Fetches
     /// nothing and reduces nothing.
@@ -90,7 +90,7 @@ pub(super) enum CleanupUnit {
 
 impl CleanupUnit {
     /// Whether running the unit fetches index files from the mirror: only a
-    /// reconcile's [`SourceGroup`]s do. Cleanup drops these units for a
+    /// reconcile's [`IndexSource`]s do. Cleanup drops these units for a
     /// mirror the allow-lists no longer permit, which leaves its package
     /// trees as they are rather than sweeping them against an index it did
     /// not fetch.
@@ -109,13 +109,13 @@ impl CleanupUnit {
 pub(super) struct ReconcileUnit {
     pub facet: ReconcileFacet,
     pub tree: TreeSpec,
-    pub groups: Vec<SourceGroup>,
+    pub groups: Vec<IndexSource>,
     pub policy: ReconcilePolicy,
 }
 
 /// A [`CleanupUnit::ByHash`] unit. `release_dir`/`dist_gate` name the on-disk
 /// `Release` set that *defines* "referenced" — the by-hash counterpart of a
-/// reconcile unit's [`SourceGroup`]s, except nothing is fetched. A complete
+/// reconcile unit's [`IndexSource`]s, except nothing is fetched. A complete
 /// reference set keeps referenced digests and sweeps unreferenced-but-covered
 /// ones past `grace`; anything uncovered (or the whole tree, when the reference
 /// set is incomplete) sweeps past `backstop`.
@@ -193,16 +193,6 @@ impl TreeSpec {
     }
 }
 
-/// One source *description* applied to the unit's candidate map. Per-origin
-/// fan-out happens at resolution time in the engine and is conjunctive there:
-/// an origin group counts as complete only when every one of its
-/// origins' `Packages` fetches resolved.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct SourceGroup {
-    pub source: IndexSource,
-    pub owning: bool,
-}
-
 /// A reference-set source that reduces a *reconcile* unit's candidate map. The
 /// by-hash facets carry their `Release` digest source on their retention policy
 /// instead, so every variant here is one `resolve_group` can actually dispatch.
@@ -215,6 +205,16 @@ pub(super) enum IndexSource {
     ArchiveRoot { root: String, prefix: String },
     /// A flat-repository `Packages` fetch (co-located or root-segment).
     FlatPackages { fetch: FlatFetch },
+}
+
+impl IndexSource {
+    /// Only an archive-root reference set owns the complete reconciliation.
+    pub(super) const fn is_owning(&self) -> bool {
+        match self {
+            Self::ArchiveRoot { .. } => true,
+            Self::SelfOrigins | Self::FlatPackages { .. } => false,
+        }
+    }
 }
 
 /// Where a flat `Packages` index is fetched from.
@@ -237,7 +237,7 @@ pub(super) enum DistGate {
     None,
 }
 
-/// How a [`ReconcileUnit`] retains leftovers once its ordered [`SourceGroup`]s
+/// How a [`ReconcileUnit`] retains leftovers once its ordered [`IndexSource`]s
 /// have run. The only policy [`decide_sweep`] takes: the by-hash and age-only
 /// shapes carry their retention on their own payloads and never reach it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,7 +266,7 @@ impl ReconcilePolicy {
     }
 }
 
-/// Outcome of resolving one [`SourceGroup`] against the candidate map.
+/// Outcome of resolving one [`IndexSource`] against the candidate map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum GroupOutcome {
     /// The source resolved and reduced the candidate map (or had nothing to
@@ -293,7 +293,7 @@ pub(super) enum SkipReason {
     NoActiveOrigins,
 }
 
-/// Result of running one [`SourceGroup`] in a unit, carrying the context
+/// Result of running one [`IndexSource`] in a unit, carrying the context
 /// `decide_sweep` needs to build a diagnostic warn suffix.
 #[derive(Debug)]
 pub(super) struct GroupResult {
@@ -496,10 +496,7 @@ pub(super) fn classify_mirror(
         units.push(CleanupUnit::Reconcile(ReconcileUnit {
             facet,
             tree: TreeSpec::shallow(paths.entry_dir(facet.cache_layout(), site)),
-            groups: vec![SourceGroup {
-                source: IndexSource::SelfOrigins,
-                owning: false,
-            }],
+            groups: vec![IndexSource::SelfOrigins],
             policy: ReconcilePolicy::ReferencedOrBail {
                 grace: UNREFERENCED_KEEP_SPAN,
             },
@@ -508,30 +505,21 @@ pub(super) fn classify_mirror(
 
     let mut flat_groups = Vec::with_capacity(3);
     if let Some((root, prefix)) = flat_pool_archive_root(&entry.path) {
-        flat_groups.push(SourceGroup {
-            source: IndexSource::ArchiveRoot {
-                root: root.to_owned(),
-                prefix,
-            },
-            owning: true,
+        flat_groups.push(IndexSource::ArchiveRoot {
+            root: root.to_owned(),
+            prefix,
         });
     }
     if let Some((seg, prefix)) = flat_root_split(&entry.path) {
-        flat_groups.push(SourceGroup {
-            source: IndexSource::FlatPackages {
-                fetch: FlatFetch::RootSegment {
-                    seg: seg.to_owned(),
-                    prefix,
-                },
+        flat_groups.push(IndexSource::FlatPackages {
+            fetch: FlatFetch::RootSegment {
+                seg: seg.to_owned(),
+                prefix,
             },
-            owning: false,
         });
     }
-    flat_groups.push(SourceGroup {
-        source: IndexSource::FlatPackages {
-            fetch: FlatFetch::Colocated,
-        },
-        owning: false,
+    flat_groups.push(IndexSource::FlatPackages {
+        fetch: FlatFetch::Colocated,
     });
 
     let facet = ReconcileFacet::FlatTree;
@@ -896,10 +884,7 @@ mod tests {
                 CleanupUnit::Reconcile(ReconcileUnit {
                     facet: ReconcileFacet::StructuredPool,
                     tree: TreeSpec::shallow(PathBuf::from("/cache/deb.debian.org/debian")),
-                    groups: vec![SourceGroup {
-                        source: IndexSource::SelfOrigins,
-                        owning: false,
-                    }],
+                    groups: vec![IndexSource::SelfOrigins],
                     policy: ReconcilePolicy::ReferencedOrBail {
                         grace: UNREFERENCED_KEEP_SPAN,
                     },
@@ -913,11 +898,8 @@ mod tests {
                             boundaries: Vec::new(),
                         },
                     },
-                    groups: vec![SourceGroup {
-                        source: IndexSource::FlatPackages {
-                            fetch: FlatFetch::Colocated,
-                        },
-                        owning: false,
+                    groups: vec![IndexSource::FlatPackages {
+                        fetch: FlatFetch::Colocated,
                     }],
                     policy: ReconcilePolicy::ReferencedOrAge {
                         grace: UNREFERENCED_KEEP_SPAN,
@@ -1063,32 +1045,32 @@ mod tests {
         let units = classify_mirror(&entry, Vec::new(), &config);
         let flat_tree = flat_tree_unit(&units);
 
+        assert_eq!(
+            flat_tree
+                .groups
+                .iter()
+                .map(IndexSource::is_owning)
+                .collect::<Vec<_>>(),
+            [true, false, false],
+        );
+
         // The full cascade: the owning hybrid group first, then the flat-root
         // fallback, then the always-last co-located probe `decide_sweep` reads.
         assert_eq!(
             flat_tree.groups,
             vec![
-                SourceGroup {
-                    source: IndexSource::ArchiveRoot {
-                        root: "api/packages/85/debian".to_owned(),
-                        prefix: "pool/php-zts/main/".to_owned(),
-                    },
-                    owning: true,
+                IndexSource::ArchiveRoot {
+                    root: "api/packages/85/debian".to_owned(),
+                    prefix: "pool/php-zts/main/".to_owned(),
                 },
-                SourceGroup {
-                    source: IndexSource::FlatPackages {
-                        fetch: FlatFetch::RootSegment {
-                            seg: "api".to_owned(),
-                            prefix: "packages/85/debian/pool/php-zts/main/".to_owned(),
-                        },
+                IndexSource::FlatPackages {
+                    fetch: FlatFetch::RootSegment {
+                        seg: "api".to_owned(),
+                        prefix: "packages/85/debian/pool/php-zts/main/".to_owned(),
                     },
-                    owning: false,
                 },
-                SourceGroup {
-                    source: IndexSource::FlatPackages {
-                        fetch: FlatFetch::Colocated,
-                    },
-                    owning: false,
+                IndexSource::FlatPackages {
+                    fetch: FlatFetch::Colocated,
                 },
             ]
         );
@@ -1105,20 +1087,14 @@ mod tests {
         assert_eq!(
             flat_tree.groups,
             vec![
-                SourceGroup {
-                    source: IndexSource::FlatPackages {
-                        fetch: FlatFetch::RootSegment {
-                            seg: "apt".to_owned(),
-                            prefix: "amd64/".to_owned(),
-                        },
+                IndexSource::FlatPackages {
+                    fetch: FlatFetch::RootSegment {
+                        seg: "apt".to_owned(),
+                        prefix: "amd64/".to_owned(),
                     },
-                    owning: false,
                 },
-                SourceGroup {
-                    source: IndexSource::FlatPackages {
-                        fetch: FlatFetch::Colocated,
-                    },
-                    owning: false,
+                IndexSource::FlatPackages {
+                    fetch: FlatFetch::Colocated,
                 },
             ]
         );
@@ -1134,11 +1110,8 @@ mod tests {
 
         assert_eq!(
             flat_tree.groups,
-            vec![SourceGroup {
-                source: IndexSource::FlatPackages {
-                    fetch: FlatFetch::Colocated,
-                },
-                owning: false,
+            vec![IndexSource::FlatPackages {
+                fetch: FlatFetch::Colocated,
             }]
         );
     }

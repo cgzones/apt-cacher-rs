@@ -30,7 +30,7 @@ use http::{StatusCode, header::CONTENT_LENGTH};
 use crate::cleanup::model::{
     ByHashUnit, CleanupUnit, DistGate, FlatFetch, GroupOutcome, GroupResult, IndexSource,
     MetadataUnit, PartialsUnit, ReconcileFacet, ReconcilePolicy, ReconcileUnit, SkipReason,
-    SourceGroup, SweepAction, SweepReason, decide_sweep,
+    SweepAction, SweepReason, decide_sweep,
 };
 use crate::cleanup::packages::{
     DebnameKind, FetchFailure, KeyMapper, ReduceContext, ReduceError, body_is_incomplete,
@@ -484,7 +484,7 @@ struct ReconcileCtx<'a> {
 /// Signal from a source-group resolver back to the generic tail.
 ///
 /// A resolver reports only *what happened*; the tail stamps the `owning` /
-/// `root_seg` context back on from the [`SourceGroup`] it dispatched, so those
+/// `root_seg` context back on from the [`IndexSource`] it dispatched, so those
 /// two can never drift from the classifier's emission.
 enum GroupResolution {
     /// The group ran with this outcome (pushed onto the tail's results).
@@ -785,7 +785,7 @@ async fn sweep_byhash_dir(
 }
 
 /// Generic candidate-reconcile engine tail, shared by every candidate facet:
-/// scan the tree, resolve each ordered [`SourceGroup`] into a [`GroupResult`],
+/// scan the tree, resolve each ordered [`IndexSource`] into a [`GroupResult`],
 /// let [`decide_sweep`] pick the [`SweepAction`] from the unit's policy, and act
 /// on it. The per-source resolvers (fetch / reduce / diagnostics) and the
 /// per-facet completion summaries are the only facet-specific parts — the
@@ -855,17 +855,18 @@ async fn run_reconcile_unit(
             GroupResolution::Ran(outcome) => {
                 // An owning group that Completed owns the whole reconciliation:
                 // stop resolving further groups and grace-sweep the leftovers.
-                let owning_complete = group.owning && matches!(outcome, GroupOutcome::Complete);
+                let owning_complete =
+                    group.is_owning() && matches!(outcome, GroupOutcome::Complete);
                 // The resolver reports only the outcome; `owning`/`root_seg`
                 // come straight off the group the classifier emitted, so they
                 // cannot drift from it.
                 results.push(GroupResult {
-                    owning: group.owning,
-                    root_seg: flat_root_segment(&group.source).map(str::to_owned),
+                    owning: group.is_owning(),
+                    root_seg: flat_root_segment(group).map(str::to_owned),
                     outcome,
                 });
                 if owning_complete {
-                    owning_root = archive_root_segment(&group.source);
+                    owning_root = archive_root_segment(group);
                     break;
                 }
             }
@@ -955,17 +956,17 @@ async fn run_reconcile_unit(
     Ok(tally)
 }
 
-/// Dispatch one [`SourceGroup`] to its resolver: the structured-pool, hybrid
+/// Dispatch one [`IndexSource`] to its resolver: the structured-pool, hybrid
 /// archive-root, and flat (root-segment / co-located) sources. Every
 /// [`IndexSource`] variant has an arm here — the by-hash `Release` digest set is
 /// not one of them, it lives on the [`ByHashUnit`] payload.
 async fn resolve_group(
     ctx: &ReconcileCtx<'_>,
-    group: &SourceGroup,
+    group: &IndexSource,
     cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
 ) -> GroupResolution {
-    match &group.source {
+    match group {
         IndexSource::SelfOrigins => resolve_origin_packages_self(ctx, cached_files, tally).await,
         IndexSource::ArchiveRoot { root, prefix } => {
             resolve_origin_packages_archive_root(ctx, root, prefix, cached_files, tally).await
