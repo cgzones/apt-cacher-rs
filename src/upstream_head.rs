@@ -418,7 +418,8 @@ pub(crate) enum RejectReason {
     /// an upstream fault, neither cached nor relayed.  An unknown-length body
     /// that turns out empty gets the same rule where it is detected: splice's
     /// buffered volatile path answers 502 `zero-length body`, hyper's download
-    /// worker fails the download at the end of the body.
+    /// worker fails the download at the end of the body, and the hyper-less
+    /// cleanup bridge (`splice/cleanup_bridge.rs`) fails cleanup's index fetch.
     ZeroContentLength,
     /// The body bytes that arrived in the same read as the head already
     /// exceed the declared `Content-Length`.  Relaying them would hand the

@@ -23,6 +23,7 @@ use crate::integrity::note_cached_index_touch;
 use crate::limits::{self, PackagesCompression};
 use crate::log_once::Logged;
 use crate::metrics;
+use crate::transfer_error::UpstreamError;
 use crate::warn_once_or_info;
 use crate::{
     AppState,
@@ -223,7 +224,19 @@ async fn cleanup_upstream_fetch(
     let body = resp
         .framing
         .read_to_vec(upstream, &hdr_buf[hdr_end..], max_bytes)
-        .await;
+        .await
+        // An empty index is the upstream fault `RejectReason::ZeroContentLength`
+        // documents (its doc holds the rationale), whatever the framing: fail
+        // the fetch like the hyper backend's cleanup fetches do, so cleanup
+        // skips the mirror instead of reconciling against an empty reference
+        // set.
+        .and_then(|body| {
+            if body.is_empty() {
+                Err(UpstreamError::protocol("empty body"))
+            } else {
+                Ok(body)
+            }
+        });
 
     match body {
         Ok(body) => http::Response::builder()
