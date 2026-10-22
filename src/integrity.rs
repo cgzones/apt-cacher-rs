@@ -1891,21 +1891,16 @@ fn ingest_outcome(result: &std::io::Result<()>) -> Outcome {
 }
 
 /// Registry identity of an already-classified URI path. Routing validates
-/// fields before this boundary; decode each segment once, after collapsing
+/// fields before this boundary; decode the path once, after collapsing
 /// redundant separators and dot segments. Release metadata paths are literal
 /// filesystem names and must never pass through this URI-only helper.
 fn registry_path_from_uri(raw_uri_path: &str) -> Cow<'_, str> {
     let normalized = normalize_uri_path(raw_uri_path);
     if normalized.contains('%') {
         Cow::Owned(
-            normalized
-                .trim_start_matches('/')
-                .split('/')
-                .map(|segment| {
-                    urlencoding::decode(segment).expect("classified URI segment is valid UTF-8")
-                })
-                .collect::<Vec<_>>()
-                .join("/"),
+            urlencoding::decode(normalized.trim_start_matches('/'))
+                .expect("classified URI path is valid UTF-8")
+                .into_owned(),
         )
     } else {
         match normalized {
