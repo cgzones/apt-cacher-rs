@@ -171,7 +171,11 @@ pub(crate) struct MirrorUri<'a> {
 
 impl std::fmt::Display for MirrorUri<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.host.format_authority(self.port), self.path)
+        write!(f, "{}", self.host)?;
+        if let Some(port) = self.port {
+            write!(f, ":{port}")?;
+        }
+        write!(f, "/{}", self.path)
     }
 }
 
