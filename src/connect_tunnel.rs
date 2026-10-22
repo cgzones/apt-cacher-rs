@@ -24,10 +24,7 @@ use core::num::NonZero;
 use std::{
     io::ErrorKind,
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
     task::{Context, Poll},
     time::Duration,
 };
@@ -253,10 +250,10 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    let activity = Arc::new(ActivityClock::new());
+    let activity = ActivityClock::new();
     let mut client = IdleTracked {
         inner: client,
-        activity: Arc::clone(&activity),
+        activity: &activity,
         read: 0,
         written: 0,
     };
@@ -383,16 +380,16 @@ impl ActivityClock {
 /// write, and counting the bytes.  Wrapping the client side alone sees both
 /// directions: bytes from the upstream are written *to* the client, bytes
 /// from the client are read *from* it.
-struct IdleTracked<S> {
+struct IdleTracked<'a, S> {
     inner: S,
-    activity: Arc<ActivityClock>,
+    activity: &'a ActivityClock,
     /// Bytes read from the client (headed upstream).
     read: u64,
     /// Bytes written to the client (from the upstream).
     written: u64,
 }
 
-impl<S: AsyncRead + Unpin> AsyncRead for IdleTracked<S> {
+impl<S: AsyncRead + Unpin> AsyncRead for IdleTracked<'_, S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -408,7 +405,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for IdleTracked<S> {
     }
 }
 
-impl<S: AsyncWrite + Unpin> AsyncWrite for IdleTracked<S> {
+impl<S: AsyncWrite + Unpin> AsyncWrite for IdleTracked<'_, S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
