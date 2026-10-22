@@ -1072,7 +1072,8 @@ mod tests {
         assert!(entry.last_modified.is_none());
         // Second call still hits the cache.
         assert_eq!(store.len(), 1);
-        let _again = store.resolve(&key.as_ref(), &file, &path);
+        let again = store.resolve(&key.as_ref(), &file, &path);
+        assert!(Arc::ptr_eq(&entry, &again), "the negative entry is reused");
         assert_eq!(store.len(), 1);
     }
 
