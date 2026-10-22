@@ -75,13 +75,7 @@ pub(crate) fn open_cached_file_inline(path: &Path) -> std::io::Result<tokio::fs:
 /// [`nofollow_options`] over [`tokio::fs::OpenOptions`], with the same
 /// `custom_flags` caveat.
 pub(crate) fn tokio_nofollow_options() -> tokio::fs::OpenOptions {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "single blessed construction site"
-    )]
-    let mut options = tokio::fs::OpenOptions::new();
-    options.custom_flags(nix::libc::O_NOFOLLOW);
-    options
+    nofollow_options().into()
 }
 
 /// Probe whether `path` is a real directory.
