@@ -2507,75 +2507,64 @@ mod test {
     }
 
     #[test]
-    fn test_domain_name_new() {
-        // Mirrors the accept/reject set that `DomainName::new` enforces,
-        // which is the same set `cleanup_invalid_rows` uses to purge bad
-        // mirror rows before `flat_blocklist::init` runs.
-        fn accepts(s: &str) -> bool {
-            DomainName::new(s).is_ok()
+    fn exact_hosts_have_the_same_acceptance_in_domain_and_config() {
+        for (input, expected) in [
+            ("debian.org", true),
+            ("salsa.debian.org", true),
+            ("metadata.ftp-master.debian.org", true),
+            ("", false),
+            ("debian..org", false),
+            ("debian.f.org", true),
+            (
+                "debian.abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789AAA.org",
+                false,
+            ),
+            ("-debian.org", false),
+            ("debian-.org", false),
+            ("d-ebian.org", true),
+            ("de-bian.org", true),
+            ("deb-ian.org", true),
+            ("debi-an.org", true),
+            ("deb_ian.org", false),
+            (".", false),
+            ("..", false),
+            ("foo/bar", false),
+            ("192.168.1.1", true),
+            ("10.0.0.1", true),
+            ("127.0.0.1", true),
+            ("255.255.255.255", true),
+            ("::1", true),
+            ("2001:db8::1", true),
+            ("fe80::1", true),
+            ("::ffff:192.168.1.1", true),
+            ("2001:0db8:0000:0000:0000:0000:0000:0001", true),
+            (":::1", false),
+            ("2001:db8::xyz", false),
+            ("2001:db8::1::2", false),
+            ("[2001:db8::1]", true),
+            ("[2001:db8::1]:8080", false),
+        ] {
+            assert_eq!(
+                DomainName::new(input).is_ok(),
+                expected,
+                "DomainName: {input}"
+            );
+            assert_eq!(
+                ConfigDomainName::new(input).is_ok(),
+                expected,
+                "ConfigDomainName: {input}",
+            );
         }
 
-        assert!(accepts("debian.org"));
-        assert!(accepts("salsa.debian.org"));
-        assert!(accepts("metadata.ftp-master.debian.org"));
-
-        // empty
-        assert!(!accepts(""));
-
-        // double dots
-        assert!(!accepts("debian..org"));
-
-        // short part
-        assert!(accepts("debian.f.org"));
-
-        // too long part
-        assert!(!accepts(
-            "debian.abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789AAA.org"
-        ));
-
-        // starting dash
-        assert!(!accepts("-debian.org"));
-
-        // ending dash
-        assert!(!accepts("debian-.org"));
-
-        // dash in positions 2-5
-        assert!(accepts("d-ebian.org"));
-        assert!(accepts("de-bian.org"));
-        assert!(accepts("deb-ian.org"));
-        assert!(accepts("debi-an.org"));
-
-        // invalid char
-        assert!(!accepts("deb_ian.org"));
-
-        // special directory entries
-        assert!(!accepts("."));
-        assert!(!accepts(".."));
-        assert!(!accepts("foo/bar"));
-
-        // wild card
-        assert!(!accepts("*.debian.org"));
-        assert!(!accepts("*e.debian.org"));
-        assert!(!accepts("deb.*.debian.org"));
-        assert!(!accepts("debian.*"));
-
-        // IPv4 addresses (DomainName routes these through `Ipv4Addr::parse`)
-        assert!(accepts("192.168.1.1"));
-        assert!(accepts("10.0.0.1"));
-        assert!(accepts("127.0.0.1"));
-        assert!(accepts("255.255.255.255"));
-
-        // IPv6 addresses
-        assert!(accepts("::1"));
-        assert!(accepts("2001:db8::1"));
-        assert!(accepts("fe80::1"));
-        assert!(accepts("::ffff:192.168.1.1"));
-        assert!(accepts("2001:0db8:0000:0000:0000:0000:0000:0001"));
-
-        // invalid IPv6
-        assert!(!accepts(":::1"));
-        assert!(!accepts("2001:db8::xyz"));
-        assert!(!accepts("2001:db8::1::2"));
+        // Exact hosts never accept wildcard patterns.
+        for input in [
+            "*.debian.org",
+            "*e.debian.org",
+            "deb.*.debian.org",
+            "debian.*",
+        ] {
+            assert!(DomainName::new(input).is_err(), "DomainName: {input}");
+        }
     }
 
     /// Every spelling of an IPv6 host parses to one value whose text is the
@@ -2718,103 +2707,31 @@ mod test {
     }
 
     #[test]
-    fn test_accepts_config() {
-        fn accepts_config(s: &str) -> bool {
-            ConfigDomainName::new(s).is_ok()
+    fn config_wildcard_patterns_have_explicit_acceptance() {
+        for (input, expected) in [
+            ("*.debian.org", true),
+            ("*e.debian.org", false),
+            ("deb.*.debian.org", false),
+            ("debian.*", false),
+            ("*.org", false),
+            ("*.com", false),
+            ("*.ftp.debian.org", true),
+            ("*", false),
+            ("*.", false),
+            ("**.debian.org", false),
+            ("*-.debian.org", false),
+            ("*.debian.org.", false),
+            ("*.[2001:db8::1]", false),
+            ("*.1.1", false),
+            ("*.168.1.1", false),
+            ("*.0.0.1", false),
+        ] {
+            assert_eq!(
+                ConfigDomainName::new(input).is_ok(),
+                expected,
+                "ConfigDomainName: {input}",
+            );
         }
-
-        assert!(accepts_config("debian.org"));
-
-        assert!(accepts_config("salsa.debian.org"));
-
-        assert!(accepts_config("metadata.ftp-master.debian.org"));
-
-        // empty
-        assert!(!accepts_config(""));
-
-        // double dots
-        assert!(!accepts_config("debian..org"));
-
-        // short part
-        assert!(accepts_config("debian.f.org"));
-
-        // too long part
-        assert!(!accepts_config(
-            "debian.abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789AAA.org"
-        ));
-
-        // starting dash
-        assert!(!accepts_config("-debian.org"));
-
-        // ending dash
-        assert!(!accepts_config("debian-.org"));
-
-        // dash in position 2
-        assert!(accepts_config("d-ebian.org"));
-
-        // dash in position 3
-        assert!(accepts_config("de-bian.org"));
-
-        // dash in position 4
-        assert!(accepts_config("deb-ian.org"));
-
-        // dash in position 5
-        assert!(accepts_config("debi-an.org"));
-
-        // invalid char
-        assert!(!accepts_config("deb_ian.org"));
-
-        // special directory entry
-        assert!(!accepts_config("."));
-        assert!(!accepts_config(".."));
-        assert!(!accepts_config("foo/bar"));
-
-        // wild card
-        assert!(accepts_config("*.debian.org"));
-        assert!(!accepts_config("*e.debian.org"));
-        assert!(!accepts_config("deb.*.debian.org"));
-        assert!(!accepts_config("debian.*"));
-
-        // wildcard minimum depth (must have at least 3 parts)
-        assert!(!accepts_config("*.org"));
-        assert!(!accepts_config("*.com"));
-        assert!(accepts_config("*.debian.org"));
-        assert!(accepts_config("*.ftp.debian.org"));
-
-        // a wildcard is the whole first label and nothing else
-        assert!(!accepts_config("*"));
-        assert!(!accepts_config("*."));
-        assert!(!accepts_config("**.debian.org"));
-        assert!(!accepts_config("*-.debian.org"));
-        assert!(!accepts_config("*.debian.org."));
-
-        // IPv4 addresses
-        assert!(accepts_config("192.168.1.1"));
-        assert!(accepts_config("10.0.0.1"));
-        assert!(accepts_config("127.0.0.1"));
-        assert!(accepts_config("255.255.255.255"));
-
-        // IPv6 addresses
-        assert!(accepts_config("::1"));
-        assert!(accepts_config("2001:db8::1"));
-        assert!(accepts_config("fe80::1"));
-        assert!(accepts_config("::ffff:192.168.1.1"));
-        assert!(accepts_config("2001:0db8:0000:0000:0000:0000:0000:0001"));
-
-        // invalid IPv6
-        assert!(!accepts_config(":::1"));
-        assert!(!accepts_config("2001:db8::xyz"));
-        assert!(!accepts_config("2001:db8::1::2"));
-
-        // bracketed IPv6, but no port and no wildcard around an address
-        assert!(accepts_config("[2001:db8::1]"));
-        assert!(!accepts_config("[2001:db8::1]:8080"));
-        assert!(!accepts_config("*.[2001:db8::1]"));
-
-        // Wildcards that look like partial IPv4 addresses
-        assert!(!accepts_config("*.1.1"));
-        assert!(!accepts_config("*.168.1.1"));
-        assert!(!accepts_config("*.0.0.1"));
     }
 
     // -----------------------------------------------------------------
