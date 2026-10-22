@@ -1162,7 +1162,7 @@ mod tests {
         let mut expected = [InvalidValidator::LastModified("not a date")].into_iter();
         let (etag, lm) =
             check_upstream_validators(Some("\"abc\""), Some("not a date"), |invalid| {
-                assert_eq!(Some(invalid), expected.next())
+                assert_eq!(Some(invalid), expected.next());
             });
         assert_eq!(etag, Some("\"abc\""));
         assert_eq!(lm, None);

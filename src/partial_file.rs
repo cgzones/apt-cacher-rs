@@ -111,7 +111,7 @@ impl PartialDownload {
         }
     }
 
-    /// Strong ETag authorizing a resume, absent once the partial is discarded.
+    /// Strong `ETag` authorizing a resume, absent once the partial is discarded.
     pub(crate) fn if_range(&self) -> Option<&str> {
         self.resumed_validators()
             .and_then(|meta| meta.etag.as_deref())

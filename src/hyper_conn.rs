@@ -1089,12 +1089,11 @@ async fn serve_cached_file(
     // otherwise fall back to the post-flight cache (lazy-loads xattr on miss).
     let cache_info = {
         let resolved;
-        let meta = match prefetched_upstream_metadata {
-            Some(meta) => meta,
-            None => {
-                resolved = cache_metadata::store().resolve(&cache_key, &file, &file_path);
-                &resolved
-            }
+        let meta = if let Some(meta) = prefetched_upstream_metadata {
+            meta
+        } else {
+            resolved = cache_metadata::store().resolve(&cache_key, &file, &file_path);
+            &resolved
         };
         CacheInfo::with_meta(&mdata, meta)
     };
