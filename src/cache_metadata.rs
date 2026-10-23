@@ -1004,11 +1004,9 @@ mod tests {
         );
 
         for n in 0..CACHE_METADATA_MAX_ENTRIES {
-            let key = CacheEntryKey {
-                debname: format!("fill-{n}.deb"),
-                ..fixture_key()
-            };
-            store.set(&key.as_ref(), Arc::clone(&meta));
+            let debname = format!("fill-{n}.deb");
+            let key = CacheEntryKeyRef::new(&first.mirror, &debname, first.layout);
+            store.set(&key, Arc::clone(&meta));
         }
         assert_eq!(
             store.len(),
