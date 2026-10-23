@@ -431,12 +431,13 @@ mod tests {
 
     #[test]
     fn passthrough_final_frame_is_clean_completion() {
-        use crate::rate_checked_body::ClientBody;
-        let inner = ClientBody::new(
+        use crate::rate_checked_body::MaybeRated;
+        let inner = MaybeRated::new(
             http_body_util::Full::new(Bytes::from_static(b"body")),
             None,
             nonzero!(1),
-        );
+        )
+        .into_client_body();
         let mut body = AccountedBody::new(
             inner,
             Subject::Passthrough {

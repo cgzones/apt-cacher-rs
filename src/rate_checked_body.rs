@@ -2,6 +2,7 @@ use std::num::NonZero;
 
 use bytes::Buf as _;
 use http_body::{Body, Frame, SizeHint};
+use http_body_util::BodyExt as _;
 use pin_project::pin_project;
 
 use crate::{
@@ -52,6 +53,17 @@ where
             rate_failed: sticky::Bool::new(),
         }
     }
+
+    /// Map rate and source failures into the client's typed delivery result.
+    pub(crate) fn into_client_body(self) -> impl Body<Data = B::Data, Error = DeliveryFailure>
+    where
+        B::Error: Into<DeliveryFailure>,
+    {
+        self.map_err(|err| match *err {
+            RateCheckedBodyErr::RateTimeout(rate) => ClientError::rate(rate).into(),
+            RateCheckedBodyErr::Inner(err) => err.into(),
+        })
+    }
 }
 
 impl<B> Body for MaybeRated<B>
@@ -100,56 +112,6 @@ where
         }
 
         msg.map_err(|e| Box::new(RateCheckedBodyErr::Inner(e)))
-    }
-}
-
-/// Client operation adapter: rate failures and source-body failures share one
-/// typed delivery result. Generic over the source so its data type passes
-/// through unboxed.
-#[pin_project]
-pub(crate) struct ClientBody<B: Body> {
-    #[pin]
-    inner: MaybeRated<B>,
-}
-
-impl<B: Body> ClientBody<B> {
-    pub(crate) fn new(
-        inner: B,
-        minimum: Option<NonZero<usize>>,
-        timeframe: NonZero<usize>,
-    ) -> Self {
-        Self {
-            inner: MaybeRated::new(inner, minimum, timeframe),
-        }
-    }
-}
-
-impl<B> Body for ClientBody<B>
-where
-    B: Body,
-    B::Error: Into<DeliveryFailure>,
-{
-    type Data = B::Data;
-    type Error = DeliveryFailure;
-
-    fn poll_frame(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        self.project()
-            .inner
-            .poll_frame(cx)
-            .map_err(|err| match *err {
-                RateCheckedBodyErr::RateTimeout(rate) => ClientError::rate(rate).into(),
-                RateCheckedBodyErr::Inner(err) => err.into(),
-            })
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
     }
 }
 
@@ -214,9 +176,7 @@ mod tests {
             precise_instant::PreciseInstant,
             transfer_error::DeliveryFailure,
         };
-        let body = ClientBody {
-            inner: breaching_body(),
-        };
+        let body = breaching_body().into_client_body();
         let mut body = AccountedBody::new(
             body,
             Subject::Passthrough {

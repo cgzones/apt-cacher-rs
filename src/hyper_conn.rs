@@ -86,7 +86,7 @@ use crate::{
     permitted_host_cache::{HostReject, authorize_cache_access, permitted_host, permitted_port},
     precise_instant::PreciseInstant,
     proxy_body::{ProxyCacheBody, full_body, quick_response, quick_response_closing},
-    rate_checked_body::{ClientBody, MaybeRated, RateCheckedBodyErr},
+    rate_checked_body::{MaybeRated, RateCheckedBodyErr},
     rate_log,
     request_dispatch::{
         ClientAcls, DispatchOutcome, PassthroughReason, RejectReason, RequestKind, RequestTarget,
@@ -735,7 +735,8 @@ where
     B::Error: Into<DeliveryFailure>,
 {
     let config = global_config();
-    let rated = ClientBody::new(body, config.min_download_rate, config.rate_check_timeframe);
+    let rated = MaybeRated::new(body, config.min_download_rate, config.rate_check_timeframe)
+        .into_client_body();
     ProxyCacheBody::new(AccountedBody::new(rated, subject))
 }
 
