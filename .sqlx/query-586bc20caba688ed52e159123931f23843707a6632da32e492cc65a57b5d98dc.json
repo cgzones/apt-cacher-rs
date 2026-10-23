@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n            SELECT\n                mirrors_v2.host AS \"host: ClientHost\",\n                mirrors_v2.port AS \"port: u16\",\n                mirrors_v2.path,\n                mirrors_v2.first_seen,\n                mirrors_v2.last_seen,\n                mirrors_v2.last_cleanup,\n                COALESCE(downloads.total_size, 0) AS \"total_download_size: i64\",\n                COALESCE(deliveries.total_size, 0) AS \"total_delivery_size: i64\",\n                COALESCE(downloads.cnt, 0) AS \"download_count: i64\",\n                COALESCE(deliveries.cnt, 0) AS \"delivery_count: i64\"\n            FROM mirrors_v2\n            LEFT JOIN\n                (SELECT mirror_id, SUM(size) AS total_size, COUNT(*) AS cnt FROM downloads GROUP BY mirror_id) AS downloads\n            ON mirrors_v2.id = downloads.mirror_id\n            LEFT JOIN\n                (SELECT mirror_id, SUM(size) AS total_size, COUNT(*) AS cnt FROM deliveries GROUP BY mirror_id) AS deliveries\n            ON mirrors_v2.id = deliveries.mirror_id\n            ;\n        ",
+  "query": "\n            SELECT\n                mirrors_v2.host AS \"host: ClientHost\",\n                mirrors_v2.port AS \"port: u16\",\n                mirrors_v2.path,\n                mirrors_v2.kind AS \"kind!: i64\",\n                mirrors_v2.first_seen,\n                mirrors_v2.last_seen,\n                mirrors_v2.last_cleanup,\n                COALESCE(downloads.total_size, 0) AS \"total_download_size: i64\",\n                COALESCE(deliveries.total_size, 0) AS \"total_delivery_size: i64\",\n                COALESCE(downloads.cnt, 0) AS \"download_count: i64\",\n                COALESCE(deliveries.cnt, 0) AS \"delivery_count: i64\"\n            FROM mirrors_v2\n            LEFT JOIN\n                (SELECT mirror_id, SUM(size) AS total_size, COUNT(*) AS cnt FROM downloads GROUP BY mirror_id) AS downloads\n            ON mirrors_v2.id = downloads.mirror_id\n            LEFT JOIN\n                (SELECT mirror_id, SUM(size) AS total_size, COUNT(*) AS cnt FROM deliveries GROUP BY mirror_id) AS deliveries\n            ON mirrors_v2.id = deliveries.mirror_id\n            ;\n        ",
   "describe": {
     "columns": [
       {
@@ -37,8 +37,19 @@
         }
       },
       {
-        "name": "first_seen",
+        "name": "kind!: i64",
         "ordinal": 3,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "mirrors_v2",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "name": "first_seen",
+        "ordinal": 4,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -49,7 +60,7 @@
       },
       {
         "name": "last_seen",
-        "ordinal": 4,
+        "ordinal": 5,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -60,7 +71,7 @@
       },
       {
         "name": "last_cleanup",
-        "ordinal": 5,
+        "ordinal": 6,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -71,25 +82,25 @@
       },
       {
         "name": "total_download_size: i64",
-        "ordinal": 6,
-        "type_info": "Integer",
-        "origin": "Expression"
-      },
-      {
-        "name": "total_delivery_size: i64",
         "ordinal": 7,
         "type_info": "Integer",
         "origin": "Expression"
       },
       {
-        "name": "download_count: i64",
+        "name": "total_delivery_size: i64",
         "ordinal": 8,
         "type_info": "Integer",
         "origin": "Expression"
       },
       {
-        "name": "delivery_count: i64",
+        "name": "download_count: i64",
         "ordinal": 9,
+        "type_info": "Integer",
+        "origin": "Expression"
+      },
+      {
+        "name": "delivery_count: i64",
+        "ordinal": 10,
         "type_info": "Integer",
         "origin": "Expression"
       }
@@ -107,8 +118,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "c7d11169229f2e5c5bad7f23f69fe7fcd960ecd0306821f8d44e755a1266b51c"
+  "hash": "586bc20caba688ed52e159123931f23843707a6632da32e492cc65a57b5d98dc"
 }

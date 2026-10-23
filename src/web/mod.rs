@@ -76,6 +76,7 @@
 mod assets;
 mod dashboard;
 mod fmt;
+mod footprint;
 pub(crate) mod host_gate;
 mod logs;
 mod metrics_page;
