@@ -514,7 +514,7 @@ async fn run_unit(unit: &CleanupUnit, ctx: &MirrorCtx<'_>) -> Result<UnitStats, 
 async fn run_partials_unit(unit: &PartialsUnit, ctx: &MirrorCtx<'_>) -> UnitStats {
     let mirror = ctx.mirror;
 
-    let reaped = cleanup_tmp_dir(&unit.root, ctx.now, unit.span).await;
+    let reaped = cleanup_tmp_dir(&ctx.config.cache_directory, &unit.root, ctx.now, unit.span).await;
 
     if reaped.entries > 0 {
         info!(
@@ -551,7 +551,15 @@ async fn run_metadata_unit(unit: &MetadataUnit, ctx: &MirrorCtx<'_>) -> UnitStat
         unit.root.display()
     );
 
-    let swept = sweep_aged_metadata(&unit.root, unit.span, ctx.now, mirror, unit.layout).await;
+    let swept = sweep_aged_metadata(
+        &ctx.config.cache_directory,
+        &unit.root,
+        unit.span,
+        ctx.now,
+        mirror,
+        unit.layout,
+    )
+    .await;
 
     if swept.files_removed > 0 {
         info!(
@@ -609,6 +617,7 @@ async fn run_byhash_unit(
 ) -> Result<UnitStats, CleanupUnitError> {
     let mirror = ctx.mirror;
     let layout = unit.layout;
+    let cache_root = &ctx.config.cache_directory;
 
     // Cheap absence check: skip the origins query + Release reads for a mirror
     // whose per-layout by-hash tree does not exist. A failed probe abandons
@@ -625,14 +634,18 @@ async fn run_byhash_unit(
     let reference = match unit.dist_gate {
         DistGate::ActiveOriginDists => match active_origin_distributions(ctx.self_origins) {
             Some(expected_dists) => {
-                build_byhash_reference_set(&unit.release_dir, layout, &expected_dists).await
+                build_byhash_reference_set(cache_root, &unit.release_dir, layout, &expected_dists)
+                    .await
             }
             None => None,
         },
-        DistGate::None => build_byhash_reference_set(&unit.release_dir, layout, &[]).await,
+        DistGate::None => {
+            build_byhash_reference_set(cache_root, &unit.release_dir, layout, &[]).await
+        }
     };
 
     let outcome = sweep_byhash_dir(
+        cache_root,
         &unit.root,
         reference.as_ref(),
         unit.grace,
@@ -686,8 +699,14 @@ static BYHASH_WALK: WalkContext = WalkContext {
 /// handling all flow through [`sweep_candidates`].
 ///
 /// `NotFound` is treated as "nothing to do" (TOCTOU: the caller pre-probes with
-/// `byhash_dir_present`, but the tree may vanish in between).
+/// `byhash_dir_present`, but the tree may vanish in between). The walk is
+/// confined to `cache_root` (`Walker::confined_to`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "single production call site; the tests drive each span and mode through it directly"
+)]
 async fn sweep_byhash_dir(
+    cache_root: &Path,
     byhash_path: &Path,
     reference: Option<&ByHashReferenceSet>,
     grace: Duration,
@@ -700,7 +719,8 @@ async fn sweep_byhash_dir(
     let mut referenced_kept = 0u64;
     let mut io_failures = 0u64;
 
-    let mut walker = Walker::new(byhash_path, &BYHASH_WALK, OnMissing::Tolerate, ());
+    let mut walker =
+        Walker::new(byhash_path, &BYHASH_WALK, OnMissing::Tolerate, ()).confined_to(cache_root);
 
     while let Some(entry) = walker.next().await {
         match entry.kind() {
@@ -800,7 +820,7 @@ async fn run_reconcile_unit(
     let ScannedTree {
         candidates: mut cached_files,
         io_failures,
-    } = scan_candidates(&unit.tree, mirror.path()).await?;
+    } = scan_candidates(&config.cache_directory, &unit.tree, mirror.path()).await?;
 
     trace!("Cached files ({}): {cached_files:?}", cached_files.len());
 
@@ -1542,6 +1562,7 @@ mod tests {
         let now = SystemTime::now() + Duration::from_secs(10 * DAY);
         let outcome = sweep_byhash_dir(
             dir.path(),
+            dir.path(),
             Some(&set),
             Duration::from_secs(3 * DAY),
             Duration::from_secs(90 * DAY),
@@ -1587,6 +1608,7 @@ mod tests {
             }
             let references = build_byhash_reference_set(
                 releases.path(),
+                releases.path(),
                 CacheLayout::DistsByHash,
                 &["stable", "sid"],
             )
@@ -1597,6 +1619,7 @@ mod tests {
             let now = SystemTime::now();
             for (age_days, expected_removed) in [(10, 0), (91, 2)] {
                 let outcome = sweep_byhash_dir(
+                    files.path(),
                     files.path(),
                     references.as_ref(),
                     Duration::from_secs(3 * DAY),
@@ -1626,6 +1649,7 @@ mod tests {
         std::os::unix::fs::symlink("/nonexistent", &link).expect("symlink");
 
         let outcome = sweep_byhash_dir(
+            dir.path(),
             dir.path(),
             None,
             Duration::from_secs(3 * DAY),
@@ -1663,6 +1687,7 @@ mod tests {
         let now = SystemTime::now() + Duration::from_secs(DAY);
         let outcome = sweep_byhash_dir(
             dir.path(),
+            dir.path(),
             Some(&set),
             Duration::from_secs(3 * DAY),
             Duration::from_secs(90 * DAY),
@@ -1694,6 +1719,7 @@ mod tests {
         let young = now + Duration::from_secs(DAY);
         let outcome = sweep_byhash_dir(
             dir.path(),
+            dir.path(),
             None,
             grace,
             backstop,
@@ -1709,6 +1735,7 @@ mod tests {
         // Past the backstop with no reference set -> aged out, not "unreferenced".
         let old = now + Duration::from_secs(91 * DAY);
         let outcome = sweep_byhash_dir(
+            dir.path(),
             dir.path(),
             None,
             grace,

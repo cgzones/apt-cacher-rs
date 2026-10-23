@@ -278,6 +278,7 @@ static METADATA_WALK: WalkContext = WalkContext {
 /// `now` is injected for testability, matching [`sweep_candidates`]: birthtime is
 /// not backdatable on Linux, so removal cannot be exercised via mtime alone.
 pub(super) async fn sweep_aged_metadata(
+    cache_root: &Path,
     dir: &Path,
     keep_span: Duration,
     now: SystemTime,
@@ -293,7 +294,8 @@ pub(super) async fn sweep_aged_metadata(
         io_failures: 0,
     };
 
-    let mut walker = Walker::new(dir, &METADATA_WALK, OnMissing::Tolerate, ());
+    let mut walker =
+        Walker::new(dir, &METADATA_WALK, OnMissing::Tolerate, ()).confined_to(cache_root);
 
     while let Some(mut entry) = walker.next().await {
         match entry.kind() {
@@ -520,8 +522,15 @@ mod tests {
         // `now` far in the future so both regular files are past the span
         // (birthtime is not backdatable on Linux, so inject `now` instead).
         let now = SystemTime::now() + Duration::from_hours(91 * 24);
-        let res =
-            sweep_aged_metadata(dir.path(), keep_span, now, &mirror, CacheLayout::Dists).await;
+        let res = sweep_aged_metadata(
+            dir.path(),
+            dir.path(),
+            keep_span,
+            now,
+            &mirror,
+            CacheLayout::Dists,
+        )
+        .await;
         assert_eq!(res.files_removed, 2);
         assert!(res.bytes_removed >= 2);
         assert!(!dir.path().join("sid_Release").exists());
@@ -538,8 +547,15 @@ mod tests {
         // A young file (within the span) is retained.
         std::fs::write(dir.path().join("trixie_Release"), b"r").expect("write release");
         let now = SystemTime::now() + Duration::from_hours(24);
-        let res =
-            sweep_aged_metadata(dir.path(), keep_span, now, &mirror, CacheLayout::Dists).await;
+        let res = sweep_aged_metadata(
+            dir.path(),
+            dir.path(),
+            keep_span,
+            now,
+            &mirror,
+            CacheLayout::Dists,
+        )
+        .await;
         assert_eq!(res.files_removed, 0);
         assert!(dir.path().join("trixie_Release").exists());
     }
@@ -568,7 +584,15 @@ mod tests {
         let keep_span = Duration::from_hours(90 * 24);
         let now = SystemTime::now() + Duration::from_hours(91 * 24);
 
-        let res = sweep_aged_metadata(dir.path(), keep_span, now, &mirror, CacheLayout::Flat).await;
+        let res = sweep_aged_metadata(
+            dir.path(),
+            dir.path(),
+            keep_span,
+            now,
+            &mirror,
+            CacheLayout::Flat,
+        )
+        .await;
         assert_eq!(res.files_removed, 2, "only the two index files are swept");
         assert!(!dir.path().join("Release").exists());
         assert!(!dir.path().join("Packages").exists());
@@ -582,6 +606,7 @@ mod tests {
     async fn sweep_aged_metadata_absent_dir_is_noop() {
         let dir = tempfile::tempdir().expect("tempdir");
         let res = sweep_aged_metadata(
+            dir.path(),
             &dir.path().join("does-not-exist"),
             Duration::from_hours(90 * 24),
             SystemTime::now() + Duration::from_hours(91 * 24),
