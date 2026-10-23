@@ -1329,22 +1329,17 @@ async fn try_sendfile_request(
                     let last_modified = md
                         .modified()
                         .expect("Platform should support modification timestamps via setup check");
-                    let elapsed = match volatile_freshness(last_modified, SystemTime::now()) {
-                        Ok(elapsed) => elapsed,
-                        Err(reason) => {
-                            if reason == MissReason::FutureTimestamp {
-                                warn_once_or_info!(
-                                    "Volatile file `{}` was modified in the future; treating it as stale and refetching from upstream",
-                                    cache_path.display()
-                                );
+                    let elapsed =
+                        match volatile_freshness(&cache_path, last_modified, SystemTime::now()) {
+                            Ok(elapsed) => elapsed,
+                            Err(reason) => {
+                                break 'cache_lookup Err(CacheMiss::StaleVolatile {
+                                    reason,
+                                    file,
+                                    size: md.size(),
+                                });
                             }
-                            break 'cache_lookup Err(CacheMiss::StaleVolatile {
-                                reason,
-                                file,
-                                size: md.size(),
-                            });
-                        }
-                    };
+                        };
                     debug!(
                         "Volatile file `{}` age {} is within the {} freshness window, serving cached version...",
                         cache_path.display(),

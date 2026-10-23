@@ -13,7 +13,6 @@ use tracing::{debug, error};
 
 use crate::cache_conditional::volatile_freshness;
 use crate::cache_layout::ConnectionDetails;
-use crate::cache_layout::MissReason;
 use crate::deb_mirror::Mirror;
 use crate::error::ErrorReport;
 use crate::fs_open::{
@@ -82,17 +81,8 @@ async fn serve_cached_cleanup_file(
     let modified = mdata
         .modified()
         .expect("Platform should support modification timestamps via setup check");
-    let elapsed = match volatile_freshness(modified, now) {
-        Ok(elapsed) => elapsed,
-        Err(reason) => {
-            if reason == MissReason::FutureTimestamp {
-                warn_once_or_info!(
-                    "Volatile file `{}` was modified in the future; treating it as stale and refetching from upstream",
-                    cache_path.display()
-                );
-            }
-            return None;
-        }
+    let Ok(elapsed) = volatile_freshness(cache_path, modified, now) else {
+        return None;
     };
 
     let max_bytes = buffering_cap(req.uri().path());

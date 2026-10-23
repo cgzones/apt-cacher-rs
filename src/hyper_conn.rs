@@ -1401,7 +1401,7 @@ async fn serve_volatile_file(
         .modified()
         .expect("Platform should support modification timestamps via setup check");
 
-    let reason = match volatile_freshness(modified_system_time, SystemTime::now()) {
+    let reason = match volatile_freshness(&file_path, modified_system_time, SystemTime::now()) {
         Ok(elapsed) => {
             debug!(
                 "Volatile file `{}` age {} is within the {} freshness window, serving cached version...",
@@ -1418,15 +1418,7 @@ async fn serve_volatile_file(
             note_cached_index_touch(&conn_details, req.uri().path(), &file_path);
             return serve_cached_file(conn_details, &req, file, file_path, None, Some(mdata)).await;
         }
-        Err(reason) => {
-            if reason == MissReason::FutureTimestamp {
-                warn_once_or_info!(
-                    "Volatile file `{}` was modified in the future; treating it as stale and refetching from upstream",
-                    file_path.display()
-                );
-            }
-            reason
-        }
+        Err(reason) => reason,
     };
 
     // Lookup-site parent refetch bump; dominates the VOLATILE_REFETCHED_*

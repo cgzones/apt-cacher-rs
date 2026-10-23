@@ -33,19 +33,25 @@ use crate::{
     http_etag::if_none_match,
     http_range::{HttpDate, ParsedRange, cache_file_http_date, compute_age, http_parse_range},
     limits::VOLATILE_CACHE_MAX_AGE,
-    warn_once_or_debug,
+    warn_once_or_debug, warn_once_or_info,
 };
 
 /// A volatile copy is fresh only within the fixed cache window. Compare raw
 /// timestamps: HTTP-date rounding can turn subsecond mtimes into future dates.
-/// Future timestamps are stale, so clock skew cannot freeze an index in cache.
+/// Future timestamps are stale, so clock skew cannot freeze an index in cache;
+/// one is logged against `path`.
 pub(crate) fn volatile_freshness(
+    path: &Path,
     modified: SystemTime,
     now: SystemTime,
 ) -> Result<Duration, MissReason> {
-    let age = now
-        .duration_since(modified)
-        .map_err(|_future| MissReason::FutureTimestamp)?;
+    let age = now.duration_since(modified).map_err(|_future| {
+        warn_once_or_info!(
+            "Volatile file `{}` was modified in the future; treating it as stale and refetching from upstream",
+            path.display()
+        );
+        MissReason::FutureTimestamp
+    })?;
     if age < VOLATILE_CACHE_MAX_AGE {
         Ok(age)
     } else {
@@ -430,18 +436,21 @@ mod tests {
             Duration::from_secs(29),
             Duration::from_nanos(29_999_999_999),
         ] {
-            assert_eq!(volatile_freshness(now - age, now), Ok(age));
+            assert_eq!(
+                volatile_freshness(Path::new("index"), now - age, now),
+                Ok(age)
+            );
         }
         assert_eq!(
-            volatile_freshness(now - Duration::from_secs(30), now),
+            volatile_freshness(Path::new("index"), now - Duration::from_secs(30), now),
             Err(MissReason::Expired)
         );
         assert_eq!(
-            volatile_freshness(now - Duration::from_secs(31), now),
+            volatile_freshness(Path::new("index"), now - Duration::from_secs(31), now),
             Err(MissReason::Expired)
         );
         assert_eq!(
-            volatile_freshness(now + Duration::from_nanos(1), now),
+            volatile_freshness(Path::new("index"), now + Duration::from_nanos(1), now),
             Err(MissReason::FutureTimestamp)
         );
     }
