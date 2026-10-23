@@ -476,9 +476,8 @@ struct ReconcileCtx<'a> {
 
 /// Signal from a source-group resolver back to the generic tail.
 ///
-/// A resolver reports only *what happened*; the tail stamps the `owning` /
-/// `root_seg` context back on from the [`IndexSource`] it dispatched, so those
-/// two can never drift from the classifier's emission.
+/// A resolver reports only *what happened*; the tail derives the root segment
+/// and owning-group early exit from the [`IndexSource`] it dispatched.
 enum GroupResolution {
     /// The group ran with this outcome (pushed onto the tail's results).
     Ran(GroupOutcome),
@@ -848,12 +847,17 @@ async fn run_reconcile_unit(
                 // stop resolving further groups and grace-sweep the leftovers.
                 let owning_complete =
                     group.is_owning() && matches!(outcome, GroupOutcome::Complete);
-                // The resolver reports only the outcome; `owning`/`root_seg`
-                // come straight off the group the classifier emitted, so they
-                // cannot drift from it.
+                // The root segment comes from the group the classifier emitted.
+                let root_seg = flat_root_segment(group);
+                // `decide_sweep` names the fallback warn's flat root by the
+                // nearest group carrying a segment, so an owning group must
+                // never carry one.
+                debug_assert!(
+                    !(group.is_owning() && root_seg.is_some()),
+                    "owning group with a flat root segment: {group:?}"
+                );
                 results.push(GroupResult {
-                    owning: group.is_owning(),
-                    root_seg: flat_root_segment(group).map(str::to_owned),
+                    root_seg: root_seg.map(str::to_owned),
                     outcome,
                 });
                 if owning_complete {

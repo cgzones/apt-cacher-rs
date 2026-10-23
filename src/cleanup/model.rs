@@ -297,7 +297,6 @@ pub(super) enum SkipReason {
 /// `decide_sweep` needs to build a diagnostic warn suffix.
 #[derive(Debug)]
 pub(super) struct GroupResult {
-    pub owning: bool,
     /// Set for [`FlatFetch::RootSegment`] groups — feeds the warn suffix.
     pub root_seg: Option<String>,
     pub outcome: GroupOutcome,
@@ -383,10 +382,6 @@ pub(super) fn decide_sweep(policy: ReconcilePolicy, groups: &[GroupResult]) -> S
             let Some(colocated) = groups.last() else {
                 return grace_sweep();
             };
-            if colocated.owning && matches!(colocated.outcome, GroupOutcome::Complete) {
-                return grace_sweep();
-            }
-
             match &colocated.outcome {
                 GroupOutcome::Complete | GroupOutcome::NotApplicable(_) => grace_sweep(),
                 // A parse error falls back to age retention even when the
@@ -403,10 +398,11 @@ pub(super) fn decide_sweep(policy: ReconcilePolicy, groups: &[GroupResult]) -> S
                     // The root-segment group, when one ran ahead of the
                     // co-located probe: its segment names the flat-repo root in
                     // the fallback warn suffix.
-                    let root = groups.iter().rev().skip(1).find_map(|g| match &g.root_seg {
-                        Some(seg) if !g.owning => Some((seg.as_str(), &g.outcome)),
-                        Some(_) | None => None,
-                    });
+                    let root = groups
+                        .iter()
+                        .rev()
+                        .skip(1)
+                        .find_map(|g| g.root_seg.as_deref().map(|seg| (seg, &g.outcome)));
                     match root {
                         Some((_, GroupOutcome::Complete)) => grace_sweep(),
                         Some((seg, GroupOutcome::FetchFailed(root_failure))) => age_sweep(
@@ -596,7 +592,6 @@ mod tests {
 
     fn gr(outcome: GroupOutcome) -> GroupResult {
         GroupResult {
-            owning: false,
             root_seg: None,
             outcome,
         }
@@ -604,7 +599,6 @@ mod tests {
 
     fn root(seg: &str, outcome: GroupOutcome) -> GroupResult {
         GroupResult {
-            owning: false,
             root_seg: Some(seg.to_owned()),
             outcome,
         }
@@ -626,14 +620,6 @@ mod tests {
                 primary,
                 root_failed,
             },
-        }
-    }
-
-    fn owning(outcome: GroupOutcome) -> GroupResult {
-        GroupResult {
-            owning: true,
-            root_seg: None,
-            outcome,
         }
     }
 
@@ -701,10 +687,7 @@ mod tests {
 
     #[test]
     fn age_owning_complete_is_grace() {
-        assert_eq!(
-            decide_sweep(AGE, &[owning(GroupOutcome::Complete)]),
-            grace()
-        );
+        assert_eq!(decide_sweep(AGE, &[gr(GroupOutcome::Complete)]), grace());
     }
 
     #[test]
@@ -812,7 +795,7 @@ mod tests {
             decide_sweep(
                 AGE,
                 &[
-                    owning(GroupOutcome::FetchFailed(ff(404))),
+                    gr(GroupOutcome::FetchFailed(ff(404))),
                     root("apt", GroupOutcome::Complete),
                     gr(GroupOutcome::FetchFailed(ff(404)))
                 ]
