@@ -1786,6 +1786,18 @@ impl Config {
             }
 
             for (pos, alias) in self.aliases.iter().enumerate() {
+                // A main listed as its own alias names one mirror row as both
+                // the alias row and its main: `Database::merge_alias_rows`
+                // would fold that row into itself and delete it, with its
+                // origins, on every start.
+                if alias
+                    .aliases
+                    .binary_search_by_key(&alias.main.as_str(), |a| a.as_str())
+                    .is_ok()
+                {
+                    invalid!("Alias {} lists itself as one of its aliases", alias.main);
+                }
+
                 let remaining_aliases = &self.aliases.as_slice()[pos + 1..];
 
                 if let Some(falias) = remaining_aliases.iter().find(|ialias| {
@@ -3562,6 +3574,36 @@ mod test {
             let err = error_for(input);
             assert!(
                 err.contains("conflicts with alias"),
+                "{case} must be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn self_alias_is_rejected() {
+        // Every spelling of the main's own host, including one `DomainName`
+        // only folds to it (case, IPv6 notation).
+        for (case, input) in [
+            (
+                "the main as its only alias",
+                "aliases = [ ['deb.debian.org', ['deb.debian.org']] ]",
+            ),
+            (
+                "the main among other aliases",
+                "aliases = [ ['deb.debian.org', ['ftp.us.debian.org', 'deb.debian.org']] ]",
+            ),
+            (
+                "the main in another letter case",
+                "aliases = [ ['deb.debian.org', ['DEB.Debian.org']] ]",
+            ),
+            (
+                "an IPv6 main in another notation",
+                "aliases = [ ['[2001:db8::1]', ['[2001:db8:0::1]']] ]",
+            ),
+        ] {
+            let err = error_for(input);
+            assert!(
+                err.contains("lists itself as one of its aliases"),
                 "{case} must be rejected, got: {err}"
             );
         }

@@ -1392,6 +1392,15 @@ impl Database {
         for group in aliases {
             let main_host = group.main.to_client_host();
             for alias in &group.aliases {
+                // A main listed as its own alias would find each of its rows
+                // as both the alias row and its main, and the merge below
+                // would delete them with their origins. `Config::validate`
+                // refuses such a group; fail hard rather than lose rows if
+                // that check ever stops holding.
+                assert!(
+                    *alias != main_host,
+                    "alias group {main_host} lists itself as an alias; Config::validate must refuse it"
+                );
                 let alias_rows = query!(
                     r"SELECT id, port, path FROM mirrors_v2 WHERE host = ?;",
                     alias
@@ -1422,6 +1431,13 @@ impl Database {
                             );
                         }
                         Some(main_row) => {
+                            // Folding a row into itself deletes it; the assert
+                            // above already rules this out.
+                            assert_ne!(
+                                main_row.id, alias_row.id,
+                                "mirror row {alias}/{} would be merged into itself",
+                                alias_row.path
+                            );
                             query!(
                                 r"INSERT INTO origins (mirror_id, distribution, component, architecture, first_seen, last_seen)
                                 SELECT ?, distribution, component, architecture, first_seen, last_seen
@@ -1704,6 +1720,30 @@ mod retention_tests {
         let left = db.get_origins().await.expect("get origins");
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].mirror_path, "fresh");
+    }
+
+    /// A self-aliasing group that got past `Config::validate` stops the merge
+    /// before it touches a row: folding a row into itself would delete it
+    /// and its origins.
+    #[tokio::test]
+    #[should_panic(expected = "lists itself as an alias")]
+    async fn merge_alias_rows_refuses_a_self_alias() {
+        use crate::config::Alias;
+        let (_dir, db) = Database::temp().await;
+        let main_id = db.insert_mirror_host("deb.example.org", "debian").await;
+        db.batch_upsert_origins(&[origin(main_id, "sid")])
+            .await
+            .expect("upsert origins");
+
+        let aliases = [Alias {
+            main: ClientHost::new("deb.example.org")
+                .expect("host")
+                .into_cache_host(),
+            aliases: vec![ClientHost::new("deb.example.org").expect("host")],
+        }];
+        db.merge_alias_rows(&aliases)
+            .await
+            .expect("the assert fires before any query can fail");
     }
 
     #[tokio::test]
