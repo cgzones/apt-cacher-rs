@@ -251,13 +251,11 @@ impl PartialResume {
 /// path is left untouched on the filesystem either way.
 pub(crate) async fn prepare_partial_resume(
     ibarrier: &InitBarrier,
-    debname: &str,
-    mirror: &deb_mirror::Mirror,
     speaker: ResumeLog,
 ) -> Result<PartialResume, PartialOpenFailure> {
     let path = partial_path_for_barrier(CachePaths::global(), ibarrier);
     let quota = Some(global_cache_quota().clone());
-    prepare_partial_resume_at(path, quota, debname, mirror, speaker).await
+    prepare_partial_resume_at(path, quota, ibarrier.debname(), ibarrier.mirror(), speaker).await
 }
 
 /// Which backend's voice [`prepare_partial_resume`]'s lines take. The hyper

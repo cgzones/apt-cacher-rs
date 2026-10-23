@@ -764,13 +764,7 @@ async fn open_partial_resume(
     if conn_details.cached_flavor() != CachedFlavor::Permanent {
         return Ok(partial_file::PartialResume::volatile());
     }
-    match partial_file::prepare_partial_resume(
-        ibarrier,
-        &conn_details.debname,
-        &conn_details.mirror,
-        partial_file::ResumeLog::SpliceProxy,
-    )
-    .await
+    match partial_file::prepare_partial_resume(ibarrier, partial_file::ResumeLog::SpliceProxy).await
     {
         Ok(resume) => Ok(resume),
         Err(partial_file::PartialOpenFailure { failure, guard }) => {

@@ -50,6 +50,7 @@ use crate::{
     cache_metadata::{self, UpstreamMetadata},
     cache_paths::MirrorSite,
     cache_quota::QuotaReservation,
+    deb_mirror::Mirror,
     error::ErrorReport,
     fs_open::count_cache_failure,
     global_verify_throttle,
@@ -384,6 +385,11 @@ impl InitBarrier {
     #[must_use]
     pub(crate) fn debname(&self) -> &str {
         &self.key.debname
+    }
+
+    #[must_use]
+    pub(crate) fn mirror(&self) -> &Mirror {
+        &self.key.mirror
     }
 
     /// The raw client request path this barrier will hand to `RenamePlan`.
@@ -972,7 +978,7 @@ mod tests {
 
     fn key_on(host: &str, debname: &str) -> CacheEntryKey {
         CacheEntryKey {
-            mirror: crate::deb_mirror::Mirror::new(
+            mirror: Mirror::new(
                 ClientHost::new(host).expect("valid host"),
                 std::num::NonZero::new(80),
                 "/debian".into(),

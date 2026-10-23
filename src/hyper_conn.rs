@@ -2157,13 +2157,8 @@ async fn serve_new_file_worker(
     } = if conn_details.cached_flavor() == CachedFlavor::Permanent
         && matches!(cfstate, CacheFileStat::New)
     {
-        match partial_file::prepare_partial_resume(
-            ibarrier,
-            &conn_details.debname,
-            &conn_details.mirror,
-            partial_file::ResumeLog::Unprefixed,
-        )
-        .await
+        match partial_file::prepare_partial_resume(ibarrier, partial_file::ResumeLog::Unprefixed)
+            .await
         {
             Ok(r) => r,
             Err(partial_file::PartialOpenFailure { failure, guard }) => {
