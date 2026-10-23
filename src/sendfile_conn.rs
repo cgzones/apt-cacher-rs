@@ -78,9 +78,9 @@ use crate::{
     },
     global_config, global_webif_hosts,
     http_helpers::{
-        ConnectionAction, ConnectionVersion, WritePhase, find_header_end, leading_empty_lines,
-        write_304_response, write_416_response, write_all_to_stream, write_invalid_response,
-        write_response_headers,
+        ConnectionAction, ConnectionVersion, HeadEnd, WritePhase, capped_header_end,
+        leading_empty_lines, write_304_response, write_416_response, write_all_to_stream,
+        write_invalid_response, write_response_headers,
     },
     http_range::format_http_date,
     humanfmt::HumanFmt,
@@ -493,7 +493,8 @@ async fn write_request_error_response(
 ///
 /// Empty lines before the request line are dropped from `buf` as they
 /// arrive, so `buf` starts with the request line and the returned index is
-/// the byte count httparse consumes for it (see [`find_header_end`]): the
+/// the byte count httparse consumes for it (see
+/// [`find_header_end`](crate::http_helpers::find_header_end)): the
 /// caller's `advance` by that index then moves past the request exactly
 /// once.
 ///
@@ -509,8 +510,16 @@ async fn read_request_headers(
     use tokio::io::AsyncReadExt as _;
 
     let mut scanned = 0;
-    if let Some(next_index) = resume_header_end(buf, &mut scanned) {
-        return Ok(Some(next_index));
+    // A keep-alive connection may already hold the next request, whole.
+    match resume_header_end(buf, &mut scanned) {
+        HeadEnd::Complete(next_index) => return Ok(Some(next_index)),
+        HeadEnd::TooLarge(_) => {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                HeadersTooLarge,
+            ));
+        }
+        HeadEnd::Incomplete => {}
     }
 
     let client_idle_timeout = global_config().client_idle_timeout;
@@ -539,19 +548,21 @@ async fn read_request_headers(
                             "connection closed mid-request",
                         ));
                     }
-                    Ok(n) => {
-                        if let Some(next_index) = resume_header_end(buf, &mut scanned) {
+                    Ok(n) => match resume_header_end(buf, &mut scanned) {
+                        HeadEnd::Complete(next_index) => {
                             trace!("Read {n} bytes from client, found header end at {next_index}");
                             return Ok(Some(next_index));
                         }
-                        if buf.len() > MAX_HEADER_SIZE {
+                        HeadEnd::TooLarge(_) => {
                             return Err(std::io::Error::new(
                                 ErrorKind::InvalidInput,
                                 HeadersTooLarge,
                             ));
                         }
-                        trace!("Read {n} bytes from client, did not find header end");
-                    }
+                        HeadEnd::Incomplete => {
+                            trace!("Read {n} bytes from client, did not find header end");
+                        }
+                    },
                     Err(err) if err.kind() == ErrorKind::Interrupted => {}
                     Err(err) => return Err(err),
                 }
@@ -575,15 +586,17 @@ async fn read_request_headers(
 /// `scanned` is the length of `buf` that call found no terminator in (`0`
 /// for the first). Rescanning from the start on every read would make a
 /// client that dribbles its head one byte per segment cost time quadratic in
-/// the head size.
-fn resume_header_end(buf: &mut BytesMut, scanned: &mut usize) -> Option<usize> {
+/// the head size. The head is checked against [`MAX_HEADER_SIZE`] here, the
+/// empty lines before it not counted, so the verdict does not depend on how
+/// the head was split across reads.
+fn resume_header_end(buf: &mut BytesMut, scanned: &mut usize) -> HeadEnd {
     let skipped = leading_empty_lines(buf);
     buf.advance(skipped);
     // A terminator is up to three bytes (`LF CR LF`), so one starting in the
     // last two bytes scanned may have been cut short then.
     let from = scanned.saturating_sub(skipped).saturating_sub(2);
     *scanned = buf.len();
-    find_header_end(&buf[from..]).map(|end| from + end)
+    capped_header_end(buf, from, MAX_HEADER_SIZE)
 }
 
 /// Log a failed write of a proxy-generated response to the client, taking the
@@ -2899,7 +2912,7 @@ mod header_end_tests {
     use bytes::BytesMut;
 
     use super::resume_header_end;
-    use crate::http_helpers::{find_header_end, leading_empty_lines};
+    use crate::http_helpers::{HeadEnd, find_header_end, leading_empty_lines};
 
     #[test]
     fn a_resumed_scan_matches_a_full_scan_for_every_split() {
@@ -2922,7 +2935,10 @@ mod header_end_tests {
                 let mut found = None;
                 for piece in head.chunks(chunk) {
                     buf.extend_from_slice(piece);
-                    found = resume_header_end(&mut buf, &mut scanned);
+                    found = match resume_header_end(&mut buf, &mut scanned) {
+                        HeadEnd::Complete(end) => Some(end),
+                        HeadEnd::Incomplete | HeadEnd::TooLarge(_) => None,
+                    };
                     if found.is_some() {
                         break;
                     }

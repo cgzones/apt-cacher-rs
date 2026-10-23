@@ -35,7 +35,7 @@ use tokio::{
 
 use crate::cache_layout::ConnectionDetails;
 use crate::http_helpers::{
-    ConnectionAction, ConnectionVersion, OptHeader, find_header, find_header_end,
+    ConnectionAction, ConnectionVersion, HeadEnd, OptHeader, capped_header_end, find_header,
 };
 use crate::http_range::{ContentRange, parse_content_range};
 use crate::humanfmt::HumanFmt;
@@ -217,21 +217,24 @@ async fn read_upstream_response_headers(
         // terminator test is `find_header_end`'s, which accepts the bare-LF
         // endings httparse accepts: a CRLF-only scan would swallow an
         // LF-only upstream's body as header bytes.
+        //
+        // The cap applies to the head alone, wherever the read boundaries
+        // fall: a terminator in the read that also carries the overflow is
+        // still too large, and body bytes behind a complete head are not
+        // counted.
         let scan_from = search_offset.saturating_sub(3);
-        if let Some(rel) = find_header_end(&buf[scan_from..]) {
-            return Ok(scan_from + rel);
-        }
-        search_offset = buf.len();
-
-        if buf.len() > MAX_UPSTREAM_HEADER_SIZE {
-            // Counted here, like the parser's refusals in
-            // `send_and_read_headers`: every `HeadError::Protocol` is one
-            // `UPSTREAM_PROTOCOL_VIOLATION`, bumped where it was detected.
-            metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-            return Err(HeadError::Protocol(format!(
-                "upstream response header size of {} bytes exceeds {MAX_UPSTREAM_HEADER_SIZE} byte cap",
-                buf.len()
-            )));
+        match capped_header_end(buf, scan_from, MAX_UPSTREAM_HEADER_SIZE) {
+            HeadEnd::Complete(end) => return Ok(end),
+            HeadEnd::TooLarge(size) => {
+                // Counted here, like the parser's refusals in
+                // `send_and_read_headers`: every `HeadError::Protocol` is one
+                // `UPSTREAM_PROTOCOL_VIOLATION`, bumped where it was detected.
+                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                return Err(HeadError::Protocol(format!(
+                    "upstream response header size of {size} bytes exceeds {MAX_UPSTREAM_HEADER_SIZE} byte cap"
+                )));
+            }
+            HeadEnd::Incomplete => search_offset = buf.len(),
         }
     }
 }
@@ -347,6 +350,12 @@ impl BodyFraming {
                 Ok(forwarded)
             }
             Self::CloseDelimited => {
+                // Unlike the chunked arm, `max_bytes` caps only what follows
+                // `body_prefix`, so the relay may forward up to the prefix's
+                // length past it. Accepted: the prefix is what the head read
+                // pulled in behind the head (a few KiB, never more than one
+                // read), and the body streams through a fixed buffer, so the
+                // cap bounds how long a relay runs, not what it holds.
                 write_prefix(client_stream, body_prefix).await?;
                 let forwarded =
                     forward_upstream_body_until_eof(&mut upstream, client_stream, max_bytes)

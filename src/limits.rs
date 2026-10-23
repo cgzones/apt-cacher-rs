@@ -25,7 +25,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncRead, ReadBuf};
 use crate::nonzero;
 use crate::xz_stream::xz_decoder;
 
-/// Maximum size (bytes) of an upstream HTTP response header block.
+/// Maximum size (bytes) of an upstream HTTP response header block, and of a
+/// chunked body's trailer section. Twice the sendfile backend's request-head
+/// cap: a response head also carries what the mirror's CDN adds.
 #[cfg_attr(
     not(feature = "splice"),
     expect(
@@ -33,7 +35,7 @@ use crate::xz_stream::xz_decoder;
         reason = "splice/http.rs is the sole consumer; not compiled without splice"
     )
 )]
-pub(crate) const MAX_UPSTREAM_HEADER_SIZE: usize = 8192;
+pub(crate) const MAX_UPSTREAM_HEADER_SIZE: usize = 16 * 1024;
 
 /// Maximum number of header fields parsed from an upstream HTTP response.
 pub(crate) const MAX_UPSTREAM_HEADERS: usize = 32;

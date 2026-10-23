@@ -92,6 +92,39 @@ pub(crate) fn find_header_end(buf: &[u8]) -> Option<usize> {
     None
 }
 
+/// Where a head still being read stands against its byte cap, from
+/// [`capped_header_end`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HeadEnd {
+    /// The head ends at this index, within the cap; what follows is body or a
+    /// pipelined request.
+    Complete(usize),
+    /// No terminator yet, and the bytes so far still fit the cap.
+    Incomplete,
+    /// The head is longer than the cap: this many bytes, or at least this
+    /// many while its terminator has not arrived.
+    TooLarge(usize),
+}
+
+/// [`find_header_end`] over `buf[from..]` (`from` skips bytes an earlier call
+/// on the same head already scanned), then the head checked against `cap`.
+///
+/// The verdict depends on the head alone, never on how its bytes were split
+/// across reads: a terminator arriving in the read that also carries the
+/// overflow is still too large, and a complete head within the cap is
+/// accepted with any number of bytes behind it. Without a terminator, a
+/// buffer past the cap is refused at once: a head that fits would have ended
+/// within the bytes already scanned.
+#[must_use]
+pub(crate) fn capped_header_end(buf: &[u8], from: usize, cap: usize) -> HeadEnd {
+    match find_header_end(&buf[from..]) {
+        Some(rel) if from + rel <= cap => HeadEnd::Complete(from + rel),
+        Some(rel) => HeadEnd::TooLarge(from + rel),
+        None if buf.len() > cap => HeadEnd::TooLarge(buf.len()),
+        None => HeadEnd::Incomplete,
+    }
+}
+
 /// The length of the complete empty lines (`CRLF` or a bare `LF`) at the
 /// start of `buf`, which a server ignores before a request line (RFC 9112
 /// §2.2) -- as httparse does, any number of them. A trailing lone `CR` is not
@@ -367,6 +400,53 @@ mod tests {
             find_header_end(b"GET /a HTTP/1.1\nHost: x\n\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n"),
             Some(25)
         );
+    }
+
+    /// A head of exactly `cap` bytes is accepted and one of `cap + 1` refused,
+    /// with a body (or pipelined request) behind it or not, however the
+    /// bytes are split across reads.
+    #[test]
+    fn capped_header_end_is_independent_of_read_boundaries() {
+        const CAP: usize = 64;
+        let head = |len: usize| {
+            let preamble = b"GET / HTTP/1.1\r\nX: \r\n\r\n".len();
+            let mut head = b"GET / HTTP/1.1\r\nX: ".to_vec();
+            head.extend(std::iter::repeat_n(b'a', len - preamble));
+            head.extend_from_slice(b"\r\n\r\n");
+            assert_eq!(head.len(), len);
+            head
+        };
+        for (len, fits) in [(CAP, true), (CAP + 1, false)] {
+            for tail in [&b""[..], b"body", b"GET /next HTTP/1.1\r\n\r\n"] {
+                let mut input = head(len);
+                input.extend_from_slice(tail);
+                for chunk in 1..=input.len() {
+                    let mut buf = Vec::new();
+                    let mut from = 0;
+                    let mut verdict = HeadEnd::Incomplete;
+                    for piece in input.chunks(chunk) {
+                        buf.extend_from_slice(piece);
+                        verdict = capped_header_end(&buf, from, CAP);
+                        if verdict != HeadEnd::Incomplete {
+                            break;
+                        }
+                        // A terminator is up to three bytes long.
+                        from = buf.len().saturating_sub(2);
+                    }
+                    // Without its terminator, an overlong head is refused as
+                    // soon as the buffer passes the cap, at its length so far.
+                    let ok = if fits {
+                        verdict == HeadEnd::Complete(CAP)
+                    } else {
+                        matches!(verdict, HeadEnd::TooLarge(seen) if seen > CAP)
+                    };
+                    assert!(
+                        ok,
+                        "len {len}, tail {tail:?}, chunks of {chunk}: {verdict:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
