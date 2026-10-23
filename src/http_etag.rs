@@ -1,4 +1,8 @@
-use std::{borrow::Cow, iter::FusedIterator, sync::atomic::AtomicBool};
+use std::{
+    borrow::Cow,
+    iter::FusedIterator,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use crate::{sticky, xattr_helpers::XattrValue};
 
@@ -61,7 +65,7 @@ pub(crate) fn is_valid_etag(s: &str) -> bool {
 /// Constructed only by [`XattrValue::parse`], so a stored or written value is
 /// always well-formed per RFC 9110 §8.8.3.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ETag(String);
+pub(crate) struct ETag(Arc<str>);
 
 impl ETag {
     /// Whether the tag is strong (no `W/` weak indicator, RFC 9110 §8.8.1):
@@ -72,7 +76,7 @@ impl ETag {
         !etag.starts_with("W/")
     }
 
-    pub(crate) fn into_string(self) -> String {
+    pub(crate) fn into_shared(self) -> Arc<str> {
         let Self(etag) = self;
         etag
     }
@@ -90,7 +94,7 @@ impl XattrValue for ETag {
     }
 
     fn parse(raw: &str) -> Option<Self> {
-        is_valid_etag(raw).then(|| Self(raw.to_owned()))
+        is_valid_etag(raw).then(|| Self(Arc::from(raw)))
     }
 
     fn render(&self) -> Cow<'_, str> {
@@ -377,7 +381,7 @@ mod tests {
     fn etag_parse_and_render() {
         let strong = ETag::parse("\"abc\"").expect("strong ETag");
         assert_eq!(strong.render(), "\"abc\"");
-        assert_eq!(strong.into_string(), "\"abc\"");
+        assert_eq!(strong.into_shared().as_ref(), "\"abc\"");
         let weak = ETag::parse("W/\"abc\"").expect("weak ETag");
         assert_eq!(weak.render(), "W/\"abc\"");
         assert!(ETag::parse("abc").is_none());

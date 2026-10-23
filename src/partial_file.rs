@@ -19,7 +19,6 @@ use std::{
     fmt,
     ops::Deref,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use rand::{
@@ -322,12 +321,11 @@ async fn prepare_partial_resume_at(
             if let Some(if_range) =
                 xattr_helpers::read::<ETag>(&file, &guard).filter(ETag::is_strong)
             {
-                let if_range = if_range.into_string();
+                let if_range = if_range.into_shared();
                 let last_modified = xattr_helpers::read::<LastModified>(&file, &guard)
-                    .map(LastModified::into_parts)
-                    .map(|(raw, time)| (Arc::from(raw), time));
+                    .map(LastModified::into_parts);
                 let stored = UpstreamMetadata {
-                    etag: Some(Arc::from(if_range)),
+                    etag: Some(if_range),
                     last_modified,
                 };
                 let expected_total =

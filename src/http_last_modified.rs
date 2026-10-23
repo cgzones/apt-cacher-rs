@@ -1,4 +1,7 @@
-use std::{borrow::Cow, sync::atomic::AtomicBool};
+use std::{
+    borrow::Cow,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use crate::{http_range::HttpDate, xattr_helpers::XattrValue};
 
@@ -20,12 +23,12 @@ pub(crate) fn is_valid_http_date(s: &str) -> bool {
 /// Constructed only by [`XattrValue::parse`], so it is always an IMF-fixdate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LastModified {
-    raw: String,
+    raw: Arc<str>,
     time: HttpDate,
 }
 
 impl LastModified {
-    pub(crate) fn into_parts(self) -> (String, HttpDate) {
+    pub(crate) fn into_parts(self) -> (Arc<str>, HttpDate) {
         let Self { raw, time } = self;
         (raw, time)
     }
@@ -44,7 +47,7 @@ impl XattrValue for LastModified {
 
     fn parse(raw: &str) -> Option<Self> {
         HttpDate::parse(raw).map(|time| Self {
-            raw: raw.to_owned(),
+            raw: Arc::from(raw),
             time,
         })
     }
@@ -84,7 +87,7 @@ mod tests {
         let parsed = LastModified::parse(value).expect("IMF-fixdate");
         assert_eq!(parsed.render(), value);
         let (raw, time) = parsed.into_parts();
-        assert_eq!(raw, value);
+        assert_eq!(raw.as_ref(), value);
         assert_eq!(time, HttpDate::from_secs(12_345_678_909));
         assert!(LastModified::parse("garbage").is_none());
         assert!(LastModified::parse("").is_none());

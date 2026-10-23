@@ -521,13 +521,8 @@ impl CacheMetadataStore {
         // If either read errors, surface a best-effort `Arc` containing
         // whichever fields succeeded for this request but do not insert —
         // see the "Negative caching and transient errors" module docs.
-        let etag_res = etag_res.map(|o| o.map(|etag| Arc::from(etag.into_string())));
-        let last_modified_res = last_modified_res.map(|o| {
-            o.map(|lm| {
-                let (raw, time) = lm.into_parts();
-                (Arc::from(raw), time)
-            })
-        });
+        let etag_res = etag_res.map(|o| o.map(ETag::into_shared));
+        let last_modified_res = last_modified_res.map(|o| o.map(LastModified::into_parts));
         let (etag, last_modified) = match (etag_res, last_modified_res) {
             (Ok(etag), Ok(last_modified)) => (etag, last_modified),
             (etag_res, last_modified_res) => {
