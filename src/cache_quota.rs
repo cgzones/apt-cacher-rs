@@ -1732,7 +1732,7 @@ mod tests {
     /// would strand one more blocking thread every few seconds, nor wait for
     /// one: they go on with the previous sample until the hung probe
     /// returns, and its sample then lands.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_hung_disk_probe_is_never_doubled() {
         let quota = CacheQuota::with_disk_headroom(
             0,
