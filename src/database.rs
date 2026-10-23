@@ -185,6 +185,9 @@ pub(crate) struct MirrorStatEntry {
     /// Raw port from database. `0` means no explicit port; use `port()` to get `Option<NonZero<u16>>`.
     port: u16,
     pub(crate) path: String,
+    /// Raw `mirrors_v2.kind` (INTEGER) value; decoded on demand by
+    /// [`decode_mirror_kind`].
+    kind: i64,
     pub(crate) first_seen: i64,
     pub(crate) last_seen: i64,
     pub(crate) last_cleanup: i64,
@@ -198,6 +201,13 @@ impl MirrorStatEntry {
     #[must_use]
     pub(crate) const fn port(&self) -> Option<NonZero<u16>> {
         NonZero::new(self.port)
+    }
+
+    /// Which layouts the mirror owns on disk: a `Flat` row has no structured
+    /// tree (see `MirrorEntry::kind`).
+    #[must_use]
+    pub(crate) fn kind(&self) -> MirrorKind {
+        decode_mirror_kind(self.kind, &self.path)
     }
 
     #[must_use]
@@ -658,6 +668,7 @@ impl Database {
                 mirrors_v2.host AS "host: ClientHost",
                 mirrors_v2.port AS "port: u16",
                 mirrors_v2.path,
+                mirrors_v2.kind AS "kind!: i64",
                 mirrors_v2.first_seen,
                 mirrors_v2.last_seen,
                 mirrors_v2.last_cleanup,

@@ -12,7 +12,9 @@
 //!   concurrent removal, not an I/O failure: `debug!`, no counter.
 //! - A symlink / FIFO / socket / device is reported on sight (at the walk's
 //!   [`AnomalyLevel`] + `CACHE_NON_REGULAR`) and still handed to the caller
-//!   as [`EntryKind::NonRegular`] so cleanup can unlink it.
+//!   as [`EntryKind::NonRegular`] so cleanup can unlink it. The root is
+//!   opened by path, so a walk whose root could be reached through one opts
+//!   into [`Walker::confined_to`], which reports it the same way.
 //! - A directory or regular file is *classified* by the caller: what is a
 //!   stray entry depends on where the walk is (a `dists/` directory is fine
 //!   in a mirror root, not in a pool).  The caller reports one via
@@ -270,6 +272,8 @@ pub(crate) struct Walker<T> {
     missing: OnMissing,
     /// Set by [`Walker::stat_files`].
     stat_files: bool,
+    /// Set by [`Walker::confined_to`].
+    confined_to: Option<PathBuf>,
     pending: Vec<Frame<T>>,
     current: Option<Open<T>>,
     yielded: Option<Yielded>,
@@ -297,6 +301,7 @@ impl<T: Copy + Send> Walker<T> {
             ctx,
             missing,
             stat_files: false,
+            confined_to: None,
             pending: vec![Frame {
                 path: root.to_path_buf(),
                 rel: PathBuf::new(),
@@ -319,6 +324,24 @@ impl<T: Copy + Send> Walker<T> {
     #[must_use]
     pub(crate) const fn stat_files(mut self) -> Self {
         self.stat_files = true;
+        self
+    }
+
+    /// Refuse a root reached from `base` through anything but directories.
+    ///
+    /// The walker never follows a symlink it lists, but the root itself is
+    /// opened by path, so a symlink at it or at any component between `base`
+    /// and it would be followed: two walks rooted at different paths could
+    /// then read the same directory, or one outside the cache. With this
+    /// set, a symlink / FIFO / socket / device among those components is
+    /// reported like a listed one (`CACHE_NON_REGULAR`, the walk's anomaly
+    /// line naming the component) and the walk yields nothing. The `lstat`s
+    /// run in the root's listing hop; they narrow a concurrent swap to the
+    /// window before its `opendir` without closing it. `root` must lie below
+    /// `base`, which the caller trusts (the cache root, a host directory).
+    #[must_use]
+    pub(crate) fn confined_to(mut self, base: &Path) -> Self {
+        self.confined_to = Some(base.to_path_buf());
         self
     }
 
@@ -441,13 +464,22 @@ impl<T: Copy + Send> Walker<T> {
         let is_root = frame.rel.as_os_str().is_empty();
         let path = frame.path.clone();
         let stat_files = self.stat_files;
+        let confined_to = self.confined_to.take().filter(|_| is_root);
         let opened = tokio::task::spawn_blocking(move || {
-            std::fs::read_dir(path).map(|reader| Batch::read(reader, stat_files))
+            if let Some(base) = confined_to
+                && let Some(refused) = non_regular_component(&base, &path)?
+            {
+                return Ok(Err(refused));
+            }
+            std::fs::read_dir(path).map(|reader| Ok(Batch::read(reader, stat_files)))
         })
         .await
         .unwrap_or_else(|err| Err(io::Error::other(err)));
         match opened {
-            Ok(batch) => self.current = Some(Open { frame, batch }),
+            Ok(Ok(batch)) => self.current = Some(Open { frame, batch }),
+            Ok(Err((component, file_type))) => {
+                report_non_regular(self.ctx, &component, file_type);
+            }
             Err(err) if err.kind() == ErrorKind::NotFound && is_root => match self.missing {
                 OnMissing::Tolerate => self.root_missing = true,
                 OnMissing::Fail => self.dir_failed("read", &frame.path, err),
@@ -480,6 +512,62 @@ impl<T: Copy + Send> Walker<T> {
     }
 }
 
+/// The one report of a symlink / FIFO / socket / device met by a walk:
+/// `CACHE_NON_REGULAR` and the walk's anomaly line.
+fn report_non_regular(ctx: &'static WalkContext, path: &Path, ft: FileType) {
+    metrics::CACHE_NON_REGULAR.increment();
+    let kind = if ft.is_symlink() {
+        "symlink"
+    } else {
+        "non-regular"
+    };
+    match ctx.anomalies {
+        AnomalyLevel::Warn => warn!(
+            "Unrecognized {kind} entry `{}` in {}; {}",
+            path.display(),
+            ctx.what,
+            ctx.non_regular
+        ),
+        AnomalyLevel::Debug => debug!(
+            "Unrecognized {kind} entry `{}` in {}; {}",
+            path.display(),
+            ctx.what,
+            ctx.non_regular
+        ),
+    }
+}
+
+/// The first component of `root` below `base` that is neither a directory
+/// nor a regular file, with its type: `None` when every one is a directory
+/// (or the chain ends early, at a missing component or a regular file, which
+/// the root's `read_dir` then reports as it would without the check).
+/// Blocking.
+fn non_regular_component(base: &Path, root: &Path) -> io::Result<Option<(PathBuf, FileType)>> {
+    debug_assert!(
+        root.starts_with(base),
+        "`{}` is not below `{}`",
+        root.display(),
+        base.display()
+    );
+    let Ok(below) = root.strip_prefix(base) else {
+        return Ok(None);
+    };
+    let mut path = base.to_path_buf();
+    for component in below.components() {
+        path.push(component);
+        let file_type = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta.file_type(),
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        if file_type.is_dir() {
+            continue;
+        }
+        return Ok((!file_type.is_file()).then_some((path, file_type)));
+    }
+    Ok(None)
+}
+
 /// Classify one listed entry of directory `dir`, reporting a non-regular
 /// one on sight.  `None` means the entry dropped out of the walk (vanished,
 /// or its type could not be read - logged and counted here, and in
@@ -495,27 +583,7 @@ fn classify(
         Ok(ft) if ft.is_file() => Some(EntryKind::File),
         Ok(ft) if ft.is_dir() => Some(EntryKind::Dir),
         Ok(ft) => {
-            metrics::CACHE_NON_REGULAR.increment();
-            let kind = if ft.is_symlink() {
-                "symlink"
-            } else {
-                "non-regular"
-            };
-            let path = dir.join(name);
-            match ctx.anomalies {
-                AnomalyLevel::Warn => warn!(
-                    "Unrecognized {kind} entry `{}` in {}; {}",
-                    path.display(),
-                    ctx.what,
-                    ctx.non_regular
-                ),
-                AnomalyLevel::Debug => debug!(
-                    "Unrecognized {kind} entry `{}` in {}; {}",
-                    path.display(),
-                    ctx.what,
-                    ctx.non_regular
-                ),
-            }
+            report_non_regular(ctx, &dir.join(name), ft);
             Some(EntryKind::NonRegular)
         }
         Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -747,6 +815,51 @@ mod tests {
         }
         events.sort_unstable();
         (events, walker.finish())
+    }
+
+    /// Every entry of a walk rooted at `root` confined to `base`.
+    async fn confined_names(base: &Path, root: &Path) -> (Vec<PathBuf>, WalkOutcome) {
+        let mut names = Vec::new();
+        let mut walker = Walker::new(root, &CONTINUE, OnMissing::Tolerate, ()).confined_to(base);
+        while let Some(entry) = walker.next().await {
+            names.push(entry.rel_path());
+        }
+        (names, walker.finish())
+    }
+
+    /// A confined walk refuses a root reached through a symlink, at the root
+    /// itself or at any component below its base, and counts it as a
+    /// non-regular entry; a real tree, a missing root and a symlink above
+    /// the base (the base is trusted) walk as without the confinement.
+    #[tokio::test]
+    async fn a_confined_walk_refuses_a_root_reached_through_a_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("host");
+        std::fs::create_dir_all(base.join("real/sub")).expect("mkdir");
+        std::fs::write(base.join("real/sub/f"), b"x").expect("f");
+        std::os::unix::fs::symlink(base.join("real"), base.join("alias")).expect("symlink");
+        std::os::unix::fs::symlink(base.join("real/sub"), base.join("leaf")).expect("symlink");
+
+        let (names, outcome) = confined_names(&base, &base.join("real/sub")).await;
+        assert_eq!(names, [PathBuf::from("f")]);
+        assert!(matches!(outcome, WalkOutcome::Complete), "{outcome:?}");
+
+        for refused in ["alias/sub", "leaf"] {
+            let before = metrics::CACHE_NON_REGULAR.get();
+            let (names, outcome) = confined_names(&base, &base.join(refused)).await;
+            assert!(names.is_empty(), "{refused}: {names:?}");
+            assert!(matches!(outcome, WalkOutcome::Complete), "{outcome:?}");
+            assert_eq!(metrics::CACHE_NON_REGULAR.get(), before + 1, "{refused}");
+        }
+
+        let (names, outcome) = confined_names(&base, &base.join("missing/sub")).await;
+        assert_eq!(names, [] as [PathBuf; 0]);
+        assert!(matches!(outcome, WalkOutcome::RootMissing), "{outcome:?}");
+
+        let trusted = dir.path().join("trusted");
+        std::os::unix::fs::symlink(&base, &trusted).expect("symlink");
+        let (names, _) = confined_names(&trusted, &trusted.join("real/sub")).await;
+        assert_eq!(names, [PathBuf::from("f")]);
     }
 
     #[tokio::test]

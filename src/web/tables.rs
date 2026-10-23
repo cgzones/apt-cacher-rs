@@ -1,9 +1,11 @@
 //! The dashboard's row tables (Mirrors, Origins, Clients, Top Packages,
-//! Uncacheables), each returned as a [`Section`], plus the cached per-mirror
-//! directory walk that feeds the Mirrors table.
+//! Uncacheables), each returned as a [`Section`], plus the cache of the
+//! per-mirror directory walks (`footprint`) that feed the Mirrors table.
 
 use std::{
     cmp::Reverse,
+    ffi::OsStr,
+    fs::Metadata,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
     time::SystemTime,
@@ -14,8 +16,7 @@ use hashbrown::HashMap;
 use tracing::error;
 
 use crate::{
-    cache_paths::{CachePaths, SUBDIR_FLAT_BYHASH},
-    cache_walk::{AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkContext, Walker},
+    cache_paths::CachePaths,
     client_trouble::ClientTrouble,
     config::{ClientHost, Config},
     database::{ClientStatEntry, MirrorStatEntry, OriginEntry, TopPackageEntry},
@@ -33,6 +34,7 @@ use crate::{
 
 use super::{
     fmt::{Count, FmtLastSeenHealth, Freshness, HtmlEscape, Level, Nonzero, RelTime, as_size},
+    footprint::{Footprint, plan_footprints, walk_footprint},
     table::{Table, tr, when, write_section_error},
 };
 
@@ -59,11 +61,17 @@ impl Section {
 /// TTL for cached per-mirror directory-scan results.
 const DIR_STATS_TTL_SECS: u64 = 60;
 
+/// Idle time after which a `DIR_STATS_CACHE` slot no load asked for is
+/// dropped: a row that went away (cleanup removed it, an alias folded it)
+/// stops being asked for, while a slot any load just used is never evicted,
+/// however stale that load's mirror list.
+const DIR_STATS_IDLE_SECS: u64 = 2 * DIR_STATS_TTL_SECS;
+
 /// Maximum number of mirror directory walks running concurrently when the
 /// `DIR_STATS_CACHE` is cold. Bounds disk fan-out and FD usage.
 const DIR_SCAN_CONCURRENCY: usize = 8;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(super) struct DirStats {
     pub(super) size: u64,
     pub(super) byhash_files: usize,
@@ -82,6 +90,26 @@ pub(super) struct DirStats {
 impl DirStats {
     fn files(self) -> usize {
         self.deb_files + self.metadata_files
+    }
+
+    /// Count one regular file named `name`, found under a `by-hash/` leaf
+    /// or not.
+    pub(super) fn add_file(&mut self, name: &OsStr, metadata: &Metadata, in_byhash: bool) {
+        let len = metadata.len();
+        self.size += len;
+        self.max_file_size = self.max_file_size.max(len);
+        if in_byhash {
+            self.byhash_files += 1;
+        }
+        if name.to_str().is_some_and(is_deb_package) {
+            self.deb_files += 1;
+        } else {
+            self.metadata_files += 1;
+        }
+        if let Ok(mtime) = metadata.modified() {
+            self.oldest_mtime = merge_min(self.oldest_mtime, Some(mtime));
+            self.newest_mtime = merge_max(self.newest_mtime, Some(mtime));
+        }
     }
 
     fn merge(&mut self, other: Self) {
@@ -113,41 +141,62 @@ fn merge_max(a: Option<SystemTime>, b: Option<SystemTime>) -> Option<SystemTime>
     a.into_iter().chain(b).max()
 }
 
-/// One mirror directory's cached walk result. The async lock is held for the
-/// whole refresh, so concurrent dashboard loads that find the entry stale wait
-/// for the one walk in flight and read its result instead of each walking
-/// the tree again.
-type DirStatsSlot = Arc<tokio::sync::Mutex<Option<(Instant, DirStats)>>>;
+/// One row's cached walk result, with the footprint it was computed from.
+#[derive(Clone)]
+struct CachedStats {
+    at: Instant,
+    footprint: Footprint,
+    stats: DirStats,
+}
 
-type DirStatsCache = parking_lot::Mutex<HashMap<PathBuf, DirStatsSlot>>;
+/// One row's slot. The async lock is held for the whole refresh, so
+/// concurrent dashboard loads that find the entry stale wait for the one
+/// walk in flight and read its result instead of each walking the tree
+/// again.
+type DirStatsSlot = Arc<tokio::sync::Mutex<Option<CachedStats>>>;
+
+/// A slot and when a load last asked for it (see [`DIR_STATS_IDLE_SECS`]).
+struct SlotEntry {
+    slot: DirStatsSlot,
+    used: Instant,
+}
+
+/// Keyed by the row's mirror directory, which names one `(host, port,
+/// path)` whatever its kind.
+type DirStatsCache = parking_lot::Mutex<HashMap<PathBuf, SlotEntry>>;
 
 static DIR_STATS_CACHE: LazyLock<DirStatsCache> =
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
-async fn cached_mirror_directory_size(path: &Path) -> DirStats {
-    cached_dir_stats(
-        path,
-        |path| async move { mirror_directory_size(&path).await },
-    )
+async fn cached_footprint_stats(key: &Path, footprint: Footprint) -> DirStats {
+    cached_dir_stats(key, footprint, |footprint| async move {
+        walk_footprint(&footprint).await
+    })
     .await
 }
 
-/// The slot's result while it is younger than [`DIR_STATS_TTL_SECS`].
-fn fresh_dir_stats(cached: Option<(Instant, DirStats)>) -> Option<DirStats> {
+/// The slot's result while it is younger than [`DIR_STATS_TTL_SECS`] and was
+/// computed from `footprint`. The footprint check is what keeps a fresh
+/// result from being summed with a stale one that still counts its files:
+/// a row that gains a nested mirror changes footprint, and so does one whose
+/// directory a refresh for an older mirror list published.
+fn fresh_dir_stats(cached: Option<&CachedStats>, footprint: &Footprint) -> Option<DirStats> {
     cached
-        .filter(|(ts, _)| ts.elapsed().as_secs() < DIR_STATS_TTL_SECS)
-        .map(|(_, stats)| stats)
+        .filter(|c| c.at.elapsed().as_secs() < DIR_STATS_TTL_SECS && c.footprint == *footprint)
+        .map(|c| c.stats)
 }
 
-/// [`cached_mirror_directory_size`] with the walk passed in, so the
-/// single-flight refresh is testable without a mirror tree.
+/// [`cached_footprint_stats`] with the walk passed in, so the single-flight
+/// refresh is testable without a mirror tree.
 ///
 /// A refresh runs as its own task holding the slot, so a dashboard load
 /// cancelled mid-walk (the browser went away) does not throw the walk away:
-/// it completes and publishes, and the next load reads its result.
+/// it completes and publishes, and the next load with the same footprint
+/// reads its result.
 async fn cached_dir_stats<F>(
-    path: &Path,
-    walk: impl FnOnce(PathBuf) -> F + Send + 'static,
+    key: &Path,
+    footprint: Footprint,
+    walk: impl FnOnce(Footprint) -> F + Send + 'static,
 ) -> DirStats
 where
     F: Future<Output = DirStats> + Send + 'static,
@@ -157,21 +206,34 @@ where
     // await is a deadlock waiting for someone to extend the body.
     // `entry_ref` looks up by the borrowed `&Path`; only a first visit
     // materialises the owned `PathBuf` key.
-    let slot = Arc::clone(DIR_STATS_CACHE.lock().entry_ref(path).or_default());
+    let slot = {
+        let mut cache = DIR_STATS_CACHE.lock();
+        let entry = cache.entry_ref(key).or_insert_with(|| SlotEntry {
+            slot: DirStatsSlot::default(),
+            used: Instant::now(),
+        });
+        entry.used = Instant::now();
+        let slot = Arc::clone(&entry.slot);
+        drop(cache);
+        slot
+    };
     // Waits for a refresh in flight, which holds the lock.
-    let cached = *slot.lock().await;
-    if let Some(stats) = fresh_dir_stats(cached) {
+    let fresh = fresh_dir_stats(slot.lock().await.as_ref(), &footprint);
+    if let Some(stats) = fresh {
         return stats;
     }
-    let owned = path.to_path_buf();
     let refresh = tokio::spawn(async move {
         let mut cached = slot.lock_owned().await;
         // Another load may have refreshed the slot since the check above.
-        if let Some(stats) = fresh_dir_stats(*cached) {
+        if let Some(stats) = fresh_dir_stats(cached.as_ref(), &footprint) {
             return stats;
         }
-        let stats = walk(owned).await;
-        *cached = Some((Instant::now(), stats));
+        let stats = walk(footprint.clone()).await;
+        *cached = Some(CachedStats {
+            at: Instant::now(),
+            footprint,
+            stats,
+        });
         stats
     });
     match refresh.await {
@@ -179,7 +241,7 @@ where
         Err(err) => {
             error!(
                 "Failed to walk mirror directory `{}` for the dashboard; reporting it as empty:  {}",
-                path.display(),
+                key.display(),
                 ErrorReport(&err)
             );
             DirStats::default()
@@ -187,61 +249,14 @@ where
     }
 }
 
-static DASHBOARD_WALK: WalkContext = WalkContext {
-    what: "a mirror directory",
-    dir_failure: DirFailure::Continue("excluding its unread entries from the reported cache size"),
-    entry_failure: "excluding it from the reported cache size",
-    non_regular: "excluding it from the reported cache size",
-    anomalies: AnomalyLevel::Debug,
-};
-
-/// Tally every regular file below `path` for the dashboard's Mirrors table.
-///
-/// Unlike the startup scan this walk knows nothing about the layout: every
-/// directory is descended into (`tmp/` and nested mirrors included), and
-/// every regular file counts.  The walker's tag remembers whether the
-/// directory sits under a `by-hash/` subtree.  Failures (a stat failure, an
-/// unreadable subdirectory) are logged and counted by the walker like
-/// everywhere else and the walk carries on, so one bad entry no longer drops
-/// the whole mirror from the table.  A symlink or other non-regular entry is
-/// counted but logged at `debug` only ([`AnomalyLevel::Debug`]): a viewer's
-/// refresh re-runs this walk, and the startup scan and cleanup already warn
-/// about the same entry.
-async fn mirror_directory_size(path: &Path) -> DirStats {
-    let mut stats = DirStats::default();
-    let mut walker = Walker::new(path, &DASHBOARD_WALK, OnMissing::Tolerate, false).stat_files();
-
-    while let Some(mut entry) = walker.next().await {
-        match entry.kind() {
-            EntryKind::NonRegular => {}
-            EntryKind::File => {
-                let Some(mdata) = entry.metadata().await else {
-                    continue;
-                };
-                let len = mdata.len();
-                stats.size += len;
-                stats.max_file_size = stats.max_file_size.max(len);
-                if entry.tag() {
-                    stats.byhash_files += 1;
-                }
-                if entry.name().to_str().is_some_and(is_deb_package) {
-                    stats.deb_files += 1;
-                } else {
-                    stats.metadata_files += 1;
-                }
-                if let Ok(mtime) = mdata.modified() {
-                    stats.oldest_mtime = merge_min(stats.oldest_mtime, Some(mtime));
-                    stats.newest_mtime = merge_max(stats.newest_mtime, Some(mtime));
-                }
-            }
-            EntryKind::Dir => {
-                let in_byhash = entry.tag() || entry.name() == SUBDIR_FLAT_BYHASH;
-                entry.descend(in_byhash);
-            }
-        }
-    }
-
-    stats
+/// Drop the slots no load asked for within [`DIR_STATS_IDLE_SECS`], unless a
+/// refresh still holds one. Keeps `DIR_STATS_CACHE` from growing unbounded
+/// as mirrors come and go, without letting a load working from an older
+/// mirror list evict a slot a newer one just created.
+fn evict_idle_dir_stats() {
+    DIR_STATS_CACHE.lock().retain(|_, entry| {
+        entry.used.elapsed().as_secs() < DIR_STATS_IDLE_SECS || Arc::strong_count(&entry.slot) > 1
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -681,36 +696,43 @@ pub(super) async fn build_mirror_table(
     let mut sorted: Vec<&MirrorStatEntry> = mirrors.iter().collect();
     sorted.sort_unstable_by_key(|m| Reverse(m.last_seen));
 
+    // Every row's directories at once: which a row owns depends on every
+    // other row of its host (`footprint`).
     let paths = CachePaths::new(&config.cache_directory);
-    let mirror_paths: Vec<PathBuf> = sorted
+    let rows: Vec<_> = sorted
         .iter()
-        .map(|mirror| paths.mirror_dir(mirror.site()))
+        .map(|mirror| (mirror.site(), mirror.kind()))
+        .collect();
+    let footprints = plan_footprints(&rows, paths);
+    let keys: Vec<PathBuf> = rows
+        .iter()
+        .map(|(site, _)| paths.mirror_dir(*site))
         .collect();
 
     // Bound disk fan-out: cold-cache rebuilds otherwise spawn one concurrent
-    // recursive walk per known mirror. We process in fixed-size chunks so
-    // (a) at most `DIR_SCAN_CONCURRENCY` walks run at once and (b) the
-    // collected order matches `mirror_paths` (and therefore `sorted`).
-    let mut dir_stats: Vec<DirStats> = Vec::with_capacity(mirror_paths.len());
-    for chunk in mirror_paths.chunks(DIR_SCAN_CONCURRENCY) {
+    // walk per known mirror. We process in fixed-size chunks so (a) at most
+    // `DIR_SCAN_CONCURRENCY` walks run at once and (b) the collected order
+    // matches `footprints` (and therefore `sorted`).
+    let mut dir_stats: Vec<DirStats> = Vec::with_capacity(footprints.len());
+    for chunk in keys
+        .iter()
+        .zip(&footprints)
+        .collect::<Vec<_>>()
+        .chunks(DIR_SCAN_CONCURRENCY)
+    {
         let chunk_stats = futures_util::future::join_all(
             chunk
                 .iter()
-                .map(|mirror_path| cached_mirror_directory_size(mirror_path)),
+                .map(|(key, footprint)| cached_footprint_stats(key, (*footprint).clone())),
         )
         .await;
         dir_stats.extend(chunk_stats);
     }
-
-    // Drop cache entries for paths no longer attached to any known mirror.
-    // Keeps `DIR_STATS_CACHE` from growing unbounded as mirrors come and go.
-    {
-        let mut cache = DIR_STATS_CACHE.lock();
-        cache.retain(|k, _| mirror_paths.iter().any(|p| p == k));
-    }
+    evict_idle_dir_stats();
 
     // Complete before the first row is rendered: the Disk Space cell shows
-    // each mirror's share of `aggregate.size`.
+    // each mirror's share of `aggregate.size`. The rows' footprints are
+    // disjoint, so the sum counts every file once.
     let mut aggregate = DirStats::default();
     for stats in &dir_stats {
         aggregate.merge(*stats);
@@ -1174,10 +1196,11 @@ mod tests {
     /// Counts its calls; each takes 50 ms and reports seven files.
     fn counted_walk(
         walks: &Arc<std::sync::atomic::AtomicUsize>,
-    ) -> impl FnOnce(PathBuf) -> std::pin::Pin<Box<dyn Future<Output = DirStats> + Send>> + Send + 'static
-    {
+    ) -> impl FnOnce(Footprint) -> std::pin::Pin<Box<dyn Future<Output = DirStats> + Send>>
+    + Send
+    + 'static {
         let walks = Arc::clone(walks);
-        move |_path| {
+        move |_footprint| {
             Box::pin(async move {
                 walks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1198,7 +1221,10 @@ mod tests {
         let dir = Path::new("concurrent_refreshes_of_one_directory_walk_it_once");
         let walks = Arc::new(AtomicUsize::new(0));
         let results = futures_util::future::join_all(
-            std::iter::repeat_with(|| cached_dir_stats(dir, counted_walk(&walks))).take(5),
+            std::iter::repeat_with(|| {
+                cached_dir_stats(dir, Footprint::default(), counted_walk(&walks))
+            })
+            .take(5),
         )
         .await;
         assert!(results.iter().all(|stats| stats.files() == 7));
@@ -1217,15 +1243,19 @@ mod tests {
         let (started_tx, mut started) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
         let walk_count = Arc::clone(&walks);
-        let mut load = Box::pin(cached_dir_stats(dir, move |_path| async move {
-            walk_count.fetch_add(1, Ordering::SeqCst);
-            started_tx.send(()).expect("caller waits for the walk");
-            released.await.expect("test releases the walk");
-            DirStats {
-                deb_files: 7,
-                ..DirStats::default()
-            }
-        }));
+        let mut load = Box::pin(cached_dir_stats(
+            dir,
+            Footprint::default(),
+            move |_| async move {
+                walk_count.fetch_add(1, Ordering::SeqCst);
+                started_tx.send(()).expect("caller waits for the walk");
+                released.await.expect("test releases the walk");
+                DirStats {
+                    deb_files: 7,
+                    ..DirStats::default()
+                }
+            },
+        ));
         std::future::poll_fn(|cx| {
             assert!(load.as_mut().poll(cx).is_pending());
             std::pin::Pin::new(&mut started).poll(cx)
@@ -1236,7 +1266,7 @@ mod tests {
         release
             .send(())
             .expect("cancelled caller left the walk alive");
-        let stats = cached_dir_stats(dir, counted_walk(&walks)).await;
+        let stats = cached_dir_stats(dir, Footprint::default(), counted_walk(&walks)).await;
         assert_eq!(stats.files(), 7);
         assert_eq!(
             walks.load(Ordering::SeqCst),
@@ -1244,6 +1274,93 @@ mod tests {
             "the cancelled walk was kept"
         );
         DIR_STATS_CACHE.lock().remove(dir);
+    }
+
+    /// A row whose footprint changed (it gained a nested mirror, a legacy
+    /// row took a directory) is walked again although its result is young;
+    /// the same footprint is served from the cache.
+    #[tokio::test(start_paused = true)]
+    async fn a_changed_footprint_is_walked_again_before_the_ttl() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = Path::new("a_changed_footprint_is_walked_again_before_the_ttl");
+        let walks = Arc::new(AtomicUsize::new(0));
+        let before = Footprint::with_host_dir("before");
+        let after = Footprint::with_host_dir("after");
+        for (footprint, expected_walks) in [(&before, 1), (&before, 1), (&after, 2), (&after, 2)] {
+            cached_dir_stats(dir, footprint.clone(), counted_walk(&walks)).await;
+            assert_eq!(walks.load(Ordering::SeqCst), expected_walks);
+        }
+        DIR_STATS_CACHE.lock().remove(dir);
+    }
+
+    /// A refresh started for an older footprint that publishes while a load
+    /// for a newer one waits on the slot does not answer that load: it reads
+    /// the publication, finds the footprint differs, and walks its own.
+    #[tokio::test]
+    async fn a_refresh_for_an_older_footprint_does_not_answer_a_newer_one() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = Path::new("a_refresh_for_an_older_footprint_does_not_answer_a_newer_one");
+        let walks = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let old = tokio::spawn(cached_dir_stats(
+            dir,
+            Footprint::with_host_dir("old"),
+            move |_| async move {
+                started_tx.send(()).expect("test waits for the walk");
+                released.await.expect("test releases the walk");
+                DirStats {
+                    deb_files: 1,
+                    ..DirStats::default()
+                }
+            },
+        ));
+        started.await.expect("old walk started");
+        let new = tokio::spawn({
+            let walks = Arc::clone(&walks);
+            async move {
+                cached_dir_stats(dir, Footprint::with_host_dir("new"), counted_walk(&walks)).await
+            }
+        });
+        release.send(()).expect("old walk is waiting");
+        assert_eq!(old.await.expect("old load").files(), 1);
+        assert_eq!(new.await.expect("new load").files(), 7);
+        assert_eq!(
+            walks.load(Ordering::SeqCst),
+            1,
+            "the newer load walked its own"
+        );
+        DIR_STATS_CACHE.lock().remove(dir);
+    }
+
+    /// Eviction drops only a slot no load asked for in a while and no
+    /// refresh holds; a slot just created (by a load working from a newer
+    /// mirror list than the evicting one) survives.
+    #[test]
+    fn eviction_keeps_recently_used_and_busy_slots() {
+        let idle = Instant::now() - coarsetime::Duration::from_secs(DIR_STATS_IDLE_SECS + 1);
+        let held = DirStatsSlot::default();
+        let keys = ["evict_idle", "evict_fresh", "evict_held"].map(PathBuf::from);
+        {
+            let mut cache = DIR_STATS_CACHE.lock();
+            for (key, used, slot) in [
+                (&keys[0], idle, DirStatsSlot::default()),
+                (&keys[1], Instant::now(), DirStatsSlot::default()),
+                (&keys[2], idle, Arc::clone(&held)),
+            ] {
+                cache.insert(key.clone(), SlotEntry { slot, used });
+            }
+        }
+        evict_idle_dir_stats();
+        let mut cache = DIR_STATS_CACHE.lock();
+        assert!(!cache.contains_key(&keys[0]), "idle slot evicted");
+        assert!(cache.contains_key(&keys[1]), "recently used slot kept");
+        assert!(cache.contains_key(&keys[2]), "slot a refresh holds kept");
+        for key in &keys {
+            cache.remove(key);
+        }
     }
 
     #[test]
