@@ -331,12 +331,7 @@ pub(crate) const fn no_fallback_reason(mode: HttpsUpgradeMode) -> &'static str {
 /// Resolve the upstream scheme for `key` from the cache and config — the single
 /// entry point both backends use to decide HTTP vs HTTPS.
 pub(crate) fn resolve(key: SchemeKeyRef<'_>, config: &Config) -> SchemeDecision {
-    // An upgrade keeps an explicit port and dials 443 for a mirror named
-    // without one, which `allowed_mirror_ports` may refuse: such a mirror
-    // stays on http (`Config::validate` refuses `Always` in that case and
-    // warns under `Auto`). An explicit port was checked with the request.
-    let https_permitted =
-        key.port.is_some() || port_permitted(&config.allowed_mirror_ports, None, true);
+    let https_permitted = https_permitted(key, config);
     let cached = cached_scheme_at(key, Instant::now());
     // `decide` returns on `cached` before reading `is_http_only`; skip the
     // `http_only_mirrors` scan on a cache hit.
@@ -347,6 +342,17 @@ pub(crate) fn resolve(key: SchemeKeyRef<'_>, config: &Config) -> SchemeDecision 
         https_permitted,
         config.https_upgrade_mode,
     )
+}
+
+/// Whether `allowed_mirror_ports` lets `key` be dialled over https at all.
+/// An upgrade keeps an explicit port and dials 443 for a mirror named
+/// without one, which the list may refuse: such a mirror stays on http
+/// (`Config::validate` refuses `Always` in that case and warns under
+/// `Auto`). An explicit port was checked with the request. The one gate
+/// [`resolve`] and [`verdict_for`] share, so the dashboard explains the
+/// scheme the backends dial.
+fn https_permitted(key: SchemeKeyRef<'_>, config: &Config) -> bool {
+    key.port.is_some() || port_permitted(&config.allowed_mirror_ports, None, true)
 }
 
 /// A live cache entry, as the dashboard reads it: the scheme and, for a
@@ -386,6 +392,9 @@ pub(crate) enum SchemeVerdict {
     HttpOnlyListed,
     /// Plain HTTP because `https_upgrade_mode` is `Never`.
     HttpNever,
+    /// Plain HTTP because `allowed_mirror_ports` does not list 443, which an
+    /// HTTPS upgrade of a mirror named without a port would dial.
+    HttpsPortRefused,
     /// HTTPS because `https_upgrade_mode` is `Always` (no fallback).
     HttpsForced,
     /// HTTPS, learned by an `Auto` upgrade probe that succeeded.
@@ -404,9 +413,10 @@ impl SchemeVerdict {
     #[must_use]
     pub(crate) const fn scheme(self) -> Option<Scheme> {
         match self {
-            Self::HttpOnlyListed | Self::HttpNever | Self::HttpFallback { reprobe_in: _ } => {
-                Some(Scheme::Http)
-            }
+            Self::HttpOnlyListed
+            | Self::HttpNever
+            | Self::HttpsPortRefused
+            | Self::HttpFallback { reprobe_in: _ } => Some(Scheme::Http),
             Self::HttpsForced | Self::HttpsUpgraded => Some(Scheme::Https),
             Self::Undecided => None,
         }
@@ -418,11 +428,23 @@ impl SchemeVerdict {
 /// `decide` puts a live entry first: the two agree because a live entry
 /// never contradicts them (no upgrade is attempted for such a host, and no
 /// scheme is recorded for one the mode fixes), and naming the option is
-/// what the dashboard needs. Then the mode.
+/// what the dashboard needs. Then the mode, where an upgrading mode first
+/// needs `https_permitted` (see [`https_permitted`]), as in `decide`.
 #[must_use]
-fn verdict(mode: HttpsUpgradeMode, is_http_only: bool, live: Option<LiveScheme>) -> SchemeVerdict {
+fn verdict(
+    mode: HttpsUpgradeMode,
+    is_http_only: bool,
+    https_permitted: bool,
+    live: Option<LiveScheme>,
+) -> SchemeVerdict {
     if is_http_only {
         return SchemeVerdict::HttpOnlyListed;
+    }
+    if mode == HttpsUpgradeMode::Never {
+        return SchemeVerdict::HttpNever;
+    }
+    if !https_permitted {
+        return SchemeVerdict::HttpsPortRefused;
     }
     match mode {
         HttpsUpgradeMode::Never => SchemeVerdict::HttpNever,
@@ -449,6 +471,7 @@ pub(crate) fn verdict_for(key: SchemeKeyRef<'_>, config: &Config) -> SchemeVerdi
     verdict(
         config.https_upgrade_mode,
         is_http_only(key, config),
+        https_permitted(key, config),
         live_entry(key),
     )
 }
@@ -798,37 +821,73 @@ mod tests {
             HttpsUpgradeMode::Always,
         ] {
             for live in [None, https, http] {
+                for https_permitted in [true, false] {
+                    assert_eq!(
+                        verdict(mode, true, https_permitted, live),
+                        SchemeVerdict::HttpOnlyListed,
+                        "configured HTTP wins: {mode:?} {live:?} {https_permitted}"
+                    );
+                }
+                // A refused 443 keeps every upgrading mode on http, live
+                // entry or not, as `decide` does; `Never` keeps its own name.
                 assert_eq!(
-                    verdict(mode, true, live),
-                    SchemeVerdict::HttpOnlyListed,
-                    "configured HTTP wins: {mode:?} {live:?}"
+                    verdict(mode, false, false, live),
+                    if mode == HttpsUpgradeMode::Never {
+                        SchemeVerdict::HttpNever
+                    } else {
+                        SchemeVerdict::HttpsPortRefused
+                    },
+                    "{mode:?} {live:?}"
                 );
             }
             assert_eq!(
-                verdict(mode, false, None).scheme().is_none(),
+                verdict(mode, false, true, None).scheme().is_none(),
                 mode == HttpsUpgradeMode::Auto
             );
         }
         assert_eq!(
-            verdict(HttpsUpgradeMode::Never, false, http),
+            verdict(HttpsUpgradeMode::Never, false, true, http),
             SchemeVerdict::HttpNever
         );
         assert_eq!(
-            verdict(HttpsUpgradeMode::Always, false, None),
+            verdict(HttpsUpgradeMode::Always, false, true, None),
             SchemeVerdict::HttpsForced
         );
         assert_eq!(
-            verdict(HttpsUpgradeMode::Auto, false, https),
+            verdict(HttpsUpgradeMode::Auto, false, true, https),
             SchemeVerdict::HttpsUpgraded
         );
         assert_eq!(
-            verdict(HttpsUpgradeMode::Auto, false, http),
+            verdict(HttpsUpgradeMode::Auto, false, true, http),
             SchemeVerdict::HttpFallback { reprobe_in }
         );
         assert_eq!(
-            verdict(HttpsUpgradeMode::Auto, false, None),
+            verdict(HttpsUpgradeMode::Auto, false, true, None),
             SchemeVerdict::Undecided
         );
+    }
+
+    /// The verdict and the backends' decision read the port gate from the
+    /// same place: under `Auto` with 443 refused, a mirror named without a
+    /// port is dialled over http and the dashboard says why; one with an
+    /// explicit port is unaffected.
+    #[test]
+    fn the_verdict_follows_the_port_gate_resolve_applies() {
+        let mut config = Config::default();
+        config.https_upgrade_mode = HttpsUpgradeMode::Auto;
+        config.allowed_mirror_ports = vec![NonZero::new(80).unwrap(), NonZero::new(8080).unwrap()];
+        let bare = SchemeKeyRef {
+            host: "port-gate.test.invalid",
+            port: None,
+        };
+        assert_eq!(resolve(bare, &config), SchemeDecision::Http);
+        assert_eq!(verdict_for(bare, &config), SchemeVerdict::HttpsPortRefused);
+        let explicit = SchemeKeyRef {
+            host: "port-gate.test.invalid",
+            port: Some(8080),
+        };
+        assert_eq!(resolve(explicit, &config), SchemeDecision::AutoUpgrade);
+        assert_eq!(verdict_for(explicit, &config), SchemeVerdict::Undecided);
     }
 
     /// The table looks entries up by the row's own port: an explicit `:80`

@@ -356,6 +356,9 @@ mod mirror_cells {
                 SchemeVerdict::HttpNever => {
                     f.write_str("Plain HTTP: https_upgrade_mode is Never.")
                 }
+                SchemeVerdict::HttpsPortRefused => f.write_str(
+                    "Plain HTTP: allowed_mirror_ports does not list 443, which HTTPS for a mirror named without a port dials. List 443 to upgrade it.",
+                ),
                 SchemeVerdict::HttpsForced => {
                     f.write_str("HTTPS: https_upgrade_mode is Always.")
                 }
