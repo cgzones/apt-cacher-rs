@@ -158,7 +158,15 @@ pub(super) async fn build_byhash_reference_set(
                 return None;
             }
         };
-        let parsed = match parse_release_byhash_digests(&content) {
+        // A parse error drops this whole local aggregate, including a valid prefix.
+        let parsed = match parse_release_byhash_digests(&content, |digest| match digest {
+            ByHashRef::Sha256(d) => {
+                set.sha256.insert(d);
+            }
+            ByHashRef::Sha512(d) => {
+                set.sha512.insert(d);
+            }
+        }) {
             Ok(parsed) => parsed,
             Err(reason) => {
                 warn!(
@@ -176,16 +184,6 @@ pub(super) async fn build_byhash_reference_set(
         let algorithms = coverage.entry(dist.to_owned()).or_default();
         algorithms.0 |= parsed.sha256;
         algorithms.1 |= parsed.sha512;
-        for digest in parsed.digests {
-            match digest {
-                ByHashRef::Sha256(d) => {
-                    set.sha256.insert(d);
-                }
-                ByHashRef::Sha512(d) => {
-                    set.sha512.insert(d);
-                }
-            }
-        }
     }
 
     if walker.io_failures() != 0 {
