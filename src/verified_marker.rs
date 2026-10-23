@@ -159,12 +159,12 @@ impl XattrValue for CleanupMarker {
     }
 
     fn parse(raw: &str) -> Option<Self> {
-        let fields: Vec<&str> = raw.split(':').collect();
-        let (ino, size, mtime, algo, digest) = match fields.as_slice() {
-            [ino, size, algo, digest] => (ino, size, None, algo, digest),
-            [ino, size, mtime, algo, digest] => (ino, size, Some(mtime), algo, digest),
-            _ => return None,
-        };
+        let (ino, rest) = raw.split_once(':')?;
+        let (size, rest) = rest.split_once(':')?;
+        let (prefix, digest) = rest.rsplit_once(':')?;
+        let (mtime, algo) = prefix
+            .split_once(':')
+            .map_or((None, prefix), |(mtime, algo)| (Some(mtime), algo));
         let ino = ino.parse().ok()?;
         let size = size.parse().ok()?;
         let identity = match mtime {
