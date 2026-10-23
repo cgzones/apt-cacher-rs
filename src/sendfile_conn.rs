@@ -1630,12 +1630,13 @@ pub(crate) async fn serve_file_via_sendfile(
 
     let file_size = mdata.len();
 
-    let cache_info = if let Some(meta) = prefetched_upstream_metadata {
-        CacheInfo::with_meta(&mdata, meta)
-    } else {
-        let key = conn_details.key();
-        CacheInfo::resolve(&file, file_path, &mdata, &key)
-    };
+    let cache_info = CacheInfo::resolve(
+        &file,
+        file_path,
+        &mdata,
+        &conn_details.key(),
+        prefetched_upstream_metadata,
+    );
 
     let params = match evaluate_conditional_and_range(
         stream,

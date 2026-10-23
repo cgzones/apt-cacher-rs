@@ -1086,18 +1086,13 @@ async fn serve_cached_file(
 
     let cache_key = conn_details.key();
 
-    // Caller pre-resolves on the stale-volatile revalidation path;
-    // otherwise fall back to the post-flight cache (lazy-loads xattr on miss).
-    let cache_info = {
-        let resolved;
-        let meta = if let Some(meta) = prefetched_upstream_metadata {
-            meta
-        } else {
-            resolved = cache_metadata::store().resolve(&cache_key, &file, &file_path);
-            &resolved
-        };
-        CacheInfo::with_meta(&mdata, meta)
-    };
+    let cache_info = CacheInfo::resolve(
+        &file,
+        &file_path,
+        &mdata,
+        &cache_key,
+        prefetched_upstream_metadata,
+    );
     let headers = RangeRequestHeaders::from_http(req.headers(), &conn_details.client);
 
     let params = match cache_info.plan(file_size, &headers, &conn_details.client) {

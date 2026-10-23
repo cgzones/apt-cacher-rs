@@ -12,17 +12,13 @@
 //! backend representation (`extract` for httparse, `from_http` for hyper),
 //! so the malformed-header logging lives here too.
 
-#[cfg(feature = "sendfile")]
-use std::path::Path;
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, path::Path, sync::Arc};
 
 #[cfg(feature = "hyper")]
 use http::HeaderMap;
 use http::StatusCode;
 
-#[cfg(feature = "sendfile")]
 use crate::cache_layout::CacheEntryKeyRef;
-#[cfg(feature = "sendfile")]
 use crate::cache_metadata;
 #[cfg(feature = "sendfile")]
 use crate::http_helpers::find_header;
@@ -261,18 +257,24 @@ pub(crate) struct CacheInfo {
 
 impl CacheInfo {
     /// Build a [`CacheInfo`] for a post-flight cache-hit serve, consulting
-    /// the in-process [`cache_metadata`] cache before any xattr read.
-    /// On miss, the cache lazy-loads from xattrs.
-    #[cfg(feature = "sendfile")]
+    /// the caller's prefetched snapshot first, including an empty one. Otherwise
+    /// consult the in-process [`cache_metadata`] cache, lazy-loading xattrs on miss.
     #[must_use]
     pub(crate) fn resolve(
         file: &tokio::fs::File,
         file_path: &Path,
         metadata: &std::fs::Metadata,
         key: &CacheEntryKeyRef<'_>,
+        prefetched: Option<&UpstreamMetadata>,
     ) -> Self {
-        let resolved = cache_metadata::store().resolve(key, file, file_path);
-        Self::with_meta(metadata, &resolved)
+        let resolved;
+        let meta = if let Some(meta) = prefetched {
+            meta
+        } else {
+            resolved = cache_metadata::store().resolve(key, file, file_path);
+            &resolved
+        };
+        Self::with_meta(metadata, meta)
     }
 
     /// Build a [`CacheInfo`] from a caller-supplied [`UpstreamMetadata`]
@@ -737,6 +739,24 @@ mod tests {
         );
         assert!(partial.is_partial());
         assert_eq!(partial.http_status(), StatusCode::PARTIAL_CONTENT);
+    }
+
+    #[test]
+    fn an_empty_prefetched_snapshot_bypasses_the_metadata_store() {
+        // The global metadata store is deliberately uninitialized in this test.
+        let temp = tempfile::NamedTempFile::new().expect("create temp file");
+        let metadata = temp.as_file().metadata().expect("stat temp file");
+        let file = tokio::fs::File::from_std(temp.reopen().expect("reopen temp file"));
+        let details = crate::test_support::connection_details("cached.deb");
+        let info = CacheInfo::resolve(
+            &file,
+            temp.path(),
+            &metadata,
+            &details.key(),
+            Some(&UpstreamMetadata::default()),
+        );
+        assert!(info.file_etag.is_none());
+        assert_eq!(info.last_modified_for_ims, cache_file_http_date(&metadata));
     }
 
     #[test]
