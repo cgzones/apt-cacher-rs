@@ -4,6 +4,7 @@ use tracing::debug;
 
 use crate::{
     cache_layout::{MAX_DEBNAME_LEN, classify_request},
+    cache_paths::MirrorSite,
     client_info::ClientInfo,
     config::ClientHost,
     database,
@@ -111,6 +112,17 @@ impl Mirror {
     #[must_use]
     pub(crate) const fn path(&self) -> &str {
         self.path.as_str()
+    }
+
+    /// The on-disk identity of this mirror: a plain projection, so callers
+    /// must hold the canonical (alias-resolved) mirror.
+    #[must_use]
+    pub(crate) fn site(&self) -> MirrorSite<'_> {
+        MirrorSite {
+            host: self.host.as_cache_host(),
+            port: self.port,
+            path: self.path(),
+        }
     }
 
     /// The heap this value owns beyond its inline size: the host text, the

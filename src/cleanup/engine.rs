@@ -11,7 +11,6 @@ use tracing::{debug, error, info, trace, warn};
 use crate::{
     AppState,
     cache_layout::CacheLayout,
-    cache_paths::MirrorSite,
     cache_quota::accounted_size,
     cache_walk::{
         AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker,
@@ -1327,11 +1326,7 @@ async fn resolve_origin_packages_self(
         "Found {} active origins and {} cached deb files for mirror {mirror} (`{}`)",
         active_origins.len(),
         cached_files.len(),
-        MirrorSite {
-            host: mirror.host().as_cache_host(),
-            port: mirror.port(),
-            path: mirror.path(),
-        },
+        mirror.site(),
     );
 
     // Diagnostic: cached debs exist but cleanup will fetch no Packages

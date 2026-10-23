@@ -613,11 +613,7 @@ impl ConnectionDetails {
     /// the same site, so the `.partial` lands next to its rename target.
     #[must_use]
     pub(crate) fn site(&self) -> MirrorSite<'_> {
-        MirrorSite {
-            host: self.mirror.host().as_cache_host(),
-            port: self.mirror.port(),
-            path: self.mirror.path(),
-        }
+        self.mirror.site()
     }
 
     /// The `host[:port]` authority of the upstream the fetch dials: the

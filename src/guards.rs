@@ -419,12 +419,7 @@ impl InitBarrier {
     pub(crate) fn site(&self) -> MirrorSite<'_> {
         // `key.mirror` is the canonical (alias-resolved) mirror, so this is
         // the same projection as `ConnectionDetails::site`.
-        let mirror = &self.key.mirror;
-        MirrorSite {
-            host: mirror.host().as_cache_host(),
-            port: mirror.port(),
-            path: mirror.path(),
-        }
+        self.key.mirror.site()
     }
 }
 
