@@ -50,23 +50,22 @@ pub(crate) const FALLBACK_DELAY: Duration = Duration::from_millis(300);
 /// kind of the last attempt that did not time out.
 pub(crate) async fn connect(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
     let deadline = Instant::now() + timeout;
-    let addrs: Vec<SocketAddr> =
-        match tokio::time::timeout_at(deadline, lookup_host((host, port))).await {
-            Ok(addrs) => addrs?.collect(),
-            Err(_elapsed @ Elapsed { .. }) => {
-                metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
-                return Err(io::Error::new(
-                    ErrorKind::TimedOut,
-                    format!(
-                        "name resolution timed out after {}",
-                        HumanFmt::Time(timeout)
-                    ),
-                ));
-            }
-        };
+    let addrs = match tokio::time::timeout_at(deadline, lookup_host((host, port))).await {
+        Ok(addrs) => addrs?,
+        Err(_elapsed @ Elapsed { .. }) => {
+            metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
+            return Err(io::Error::new(
+                ErrorKind::TimedOut,
+                format!(
+                    "name resolution timed out after {}",
+                    HumanFmt::Time(timeout)
+                ),
+            ));
+        }
+    };
 
     race(
-        &addrs,
+        addrs,
         deadline,
         FALLBACK_DELAY,
         TcpStream::connect::<SocketAddr>,
@@ -84,7 +83,7 @@ pub(crate) async fn connect(host: &str, port: u16, timeout: Duration) -> io::Res
 ///
 /// Generic over the connection so the race is testable without a network.
 async fn race<S, F, Fut>(
-    addrs: &[SocketAddr],
+    mut addrs: impl Iterator<Item = SocketAddr> + Send,
     deadline: Instant,
     fallback_delay: Duration,
     connect: F,
@@ -94,14 +93,14 @@ where
     F: Fn(SocketAddr) -> Fut + Sync,
     Fut: Future<Output = io::Result<S>> + Send,
 {
-    let Some(first) = addrs.first() else {
+    let Some(first) = addrs.next() else {
         return Err(io::Error::new(
             ErrorKind::NotFound,
             "the host name resolved to no address",
         ));
     };
-    let (preferred, fallback): (Vec<SocketAddr>, Vec<SocketAddr>) = addrs
-        .iter()
+    let (preferred, fallback): (Vec<SocketAddr>, Vec<SocketAddr>) = std::iter::once(first)
+        .chain(addrs)
         .partition(|addr| addr.is_ipv6() == first.is_ipv6());
 
     let preferred_attempts = sequence(&preferred, deadline, &connect);
@@ -294,9 +293,12 @@ mod tests {
         timeout: Duration,
         fallback_delay: Duration,
     ) -> io::Result<SocketAddr> {
-        race(addrs, Instant::now() + timeout, fallback_delay, |addr| {
-            fake.connect(addr)
-        })
+        race(
+            addrs.iter().copied(),
+            Instant::now() + timeout,
+            fallback_delay,
+            |addr| fake.connect(addr),
+        )
         .await
     }
 
@@ -464,7 +466,7 @@ mod tests {
         let v4_addr = v4.local_addr().unwrap();
 
         let stream = race(
-            &[v6_addr, v4_addr],
+            [v6_addr, v4_addr].into_iter(),
             Instant::now() + Duration::from_secs(10),
             FALLBACK_DELAY,
             TcpStream::connect::<SocketAddr>,
