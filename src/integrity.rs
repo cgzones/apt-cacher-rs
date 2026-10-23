@@ -2313,7 +2313,7 @@ impl PendingDigests {
         let (Some(filename), Some(sha256)) = (stanza.filename(), stanza.sha256) else {
             return false;
         };
-        let Some(key) = index_parser::registry_key_from_filename_field(filename) else {
+        let Some(key) = stanza.registry_key() else {
             // `Stanza` already rejected (and logged) unsafe values, so this
             // is the length gate: a name no cache file can have.
             warn_once_or_debug!(

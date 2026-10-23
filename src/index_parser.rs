@@ -284,6 +284,15 @@ impl Stanza {
         (!self.filename.is_empty()).then_some(self.filename.as_str())
     }
 
+    /// Project the validated filename to a structured registry key. The cache
+    /// flattens `pool/.../<deb>` to its basename; flat repositories do not use
+    /// the registry. Keep the basename within Linux's `NAME_MAX`, since no
+    /// cache file can have a longer name, and bound pending key storage.
+    pub(crate) fn registry_key(&self) -> Option<&str> {
+        let key = structured_lookup_key(self.filename()?);
+        (key.len() <= MAX_REGISTRY_KEY_COMPONENT_LEN).then_some(key)
+    }
+
     pub(crate) fn reset(&mut self) {
         self.filename.clear();
         self.sha256 = None;
@@ -502,28 +511,6 @@ pub(crate) fn byhash_digest_for_algo(algo: HashAlgo, filename: &str) -> Option<V
 /// cache file, and no longer name can exist on disk, so no download could
 /// ever look such a key up.
 const MAX_REGISTRY_KEY_COMPONENT_LEN: usize = 255;
-
-/// Map a structured repository's `Packages` stanza `Filename:` value to the
-/// registry key used to look it up at `.deb` download time: the cache
-/// flattens `pool/.../<deb>` to the basename, so the key is the basename
-/// (`structured_lookup_key`). Flat repositories feed no registry: their pool
-/// downloads are not verified against it.
-///
-/// Returns `None` when the relpath fails `is_safe_filename_relpath` (after
-/// [`strip_leading_dot_segments`]; a `Stanza`'s value is already stripped,
-/// this repeats it so the function gates a raw field the same way), and when
-/// the key could not name a cache file: longer than
-/// [`MAX_REGISTRY_KEY_COMPONENT_LEN`]. The registry caps entries, not bytes,
-/// so without the length gate a hostile index could retain up to the line
-/// cap per entry -- gigabytes at the default entry cap.
-pub(crate) fn registry_key_from_filename_field(filename_field: &str) -> Option<&str> {
-    let filename_field = strip_leading_dot_segments(filename_field);
-    if !is_safe_filename_relpath(filename_field) {
-        return None;
-    }
-    let key = structured_lookup_key(filename_field);
-    (key.len() <= MAX_REGISTRY_KEY_COMPONENT_LEN).then_some(key)
-}
 
 /// Iterate the `(section, hex, path)` triples of every indented
 /// `<hex> <size> <path>` entry inside a `SHA256:`/`SHA512:` section of a Debian
@@ -1397,10 +1384,16 @@ mod tests {
         );
     }
 
+    fn stanza_with_filename(filename: &str) -> Stanza {
+        let mut stanza = Stanza::new();
+        stanza.ingest(&format!("Filename: {filename}"));
+        stanza
+    }
+
     #[test]
     fn registry_key_for_structured_pool_uses_basename() {
         assert_eq!(
-            registry_key_from_filename_field("pool/main/f/foo/foo_1.0_amd64.deb"),
+            stanza_with_filename("pool/main/f/foo/foo_1.0_amd64.deb").registry_key(),
             Some("foo_1.0_amd64.deb")
         );
     }
@@ -1408,15 +1401,15 @@ mod tests {
     #[test]
     fn registry_key_strips_leading_dot_slash() {
         assert_eq!(
-            registry_key_from_filename_field("./foo_1.0_amd64.deb"),
+            stanza_with_filename("./foo_1.0_amd64.deb").registry_key(),
             Some("foo_1.0_amd64.deb")
         );
     }
 
     #[test]
     fn registry_key_rejects_unsafe_relpath() {
-        assert_eq!(registry_key_from_filename_field("../etc/passwd"), None);
-        assert_eq!(registry_key_from_filename_field(""), None);
+        assert_eq!(stanza_with_filename("../etc/passwd").registry_key(), None);
+        assert_eq!(stanza_with_filename("").registry_key(), None);
     }
 
     #[test]
@@ -1427,7 +1420,7 @@ mod tests {
         // part does not matter...
         let long_dir = format!("pool/{}{at_cap}", "d/".repeat(1000));
         assert_eq!(
-            registry_key_from_filename_field(&long_dir),
+            stanza_with_filename(&long_dir).registry_key(),
             Some(at_cap.as_str())
         );
         // ... but a basename past NAME_MAX, up to the 8 KiB line cap, does.
@@ -1436,7 +1429,7 @@ mod tests {
             "a".repeat(MAX_METADATA_LINE_LEN - "Filename: pool/".len()),
         ] {
             assert_eq!(
-                registry_key_from_filename_field(&format!("pool/{name}")),
+                stanza_with_filename(&format!("pool/{name}")).registry_key(),
                 None,
                 "{} byte basename",
                 name.len()
