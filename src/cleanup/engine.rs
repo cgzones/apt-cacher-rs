@@ -11,6 +11,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::{
     AppState,
     cache_layout::CacheLayout,
+    cache_paths::MirrorSite,
     cache_quota::accounted_size,
     cache_walk::{
         AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker,
@@ -259,7 +260,6 @@ async fn reduce_against(
         self_origins: _,
         tree_root,
         mirror: _,
-        entry: _,
         appstate,
         config,
     } = ctx;
@@ -377,7 +377,7 @@ pub(super) async fn run_mirror_units(
     appstate: AppState,
     config: &'static Config,
 ) -> CleanupDone {
-    let mirror: Mirror = entry.clone().into();
+    let mirror: Mirror = entry.into();
     let now = SystemTime::now();
 
     // The mirror's own `origins` rows, read once: the structured-pool reconcile
@@ -385,15 +385,14 @@ pub(super) async fn run_mirror_units(
     // and used to issue this identical query one apiece. A `MirrorKind::Flat`
     // row emits neither unit, so it still issues none -- and never observes the
     // `None` that a failed read would produce.
-    let self_origins = if entry.kind() == MirrorKind::Flat {
+    let self_origins = if mirror.kind() == MirrorKind::Flat {
         None
     } else {
-        read_self_origins(&appstate, &mirror, &entry).await
+        read_self_origins(&appstate, &mirror).await
     };
 
     let ctx = MirrorCtx {
         mirror: &mirror,
-        entry: &entry,
         appstate: &appstate,
         config,
         self_origins: self_origins.as_deref(),
@@ -426,7 +425,6 @@ pub(super) async fn run_mirror_units(
 /// instant every one of its trees is aged against.
 struct MirrorCtx<'a> {
     mirror: &'a Mirror,
-    entry: &'a MirrorEntry,
     appstate: &'a AppState,
     config: &'a Config,
     /// This mirror's own `origins` rows; `None` = unread (see
@@ -442,14 +440,10 @@ struct MirrorCtx<'a> {
 /// logged and counted here, once, rather than at each consumer -- and every
 /// consumer must treat it as *unknown*, never as "this mirror has no origins":
 /// grace-sweeping on an unread origin set would delete still-referenced debs.
-async fn read_self_origins(
-    appstate: &AppState,
-    mirror: &Mirror,
-    entry: &MirrorEntry,
-) -> Option<Vec<OriginEntry>> {
+async fn read_self_origins(appstate: &AppState, mirror: &Mirror) -> Option<Vec<OriginEntry>> {
     match appstate
         .database
-        .get_origins_by_mirror(&entry.host, entry.port(), &entry.path)
+        .get_origins_by_mirror(mirror.host(), mirror.port(), mirror.path())
         .await
     {
         Ok(origins) => Some(origins),
@@ -476,7 +470,6 @@ struct ReconcileCtx<'a> {
     /// from the archive-root / flat-root *segments* the resolvers call `root`.
     tree_root: &'a Path,
     mirror: &'a Mirror,
-    entry: &'a MirrorEntry,
     appstate: &'a AppState,
     config: &'a Config,
 }
@@ -799,7 +792,6 @@ async fn run_reconcile_unit(
     let policy = unit.policy;
     let &MirrorCtx {
         mirror,
-        entry,
         appstate,
         config,
         self_origins,
@@ -810,7 +802,7 @@ async fn run_reconcile_unit(
     let ScannedTree {
         candidates: mut cached_files,
         io_failures,
-    } = scan_candidates(&unit.tree, &entry.path).await?;
+    } = scan_candidates(&unit.tree, mirror.path()).await?;
 
     trace!("Cached files ({}): {cached_files:?}", cached_files.len());
 
@@ -829,7 +821,6 @@ async fn run_reconcile_unit(
         self_origins,
         tree_root: &unit.tree.root,
         mirror,
-        entry,
         appstate,
         config,
     };
@@ -1301,7 +1292,6 @@ async fn resolve_origin_packages_self(
         self_origins,
         tree_root: _,
         mirror,
-        entry,
         appstate: _,
         config: _,
     } = ctx;
@@ -1333,7 +1323,11 @@ async fn resolve_origin_packages_self(
         "Found {} active origins and {} cached deb files for mirror {mirror} (`{}`)",
         active_origins.len(),
         cached_files.len(),
-        entry.site(),
+        MirrorSite {
+            host: mirror.host().as_cache_host(),
+            port: mirror.port(),
+            path: mirror.path(),
+        },
     );
 
     // Diagnostic: cached debs exist but cleanup will fetch no Packages
