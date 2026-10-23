@@ -128,7 +128,10 @@
     enhance: function (root) {
       announceAll(root);
       // The /logs toolbar sits outside the swapped sections.
-      announceAll(document.querySelector(".logtools") || root);
+      const toolbar = document.querySelector(".logtools");
+      if (toolbar && !root.contains(toolbar)) {
+        announceAll(toolbar);
+      }
       const footer = root.matches && root.matches("[data-section=footer]") ?
         root : (root.querySelector ? root.querySelector("[data-section=footer]") : null);
       if (footer) {
