@@ -38,8 +38,8 @@ pub(crate) const NUDGE_BODY: &str = "Download in progress";
 /// the time they ask -- and drives the probability, which decays linearly by
 /// `experimental_parallel_hack_factor` per download already in flight and
 /// reaches certainty for the first one. It is taken lazily and called at most
-/// once, only once the `enabled`/flavor short-circuit has passed, so a
-/// disabled hack or a volatile request never pays for a registry read.
+/// once, after the enabled, flavor and size checks have passed, so an
+/// ineligible request never pays for a registry read.
 #[must_use]
 pub(crate) fn should_nudge(
     config: &Config,
@@ -52,17 +52,18 @@ pub(crate) fn should_nudge(
         return false;
     }
 
+    if config
+        .experimental_parallel_hack_minsize
+        .is_some_and(|size| total_upper <= size)
+    {
+        return false;
+    }
+
     let curr_downloads = curr_downloads();
 
     if config
         .experimental_parallel_hack_maxparallel
         .is_some_and(|max_parallel| curr_downloads > max_parallel.get())
-    {
-        return false;
-    }
-    if config
-        .experimental_parallel_hack_minsize
-        .is_some_and(|size| total_upper <= size)
     {
         return false;
     }
@@ -301,6 +302,20 @@ mod tests {
             !called.get(),
             "curr_downloads must not be called for a volatile resource"
         );
+
+        for size in [nonzero!(1_u64), nonzero!(1024_u64)] {
+            assert!(!should_nudge(
+                &config,
+                CachedFlavor::Permanent,
+                probe,
+                size,
+                &mut rng(),
+            ));
+            assert!(
+                !called.get(),
+                "curr_downloads must not be called at or below the size threshold"
+            );
+        }
     }
 
     #[test]
