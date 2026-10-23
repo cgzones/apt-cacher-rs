@@ -138,7 +138,7 @@ const VERIFY_CONCURRENCY: usize = 3;
 static VERIFY_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(VERIFY_CONCURRENCY);
 
 pub(super) async fn verify_cache_file(path: PathBuf, algo: HashAlgo, expected: Vec<u8>) -> Verdict {
-    let _permit = match VERIFY_SLOTS.acquire().await {
+    let permit = match VERIFY_SLOTS.acquire().await {
         Ok(permit) => permit,
         // `AcquireError` is a tuple struct with a private field, so the
         // usual explicit destructure is not available here. It can only be
@@ -147,7 +147,17 @@ pub(super) async fn verify_cache_file(path: PathBuf, algo: HashAlgo, expected: V
         Err(err) => return Verdict::IoError(std::io::Error::other(err)),
     };
 
-    match tokio::task::spawn_blocking(move || verify_file_sync(&path, algo, &expected)).await {
+    // The permit moves into the blocking job, which runs on even if this
+    // future is dropped mid-hash: held here, a cancellation would free the
+    // slot early and let one more hash run than `VERIFY_CONCURRENCY` allows.
+    // Nothing cancels it today (each mirror's cleanup is a spawned task that
+    // awaits its hashes inline); this keeps the bound from resting on that.
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        verify_file_sync(&path, algo, &expected)
+    })
+    .await
+    {
         Ok(v) => v,
         Err(join_err) => Verdict::IoError(std::io::Error::other(join_err)),
     }
