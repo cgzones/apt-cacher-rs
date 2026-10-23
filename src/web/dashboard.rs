@@ -7,6 +7,7 @@
 use std::{
     fmt::{self, Display, Formatter},
     net::SocketAddr,
+    path::Path,
     sync::Arc,
 };
 
@@ -28,6 +29,7 @@ use crate::{
     database_task::DB_TASK_QUEUE_SENDER,
     error::ErrorReport,
     fd_usage, global_cache_quota, global_checksum_registry, global_config, global_verify_throttle,
+    healthcheck::{CHECK_TIMEOUT, ProbeSlot, ProbedSpace, probe_filesystem_space},
     humanfmt::HumanFmt,
     integrity,
     main_loop::LISTEN_ADDR,
@@ -227,29 +229,73 @@ async fn build_mirror_fs_section(
 
     let ((section, aggregate), free_disk_bytes) = tokio::join!(
         build_mirror_table(mirrors, snapshots, now_epoch, config),
-        // statvfs() can stall on slow/hung filesystems (NFS, FUSE, dying
-        // disks); run it on the blocking pool so it cannot wedge the tokio
-        // worker.
-        async {
-            let result =
-                tokio::task::spawn_blocking(|| nix::sys::statvfs::statvfs(&config.cache_directory))
-                    .await
-                    .expect("task should not panic");
-
-            let stat = result
-                .inspect_err(|err| {
-                    warn_once_or_debug!(
-                        "statvfs({}) failed:  {err}",
-                        config.cache_directory.display()
-                    );
-                })
-                .ok();
-
-            stat.and_then(|s| s.blocks_available().checked_mul(s.fragment_size()))
-        },
+        free_disk_bytes(&config.cache_directory),
     );
 
     (section, aggregate, free_disk_bytes)
+}
+
+/// The dashboard's own `statvfs(3)` slot (see [`probe_filesystem_space`]).
+static DISK_FREE_PROBE: ProbeSlot = ProbeSlot::new();
+
+/// The last free-space figure and when it was taken. The lock is held across
+/// the probe, so concurrent loads wait for the one in flight and read its
+/// result rather than finding the slot busy: `StillBlocked` then only means
+/// a probe that outran its deadline, or one a cancelled load left running.
+static DISK_FREE_MEMO: tokio::sync::Mutex<Option<(Instant, Option<u64>)>> =
+    tokio::sync::Mutex::const_new(None);
+
+/// How long a free-space figure is reused.
+const DISK_FREE_TTL: coarsetime::Duration = coarsetime::Duration::from_secs(1);
+
+/// Free bytes on the cache filesystem for the footer, `None` (shown as
+/// unknown) when they could not be measured. `statvfs(3)` can hang on a
+/// stuck network filesystem or a failing disk, and a timeout only stops the
+/// waiting, so the call goes through [`DISK_FREE_PROBE`]: one stuck probe
+/// holds one blocking-pool thread, not one per dashboard load.
+async fn free_disk_bytes(cache_dir: &Path) -> Option<u64> {
+    memoized_free_bytes(&DISK_FREE_MEMO, cache_dir, || {
+        probe_filesystem_space(&DISK_FREE_PROBE, CHECK_TIMEOUT, cache_dir)
+    })
+    .await
+}
+
+/// [`free_disk_bytes`] with the memo and the probe passed in, so the
+/// coalescing is testable without a filesystem to hang.
+async fn memoized_free_bytes<F>(
+    memo: &tokio::sync::Mutex<Option<(Instant, Option<u64>)>>,
+    cache_dir: &Path,
+    probe: impl FnOnce() -> F,
+) -> Option<u64>
+where
+    F: Future<Output = ProbedSpace>,
+{
+    let mut memo = memo.lock().await;
+    if let Some((at, free)) = *memo
+        && at.elapsed() < DISK_FREE_TTL
+    {
+        return free;
+    }
+    let free = match probe().await {
+        ProbedSpace::Measured(space) => space.map(|space| space.free_bytes),
+        ProbedSpace::TimedOut => {
+            warn_once_or_debug!(
+                "Failed to measure the free space of the filesystem holding `{}` within {}; showing it as unknown on the dashboard",
+                cache_dir.display(),
+                HumanFmt::Time(CHECK_TIMEOUT)
+            );
+            None
+        }
+        ProbedSpace::StillBlocked => {
+            warn_once_or_debug!(
+                "Failed to measure the free space of the filesystem holding `{}`: an earlier statvfs(3) of it has not returned; showing it as unknown on the dashboard",
+                cache_dir.display()
+            );
+            None
+        }
+    };
+    *memo = Some((Instant::now(), free));
+    free
 }
 
 async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
@@ -1372,7 +1418,55 @@ pub(super) async fn serve_dashboard(appstate: &AppState, options: QueryOptions) 
 
 #[cfg(test)]
 mod tests {
-    use super::orphans_over_quota_share;
+    /// Concurrent dashboard loads share one free-space probe and read its
+    /// figure; within the memo window no probe runs at all.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_loads_share_one_free_space_probe() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::healthcheck::FsSpace;
+
+        static MEMO: tokio::sync::Mutex<Option<(Instant, Option<u64>)>> =
+            tokio::sync::Mutex::const_new(None);
+        let probes = AtomicUsize::new(0);
+        let probe = || async {
+            probes.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            ProbedSpace::Measured(Some(FsSpace {
+                free_bytes: 42,
+                inodes: None,
+            }))
+        };
+        let dir = Path::new("/nonexistent");
+        let loads = futures_util::future::join_all(
+            std::iter::repeat_n(dir, 5).map(|dir| memoized_free_bytes(&MEMO, dir, probe)),
+        )
+        .await;
+        assert_eq!(loads, [Some(42); 5]);
+        assert_eq!(memoized_free_bytes(&MEMO, dir, probe).await, Some(42));
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+    }
+
+    /// A probe that outran its deadline, or found the previous one still
+    /// blocked, leaves the figure unknown rather than failing the page.
+    #[tokio::test]
+    async fn an_unmeasured_free_space_is_unknown() {
+        static TIMED_OUT: tokio::sync::Mutex<Option<(Instant, Option<u64>)>> =
+            tokio::sync::Mutex::const_new(None);
+        static BLOCKED: tokio::sync::Mutex<Option<(Instant, Option<u64>)>> =
+            tokio::sync::Mutex::const_new(None);
+        let dir = Path::new("/nonexistent");
+        assert_eq!(
+            memoized_free_bytes(&TIMED_OUT, dir, || async { ProbedSpace::TimedOut }).await,
+            None
+        );
+        assert_eq!(
+            memoized_free_bytes(&BLOCKED, dir, || async { ProbedSpace::StillBlocked }).await,
+            None
+        );
+    }
+
+    use super::{Instant, Path, ProbedSpace, memoized_free_bytes, orphans_over_quota_share};
 
     #[test]
     fn orphans_warn_above_a_tenth_of_the_quota() {

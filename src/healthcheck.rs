@@ -7,7 +7,9 @@
 //! cannot amplify disk writes or DB-channel traffic (see
 //! `cached_health_report`). Each blocking probe runs through a [`ProbeSlot`],
 //! so one the kernel never returns from is reported by later checks, not
-//! started again.
+//! started again; [`probe_filesystem_space`] offers the same bounded
+//! `statvfs(3)` to the dashboard's free-space figure, through a slot of its
+//! own.
 //!
 //! [`fs_space_from`] is the single reading of a `statvfs(3)` result, for the
 //! disk-space and inode checks (which run the call through their slot) and
@@ -42,8 +44,9 @@ use crate::{
 /// scan racing the probe window does not flag `CACHE_UNEXPECTED_REGULAR`.
 pub(crate) const PROBE_FILENAME: &str = ".apt-cacher-rs.healthprobe";
 
-/// Upper bound for each individual check.
-const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound for each individual check, and for the dashboard's
+/// free-space probe.
+pub(crate) const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One blocking probe kind, run at most once at a time.
 ///
@@ -54,7 +57,7 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// per probe until the pool is exhausted and every file operation of the
 /// daemon stalls; instead a check whose previous job has not returned
 /// reports that without starting another.
-struct ProbeSlot(AtomicBool);
+pub(crate) struct ProbeSlot(AtomicBool);
 
 /// What became of a job submitted through [`ProbeSlot::run`].
 enum Bounded<T> {
@@ -78,7 +81,7 @@ impl Drop for SlotRelease {
 }
 
 impl ProbeSlot {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self(AtomicBool::new(false))
     }
 
@@ -381,6 +384,44 @@ pub(crate) fn low_inodes_detail(inodes: Option<InodeSpace>) -> Option<String> {
     None
 }
 
+/// What a bounded `statvfs(3)` through a [`ProbeSlot`] found
+/// ([`probe_filesystem_space`]).
+pub(crate) enum ProbedSpace {
+    /// The call returned: the sample, or `None` where it failed (warned
+    /// about in [`fs_space_from`]).
+    Measured(Option<FsSpace>),
+    /// Still running at the deadline; the slot stays taken until it returns.
+    TimedOut,
+    /// Not started: the slot's previous probe has not returned yet.
+    StillBlocked,
+}
+
+/// One `statvfs(3)` of the filesystem holding `path` through `slot`, waited
+/// for at most `limit`: the health check's probe and the dashboard's
+/// free-space figure, each through a slot of its own. A slot shared by two
+/// callers would make one's ordinary probe in flight read as a blocked one
+/// to the other; each caller also coalesces its own concurrent requests
+/// under a memo lock held across this call, so `StillBlocked` means a probe
+/// outran its deadline. [`filesystem_space`] stays the unbounded entry for
+/// callers with a single-flight guard of their own (the download admission's
+/// headroom refresh) or none needed (the startup sample).
+pub(crate) async fn probe_filesystem_space(
+    slot: &'static ProbeSlot,
+    limit: Duration,
+    path: &Path,
+) -> ProbedSpace {
+    let owned = path.to_path_buf();
+    match slot
+        .run(limit, move || nix::sys::statvfs::statvfs(&owned))
+        .await
+    {
+        Bounded::Done(result) => ProbedSpace::Measured(fs_space_from(path, Ok(result))),
+        Bounded::Lost(err) => ProbedSpace::Measured(fs_space_from(path, Err(err))),
+        Bounded::TimedOut => ProbedSpace::TimedOut,
+        Bounded::Busy => ProbedSpace::StillBlocked,
+    }
+}
+
 /// One statvfs feeding both filesystem checks, bounded by [`CHECK_TIMEOUT`]
 /// like the other probes. Returns `(disk_free, inodes_free)`. The probe runs
 /// even without a configured `min_disk_free`, because inode exhaustion is
@@ -409,15 +450,10 @@ async fn probe_filesystem_in(
         };
         (disk_free, CheckResult::Pass)
     };
-    let owned = cache_dir.to_path_buf();
-    let space = match slot
-        .run(limit, move || nix::sys::statvfs::statvfs(&owned))
-        .await
-    {
-        Bounded::Done(result) => fs_space_from(cache_dir, Ok(result)),
-        Bounded::Lost(err) => fs_space_from(cache_dir, Err(err)),
-        Bounded::TimedOut => return unmeasured(CheckResult::timed_out()),
-        Bounded::Busy => return unmeasured(CheckResult::still_blocked()),
+    let space = match probe_filesystem_space(slot, limit, cache_dir).await {
+        ProbedSpace::Measured(space) => space,
+        ProbedSpace::TimedOut => return unmeasured(CheckResult::timed_out()),
+        ProbedSpace::StillBlocked => return unmeasured(CheckResult::still_blocked()),
     };
 
     let disk_free = match min_free {
