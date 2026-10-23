@@ -5,29 +5,35 @@
 //! headroom, and free disk space on the cache filesystem. Results are
 //! memoized for one second with single-flight semantics so probe spam
 //! cannot amplify disk writes or DB-channel traffic (see
-//! `cached_health_report`).
+//! `cached_health_report`). Each blocking probe runs through a [`ProbeSlot`],
+//! so one the kernel never returns from is reported by later checks, not
+//! started again.
 //!
-//! [`filesystem_space`] is the single `statvfs(3)` entry for both the
-//! disk-space and inode checks (and for the main loop's periodic disk-free
-//! check, and the download admission's `min_disk_free` floor in
+//! [`fs_space_from`] is the single reading of a `statvfs(3)` result, for the
+//! disk-space and inode checks (which run the call through their slot) and
+//! for [`filesystem_space`], the main loop's periodic disk-free check and the
+//! download admission's `min_disk_free` floor in
 //! `cache_quota::CacheQuota::refresh_disk_headroom`, which keeps its own
-//! sample) (`inodes: None` means a filesystem without
+//! sample (`inodes: None` means a filesystem without
 //! an inode limit, not "none left"). Probing runs even without
 //! `min_disk_free`: inode exhaustion is invisible to that setting.
 
+use std::io::Write as _;
 use std::num::NonZero;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use coarsetime::Instant;
-use tokio::io::AsyncWriteExt as _;
+use nix::sys::statvfs::Statvfs;
+use tokio::task::JoinError;
 use tracing::{debug, info};
 
 use crate::{
     cache_quota::CacheQuota,
     database_task::{DatabaseCommand, send_db_command},
     error::ErrorReport,
-    fs_open::tokio_nofollow_options,
+    fs_open::nofollow_nonblock_options,
     global_cache_quota, global_config, swrite, warn_once_or_debug, warn_once_or_info,
 };
 
@@ -38,6 +44,74 @@ pub(crate) const PROBE_FILENAME: &str = ".apt-cacher-rs.healthprobe";
 
 /// Upper bound for each individual check.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One blocking probe kind, run at most once at a time.
+///
+/// A check's timeout only stops the *waiting*: the `open(2)` or
+/// `statvfs(3)` it gave up on keeps its blocking-pool thread until the
+/// kernel returns (a hung network filesystem, a FIFO a writer open waits
+/// on). Starting a fresh job on every check would strand one more thread
+/// per probe until the pool is exhausted and every file operation of the
+/// daemon stalls; instead a check whose previous job has not returned
+/// reports that without starting another.
+struct ProbeSlot(AtomicBool);
+
+/// What became of a job submitted through [`ProbeSlot::run`].
+enum Bounded<T> {
+    Done(T),
+    /// The blocking task panicked or was cancelled.
+    Lost(JoinError),
+    /// Still running at the deadline; the slot stays taken until it returns.
+    TimedOut,
+    /// Not started: the slot's previous job has not returned yet.
+    Busy,
+}
+
+/// Frees its slot when the job ends, however it ends: dropped by the job's
+/// closure, or with the closure if the pool never ran it.
+struct SlotRelease(&'static ProbeSlot);
+
+impl Drop for SlotRelease {
+    fn drop(&mut self) {
+        self.0.0.store(false, Ordering::Release);
+    }
+}
+
+impl ProbeSlot {
+    const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    /// Run `job` on the blocking pool unless this slot's previous job is
+    /// still running, and wait for it at most `limit`.
+    async fn run<T: Send + 'static>(
+        &'static self,
+        limit: Duration,
+        job: impl FnOnce() -> T + Send + 'static,
+    ) -> Bounded<T> {
+        if self.0.swap(true, Ordering::Acquire) {
+            return Bounded::Busy;
+        }
+        let release = SlotRelease(self);
+        let handle = tokio::task::spawn_blocking(move || {
+            let _release = release;
+            job()
+        });
+        match tokio::time::timeout(limit, handle).await {
+            Ok(Ok(value)) => Bounded::Done(value),
+            Ok(Err(err)) => Bounded::Lost(err),
+            Err(_elapsed) => Bounded::TimedOut,
+        }
+    }
+}
+
+/// The cache-writability probe's slot.
+static WRITE_PROBE: ProbeSlot = ProbeSlot::new();
+
+/// The health check's `statvfs(3)` slot. Only the health check's own probe:
+/// the main loop's periodic sample and the download admission's headroom
+/// refresh call [`filesystem_space`] directly.
+static STATVFS_PROBE: ProbeSlot = ProbeSlot::new();
 
 /// One `statvfs(3)` snapshot of a filesystem's remaining capacity.
 ///
@@ -81,6 +155,12 @@ impl InodeSpace {
 pub(crate) async fn filesystem_space(path: &Path) -> Option<FsSpace> {
     let owned = path.to_path_buf();
     let joined = tokio::task::spawn_blocking(move || nix::sys::statvfs::statvfs(&owned)).await;
+    fs_space_from(path, joined)
+}
+
+/// [`filesystem_space`]'s reading of a finished `statvfs(3)` job, shared
+/// with the health check's bounded probe.
+fn fs_space_from(path: &Path, joined: Result<nix::Result<Statvfs>, JoinError>) -> Option<FsSpace> {
     let result = match joined {
         Ok(result) => result,
         Err(err) => {
@@ -128,6 +208,15 @@ impl CheckResult {
     /// shared so the three probes cannot drift apart in wording.
     fn timed_out() -> Self {
         Self::Fail(format!("timed out after {}s", CHECK_TIMEOUT.as_secs()))
+    }
+
+    /// The verdict of a check whose previous probe is still blocked (see
+    /// [`ProbeSlot`]): unhealthy, like the timeout that preceded it.
+    fn still_blocked() -> Self {
+        Self::Fail(format!(
+            "still blocked: the probe started by an earlier check has not returned (timed out after {}s)",
+            CHECK_TIMEOUT.as_secs()
+        ))
     }
 
     fn write_json(&self, out: &mut String) {
@@ -300,15 +389,35 @@ async fn probe_filesystem(
     cache_dir: &Path,
     min_free: Option<NonZero<u64>>,
 ) -> (CheckResult, CheckResult) {
-    let space = match tokio::time::timeout(CHECK_TIMEOUT, filesystem_space(cache_dir)).await {
-        Ok(space) => space,
-        Err(_elapsed) => {
-            let disk_free = match min_free {
-                Some(_) => CheckResult::timed_out(),
-                None => CheckResult::Pass,
-            };
-            return (disk_free, CheckResult::Pass);
-        }
+    probe_filesystem_in(&STATVFS_PROBE, CHECK_TIMEOUT, cache_dir, min_free).await
+}
+
+/// [`probe_filesystem`] through `slot` with deadline `limit`, so a test can
+/// own both.
+async fn probe_filesystem_in(
+    slot: &'static ProbeSlot,
+    limit: Duration,
+    cache_dir: &Path,
+    min_free: Option<NonZero<u64>>,
+) -> (CheckResult, CheckResult) {
+    // No sample at all: inodes fail open as on a failed statvfs, and the
+    // byte check fails only where a minimum makes it required.
+    let unmeasured = |verdict: CheckResult| {
+        let disk_free = match min_free {
+            Some(_) => verdict,
+            None => CheckResult::Pass,
+        };
+        (disk_free, CheckResult::Pass)
+    };
+    let owned = cache_dir.to_path_buf();
+    let space = match slot
+        .run(limit, move || nix::sys::statvfs::statvfs(&owned))
+        .await
+    {
+        Bounded::Done(result) => fs_space_from(cache_dir, Ok(result)),
+        Bounded::Lost(err) => fs_space_from(cache_dir, Err(err)),
+        Bounded::TimedOut => return unmeasured(CheckResult::timed_out()),
+        Bounded::Busy => return unmeasured(CheckResult::still_blocked()),
     };
 
     let disk_free = match min_free {
@@ -319,35 +428,54 @@ async fn probe_filesystem(
 }
 
 /// Cache-directory writability: create, write, and unlink a small probe
-/// file at the cache root. `O_NOFOLLOW` (via `tokio_nofollow_options`)
-/// means a planted symlink fails the check - correct, since that indicates
-/// a compromised cache directory. `.create(true)` (not `create_new`) so an
-/// orphaned probe from a crashed run is reopened and truncated.
+/// file at the cache root, as one blocking job through [`WRITE_PROBE`].
 async fn check_cache_write(cache_dir: &Path) -> CheckResult {
+    check_cache_write_in(&WRITE_PROBE, CHECK_TIMEOUT, cache_dir).await
+}
+
+/// [`check_cache_write`] through `slot` with deadline `limit`, so a test can
+/// own both.
+async fn check_cache_write_in(
+    slot: &'static ProbeSlot,
+    limit: Duration,
+    cache_dir: &Path,
+) -> CheckResult {
     let probe = cache_dir.join(PROBE_FILENAME);
-    match tokio::time::timeout(CHECK_TIMEOUT, probe_write(&probe)).await {
-        Ok(Ok(())) => CheckResult::Pass,
-        Ok(Err(err)) => CheckResult::Fail(format!("{}", ErrorReport(&err))),
-        Err(_elapsed) => CheckResult::timed_out(),
+    match slot.run(limit, move || probe_write(&probe)).await {
+        Bounded::Done(Ok(())) => CheckResult::Pass,
+        Bounded::Done(Err(err)) => CheckResult::Fail(format!("{}", ErrorReport(&err))),
+        Bounded::Lost(err) => CheckResult::Fail(format!("probe task lost: {}", ErrorReport(&err))),
+        Bounded::TimedOut => CheckResult::timed_out(),
+        Bounded::Busy => CheckResult::still_blocked(),
     }
 }
 
-async fn probe_write(probe: &Path) -> std::io::Result<()> {
-    let mut file = tokio_nofollow_options()
+/// The probe itself, on a blocking-pool thread. `O_NOFOLLOW` means a planted
+/// symlink fails the check - correct, since that indicates a compromised
+/// cache directory. `O_NONBLOCK` (inert for a regular file) keeps a FIFO
+/// planted at the path from parking the open until a reader appears: with
+/// none it fails with `ENXIO`, with one it opens and the type check refuses
+/// it. `.create(true)` (not `create_new`) so an orphaned probe from a crashed
+/// run is reopened and truncated.
+fn probe_write(probe: &Path) -> std::io::Result<()> {
+    let mut file = nofollow_nonblock_options()
         .create(true)
         .truncate(true)
         .write(true)
-        .open(probe)
-        .await?;
-    file.write_all(b"ok").await?;
-    // tokio's File parks a failed background write in `last_write_err` and
-    // `write_all` still returns Ok; only flush surfaces it. Without this a
-    // full disk passes the very check meant to detect it.
-    file.flush().await?;
+        .open(probe)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::other(format!(
+            "`{}` is not a regular file",
+            probe.display()
+        )));
+    }
+    // A synchronous write, so a full disk surfaces here rather than parked in
+    // a background write as through `tokio::fs::File`.
+    file.write_all(b"ok")?;
     drop(file);
     // A failed unlink still passes the check: the file is scanner-ignored
     // and rewritten by the next probe.
-    if let Err(err) = tokio::fs::remove_file(probe).await {
+    if let Err(err) = std::fs::remove_file(probe) {
         debug!(
             "Failed to remove healthcheck probe `{}`; the next probe rewrites it:  {}",
             probe.display(),
@@ -566,18 +694,33 @@ mod tests {
         assert_eq!(check_inodes_free(None), CheckResult::Pass);
     }
 
+    /// The production deadline through a slot of the test's own, so tests
+    /// running in one process cannot find each other's job in flight.
+    async fn probe_fs(
+        slot: &'static ProbeSlot,
+        dir: &Path,
+        min_free: Option<NonZero<u64>>,
+    ) -> (CheckResult, CheckResult) {
+        probe_filesystem_in(slot, CHECK_TIMEOUT, dir, min_free).await
+    }
+
     #[tokio::test]
     async fn filesystem_probe_uses_real_statvfs() {
+        static SLOT: ProbeSlot = ProbeSlot::new();
         let dir = tempfile::tempdir().expect("tempdir");
         // 1 byte of required headroom passes on any writable filesystem, and
         // a real filesystem is never within 1000 inodes of exhaustion here.
-        let (disk_free, inodes_free) = probe_filesystem(dir.path(), Some(nonzero!(1_u64))).await;
+        let (disk_free, inodes_free) = probe_fs(&SLOT, dir.path(), Some(nonzero!(1_u64))).await;
         assert_eq!(disk_free, CheckResult::Pass);
         assert_eq!(inodes_free, CheckResult::Pass);
         // A missing directory must fail the disk-free probe, not silently
         // pass; the inode check fails open on the same failed sample.
-        let (disk_free, inodes_free) =
-            probe_filesystem(&dir.path().join("nonexistent"), Some(nonzero!(1_u64))).await;
+        let (disk_free, inodes_free) = probe_fs(
+            &SLOT,
+            &dir.path().join("nonexistent"),
+            Some(nonzero!(1_u64)),
+        )
+        .await;
         assert_eq!(
             disk_free,
             CheckResult::Fail(String::from("could not determine free disk space"))
@@ -587,10 +730,11 @@ mod tests {
 
     #[tokio::test]
     async fn filesystem_probe_checks_inodes_without_configured_minimum() {
+        static SLOT: ProbeSlot = ProbeSlot::new();
         let dir = tempfile::tempdir().expect("tempdir");
         // Without `min_disk_free` the byte check is skipped, but the statvfs
         // still runs so inode exhaustion stays visible.
-        let (disk_free, inodes_free) = probe_filesystem(dir.path(), None).await;
+        let (disk_free, inodes_free) = probe_fs(&SLOT, dir.path(), None).await;
         assert_eq!(disk_free, CheckResult::Pass);
         assert_eq!(inodes_free, CheckResult::Pass);
     }
@@ -616,10 +760,17 @@ mod tests {
         assert_eq!(out, "");
     }
 
+    /// [`check_cache_write`] through a slot of the test's own (see
+    /// [`probe_fs`]).
+    async fn write_probe(slot: &'static ProbeSlot, dir: &Path) -> CheckResult {
+        check_cache_write_in(slot, CHECK_TIMEOUT, dir).await
+    }
+
     #[tokio::test]
     async fn cache_write_probe_passes_and_cleans_up() {
+        static SLOT: ProbeSlot = ProbeSlot::new();
         let dir = tempfile::tempdir().expect("tempdir");
-        let r = check_cache_write(dir.path()).await;
+        let r = write_probe(&SLOT, dir.path()).await;
         assert_eq!(r, CheckResult::Pass);
         assert!(
             !dir.path().join(PROBE_FILENAME).exists(),
@@ -629,20 +780,127 @@ mod tests {
 
     #[tokio::test]
     async fn cache_write_probe_fails_on_missing_directory() {
+        static SLOT: ProbeSlot = ProbeSlot::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let gone = dir.path().join("nonexistent");
-        let r = check_cache_write(&gone).await;
+        let r = write_probe(&SLOT, &gone).await;
         assert!(matches!(r, CheckResult::Fail(_)), "unexpected: {r:?}");
     }
 
     #[tokio::test]
     async fn cache_write_probe_refuses_symlink() {
+        static SLOT: ProbeSlot = ProbeSlot::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("target");
         std::fs::write(&target, b"x").expect("write target");
         std::os::unix::fs::symlink(&target, dir.path().join(PROBE_FILENAME)).expect("symlink");
-        let r = check_cache_write(dir.path()).await;
+        let r = write_probe(&SLOT, dir.path()).await;
         assert!(!r.ok(), "O_NOFOLLOW must refuse a planted symlink");
+    }
+
+    /// A FIFO planted at the probe path fails the check at once instead of
+    /// parking the open, which no timeout could reclaim: without a reader the
+    /// nonblocking open fails (`ENXIO`), with one it opens and the type check
+    /// refuses it. Either way the probe returns, so its slot is free again.
+    #[tokio::test]
+    async fn cache_write_probe_refuses_a_fifo_without_blocking() {
+        static SLOT: ProbeSlot = ProbeSlot::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fifo = dir.path().join(PROBE_FILENAME);
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+
+        let without_reader = write_probe(&SLOT, dir.path()).await;
+        assert!(
+            matches!(&without_reader, CheckResult::Fail(detail) if detail.contains("No such device or address")),
+            "a writer open of a reader-less FIFO must fail with ENXIO: {without_reader:?}"
+        );
+
+        let _reader = nofollow_nonblock_options()
+            .read(true)
+            .open(&fifo)
+            .expect("open the FIFO's read end");
+        let with_reader = write_probe(&SLOT, dir.path()).await;
+        assert!(
+            matches!(&with_reader, CheckResult::Fail(detail) if detail.contains("is not a regular file")),
+            "a FIFO with a reader must be refused by type: {with_reader:?}"
+        );
+    }
+
+    /// Wait until `slot`'s job has returned and released it.
+    async fn wait_for_release(slot: &'static ProbeSlot) {
+        let deadline = Duration::from_secs(5);
+        tokio::time::timeout(deadline, async {
+            while slot.0.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the released job frees its slot");
+    }
+
+    /// A job still blocked past its deadline keeps its slot: the next check
+    /// reports it without starting a second job, and once the first returns
+    /// the slot runs jobs again.
+    #[tokio::test]
+    async fn a_blocked_probe_is_not_started_again_until_it_returns() {
+        static SLOT: ProbeSlot = ProbeSlot::new();
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let first = SLOT
+            .run(Duration::from_millis(20), move || {
+                blocked.recv().expect("released by the test");
+            })
+            .await;
+        assert!(matches!(first, Bounded::TimedOut));
+
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let second = {
+            let started = std::sync::Arc::clone(&started);
+            SLOT.run(CHECK_TIMEOUT, move || {
+                started.store(true, Ordering::Relaxed);
+            })
+            .await
+        };
+        assert!(matches!(second, Bounded::Busy));
+        assert!(
+            !started.load(Ordering::Relaxed),
+            "a busy slot must not start the job"
+        );
+
+        release.send(()).expect("the blocked job is still waiting");
+        wait_for_release(&SLOT).await;
+        let third = SLOT.run(CHECK_TIMEOUT, || 7).await;
+        assert!(matches!(third, Bounded::Done(7)));
+    }
+
+    /// A blocked statvfs keeps the byte check failing (without inventing an
+    /// inode verdict), now naming the earlier probe, and passes it where no
+    /// minimum is configured.
+    #[tokio::test]
+    async fn filesystem_probe_reports_a_blocked_statvfs() {
+        static SLOT: ProbeSlot = ProbeSlot::new();
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let held = SLOT
+            .run(Duration::from_millis(20), move || {
+                blocked.recv().expect("released by the test");
+            })
+            .await;
+        assert!(matches!(held, Bounded::TimedOut));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            probe_fs(&SLOT, dir.path(), Some(nonzero!(1_u64))).await,
+            (CheckResult::still_blocked(), CheckResult::Pass)
+        );
+        assert_eq!(
+            probe_fs(&SLOT, dir.path(), None).await,
+            (CheckResult::Pass, CheckResult::Pass)
+        );
+        release.send(()).expect("the blocked job is still waiting");
+        wait_for_release(&SLOT).await;
+        assert_eq!(
+            probe_fs(&SLOT, dir.path(), Some(nonzero!(1_u64))).await,
+            (CheckResult::Pass, CheckResult::Pass)
+        );
     }
 
     #[test]
