@@ -3,11 +3,12 @@
 //!
 //! Runs at startup (awaited before the listener binds, so nothing is in
 //! flight) and after every cleanup cycle.  The traversal itself belongs to
-//! the shared [`Walker`]; this module supplies only the layout knowledge:
-//! what a directory means at each depth ([`Level`]), which subtrees belong to
-//! a *different* mirror row ([`derive_nested_paths`], shared with cleanup so
-//! both agree on where a mirror's tree ends) and which hold partial
-//! downloads (`tmp/`). Those are tallied like cached files: `cache_quota`
+//! the shared [`Walker`], and what a directory means at each depth
+//! ([`Level`]) to `cache_tree`, which the dashboard's size walk shares; this
+//! module supplies which subtrees belong to a *different* mirror row
+//! ([`derive_nested_paths`], shared with cleanup so both agree on where a
+//! mirror's tree ends) and which hold partial downloads (`tmp/`). Those are
+//! tallied like cached files: `cache_quota`
 //! counts the kept partials a failed download leaves behind, which cleanup
 //! reaps only once they age out. The cache root's `.apt-cacher-rs.tmp/` (volatile
 //! scratch files, purged at startup) is not counted.
@@ -27,19 +28,15 @@ use hashbrown::HashMap;
 use tracing::{debug, error, trace};
 
 use crate::{
-    cache_paths::{
-        CachePaths, KNOWN_MIRROR_SUBDIRS, SUBDIR_FLAT_BYHASH, SUBDIR_SCRATCH, SUBDIR_TMP,
-    },
+    cache_paths::{CachePaths, SUBDIR_SCRATCH},
     cache_quota::accounted_size,
+    cache_tree::{DirRole, Level, classify_dir, is_unexpected_file},
     cache_walk::{
         AnomalyLevel, DirFailure, Entry, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker,
     },
     config::CacheHost,
     database::{Database, MirrorEntry},
-    deb_mirror::{
-        MirrorKind, NestedMirrorRelation, derive_nested_paths, is_deb_package,
-        nested_mirror_relation,
-    },
+    deb_mirror::{MirrorKind, NestedMirrorRelation, derive_nested_paths, nested_mirror_relation},
     error::ErrorReport,
     fs_open::probe_dir,
     global_config, healthcheck, metrics,
@@ -106,29 +103,6 @@ impl std::ops::AddAssign for ScanTotals {
         self.orphaned_files = self.orphaned_files.saturating_add(orphaned_files);
         self.orphaned_bytes = self.orphaned_bytes.saturating_add(orphaned_bytes);
     }
-}
-
-/// What a directory reached by [`scan_tree`] means, carried as the walker's
-/// per-directory tag so each entry's policy is decided without re-deriving
-/// it from the path.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Level {
-    /// `<host>/<mirror_path>/`: tally every regular file (warning about
-    /// non-deb ones), dispatch `dists/` to [`Level::Structured`] and `tmp/`
-    /// to [`Level::Tmp`], skip nested-mirror directories, warn on anything
-    /// else.
-    Mirror,
-    /// `dists/`-style: tally files, dispatch a `by-hash/` subdir to
-    /// [`Level::ByHash`], warn on any other directory.
-    Structured,
-    /// Host-level `flat/` subtree: tally files, dispatch `by-hash/` and
-    /// `tmp/`, recurse into every other directory (URL-path verbatim).
-    Flat,
-    /// Content-addressed leaf: tally files only; subdirs are unexpected.
-    ByHash,
-    /// Partial-download directory: tally files (the `.partial`s, and any
-    /// foreign file until cleanup reaps it); subdirs are unexpected.
-    Tmp,
 }
 
 /// The mirror rows sharing one `{host[:port]}` cache directory, keyed by that
@@ -376,8 +350,8 @@ async fn scan_mirror_dir(
 
 /// Walk one tree tallying regular-file sizes; the [`Level`] tag decides,
 /// per directory, which subdirectories are descended into (`dists/`, `tmp/`,
-/// `by-hash/`, every flat URL-dir), skipped (nested mirrors), or
-/// reported as unexpected.  `mirror_path` / `nested` only matter at
+/// `by-hash/`, every flat URL-dir: [`classify_dir`]), skipped (nested
+/// mirrors), or reported as unexpected.  `mirror_path` / `nested` only matter at
 /// [`Level::Mirror`].
 ///
 /// The walker owns the "Failed to read / iterate / get metadata" lines and
@@ -414,51 +388,25 @@ async fn scan_tree(
                 {
                     totals.add_orphan(size);
                 }
-                // A mirror directory holds the pool (`.deb`/`.udeb`/`.ddeb`)
-                // directly; any other regular file there is an operator
-                // artefact cleanup will never touch.  Deeper levels take
-                // every regular file at face value.
-                if entry.tag() == Level::Mirror
-                    && !entry.name().to_str().is_some_and(is_deb_package)
-                {
+                if is_unexpected_file(entry.tag(), entry.name()) {
                     entry.report_unexpected(
                         "counting it towards the cache size but excluding it from cleanup",
                     );
                 }
             }
-            EntryKind::Dir => match entry.tag() {
-                Level::Mirror => {
-                    // Recognized mirror-level layout subdirs get their size
-                    // tallied: `dists/` and the partial downloads in `tmp/`.
-                    // A subdir that is itself a registered
-                    // mirror path under the same host (e.g. `debian/security`
-                    // when scanning `debian`) is silently skipped — it'll be
-                    // walked under its own mirror row.  Flat repositories
-                    // live under `<host>/flat/` (host-level sibling of mirror
-                    // dirs), not below any mirror, so no `flat/` arm here.
-                    if KNOWN_MIRROR_SUBDIRS
-                        .iter()
-                        .any(|known| entry.name() == *known)
-                    {
-                        entry.descend(Level::Structured);
-                    } else if entry.name() == SUBDIR_TMP {
-                        entry.descend(Level::Tmp);
-                    } else {
-                        classify_mirror_subdir(&entry, mirror_path, nested);
-                    }
-                }
-                Level::Structured | Level::Flat if entry.name() == SUBDIR_FLAT_BYHASH => {
-                    entry.descend(Level::ByHash);
-                }
-                // Inside the host-level `flat/` subtree, any directory is a
-                // nested URL-dir under a flat repo (the URL path becomes the
-                // on-disk path verbatim) and is recursed into.  `tmp/` holds
-                // the flat partial downloads (they land at
-                // `<host>/flat/<mirror_path>/tmp/`), tallied like the
-                // structured ones.
-                Level::Flat if entry.name() == SUBDIR_TMP => entry.descend(Level::Tmp),
-                Level::Flat => entry.descend(Level::Flat),
-                Level::Structured | Level::ByHash | Level::Tmp => entry
+            EntryKind::Dir => match classify_dir(entry.tag(), entry.name()) {
+                // `dists/` and the partial downloads in `tmp/` of a mirror
+                // directory; inside the host-level `flat/` subtree every
+                // directory (the URL path is the on-disk path verbatim),
+                // its `tmp/` holding the flat partial downloads.
+                DirRole::Layout(level) => entry.descend(level),
+                // A subdir that is itself a registered mirror path under the
+                // same host (e.g. `debian/security` when scanning `debian`)
+                // is silently skipped -- it'll be walked under its own mirror
+                // row.  Flat repositories live under `<host>/flat/`
+                // (host-level sibling of mirror dirs), not below any mirror.
+                DirRole::MirrorSubdir => classify_mirror_subdir(&entry, mirror_path, nested),
+                DirRole::Stray => entry
                     .report_unexpected("not counting it or its contents towards the cache size"),
             },
         }
@@ -576,5 +524,63 @@ mod tests {
         let (_outcome, totals) =
             scan_tree(&mirror, &MIRROR_WALK, Level::Mirror, "debian", &[]).await;
         assert_eq!(totals.orphaned_files, 2, "released, it is left behind too");
+    }
+}
+
+/// The scan's totals on a mixed tree, pinned: the layout rules moved into
+/// `cache_tree`, which the dashboard's walk shares, and the quota must keep
+/// counting exactly what it counted before (src/CLAUDE.md, `cache_quota`).
+#[cfg(test)]
+mod layout_totals_tests {
+    use super::*;
+    use crate::cache_quota::QUOTA_BLOCK_SIZE;
+
+    fn file(path: &Path, len: usize) {
+        std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
+        std::fs::write(path, vec![b'x'; len]).expect("write");
+    }
+
+    #[tokio::test]
+    async fn a_mixed_tree_counts_what_the_layout_allows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mirror = dir.path().join("debian");
+        // Counted: the pool, a non-deb operator artefact beside it (reported
+        // but counted), `dists/` with its by-hash, the partials in `tmp/`.
+        file(&mirror.join("a_1.0_all.deb"), 10);
+        file(&mirror.join("README"), 5);
+        file(&mirror.join("dists/sid_Release"), 7);
+        file(&mirror.join("dists/by-hash/ab"), 3);
+        file(&mirror.join("tmp/b_1.0_all.deb.partial"), 4);
+        // Not counted: a nested mirror, the container of one, a stray
+        // directory, the legacy flat directory, and any directory below
+        // `dists/` (cache names are flattened), its `by-hash/` or `tmp/`.
+        file(&mirror.join("security/c_1.0_all.deb"), 100);
+        file(&mirror.join("ports/arm/d_1.0_all.deb"), 100);
+        file(&mirror.join("stray/e"), 100);
+        file(&mirror.join("flat/f_1.0_all.deb"), 100);
+        file(&mirror.join("tmp/sub/g"), 100);
+        file(&mirror.join("dists/sid/main/h"), 100);
+        file(&mirror.join("dists/by-hash/SHA256/i"), 100);
+        let nested = ["debian/security".to_owned(), "debian/ports/arm".to_owned()];
+        let (outcome, totals) =
+            scan_tree(&mirror, &MIRROR_WALK, Level::Mirror, "debian", &nested).await;
+        assert!(matches!(outcome, WalkOutcome::Complete));
+        assert_eq!((totals.bytes, totals.files), (5 * QUOTA_BLOCK_SIZE, 5));
+        assert_eq!(totals.orphaned_files, 1);
+
+        // The host-level flat tree: every directory recursed into, `dists/`
+        // included, but `by-hash/` and `tmp/` are leaves.
+        let flat = dir.path().join("flat");
+        file(&flat.join("repo/i_1.0_all.deb"), 1);
+        file(&flat.join("repo/dists/bookworm/pool/j_1.0_all.deb"), 1);
+        file(&flat.join("repo/by-hash/k"), 1);
+        file(&flat.join("repo/tmp/l_1.0_all.deb.partial"), 1);
+        file(&flat.join("other/deep/m_1.0_all.deb"), 1);
+        file(&flat.join("repo/by-hash/sub/n"), 100);
+        file(&flat.join("repo/tmp/sub/o"), 100);
+        let (outcome, totals) = scan_tree(&flat, &FLAT_WALK, Level::Flat, "", &[]).await;
+        assert!(matches!(outcome, WalkOutcome::Complete));
+        assert_eq!((totals.bytes, totals.files), (5 * QUOTA_BLOCK_SIZE, 5));
+        assert_eq!(totals.orphaned_files, 1);
     }
 }

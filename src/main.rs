@@ -25,6 +25,7 @@ mod cache_layout;
 mod cache_metadata;
 mod cache_paths;
 mod cache_quota;
+mod cache_tree;
 mod cache_walk;
 #[cfg(feature = "hyper")]
 mod channel_body;
