@@ -12,13 +12,18 @@
 //! backend representation (`extract` for httparse, `from_http` for hyper),
 //! so the malformed-header logging lives here too.
 
-use std::{borrow::Cow, path::Path, sync::Arc};
+use std::{
+    borrow::Cow,
+    path::Path,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 #[cfg(feature = "hyper")]
 use http::HeaderMap;
 use http::StatusCode;
 
-use crate::cache_layout::CacheEntryKeyRef;
+use crate::cache_layout::{CacheEntryKeyRef, MissReason};
 use crate::cache_metadata;
 #[cfg(feature = "sendfile")]
 use crate::http_helpers::find_header;
@@ -27,8 +32,26 @@ use crate::{
     client_info::ClientInfo,
     http_etag::if_none_match,
     http_range::{HttpDate, ParsedRange, cache_file_http_date, compute_age, http_parse_range},
+    limits::VOLATILE_CACHE_MAX_AGE,
     warn_once_or_debug,
 };
+
+/// A volatile copy is fresh only within the fixed cache window. Compare raw
+/// timestamps: HTTP-date rounding can turn subsecond mtimes into future dates.
+/// Future timestamps are stale, so clock skew cannot freeze an index in cache.
+pub(crate) fn volatile_freshness(
+    modified: SystemTime,
+    now: SystemTime,
+) -> Result<Duration, MissReason> {
+    let age = now
+        .duration_since(modified)
+        .map_err(|_future| MissReason::FutureTimestamp)?;
+    if age < VOLATILE_CACHE_MAX_AGE {
+        Ok(age)
+    } else {
+        Err(MissReason::Expired)
+    }
+}
 
 /// Raw `Range` / `If-Range` / `If-None-Match` / `If-Modified-Since` values
 /// from a client request, as the plan reads them.  Header values that are
@@ -397,6 +420,30 @@ mod tests {
             content_length: SIZE,
             content_range: None,
         })
+    }
+
+    #[test]
+    fn volatile_freshness_preserves_subseconds_and_the_thirty_second_boundary() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(60);
+        for age in [
+            Duration::ZERO,
+            Duration::from_secs(29),
+            Duration::from_nanos(29_999_999_999),
+        ] {
+            assert_eq!(volatile_freshness(now - age, now), Ok(age));
+        }
+        assert_eq!(
+            volatile_freshness(now - Duration::from_secs(30), now),
+            Err(MissReason::Expired)
+        );
+        assert_eq!(
+            volatile_freshness(now - Duration::from_secs(31), now),
+            Err(MissReason::Expired)
+        );
+        assert_eq!(
+            volatile_freshness(now + Duration::from_nanos(1), now),
+            Err(MissReason::FutureTimestamp)
+        );
     }
 
     #[test]

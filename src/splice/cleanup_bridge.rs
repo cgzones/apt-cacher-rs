@@ -11,7 +11,9 @@ use http::{StatusCode, Uri, uri::PathAndQuery};
 use tokio::io::AsyncReadExt as _;
 use tracing::{debug, error};
 
+use crate::cache_conditional::volatile_freshness;
 use crate::cache_layout::ConnectionDetails;
+use crate::cache_layout::MissReason;
 use crate::deb_mirror::Mirror;
 use crate::error::ErrorReport;
 use crate::fs_open::{
@@ -80,17 +82,18 @@ async fn serve_cached_cleanup_file(
     let modified = mdata
         .modified()
         .expect("Platform should support modification timestamps via setup check");
-    let Ok(elapsed) = now.duration_since(modified) else {
-        warn_once_or_info!(
-            "Volatile file `{}` was modified in the future; treating it as stale and refetching from upstream",
-            cache_path.display()
-        );
-        return None;
+    let elapsed = match volatile_freshness(modified, now) {
+        Ok(elapsed) => elapsed,
+        Err(reason) => {
+            if reason == MissReason::FutureTimestamp {
+                warn_once_or_info!(
+                    "Volatile file `{}` was modified in the future; treating it as stale and refetching from upstream",
+                    cache_path.display()
+                );
+            }
+            return None;
+        }
     };
-    let max_age = VOLATILE_CACHE_MAX_AGE;
-    if elapsed >= max_age {
-        return None;
-    }
 
     let max_bytes = buffering_cap(req.uri().path());
     if mdata.len() > max_bytes {
@@ -110,7 +113,7 @@ async fn serve_cached_cleanup_file(
                 "splice cleanup: serving `{}` from cache (age {} within {})",
                 cache_path.display(),
                 HumanFmt::Time(elapsed),
-                HumanFmt::Time(max_age)
+                HumanFmt::Time(VOLATILE_CACHE_MAX_AGE)
             );
             Some(
                 http::Response::builder()

@@ -13,7 +13,7 @@
 
 use std::{
     borrow::Cow, convert::Infallible, fmt, num::NonZero, os::unix::fs::MetadataExt as _,
-    path::Path, path::PathBuf, sync::Arc,
+    path::Path, path::PathBuf, sync::Arc, time::SystemTime,
 };
 
 use futures_util::StreamExt as _;
@@ -43,7 +43,9 @@ use crate::{
         Serveable, await_serveable,
     },
     build_info::{APP_USER_AGENT, APP_VIA},
-    cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
+    cache_conditional::{
+        CacheInfo, RangeRequestHeaders, ServeParams, ServePlan, volatile_freshness,
+    },
     cache_layout::{
         CacheMiss, CachedFlavor, ConnectionDetails, FetchRole, LookupOutcome, MissReason,
     },
@@ -1382,12 +1384,8 @@ async fn serve_volatile_file(
         .modified()
         .expect("Platform should support modification timestamps via setup check");
 
-    // Cache volatile files for short periods to reduce up-to-date requests.
-    // Compute age from the raw SystemTime — HttpDate rounds sub-second mtimes
-    // up to the next whole second, which would otherwise appear to be in the future.
-    let age = modified_system_time.elapsed();
-    if let Ok(elapsed) = age {
-        if elapsed < VOLATILE_CACHE_MAX_AGE {
+    let reason = match volatile_freshness(modified_system_time, SystemTime::now()) {
+        Ok(elapsed) => {
             debug!(
                 "Volatile file `{}` age {} is within the {} freshness window, serving cached version...",
                 file_path.display(),
@@ -1403,21 +1401,20 @@ async fn serve_volatile_file(
             note_cached_index_touch(&conn_details, req.uri().path(), &file_path);
             return serve_cached_file(conn_details, &req, file, file_path, None, Some(mdata)).await;
         }
-    } else {
-        warn_once_or_info!(
-            "Volatile file `{}` was modified in the future; treating it as stale and refetching from upstream",
-            file_path.display()
-        );
-    }
+        Err(reason) => {
+            if reason == MissReason::FutureTimestamp {
+                warn_once_or_info!(
+                    "Volatile file `{}` was modified in the future; treating it as stale and refetching from upstream",
+                    file_path.display()
+                );
+            }
+            reason
+        }
+    };
 
     // Lookup-site parent refetch bump; dominates the VOLATILE_REFETCHED_*
     // subset bumps in `serve_new_file`. Cleanup-synthetic probes are
     // operator bookkeeping, not user traffic, and count nothing.
-    let reason = if age.is_err() {
-        MissReason::FutureTimestamp
-    } else {
-        MissReason::Expired
-    };
     let miss = CacheMiss::StaleVolatile {
         reason,
         file,
