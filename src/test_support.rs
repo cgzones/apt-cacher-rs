@@ -75,3 +75,20 @@ pub(crate) fn levels_during(f: impl FnOnce()) -> Vec<tracing::Level> {
     drop(guard);
     levels.0.lock().clone()
 }
+
+/// Occupy the sole blocking worker until the returned sender is sent or dropped.
+/// Configure `max_blocking_threads(1)` and finish prerequisite blocking I/O
+/// before calling; release the sender before tearing down the runtime.
+#[cfg(feature = "splice")]
+pub(crate) fn pause_blocking_pool(
+    runtime: &tokio::runtime::Runtime,
+) -> std::sync::mpsc::Sender<()> {
+    let (resume, paused) = std::sync::mpsc::channel();
+    let (started, ready) = std::sync::mpsc::channel();
+    drop(runtime.spawn_blocking(move || {
+        started.send(()).unwrap();
+        let _released = paused.recv();
+    }));
+    ready.recv().unwrap();
+    resume
+}

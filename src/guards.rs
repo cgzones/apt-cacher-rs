@@ -962,6 +962,8 @@ impl Drop for RenameBarrier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "splice")]
+    use crate::test_support::pause_blocking_pool;
     use crate::{config::ClientHost, deb_mirror::MirrorKind, test_support::levels_during};
 
     fn key(debname: &str) -> CacheEntryKey {
@@ -1258,18 +1260,6 @@ mod tests {
         assert!(failure.exempts(&cleanup.client), "{failure:?}");
         assert!(!failure.exempts(&details.client), "{failure:?}");
         assert_eq!(metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.get(), rejected);
-    }
-
-    #[cfg(feature = "splice")]
-    fn pause_blocking_pool(runtime: &tokio::runtime::Runtime) -> std::sync::mpsc::Sender<()> {
-        let (resume, paused) = std::sync::mpsc::channel();
-        let (started, ready) = std::sync::mpsc::channel();
-        drop(runtime.spawn_blocking(move || {
-            started.send(()).unwrap();
-            let _released = paused.recv();
-        }));
-        ready.recv().unwrap();
-        resume
     }
 
     #[cfg(feature = "splice")]

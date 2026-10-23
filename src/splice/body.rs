@@ -2715,13 +2715,7 @@ mod tests {
             .max_blocking_threads(1)
             .build()
             .unwrap();
-        let (resume, paused) = std::sync::mpsc::channel();
-        let (started, ready) = std::sync::mpsc::channel();
-        drop(runtime.spawn_blocking(move || {
-            started.send(()).unwrap();
-            let _released = paused.recv();
-        }));
-        ready.recv().unwrap();
+        let resume = crate::test_support::pause_blocking_pool(&runtime);
         (runtime, resume)
     }
 
