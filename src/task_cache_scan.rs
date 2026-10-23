@@ -260,7 +260,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
         for mirror in &bucket.mirrors {
             let nested = derive_nested_paths(&mirror.path, &bucket.paths);
             let mirror_dir = paths.mirror_dir(mirror.site());
-            totals += scan_mirror_dir(&mirror_dir, mirror, &nested).await;
+            totals += scan_mirror_dir(cache_path, &mirror_dir, mirror, &nested).await;
         }
 
         // The host-level `flat/` subtree is a sibling of mirror dirs.
@@ -270,7 +270,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
         match probe_dir(&flat_path, "host-level flat root").await {
             Ok(true) => {
                 let (_outcome, flat_totals) =
-                    scan_tree(&flat_path, &FLAT_WALK, Level::Flat, "", &[]).await;
+                    scan_tree(cache_path, &flat_path, &FLAT_WALK, Level::Flat, "", &[]).await;
                 totals += flat_totals;
             }
             Ok(false) => {}
@@ -300,6 +300,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
 /// which the walk treats as foreign territory.
 #[must_use]
 async fn scan_mirror_dir(
+    cache_root: &Path,
     mirror_path: &Path,
     mirror: &MirrorEntry,
     nested: &[String],
@@ -307,6 +308,7 @@ async fn scan_mirror_dir(
     trace!("Scanning mirror directory `{}`...", mirror_path.display());
 
     let (outcome, totals) = scan_tree(
+        cache_root,
         mirror_path,
         &MIRROR_WALK,
         Level::Mirror,
@@ -356,9 +358,13 @@ async fn scan_mirror_dir(
 ///
 /// The walker owns the "Failed to read / iterate / get metadata" lines and
 /// the anomaly counters; a directory-level failure skips that directory's
-/// unread remainder and the walk carries on.
+/// unread remainder and the walk carries on. `root` is reached from
+/// `cache_root` through directories only (`Walker::confined_to`): a mirror
+/// directory replaced by a symlink is reported and counted as empty, so the
+/// quota never counts a tree twice, or one outside the cache.
 #[must_use]
 async fn scan_tree(
+    cache_root: &Path,
     root: &Path,
     ctx: &'static WalkContext,
     root_level: Level,
@@ -366,7 +372,9 @@ async fn scan_tree(
     nested: &[String],
 ) -> (WalkOutcome, ScanTotals) {
     let mut totals = ScanTotals::default();
-    let mut walker = Walker::new(root, ctx, OnMissing::Tolerate, root_level).stat_files();
+    let mut walker = Walker::new(root, ctx, OnMissing::Tolerate, root_level)
+        .stat_files()
+        .confined_to(cache_root);
 
     while let Some(mut entry) = walker.next().await {
         match entry.kind() {
@@ -481,15 +489,23 @@ mod tests {
         std::fs::create_dir_all(mirror.join("tmp")).expect("mkdir");
         std::fs::write(mirror.join("foo_1.0_amd64.deb"), b"12345").expect("deb");
         std::fs::write(mirror.join("tmp/bar_1.0_amd64.deb.partial"), b"123").expect("partial");
-        let (_outcome, totals) =
-            scan_tree(&mirror, &MIRROR_WALK, Level::Mirror, "debian", &[]).await;
+        let (_outcome, totals) = scan_tree(
+            dir.path(),
+            &mirror,
+            &MIRROR_WALK,
+            Level::Mirror,
+            "debian",
+            &[],
+        )
+        .await;
         assert_eq!((totals.bytes, totals.files), (2 * QUOTA_BLOCK_SIZE, 2));
 
         let flat = dir.path().join("flat");
         std::fs::create_dir_all(flat.join("repo/tmp")).expect("mkdir");
         std::fs::write(flat.join("repo/Packages"), b"12").expect("index");
         std::fs::write(flat.join("repo/tmp/x_1_all.deb.partial"), b"1234").expect("partial");
-        let (_outcome, totals) = scan_tree(&flat, &FLAT_WALK, Level::Flat, "", &[]).await;
+        let (_outcome, totals) =
+            scan_tree(dir.path(), &flat, &FLAT_WALK, Level::Flat, "", &[]).await;
         assert_eq!((totals.bytes, totals.files), (2 * QUOTA_BLOCK_SIZE, 2));
         assert_eq!(
             (totals.orphaned_files, totals.orphaned_bytes),
@@ -512,8 +528,15 @@ mod tests {
         std::fs::write(mirror.join("pool_1.0_amd64.deb.partial"), b"1").expect("misplaced");
         let claim = PartialClaim::acquire(held).expect("unclaimed");
 
-        let (_outcome, totals) =
-            scan_tree(&mirror, &MIRROR_WALK, Level::Mirror, "debian", &[]).await;
+        let (_outcome, totals) = scan_tree(
+            dir.path(),
+            &mirror,
+            &MIRROR_WALK,
+            Level::Mirror,
+            "debian",
+            &[],
+        )
+        .await;
         assert_eq!(totals.files, 4);
         assert_eq!(
             (totals.orphaned_files, totals.orphaned_bytes),
@@ -521,8 +544,15 @@ mod tests {
         );
         drop(claim);
 
-        let (_outcome, totals) =
-            scan_tree(&mirror, &MIRROR_WALK, Level::Mirror, "debian", &[]).await;
+        let (_outcome, totals) = scan_tree(
+            dir.path(),
+            &mirror,
+            &MIRROR_WALK,
+            Level::Mirror,
+            "debian",
+            &[],
+        )
+        .await;
         assert_eq!(totals.orphaned_files, 2, "released, it is left behind too");
     }
 }
@@ -562,8 +592,15 @@ mod layout_totals_tests {
         file(&mirror.join("dists/sid/main/h"), 100);
         file(&mirror.join("dists/by-hash/SHA256/i"), 100);
         let nested = ["debian/security".to_owned(), "debian/ports/arm".to_owned()];
-        let (outcome, totals) =
-            scan_tree(&mirror, &MIRROR_WALK, Level::Mirror, "debian", &nested).await;
+        let (outcome, totals) = scan_tree(
+            dir.path(),
+            &mirror,
+            &MIRROR_WALK,
+            Level::Mirror,
+            "debian",
+            &nested,
+        )
+        .await;
         assert!(matches!(outcome, WalkOutcome::Complete));
         assert_eq!((totals.bytes, totals.files), (5 * QUOTA_BLOCK_SIZE, 5));
         assert_eq!(totals.orphaned_files, 1);
@@ -578,9 +615,32 @@ mod layout_totals_tests {
         file(&flat.join("other/deep/m_1.0_all.deb"), 1);
         file(&flat.join("repo/by-hash/sub/n"), 100);
         file(&flat.join("repo/tmp/sub/o"), 100);
-        let (outcome, totals) = scan_tree(&flat, &FLAT_WALK, Level::Flat, "", &[]).await;
+        let (outcome, totals) =
+            scan_tree(dir.path(), &flat, &FLAT_WALK, Level::Flat, "", &[]).await;
         assert!(matches!(outcome, WalkOutcome::Complete));
         assert_eq!((totals.bytes, totals.files), (5 * QUOTA_BLOCK_SIZE, 5));
         assert_eq!(totals.orphaned_files, 1);
+    }
+
+    /// A mirror directory replaced by a symlink is reported and counted as
+    /// empty: the quota never counts a tree twice, or one outside the cache.
+    #[tokio::test]
+    async fn a_mirror_directory_behind_a_symlink_counts_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        file(&outside.path().join("a_1.0_all.deb"), 10);
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("debian")).expect("symlink");
+        let before = metrics::CACHE_NON_REGULAR.get();
+        let (_outcome, totals) = scan_tree(
+            dir.path(),
+            &dir.path().join("debian"),
+            &MIRROR_WALK,
+            Level::Mirror,
+            "debian",
+            &[],
+        )
+        .await;
+        assert_eq!((totals.bytes, totals.files), (0, 0));
+        assert_eq!(metrics::CACHE_NON_REGULAR.get(), before + 1);
     }
 }

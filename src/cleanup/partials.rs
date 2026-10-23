@@ -90,6 +90,7 @@ static TMP_WALK: WalkContext = WalkContext {
 /// `UnitStats::removed`/`bytes_removed`: partial-download scratch files are
 /// not cached content.
 pub(super) async fn cleanup_tmp_dir(
+    cache_root: &Path,
     tmp_dir: &Path,
     now: SystemTime,
     partial_max_age: Duration,
@@ -102,7 +103,8 @@ pub(super) async fn cleanup_tmp_dir(
 
     let mut reaped = TmpReap::default();
 
-    let mut walker = Walker::new(tmp_dir, &TMP_WALK, OnMissing::Tolerate, ());
+    let mut walker =
+        Walker::new(tmp_dir, &TMP_WALK, OnMissing::Tolerate, ()).confined_to(cache_root);
 
     while let Some(mut entry) = walker.next().await {
         let Some(mdata) = entry.metadata().await else {
@@ -288,6 +290,8 @@ mod tests {
 
     use filetime::{FileTime, set_file_mtime};
 
+    use crate::metrics;
+
     use super::{
         EMPTY_PARTIAL_MIN_AGE, PartialCutoffs, Reaped, TmpReap, cleanup_tmp_dir, reap_partial,
     };
@@ -312,6 +316,39 @@ mod tests {
         set_file_mtime(&path, FileTime::from_system_time(now - age)).expect("backdate mtime");
     }
 
+    /// A `tmp/` reached through a symlinked mirror directory is not reaped:
+    /// the stale partials of the tree the symlink points at stay put, and
+    /// the symlink is reported as a non-regular entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_tmp_dir_behind_a_symlink_is_not_reaped() {
+        let cache = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let now = SystemTime::now();
+        std::fs::create_dir(outside.path().join("tmp")).expect("mkdir");
+        plant_file(
+            &outside.path().join("tmp"),
+            "old.partial",
+            b"resume",
+            now,
+            PARTIAL_MAX_AGE * 2,
+        );
+        std::fs::create_dir(cache.path().join("mirror.test")).expect("mkdir");
+        std::os::unix::fs::symlink(outside.path(), cache.path().join("mirror.test/debian"))
+            .expect("symlink");
+
+        let before = metrics::CACHE_NON_REGULAR.get();
+        let reaped = cleanup_tmp_dir(
+            cache.path(),
+            &cache.path().join("mirror.test/debian/tmp"),
+            now,
+            PARTIAL_MAX_AGE,
+        )
+        .await;
+        assert_eq!(reaped.entries, 0);
+        assert!(outside.path().join("tmp/old.partial").exists());
+        assert_eq!(metrics::CACHE_NON_REGULAR.get(), before + 1);
+    }
+
     // A partial is reaped through `block_in_place`, which needs the
     // multi-thread runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -324,7 +361,7 @@ mod tests {
         plant_file(tmp, "young.partial", b"resume", now, PARTIAL_MAX_AGE / 2);
         plant_file(tmp, "old.partial", b"resume", now, PARTIAL_MAX_AGE * 2);
 
-        let reaped = cleanup_tmp_dir(tmp, now, PARTIAL_MAX_AGE).await;
+        let reaped = cleanup_tmp_dir(dir.path(), tmp, now, PARTIAL_MAX_AGE).await;
 
         assert_eq!(reaped.entries, 1);
         assert_eq!(
@@ -349,12 +386,12 @@ mod tests {
         plant_file(tmp, "resumed.partial", b"resume", now, PARTIAL_MAX_AGE * 2);
         let claim = PartialClaim::acquire(tmp.join("resumed.partial")).expect("unclaimed");
 
-        let reaped = cleanup_tmp_dir(tmp, now, PARTIAL_MAX_AGE).await;
+        let reaped = cleanup_tmp_dir(dir.path(), tmp, now, PARTIAL_MAX_AGE).await;
         assert_eq!(reaped, TmpReap::default(), "a download is using it");
         assert!(tmp.join("resumed.partial").exists());
 
         drop(claim);
-        let reaped = cleanup_tmp_dir(tmp, now, PARTIAL_MAX_AGE).await;
+        let reaped = cleanup_tmp_dir(dir.path(), tmp, now, PARTIAL_MAX_AGE).await;
         assert_eq!(
             reaped,
             TmpReap {
@@ -438,7 +475,7 @@ mod tests {
             EMPTY_PARTIAL_MIN_AGE + Duration::from_mins(1),
         );
 
-        let reaped = cleanup_tmp_dir(tmp, now, long_max_age).await;
+        let reaped = cleanup_tmp_dir(dir.path(), tmp, now, long_max_age).await;
 
         assert_eq!(reaped.entries, 1);
         assert!(
@@ -467,7 +504,7 @@ mod tests {
         plant_file(tmp, "six-days.bin", b"x", now, ONE_DAY * 6);
         plant_file(tmp, "eight-days.bin", b"x", now, ONE_DAY * 8);
 
-        let reaped = cleanup_tmp_dir(tmp, now, PARTIAL_MAX_AGE).await;
+        let reaped = cleanup_tmp_dir(dir.path(), tmp, now, PARTIAL_MAX_AGE).await;
 
         assert_eq!(reaped.entries, 1);
         assert_eq!(reaped.bytes, 4096);
@@ -502,7 +539,7 @@ mod tests {
         )
         .expect("backdate mtime");
 
-        let reaped = cleanup_tmp_dir(tmp, now, PARTIAL_MAX_AGE).await;
+        let reaped = cleanup_tmp_dir(dir.path(), tmp, now, PARTIAL_MAX_AGE).await;
 
         assert_eq!(reaped.entries, 1);
         assert_eq!(
@@ -535,7 +572,7 @@ mod tests {
         plant_file(tmp, "stale.partial", b"resume", now, PARTIAL_MAX_AGE * 2);
         std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o500)).expect("chmod");
 
-        let reaped = cleanup_tmp_dir(tmp, now, PARTIAL_MAX_AGE).await;
+        let reaped = cleanup_tmp_dir(dir.path(), tmp, now, PARTIAL_MAX_AGE).await;
 
         std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o700)).expect("chmod");
         assert_eq!(
@@ -554,7 +591,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let now = SystemTime::now();
 
-        let reaped = cleanup_tmp_dir(&dir.path().join("absent"), now, PARTIAL_MAX_AGE).await;
+        let reaped =
+            cleanup_tmp_dir(dir.path(), &dir.path().join("absent"), now, PARTIAL_MAX_AGE).await;
 
         assert_eq!(reaped.entries, 0);
     }

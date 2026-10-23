@@ -93,12 +93,14 @@ pub(super) struct ScannedTree {
 /// is what `sweep_candidates` rejoins to reach the file - so it must stay
 /// exactly that and never, say, a basename for a nested entry.
 pub(super) async fn scan_candidates(
+    cache_root: &Path,
     tree: &TreeSpec,
     mirror_path: &str,
 ) -> Result<ScannedTree, CleanupUnitError> {
     let mut ret = HashMap::new();
     let mut io_failures = 0;
-    let mut walker = Walker::new(&tree.root, &RECONCILE_WALK, OnMissing::Tolerate, ());
+    let mut walker =
+        Walker::new(&tree.root, &RECONCILE_WALK, OnMissing::Tolerate, ()).confined_to(cache_root);
 
     while let Some(mut entry) = walker.next().await {
         match entry.kind() {
@@ -233,6 +235,26 @@ mod tests {
         assert!(!sub.exists());
     }
 
+    /// A pool reached through a symlinked mirror directory yields no
+    /// candidates, so nothing outside the cache is ever swept.
+    #[tokio::test]
+    async fn a_pool_behind_a_symlink_yields_no_candidates() {
+        let cache = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outside.path().join("a_1.0_amd64.deb"), b"x").expect("deb");
+        std::fs::create_dir(cache.path().join("mirror.test")).expect("mkdir");
+        std::os::unix::fs::symlink(outside.path(), cache.path().join("mirror.test/debian"))
+            .expect("symlink");
+        let tree = TreeSpec {
+            root: cache.path().join("mirror.test/debian"),
+            walk: Walk::Shallow,
+        };
+        let scanned = scan_candidates(cache.path(), &tree, "debian")
+            .await
+            .expect("a refused root is an empty tree");
+        assert!(scanned.candidates.is_empty(), "{:?}", scanned.candidates);
+    }
+
     #[tokio::test]
     async fn scan_candidates_structured_is_depth1_basename_keyed() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -249,7 +271,7 @@ mod tests {
             root: dir.path().to_path_buf(),
             walk: Walk::Shallow,
         };
-        let map = scan_candidates(&tree, "debian")
+        let map = scan_candidates(dir.path(), &tree, "debian")
             .await
             .expect("scan")
             .candidates;
@@ -287,7 +309,7 @@ mod tests {
                 boundaries: Vec::new(),
             },
         };
-        let map = scan_candidates(&tree, "apt")
+        let map = scan_candidates(dir.path(), &tree, "apt")
             .await
             .expect("scan")
             .candidates;
@@ -313,7 +335,7 @@ mod tests {
                 boundaries: vec!["apt/amd64/special".to_owned()],
             },
         };
-        let map = scan_candidates(&tree, "apt")
+        let map = scan_candidates(dir.path(), &tree, "apt")
             .await
             .expect("scan")
             .candidates;
@@ -338,7 +360,7 @@ mod tests {
             root: dir.path().to_path_buf(),
             walk: Walk::Shallow,
         };
-        let map = scan_candidates(&tree, "debian")
+        let map = scan_candidates(dir.path(), &tree, "debian")
             .await
             .expect("scan")
             .candidates;
@@ -354,7 +376,7 @@ mod tests {
             root: dir.path().join("absent"),
             walk: Walk::Shallow,
         };
-        let map = scan_candidates(&tree, "debian")
+        let map = scan_candidates(dir.path(), &tree, "debian")
             .await
             .expect("scan")
             .candidates;

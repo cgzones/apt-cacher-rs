@@ -104,11 +104,13 @@ static RELEASE_WALK: WalkContext = WalkContext {
 /// slice for the flat tree, which has a single root `{In,}Release` and no
 /// per-dist union.
 pub(super) async fn build_byhash_reference_set(
+    cache_root: &Path,
     release_dir: &Path,
     layout: CacheLayout,
     expected_dists: &[&str],
 ) -> Option<ByHashReferenceSet> {
-    let mut walker = Walker::new(release_dir, &RELEASE_WALK, OnMissing::Tolerate, ());
+    let mut walker =
+        Walker::new(release_dir, &RELEASE_WALK, OnMissing::Tolerate, ()).confined_to(cache_root);
 
     let mut set = ByHashReferenceSet {
         sha256: HashSet::new(),
@@ -407,6 +409,7 @@ mod tests {
             assert!(
                 build_byhash_reference_set(
                     dir.path(),
+                    dir.path(),
                     CacheLayout::DistsByHash,
                     &["stable", "sid"]
                 )
@@ -428,7 +431,7 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("absent"), dir.path().join("sid_InRelease"))
             .expect("symlink");
         assert!(
-            build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &["sid"])
+            build_byhash_reference_set(dir.path(), dir.path(), CacheLayout::DistsByHash, &["sid"])
                 .await
                 .is_none(),
             "unreadable signed sibling forces age retention"
@@ -450,10 +453,14 @@ mod tests {
             "Archive: sid\n",
         )
         .expect("component");
-        let set =
-            build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &["sid", "stable"])
-                .await
-                .expect("valid distributions");
+        let set = build_byhash_reference_set(
+            dir.path(),
+            dir.path(),
+            CacheLayout::DistsByHash,
+            &["sid", "stable"],
+        )
+        .await
+        .expect("valid distributions");
         assert!(!set.covers(HashAlgo::Sha256));
         assert!(!set.covers(HashAlgo::Sha512));
         std::fs::write(
@@ -461,7 +468,7 @@ mod tests {
             release_with_sha256(&[[0xcc; 32]]),
         )
         .expect("additional complete algorithm");
-        let set = build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &[])
+        let set = build_byhash_reference_set(dir.path(), dir.path(), CacheLayout::DistsByHash, &[])
             .await
             .expect("set");
         assert!(set.covers(HashAlgo::Sha256));
@@ -484,7 +491,7 @@ mod tests {
         std::fs::write(dir.path().join("sid_main_binary-amd64_Packages.xz"), b"x")
             .expect("write pkg");
 
-        let set = build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &[])
+        let set = build_byhash_reference_set(dir.path(), dir.path(), CacheLayout::DistsByHash, &[])
             .await
             .expect("reference set built");
         assert!(set.sha256.contains(&a));
@@ -507,7 +514,7 @@ mod tests {
 
         let expected = ["sid", "trixie"];
         assert!(
-            build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &expected)
+            build_byhash_reference_set(dir.path(), dir.path(), CacheLayout::DistsByHash, &expected)
                 .await
                 .is_none(),
             "missing `trixie` Release must force age-based retention"
@@ -515,9 +522,10 @@ mod tests {
 
         // With only `sid` expected -- the one present -- reference mode holds.
         let only_sid = ["sid"];
-        let set = build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &only_sid)
-            .await
-            .expect("reference set built when every expected dist is present");
+        let set =
+            build_byhash_reference_set(dir.path(), dir.path(), CacheLayout::DistsByHash, &only_sid)
+                .await
+                .expect("reference set built when every expected dist is present");
         assert!(set.sha256.contains(&a));
     }
 
@@ -531,7 +539,7 @@ mod tests {
             .expect("write sid");
         let expected = ["sid"];
         assert!(
-            build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &expected)
+            build_byhash_reference_set(dir.path(), dir.path(), CacheLayout::DistsByHash, &expected)
                 .await
                 .is_some()
         );
@@ -542,15 +550,20 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         // Empty dir: no Release files.
         assert!(
-            build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &[])
+            build_byhash_reference_set(dir.path(), dir.path(), CacheLayout::DistsByHash, &[])
                 .await
                 .is_none()
         );
         // Missing dir.
         assert!(
-            build_byhash_reference_set(&dir.path().join("absent"), CacheLayout::DistsByHash, &[])
-                .await
-                .is_none()
+            build_byhash_reference_set(
+                dir.path(),
+                &dir.path().join("absent"),
+                CacheLayout::DistsByHash,
+                &[]
+            )
+            .await
+            .is_none()
         );
     }
 
@@ -562,7 +575,7 @@ mod tests {
         std::fs::write(dir.path().join("sid_InRelease"), [0xff, 0xfe, 0xfd]).expect("write");
         let io_failure = metrics::CACHE_IO_FAILURE.get();
         assert!(
-            build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &[])
+            build_byhash_reference_set(dir.path(), dir.path(), CacheLayout::DistsByHash, &[])
                 .await
                 .is_none()
         );
@@ -586,7 +599,7 @@ mod tests {
             .expect("size oversized Release");
         assert!(read_release_to_string(&path).await.is_err());
         assert!(
-            build_byhash_reference_set(dir.path(), CacheLayout::DistsByHash, &[])
+            build_byhash_reference_set(dir.path(), dir.path(), CacheLayout::DistsByHash, &[])
                 .await
                 .is_none()
         );
