@@ -100,8 +100,8 @@ use crate::{
     transfer_error::{CacheError, DeliveryFailure, DownloadFailure, InternalError, UpstreamError},
     upstream_dial,
     upstream_head::{
-        ContentLength, DownloadPlan, RejectGates, RelayedHeaders, ResumeAnomaly, ResumeState,
-        UpstreamHead, plan_download, plan_fresh_download, resolve_body_framing,
+        BodyFraming, ContentLength, DownloadPlan, RejectGates, RelayedHeaders, ResumeAnomaly,
+        ResumeState, UpstreamHead, plan_download, plan_fresh_download, resolve_body_framing,
     },
     upstream_retry::{self, RetryStop},
     uri_authority, warn_once_or_debug, warn_once_or_info, warn_once_or_info_logged,
@@ -300,6 +300,15 @@ impl Traffic {
     }
 }
 
+/// A validated response and the context of the attempt that answered.
+#[derive(Debug)]
+pub(crate) struct UpstreamExchange {
+    pub(crate) response: Response<Incoming>,
+    request_parts: http::request::Parts,
+    timing: HeadTiming,
+    framing: BodyFraming,
+}
+
 /// On success the request `Parts` are handed back alongside the response —
 /// they were consumed by the request anyway, and returning them lets the
 /// rare redirect-follow path rebuild a request without the caller cloning
@@ -310,7 +319,7 @@ pub(crate) async fn request_with_retry(
     client: &HttpClient,
     request: Request<Empty<bytes::Bytes>>,
     traffic: Traffic,
-) -> Result<(Response<Incoming>, http::request::Parts, HeadTiming), RequestFailure> {
+) -> Result<UpstreamExchange, RequestFailure> {
     // Auto-mode's HTTPS-upgrade revert branch only fires once `attempt`
     // has crossed this threshold; below it, transient connect errors
     // retry without reverting the scheme.
@@ -407,7 +416,7 @@ pub(crate) async fn request_with_retry(
         mut probe: UpgradeProbe,
         scheme_decided: bool,
         traffic: Traffic,
-    ) -> Result<(Response<Incoming>, http::request::Parts, HeadTiming), RequestFailure> {
+    ) -> Result<UpstreamExchange, RequestFailure> {
         let budget = global_config().upstream_retry_budget;
         let now = coarsetime::Instant::now();
         let mut backoff = match traffic {
@@ -452,17 +461,25 @@ pub(crate) async fn request_with_retry(
                         .headers()
                         .iter()
                         .map(|(name, value)| (name.as_str(), value.as_bytes()));
-                    if let Err(reason) = resolve_body_framing(fields) {
-                        traffic.count(|| metrics::UPSTREAM_PROTOCOL_VIOLATION.increment());
-                        return Err(RequestFailure::new(FailedRequest {
-                            error: RequestError::Framing(reason),
-                            uri: parts.uri,
-                            attempts: backoff.attempt(),
-                            limit: None,
-                        }));
-                    }
+                    let framing = match resolve_body_framing(fields) {
+                        Ok(framing) => framing,
+                        Err(reason) => {
+                            traffic.count(|| metrics::UPSTREAM_PROTOCOL_VIOLATION.increment());
+                            return Err(RequestFailure::new(FailedRequest {
+                                error: RequestError::Framing(reason),
+                                uri: parts.uri,
+                                attempts: backoff.attempt(),
+                                limit: None,
+                            }));
+                        }
+                    };
                     traffic.count(|| metrics::record_upstream_status(response.status()));
-                    return Ok((response, parts, timing));
+                    return Ok(UpstreamExchange {
+                        response,
+                        request_parts: parts,
+                        timing,
+                        framing,
+                    });
                 }
                 Err(err) if !err.is_connect() => {
                     if is_io_timed_out_in_chain(&err) {
@@ -2179,14 +2196,18 @@ async fn serve_new_file_worker(
     let mut upstream_request_sent = PreciseInstant::now();
     // The timing of the exchange whose answer is used: replaced below with
     // every followed redirect and refetch, like the response.
-    let (mut fwd_response, mut head_timing) =
-        match request_with_retry(&appstate.https_client, fwd_request, Traffic::Proxied).await {
-            Ok((r, _parts, timing)) => (r, timing),
-            Err(error) => {
-                revalidation.failed();
-                return Err(error.into_failure("request upstream response"));
-            }
-        };
+    let UpstreamExchange {
+        response: mut fwd_response,
+        timing: mut head_timing,
+        framing: mut body_framing,
+        ..
+    } = match request_with_retry(&appstate.https_client, fwd_request, Traffic::Proxied).await {
+        Ok(exchange) => exchange,
+        Err(error) => {
+            revalidation.failed();
+            return Err(error.into_failure("request upstream response"));
+        }
+    };
 
     trace!("Forwarded response: {fwd_response:?}");
 
@@ -2223,24 +2244,26 @@ async fn serve_new_file_worker(
             trace!("Forwarded redirected request: {redirected_request:?}");
 
             upstream_request_sent = PreciseInstant::now();
-            let (redirected_response, redirected_timing) = match request_with_retry(
+            UpstreamExchange {
+                response: fwd_response,
+                timing: head_timing,
+                framing: body_framing,
+                ..
+            } = match request_with_retry(
                 &appstate.https_client,
                 redirected_request,
                 Traffic::Proxied,
             )
             .await
             {
-                Ok((r, _parts, timing)) => (r, timing),
+                Ok(exchange) => exchange,
                 Err(error) => {
                     revalidation.failed();
                     return Err(error.into_failure("request upstream response"));
                 }
             };
 
-            trace!("Forwarded redirected response: {redirected_response:?}");
-
-            fwd_response = redirected_response;
-            head_timing = redirected_timing;
+            trace!("Forwarded redirected response: {fwd_response:?}");
         } else {
             log_unfollowed_redirect(&moved_uri);
         }
@@ -2257,7 +2280,7 @@ async fn serve_new_file_worker(
         CacheFileStat::New => None,
     };
 
-    let mut head = UpstreamHead::from_response(&fwd_response);
+    let mut head = UpstreamHead::from_response(&fwd_response, body_framing);
 
     if let Some((_, file_path)) = &cached {
         // Only count "out of date" when upstream actually returned fresh
@@ -2334,20 +2357,25 @@ async fn serve_new_file_worker(
                 let retry_request = build_fwd_request(&req_uri, &host, None, 0, None);
 
                 upstream_request_sent = PreciseInstant::now();
-                (fwd_response, head_timing) = match request_with_retry(
+                UpstreamExchange {
+                    response: fwd_response,
+                    timing: head_timing,
+                    framing: body_framing,
+                    ..
+                } = match request_with_retry(
                     &appstate.https_client,
                     retry_request,
                     Traffic::Proxied,
                 )
                 .await
                 {
-                    Ok((r, _parts, timing)) => (r, timing),
+                    Ok(exchange) => exchange,
                     Err(error) => {
                         revalidation.failed();
                         return Err(error.into_failure("request upstream response"));
                     }
                 };
-                head = UpstreamHead::from_response(&fwd_response);
+                head = UpstreamHead::from_response(&fwd_response, body_framing);
             }
 
             // A resume never revalidates: there is no cached copy to serve.
@@ -3228,11 +3256,14 @@ async fn pre_process_client_request(
     // The returned parts serve the origin extraction and the rare
     // redirect-follow below — no up-front HeaderMap clone per request.
     // A passthrough records no time to first byte (`mirror_perf`).
-    let (fwd_response, mut parts) =
-        match request_with_retry(&appstate.https_client, fwd_request, Traffic::Proxied).await {
-            Ok((response, parts, _timing)) => (response, parts),
-            Err(err) => return upstream_error_response(err),
-        };
+    let UpstreamExchange {
+        response: fwd_response,
+        request_parts: mut parts,
+        ..
+    } = match request_with_retry(&appstate.https_client, fwd_request, Traffic::Proxied).await {
+        Ok(exchange) => exchange,
+        Err(err) => return upstream_error_response(err),
+    };
     let request_path = parts.uri.path().to_owned();
 
     trace!("Forwarded response: {fwd_response:?}");
@@ -3288,7 +3319,7 @@ async fn pre_process_client_request(
             )
             .await
             {
-                Ok((r, _parts, _timing)) => r,
+                Ok(UpstreamExchange { response, .. }) => response,
                 Err(err) => return upstream_error_response(err),
             };
 

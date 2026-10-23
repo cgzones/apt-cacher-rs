@@ -280,24 +280,18 @@ impl<'a> RelayedHeaders<'a> {
 
 #[cfg(feature = "hyper")]
 impl<'a> UpstreamHead<'a> {
-    /// Project a hyper response.  The body type is irrelevant; only the
-    /// status and headers are read.
+    /// Project a hyper response with the framing already validated for this
+    /// head. The body type is irrelevant; only status and validator headers
+    /// are read.
     #[must_use]
-    pub(crate) fn from_response<B>(response: &'a http::Response<B>) -> Self {
+    pub(crate) fn from_response<B>(response: &'a http::Response<B>, framing: BodyFraming) -> Self {
         use http::header::{CONTENT_RANGE, ETAG};
 
         let headers = response.headers();
 
-        // The same resolution splice's parser applies, so a head both
-        // backends accept (`Content-Length: 5, 5`, a repeated line) projects
-        // the same length.  `request_with_retry` already refused a head
-        // whose framing does not resolve.
-        let fields = headers
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_bytes()));
-        let content_length = match resolve_body_framing(fields) {
-            Ok(BodyFraming::ContentLength(len)) => Some(len),
-            Ok(BodyFraming::Chunked | BodyFraming::CloseDelimited) | Err(_) => None,
+        let content_length = match framing {
+            BodyFraming::ContentLength(len) => Some(len),
+            BodyFraming::Chunked | BodyFraming::CloseDelimited => None,
         };
         let content_range = headers
             .get(CONTENT_RANGE)
@@ -1358,6 +1352,18 @@ mod tests {
     }
 
     #[cfg(feature = "hyper")]
+    fn project_response<B>(response: &http::Response<B>) -> UpstreamHead<'_> {
+        let framing = resolve_body_framing(
+            response
+                .headers()
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        )
+        .expect("valid response framing");
+        UpstreamHead::from_response(response, framing)
+    }
+
+    #[cfg(feature = "hyper")]
     #[test]
     fn from_response_projects_status_and_framing() {
         let response = http::Response::builder()
@@ -1368,7 +1374,7 @@ mod tests {
             .body(())
             .unwrap();
         assert_eq!(
-            UpstreamHead::from_response(&response),
+            project_response(&response),
             UpstreamHead {
                 etag: Some("\"abc\""),
                 ..head(206, Some(60), Some("bytes 40-99/100"))
@@ -1377,17 +1383,25 @@ mod tests {
 
         // A malformed `ETag` is dropped here, as splice drops it before
         // planning.
-        let response = http::Response::builder()
+        let mut response = http::Response::builder()
             .status(200)
             .header("content-length", "junk")
             .header("content-range", "bytes x-y/z")
             .header("etag", "unquoted")
             .body(())
             .unwrap();
-        assert_eq!(
-            UpstreamHead::from_response(&response),
-            head(200, None, None)
+        // Invalid framing is rejected before the projection can be called.
+        assert!(
+            resolve_body_framing(
+                response
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_bytes())),
+            )
+            .is_err()
         );
+        response.headers_mut().remove(http::header::CONTENT_LENGTH);
+        assert_eq!(project_response(&response), head(200, None, None));
     }
 
     /// A non-ASCII (obs-text) `ETag` is absent to the planner on hyper, as
@@ -1405,7 +1419,7 @@ mod tests {
             )
             .body(())
             .unwrap();
-        assert_eq!(UpstreamHead::from_response(&response).etag, None);
+        assert_eq!(project_response(&response).etag, None);
         assert_eq!(well_formed_etag(Some("\"caffe\u{e9}\"")), None);
     }
 
@@ -1420,20 +1434,14 @@ mod tests {
             .header("content-length", "60, 60")
             .body(())
             .unwrap();
-        assert_eq!(
-            UpstreamHead::from_response(&response),
-            head(200, Some(60), None)
-        );
+        assert_eq!(project_response(&response), head(200, Some(60), None));
         let response = http::Response::builder()
             .status(200)
             .header("content-length", "60")
             .header("content-length", "60")
             .body(())
             .unwrap();
-        assert_eq!(
-            UpstreamHead::from_response(&response),
-            head(200, Some(60), None)
-        );
+        assert_eq!(project_response(&response), head(200, Some(60), None));
     }
 
     #[cfg(feature = "hyper")]
@@ -1445,10 +1453,7 @@ mod tests {
             .header("content-length", "60")
             .body(())
             .unwrap();
-        assert_eq!(
-            UpstreamHead::from_response(&response),
-            head(200, None, None)
-        );
+        assert_eq!(project_response(&response), head(200, None, None));
     }
 
     /// Every [`RejectReason`] must own its gate. Sharing one would let a
