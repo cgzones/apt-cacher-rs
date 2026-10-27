@@ -80,7 +80,7 @@ sqlx = { version = "0.9", default-features = false, features = [
     "macros",
     "migrate",
     "runtime-tokio",
-    "sqlite",
+    "sqlite-bundled",
 ] }
 thiserror = "2"
 time = { version = "0.3.47", features = ["formatting", "macros", "parsing"] }
