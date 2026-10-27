@@ -246,25 +246,14 @@ pub(super) enum PoolCheckout {
     Empty,
 }
 
-/// Pop one entry for the key, most recently returned first, discarding
-/// entries past [`POOL_IDLE_TIMEOUT`]. `None` once the key is exhausted.
-fn pool_pop(host: &ClientHost, port: u16, is_tls: bool) -> Option<UpstreamConn> {
+/// Pop one entry for the key, most recently returned first. The caller
+/// checks its age and liveness, and drops it outside the pool lock.
+fn pool_pop(host: &ClientHost, port: u16, is_tls: bool) -> Option<PooledConn> {
     let mut map = upstream_pool().lock();
     let key = (host.clone(), port, is_tls);
     let conns = map.get_mut(&key)?;
 
-    let now = coarsetime::Instant::now();
-    let conn = loop {
-        match conns.pop() {
-            Some(entry) if now.duration_since(entry.idle_since) < POOL_IDLE_TIMEOUT => {
-                break Some(entry.conn);
-            }
-            Some(_) => {
-                debug!("splice proxy: discarding stale pooled connection to {host}:{port}");
-            }
-            None => break None,
-        }
-    };
+    let conn = conns.pop();
     if conns.is_empty() {
         map.remove(&key);
     }
@@ -280,7 +269,15 @@ fn pool_pop(host: &ClientHost, port: u16, is_tls: bool) -> Option<UpstreamConn> 
 /// one sat below it.
 pub(super) fn pool_checkout(host: &ClientHost, port: u16, is_tls: bool) -> PoolCheckout {
     let mut saw_dead = false;
-    while let Some(mut conn) = pool_pop(host, port, is_tls) {
+    while let Some(PooledConn {
+        mut conn,
+        idle_since,
+    }) = pool_pop(host, port, is_tls)
+    {
+        if idle_since.elapsed() >= POOL_IDLE_TIMEOUT {
+            debug!("splice proxy: discarding stale pooled connection to {host}:{port}");
+            continue;
+        }
         if conn.check_alive(host, port) {
             debug!("splice proxy: reusing pooled connection to {host}:{port} (tls={is_tls})");
             return PoolCheckout::Live(conn);
@@ -1092,6 +1089,53 @@ mod tests {
             pool_checkout(&host, 80, false),
             PoolCheckout::Empty
         ));
+    }
+
+    /// Checkout closes expired sockets and keeps looking for a live entry;
+    /// expiry alone remains an empty miss rather than a dead-peer miss.
+    #[tokio::test]
+    async fn pool_checkout_discards_expired_entries_without_counting_them_dead() {
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = test_host("pool-checkout-expired.invalid");
+        for with_live in [false, true] {
+            let (live, _live_peer, live_addr) = tcp_pair(&listener).await;
+            let (expired, mut expired_peer, _) = tcp_pair(&listener).await;
+            let now = coarsetime::Instant::now();
+            let mut entries = Vec::new();
+            if with_live {
+                entries.push(PooledConn {
+                    conn: UpstreamConn::Tcp(live),
+                    idle_since: now,
+                });
+            }
+            entries.push(PooledConn {
+                conn: UpstreamConn::Tcp(expired),
+                idle_since: now - (POOL_IDLE_TIMEOUT + coarsetime::Duration::from_secs(1)),
+            });
+            upstream_pool()
+                .lock()
+                .insert((host.clone(), 80, false), entries);
+
+            match pool_checkout(&host, 80, false) {
+                PoolCheckout::Live(conn) => {
+                    assert!(with_live, "expired entries cannot be reused");
+                    assert_eq!(conn.zero_copy().unwrap().local_addr().unwrap(), live_addr);
+                }
+                PoolCheckout::Empty => assert!(!with_live, "the live entry must be found"),
+                PoolCheckout::Dead => unreachable!("expiry is an empty miss, not a dead peer"),
+            }
+            let mut byte = [0];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), expired_peer.read(&mut byte))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0,
+                "checkout closes the expired connection"
+            );
+        }
     }
 
     /// Returning to a key expires its old sockets without waiting for the
