@@ -65,8 +65,8 @@ use crate::{
     client_counter,
     client_info::ClientInfo,
     connect_tunnel::{
-        ConnectReject, TunnelTarget, admit, copy_bidirectional_idle, report_tunnel_outcome,
-        validate_connect_target,
+        ConnectReject, TunnelTarget, admit, connect_upstream, copy_bidirectional_idle,
+        report_tunnel_outcome, validate_connect_target,
     },
     content_type::content_type_for_cached_file,
     database_task::{DatabaseCommand, send_db_command},
@@ -100,7 +100,6 @@ use crate::{
     transfer_error::{
         CacheError, ClientError, DeliveryEnd, DeliveryFailure, InternalError, TransferOutcome,
     },
-    upstream_dial,
     upstream_head::ContentLength,
     warn_once, warn_once_or_debug, warn_once_or_info,
     web::{WebResponse, serve_web_interface},
@@ -898,13 +897,14 @@ async fn write_tunnel_upstream_error(
     stream: &TcpStream,
     conn_version: ConnectionVersion,
     client: ClientInfo,
+    rejection: ConnectReject,
 ) {
     if let Err(err) = write_invalid_response(
         stream,
         conn_version,
         ConnectionAction::Close,
-        StatusCode::BAD_GATEWAY,
-        "Upstream Error",
+        rejection.status,
+        rejection.msg,
         None,
     )
     .await
@@ -917,14 +917,9 @@ async fn write_tunnel_upstream_error(
 
 /// Drive a policy-accepted CONNECT tunnel to completion.
 ///
-/// Consumes the connection. This DELIBERATELY diverges from the hyper backend:
-/// hyper emits `200 Connection Established` through its upgrade machinery
-/// *before* dialing upstream, so a failed upstream connect can only reach the
-/// client as `200` followed by an immediate close. Owning the raw socket here
-/// lets us connect upstream FIRST and, on an unreachable/refused/timed-out
-/// upstream, return a real `502 Bad Gateway` (per the 5xx convention) instead.
-/// This is also why the CONNECT integration tests dial a mock upstream rather
-/// than a real host: the connect must succeed for a `200` to be produced.
+/// Consumes the connection. Both backends connect upstream before sending
+/// `200 Connection Established`, so an unreachable, refused or timed-out
+/// upstream receives a real `502 Bad Gateway` instead.
 ///
 /// On a successful connect it writes `200 Connection Established`, forwards any
 /// pipelined bytes already buffered past the request header, then relays bytes
@@ -948,42 +943,13 @@ async fn run_connect_tunnel(
 
     metrics::TUNNEL_CONNECTS_TOTAL.increment();
 
-    // Connect upstream BEFORE sending `200`: owning the raw socket lets a failed
-    // connect surface as a real 502 (see the fn doc-comment).
-    let (host, port) = target.dial_addr();
-    let mut upstream = match upstream_dial::connect(host, port, config.http_timeout).await {
+    let mut upstream = match connect_upstream(config, &client, &target).await {
         Ok(upstream) => upstream,
-        Err(err) if err.kind() == ErrorKind::TimedOut => {
-            metrics::TUNNEL_TRANSFER_FAILED.increment();
-            info!(
-                "Tunnel connect to {target} for client {client} timed out after {}; returning 502:  {}",
-                HumanFmt::Time(config.http_timeout),
-                ErrorReport(&err)
-            );
-            write_tunnel_upstream_error(&stream, conn_version, client).await;
-            return;
-        }
-        Err(err) => {
-            metrics::TUNNEL_TRANSFER_FAILED.increment();
-            warn_once_or_info!(
-                "Failed to connect the tunnel to {target} for client {client}; returning 502:  {}",
-                ErrorReport(&err)
-            );
-            write_tunnel_upstream_error(&stream, conn_version, client).await;
+        Err(rejection) => {
+            write_tunnel_upstream_error(&stream, conn_version, client, rejection).await;
             return;
         }
     };
-
-    // Disable Nagle on the tunnel: TLS handshake records and HTTP request
-    // headers are interactive, and a tunnel cannot coalesce them on our behalf.
-    if config.upstream_tcp_nodelay
-        && let Err(err) = upstream.set_nodelay(true)
-    {
-        warn_once_or_debug!(
-            "Failed to set TCP_NODELAY on the upstream tunnel to {target}; continuing with Nagle enabled:  {}",
-            ErrorReport(&err)
-        );
-    }
 
     // Upstream is connected: send `200 Connection Established` so the client may
     // begin its TLS handshake. The head is the same `TunnelEstablished` shape

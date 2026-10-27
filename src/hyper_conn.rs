@@ -57,9 +57,9 @@ use crate::{
     channel_body::{ChannelBody, ChannelEvent},
     client_info::ClientInfo,
     client_trouble::{self, Trouble},
-    config::ClientHost,
+    config::{ClientHost, Config},
     connect_tunnel::{
-        ConnectReject, TunnelTarget, admit, copy_bidirectional_idle, report_tunnel_outcome,
+        ConnectReject, admit, connect_upstream, copy_bidirectional_idle, report_tunnel_outcome,
         validate_connect_target,
     },
     content_type::{content_type_for_cached_file, warn_on_content_type_mismatch},
@@ -98,7 +98,6 @@ use crate::{
     scheme_cache::{self, SchemeDecision, canonical_upstream_authority},
     static_assert,
     transfer_error::{CacheError, DeliveryFailure, DownloadFailure, InternalError, UpstreamError},
-    upstream_dial,
     upstream_head::{
         BodyFraming, ContentLength, DownloadPlan, RejectGates, RelayedHeaders, ResumeAnomaly,
         ResumeState, UpstreamHead, plan_download, plan_fresh_download, resolve_body_framing,
@@ -2727,48 +2726,6 @@ async fn serve_new_file_worker(
     ))
 }
 
-/// Create a TCP connection to `target`, build a tunnel between the connection and
-/// the upgraded connection.
-async fn tunnel(
-    client: ClientInfo,
-    upgraded: hyper::upgrade::Upgraded,
-    target: &TunnelTarget,
-) -> std::io::Result<()> {
-    let start = PreciseInstant::now();
-    let config = global_config();
-
-    /* Connect to remote server */
-    let (host, port) = target.dial_addr();
-    let mut server = upstream_dial::connect(host, port, config.http_timeout).await?;
-    // Disable Nagle on the tunnel: TLS handshake records and HTTP request
-    // headers are interactive, and a tunnel cannot coalesce them on our behalf.
-    if config.upstream_tcp_nodelay
-        && let Err(err) = server.set_nodelay(true)
-    {
-        warn_once_or_debug!(
-            "Failed to set TCP_NODELAY on the upstream tunnel to {target}; continuing with Nagle enabled:  {}",
-            ErrorReport(&err)
-        );
-    }
-    let upgraded = TokioIo::new(upgraded);
-
-    /* Proxying data */
-    // Not rate-checked; ended by `client_idle_timeout` without traffic
-    // either way, and -- `upgraded` still being the connection's
-    // `WriteStallTimeout` stream -- by a client that accepts no byte for
-    // `http_timeout` (`report_tunnel_outcome` counts it).
-    let outcome = copy_bidirectional_idle(
-        upgraded,
-        &mut server,
-        config.buffer_size,
-        config.client_idle_timeout,
-    )
-    .await;
-    report_tunnel_outcome(&outcome, &client, target, start.elapsed());
-
-    Ok(())
-}
-
 /// Cache lookup plus hit/miss accounting for a request hyper classified
 /// itself (or cleanup's synthetic index fetches), then serve or fetch.
 ///
@@ -2847,29 +2804,12 @@ struct ConnectionHold {
 /// Answer a `CONNECT` whose client already passed the proxy-client ACL in
 /// `preflight_method`.
 #[must_use]
-fn connect_response(
+async fn connect_response(
+    config: &Config,
     client: ClientInfo,
     req: Request<Incoming>,
     hold: ConnectionHold,
 ) -> Response<ProxyCacheBody> {
-    let config = global_config();
-
-    /*
-     * Received an HTTP request like:
-     * ```
-     * CONNECT www.domain.com:443 HTTP/1.1
-     * Host: www.domain.com:443
-     * Proxy-Connection: Keep-Alive
-     * ```
-     *
-     * When HTTP method is CONNECT we should return an empty body
-     * then we can eventually upgrade the connection and talk a new protocol.
-     *
-     * Note: only after client received an empty body with STATUS_OK can the
-     * connection be upgraded, so we can't return a response inside
-     * `on_upgrade` future.
-     */
-
     // Shared with the sendfile/splice backend so tunnel policy stays identical
     // across backends; logs and policy metrics are bumped inside the validator.
     // Every refusal below closes the connection, as sendfile's
@@ -2886,29 +2826,30 @@ fn connect_response(
     };
 
     metrics::TUNNEL_CONNECTS_TOTAL.increment();
+    let start = PreciseInstant::now();
+    let mut upstream = match connect_upstream(config, &client, &target).await {
+        Ok(upstream) => upstream,
+        Err(ConnectReject { status, msg }) => return quick_response_closing(status, msg),
+    };
     info!("Using uncached tunnel for client {client} to {target}");
+    let buffer_size = config.buffer_size;
+    let idle_timeout = config.client_idle_timeout;
 
     tokio::task::spawn(async move {
         let _tunnel_guard = tunnel_guard;
         let _hold = hold;
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
-                // The relay outcome is reported inside `tunnel`; only the
-                // upstream connect can still fail here.
-                if let Err(err) = tunnel(client, upgraded, &target).await {
-                    metrics::TUNNEL_TRANSFER_FAILED.increment();
-                    if err.kind() == std::io::ErrorKind::TimedOut {
-                        info!(
-                            "Tunnel for client {client} to {target} timed out:  {}",
-                            ErrorReport(&err)
-                        );
-                    } else {
-                        error!(
-                            "Failed to tunnel the connection for client {client} to {target}; closing the tunnel:  {}",
-                            ErrorReport(&err)
-                        );
-                    }
-                }
+                // The upgraded stream retains WriteStallTimeout; the idle
+                // watchdog also bounds a tunnel with no traffic either way.
+                let outcome = copy_bidirectional_idle(
+                    TokioIo::new(upgraded),
+                    &mut upstream,
+                    buffer_size,
+                    idle_timeout,
+                )
+                .await;
+                report_tunnel_outcome(&outcome, &client, &target, start.elapsed());
             }
             Err(err) => {
                 metrics::TUNNEL_TRANSFER_FAILED.increment();
@@ -3119,7 +3060,9 @@ async fn pre_process_client_request(
         let acls = ClientAcls::new(global_config(), global_webif_hosts());
 
         match preflight_method(req.method().as_str(), &client, &acls) {
-            Ok(RequestKind::Connect) => return connect_response(client, req, hold),
+            Ok(RequestKind::Connect) => {
+                return connect_response(global_config(), client, req, hold).await;
+            }
             Ok(RequestKind::Get) => {}
             Err(reason) => return reject_response(reason),
         }
@@ -3669,6 +3612,135 @@ fn log_client_connection_error(client: ClientInfo, err: &hyper::Error) {
 #[cfg(test)]
 mod tests {
     use super::{LoggedHeaderValue, SchemeDecision, UpgradeProbe, Uri, host_header_from_uri};
+
+    fn connect_server(
+        config: crate::config::Config,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<()>,
+        tokio::sync::mpsc::Receiver<crate::Never>,
+    ) {
+        let (client, server) = tokio::io::duplex(4096);
+        let (sender, done) = tokio::sync::mpsc::channel(1);
+        let hold = super::ConnectionHold { _sender: sender };
+        let config = std::sync::Arc::new(config);
+        let driver = tokio::spawn(async move {
+            let service = hyper::service::service_fn(move |req| {
+                let config = std::sync::Arc::clone(&config);
+                let hold = hold.clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(
+                        super::connect_response(
+                            &config,
+                            crate::test_support::local_client(),
+                            req,
+                            hold,
+                        )
+                        .await,
+                    )
+                }
+            });
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(server), service)
+                .with_upgrades()
+                .await
+                .expect("CONNECT server");
+        });
+        (client, driver, done)
+    }
+
+    async fn connect_head(client: &mut tokio::io::DuplexStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt as _;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 4096, "bounded response head");
+                head.push(client.read_u8().await.expect("response head byte"));
+            }
+            head
+        })
+        .await
+        .expect("CONNECT response deadline")
+    }
+
+    fn tunnel_config() -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.https_tunnel_enabled = true;
+        config.https_tunnel_allowed_mirrors =
+            vec![crate::config::DomainName::new("127.0.0.1").unwrap()];
+        config.https_tunnel_allowed_ports = Vec::new();
+        config
+    }
+
+    /// A successful CONNECT retains pipelined bytes, relays both ways and
+    /// holds the connection until the upgraded tunnel ends.
+    #[tokio::test]
+    async fn connect_dials_before_success_and_relays_pipelined_bytes() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let (mut client, driver, mut done) = connect_server(tunnel_config());
+        client
+            .write_all(
+                format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\nping").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let head = connect_head(&mut client).await;
+        assert!(head.starts_with(b"HTTP/1.1 200 "), "{head:?}");
+        let (mut upstream, _) = listener.accept().await.unwrap();
+        driver.await.unwrap();
+        assert!(
+            matches!(
+                done.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "upgraded tunnel still holds the connection"
+        );
+        let mut payload = [0; 4];
+        upstream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"ping");
+        upstream.write_all(b"pong").await.unwrap();
+        client.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"pong");
+        drop(client);
+        drop(upstream);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), done.recv())
+                .await
+                .unwrap()
+                .is_none(),
+            "finished tunnel releases its hold"
+        );
+    }
+
+    /// A refused upstream produces a real 502 and releases admission without
+    /// ever entering Hyper's upgrade path or announcing a successful tunnel.
+    #[tokio::test]
+    async fn connect_refusal_returns_502_and_releases_the_tunnel() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let refused = tokio::net::TcpSocket::new_v4().unwrap();
+        refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let target = refused.local_addr().unwrap();
+        let before = crate::tunnel_limiter::active_tunnels();
+        let failed = crate::metrics::TUNNEL_TRANSFER_FAILED.get();
+        let accepted = crate::metrics::TUNNEL_CONNECTS_TOTAL.get();
+        let (mut client, driver, mut done) = connect_server(tunnel_config());
+        client
+            .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let head = connect_head(&mut client).await;
+        assert!(head.starts_with(b"HTTP/1.1 502 "), "{head:?}");
+        let mut body = Vec::new();
+        client.read_to_end(&mut body).await.unwrap();
+        assert_eq!(body, b"Upstream Error");
+        driver.await.unwrap();
+        assert!(done.recv().await.is_none());
+        assert_eq!(crate::tunnel_limiter::active_tunnels(), before);
+        assert_eq!(crate::metrics::TUNNEL_TRANSFER_FAILED.get(), failed + 1);
+        assert_eq!(crate::metrics::TUNNEL_CONNECTS_TOTAL.get(), accepted + 1);
+    }
 
     #[test]
     fn logged_header_values_withhold_credentials() {

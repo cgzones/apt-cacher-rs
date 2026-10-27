@@ -30,7 +30,10 @@ use std::{
 };
 
 use http::{StatusCode, uri::Uri};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
+};
 use tracing::{error, info};
 
 use crate::{
@@ -41,7 +44,7 @@ use crate::{
     humanfmt::HumanFmt,
     limits, metrics,
     tunnel_limiter::{self, ActiveTunnelGuard, TunnelGuard},
-    uri_authority, warn_once_or_info,
+    upstream_dial, uri_authority, warn_once_or_debug, warn_once_or_info,
     write_stall::is_client_write_stall,
 };
 
@@ -75,7 +78,7 @@ impl std::fmt::Display for TunnelTarget {
 
 /// A rejected CONNECT request: the status/body the backend should return to the
 /// client. All logging and metric bumping already happened inside
-/// [`validate_connect_target`] or [`admit`].
+/// [`validate_connect_target`], [`admit`] or [`connect_upstream`].
 pub(crate) struct ConnectReject {
     pub status: StatusCode,
     pub msg: &'static str,
@@ -113,6 +116,48 @@ pub(crate) fn admit(config: &Config, client: &ClientInfo) -> Result<TunnelPermit
         _slot: slot,
         _active: ActiveTunnelGuard::new(),
     })
+}
+
+/// Connect an admitted tunnel before either backend sends its 200 response.
+/// A failed dial is counted and logged once here; the backend writes the 502.
+pub(crate) async fn connect_upstream(
+    config: &Config,
+    client: &ClientInfo,
+    target: &TunnelTarget,
+) -> Result<TcpStream, ConnectReject> {
+    let (host, port) = target.dial_addr();
+    let upstream = upstream_dial::connect(host, port, config.http_timeout)
+        .await
+        .map_err(|err| {
+            metrics::TUNNEL_TRANSFER_FAILED.increment();
+            if err.kind() == ErrorKind::TimedOut {
+                info!(
+                    "Tunnel connect to {target} for client {client} timed out after {}; returning 502:  {}",
+                    HumanFmt::Time(config.http_timeout),
+                    ErrorReport(&err)
+                );
+            } else {
+                warn_once_or_info!(
+                    "Failed to connect the tunnel to {target} for client {client}; returning 502:  {}",
+                    ErrorReport(&err)
+                );
+            }
+            ConnectReject {
+                status: StatusCode::BAD_GATEWAY,
+                msg: "Upstream Error",
+            }
+        })?;
+    // TLS handshake records and HTTP headers are interactive; the tunnel
+    // cannot coalesce them on the client's behalf.
+    if config.upstream_tcp_nodelay
+        && let Err(err) = upstream.set_nodelay(true)
+    {
+        warn_once_or_debug!(
+            "Failed to set TCP_NODELAY on the upstream tunnel to {target}; continuing with Nagle enabled:  {}",
+            ErrorReport(&err)
+        );
+    }
+    Ok(upstream)
 }
 
 /// Validate a CONNECT request's authority against tunnel policy.
