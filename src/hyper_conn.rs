@@ -1926,6 +1926,85 @@ async fn serve_new_file(
     }
 }
 
+/// `revalidate` carries the stored upstream validators of a stale
+/// volatile copy; `None` is an unconditional fetch.
+#[must_use]
+fn build_fwd_request(
+    uri: Uri,
+    host: Option<&HeaderValue>,
+    revalidate: Option<&UpstreamMetadata>,
+    resume_offset: u64,
+    resume_if_range: Option<&str>,
+) -> Request<Empty<bytes::Bytes>> {
+    // `Via` names this proxy so a request looping back into it (an
+    // `allowed_mirrors` entry covering the proxy's own name) is refused
+    // by `preflight_via` instead of served. `Accept-Encoding: identity`:
+    // a request without the field accepts any content coding (RFC 9110
+    // §12.5.3), and a coded body would be cached without its
+    // `Content-Encoding`.
+    let mut builder = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header(USER_AGENT, HeaderValue::from_static(APP_USER_AGENT));
+    if let Some(host) = host {
+        builder = builder.header(HOST, host);
+    }
+    let mut request = builder
+        .header(VIA, HeaderValue::from_static(APP_VIA))
+        .header(ACCEPT_ENCODING, HeaderValue::from_static("identity"))
+        .body(Empty::new())
+        .expect("request should be valid");
+
+    if let Some(UpstreamMetadata {
+        etag,
+        last_modified,
+    }) = revalidate
+    {
+        // The upstream's own `Last-Modified`, never the local mtime:
+        // that only dates the last fetch or revalidation, so a copy
+        // replayed or lagging behind the upstream would keep drawing
+        // 304s. Without a stored date, `If-None-Match` alone asks.
+        if let Some((_raw, date)) = last_modified {
+            let r = request.headers_mut().append(
+                IF_MODIFIED_SINCE,
+                HeaderValue::try_from(date.format()).expect("HTTP datetime should be valid"),
+            );
+            assert!(!r, "header does not exist by previous construction");
+        }
+
+        let r = request
+            .headers_mut()
+            .append(CACHE_CONTROL, HeaderValue::from_static("max-age=300"));
+        assert!(!r, "header does not exist by previous construction");
+
+        if let Some(etag) = etag.as_deref() {
+            let r = request.headers_mut().append(
+                IF_NONE_MATCH,
+                HeaderValue::try_from(etag).expect("ETag is validated by read_etag"),
+            );
+            assert!(!r, "header does not exist by previous construction");
+        }
+    }
+
+    if resume_offset > 0 {
+        let r = request.headers_mut().append(
+            RANGE,
+            HeaderValue::try_from(format!("bytes={resume_offset}-")).expect("range value is valid"),
+        );
+        assert!(!r, "header does not exist by previous construction");
+
+        if let Some(if_range) = resume_if_range {
+            let r = request.headers_mut().append(
+                IF_RANGE,
+                HeaderValue::try_from(if_range).expect("If-Range value is valid"),
+            );
+            assert!(!r, "header does not exist by previous construction");
+        }
+    }
+
+    request
+}
+
 /// Runs inline in the connection future (`InitBarrier::run` no longer boxes
 /// it), which puts it within roughly 2 KiB of clippy's 16 KiB `large_futures`
 /// threshold. Hence the by-reference parameters below: growing this body, or
@@ -1942,128 +2021,6 @@ async fn serve_new_file_worker(
 ) -> Result<(Settled, Response<ProxyCacheBody>), DownloadFailure> {
     // TODO: upstream constant
     const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
-
-    /// `revalidate` carries the stored upstream validators of a stale
-    /// volatile copy; `None` is an unconditional fetch.
-    #[must_use]
-    fn build_fwd_request(
-        uri: &Uri,
-        host: &HeaderValue,
-        revalidate: Option<&UpstreamMetadata>,
-        resume_offset: u64,
-        resume_if_range: Option<&str>,
-    ) -> Request<Empty<bytes::Bytes>> {
-        /*
-         * Request {
-         *      method: GET,
-         *      uri: http://deb.debian.org/debian/pool/main/g/gcc-snapshot/gcc-snapshot_20240117-1_amd64.deb,
-         *      version: HTTP/1.1,
-         *      headers: {
-         *          "host": "deb.debian.org",
-         *          "range": "bytes=34744111-",
-         *          "if-range": "Thu, 18 Jan 2024 08:28:16 GMT",
-         *          "user-agent": "Debian APT-HTTP/1.3 (2.7.10)"
-         *      },
-         *      body: Body(Empty)
-         * }
-         *
-         * Response {
-         *      status: 206,
-         *      version: HTTP/1.1,
-         *      headers: {
-         *          "connection": "keep-alive",
-         *          "content-length": "1036690709",
-         *          "server": "Apache",
-         *          "x-content-type-options": "nosniff",
-         *          "x-frame-options": "sameorigin",
-         *          "referrer-policy": "no-referrer",
-         *          "x-xss-protection": "1",
-         *          "permissions-policy": "interest-cohort=()",
-         *          "last-modified": "Thu, 18 Jan 2024 08:28:16 GMT",
-         *          "etag": "\"3fdccc44-60f3425268f75\"",
-         *          "x-clacks-overhead": "GNU Terry Pratchett",
-         *          "cache-control": "public, max-age=2592000",
-         *          "content-type": "application/vnd.debian.binary-package",
-         *          "via": "1.1 varnish, 1.1 varnish",
-         *          "accept-ranges": "bytes",
-         *          "age": "500053",
-         *          "content-range": "bytes 34744111-1071434819/1071434820",
-         *          "date": "Mon, 29 Jan 2024 12:59:10 GMT",
-         *          "x-served-by": "cache-ams21080-AMS, cache-fra-eddf8230020-FRA",
-         *          "x-cache": "HIT, HIT",
-         *          "x-cache-hits": "33, 0",
-         *          "x-timer": "S1706533151.962674,VS0,VE2"
-         *      },
-         *      body: Body(Streaming)
-         * }
-         */
-
-        // `Via` names this proxy so a request looping back into it (an
-        // `allowed_mirrors` entry covering the proxy's own name) is refused
-        // by `preflight_via` instead of served. `Accept-Encoding: identity`:
-        // a request without the field accepts any content coding (RFC 9110
-        // §12.5.3), and a coded body would be cached without its
-        // `Content-Encoding`.
-        let mut request = Request::builder()
-            .method(Method::GET)
-            .uri(uri)
-            .header(USER_AGENT, HeaderValue::from_static(APP_USER_AGENT))
-            .header(HOST, host)
-            .header(VIA, HeaderValue::from_static(APP_VIA))
-            .header(ACCEPT_ENCODING, HeaderValue::from_static("identity"))
-            .body(Empty::new())
-            .expect("request should be valid");
-
-        if let Some(UpstreamMetadata {
-            etag,
-            last_modified,
-        }) = revalidate
-        {
-            // The upstream's own `Last-Modified`, never the local mtime:
-            // that only dates the last fetch or revalidation, so a copy
-            // replayed or lagging behind the upstream would keep drawing
-            // 304s. Without a stored date, `If-None-Match` alone asks.
-            if let Some((_raw, date)) = last_modified {
-                let r = request.headers_mut().append(
-                    IF_MODIFIED_SINCE,
-                    HeaderValue::try_from(date.format()).expect("HTTP datetime should be valid"),
-                );
-                assert!(!r, "header does not exist by previous construction");
-            }
-
-            let r = request
-                .headers_mut()
-                .append(CACHE_CONTROL, HeaderValue::from_static("max-age=300"));
-            assert!(!r, "header does not exist by previous construction");
-
-            if let Some(etag) = etag.as_deref() {
-                let r = request.headers_mut().append(
-                    IF_NONE_MATCH,
-                    HeaderValue::try_from(etag).expect("ETag is validated by read_etag"),
-                );
-                assert!(!r, "header does not exist by previous construction");
-            }
-        }
-
-        if resume_offset > 0 {
-            let r = request.headers_mut().append(
-                RANGE,
-                HeaderValue::try_from(format!("bytes={resume_offset}-"))
-                    .expect("range value is valid"),
-            );
-            assert!(!r, "header does not exist by previous construction");
-
-            if let Some(if_range) = resume_if_range {
-                let r = request.headers_mut().append(
-                    IF_RANGE,
-                    HeaderValue::try_from(if_range).expect("If-Range value is valid"),
-                );
-                assert!(!r, "header does not exist by previous construction");
-            }
-        }
-
-        request
-    }
 
     let config = global_config();
 
@@ -2172,8 +2129,8 @@ async fn serve_new_file_worker(
     };
 
     let fwd_request = build_fwd_request(
-        &req_uri,
-        &host,
+        Uri::clone(&req_uri),
+        Some(&host),
         revalidate,
         resume_offset,
         partial.if_range(),
@@ -2225,8 +2182,8 @@ async fn serve_new_file_worker(
             req_uri = Cow::Owned(moved_uri);
 
             let redirected_request = build_fwd_request(
-                &req_uri,
-                &host,
+                Uri::clone(&req_uri),
+                Some(&host),
                 revalidate,
                 resume_offset,
                 partial.if_range(),
@@ -2345,7 +2302,8 @@ async fn serve_new_file_worker(
                 // discarded, so from the upstream's perspective this is a
                 // fresh unconditional fetch (no If-Modified-Since, no
                 // If-None-Match, no Range).
-                let retry_request = build_fwd_request(&req_uri, &host, None, 0, None);
+                let retry_request =
+                    build_fwd_request(Uri::clone(&req_uri), Some(&host), None, 0, None);
 
                 upstream_request_sent = PreciseInstant::now();
                 UpstreamExchange {
@@ -3166,24 +3124,15 @@ async fn pre_process_client_request(
     // (`Proxy-Authorization`), hop-by-hop fields and a `Content-Length` for
     // the body `strip_request_body` dropped must never reach the shared
     // upstream pool. The upstream `Host` is the request-target authority,
-    // never the client's own header; `Via` closes proxy loops and
-    // `Accept-Encoding: identity` keeps the body uncoded as in
-    // `build_fwd_request` (the client's own `Accept-Encoding` is not
-    // forwarded, so a coding the upstream picked could be one it cannot
-    // decode). The redirect follow below reuses these headers.
+    // never the client's own header, and the client's own `Accept-Encoding`
+    // stays behind too: a coding the upstream picked for it could be one it
+    // cannot decode. The redirect follow below reuses these headers.
     let (parts, _body) = req.into_parts();
-    let mut fwd_request = Request::builder()
-        .method(Method::GET)
-        .header(USER_AGENT, HeaderValue::from_static(APP_USER_AGENT))
-        .header(VIA, HeaderValue::from_static(APP_VIA))
-        .header(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-    if parts.uri.authority().is_some() {
-        fwd_request = fwd_request.header(HOST, host_header_from_uri(&parts.uri));
-    }
-    let fwd_request = fwd_request
-        .uri(parts.uri)
-        .body(Empty::new())
-        .expect("request should be valid");
+    let host = parts
+        .uri
+        .authority()
+        .map(|_| host_header_from_uri(&parts.uri));
+    let fwd_request = build_fwd_request(parts.uri, host.as_ref(), None, 0, None);
 
     trace!("Forwarded request: {fwd_request:?}");
 
@@ -3765,6 +3714,56 @@ mod tests {
         for name in ["x-trace", "Keep-Alive", "Pragma", "TE"] {
             assert_eq!(logged(name, "abc"), r#""abc""#, "{name}");
         }
+    }
+
+    #[test]
+    fn upstream_gets_share_base_headers_and_add_only_selected_validators() {
+        use http::{
+            Method,
+            header::{
+                ACCEPT_ENCODING, CACHE_CONTROL, HOST, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE,
+                RANGE, USER_AGENT, VIA,
+            },
+        };
+
+        let uri: Uri = "http://mirror.example/package.deb".parse().unwrap();
+        let host = host_header_from_uri(&uri);
+        let fresh = super::build_fwd_request(uri.clone(), Some(&host), None, 0, None);
+        assert_eq!(fresh.method(), Method::GET);
+        assert_eq!(fresh.uri(), &uri);
+        assert_eq!(
+            fresh.headers().len(),
+            4,
+            "only proxy-owned headers are sent"
+        );
+        // hyper writes the fields in map order: `Host` right after
+        // `User-Agent`, as the cache fetch always sent it.
+        assert_eq!(
+            fresh.headers().keys().collect::<Vec<_>>(),
+            [USER_AGENT, HOST, VIA, ACCEPT_ENCODING]
+        );
+        assert_eq!(fresh.headers()[HOST], host);
+        assert_eq!(
+            fresh.headers()[USER_AGENT],
+            crate::build_info::APP_USER_AGENT
+        );
+        assert_eq!(fresh.headers()[VIA], crate::build_info::APP_VIA);
+        assert_eq!(fresh.headers()[ACCEPT_ENCODING], "identity");
+
+        let date = "Thu, 01 Jan 1970 00:00:00 GMT";
+        let metadata =
+            crate::cache_metadata::UpstreamMetadata::from_upstream(Some("\"v1\""), Some(date));
+        let conditional =
+            super::build_fwd_request(uri.clone(), Some(&host), Some(&metadata), 0, None);
+        assert_eq!(conditional.headers()[IF_MODIFIED_SINCE], date);
+        assert_eq!(conditional.headers()[IF_NONE_MATCH], "\"v1\"");
+        assert_eq!(conditional.headers()[CACHE_CONTROL], "max-age=300");
+        assert!(!conditional.headers().contains_key(RANGE));
+
+        let resumed = super::build_fwd_request(uri, Some(&host), None, 40, Some("\"v1\""));
+        assert_eq!(resumed.headers()[RANGE], "bytes=40-");
+        assert_eq!(resumed.headers()[IF_RANGE], "\"v1\"");
+        assert!(!resumed.headers().contains_key(IF_NONE_MATCH));
     }
 
     #[test]
