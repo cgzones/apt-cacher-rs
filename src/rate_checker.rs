@@ -42,10 +42,7 @@ impl InsufficientRate {
             f,
             "Timeout occurred{context} after a download rate of {} (below {}) for the last {}",
             HumanFmt::Rate(self.transferred as u64, timeframe),
-            HumanFmt::Rate(
-                self.min_rate.get() as u64,
-                std::time::Duration::from_secs(1)
-            ),
+            HumanFmt::RatePerSec(self.min_rate.get() as u64),
             HumanFmt::Time(timeframe),
         )
     }
