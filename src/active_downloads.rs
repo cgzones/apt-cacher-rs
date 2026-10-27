@@ -13,7 +13,7 @@
 //!   [`ActiveDownloads::register`] joins or `ActiveDownloads::attach` hits.
 //! - Saturation transitions for `max_upstream_downloads`
 //!   ([`metrics::UPSTREAM_DOWNLOAD_CAP_TRANSITIONS`]) — debounced via the
-//!   module-private [`AT_CAP`] latch so each saturation episode counts once.
+//!   registry-owned saturation latch so each saturation episode counts once.
 //! - Cap rejections ([`metrics::UPSTREAM_DOWNLOAD_REJECTED_CAP`]) — bumped
 //!   for every refused origination.
 //!
@@ -30,7 +30,6 @@
 use std::num::NonZero;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use hashbrown::{HashMap, hash_map::Entry};
 use http::StatusCode;
@@ -564,6 +563,8 @@ struct Registry {
     /// move the saturation latch: a count that can only change through those
     /// two cannot change without the latch seeing it.
     upstream_slots: usize,
+    /// Count a saturation episode once until every slot drains.
+    at_cap: bool,
 }
 
 #[derive(Clone)]
@@ -609,12 +610,13 @@ impl UpstreamSlot {
     /// the origination if the count is at `max`.
     fn mint(
         upstream_slots: &mut usize,
+        at_cap: &mut bool,
         registry: &ActiveDownloads,
         max: Option<NonZero<usize>>,
     ) -> Self {
         *upstream_slots += 1;
         metrics::UPSTREAM_DOWNLOADS_ADMITTED.increment();
-        record_cap_saturation(*upstream_slots, max);
+        record_cap_saturation(*upstream_slots, max, at_cap);
         Self {
             registry: registry.clone(),
         }
@@ -628,7 +630,13 @@ impl Drop for UpstreamSlot {
             .upstream_slots
             .checked_sub(1)
             .expect("every released slot was minted");
-        record_cap_drain(guard.upstream_slots);
+        let Registry {
+            upstream_slots,
+            at_cap,
+            ..
+        } = &mut *guard;
+        record_cap_drain(*upstream_slots, at_cap);
+        drop(guard);
     }
 }
 
@@ -662,49 +670,25 @@ pub(crate) enum Admission {
     AtCapacity { max: NonZero<usize> },
 }
 
-/// Saturation-transition latch for `max_upstream_downloads`, used exclusively
-/// by [`record_cap_saturation`] and [`record_cap_drain`] -- which in turn are
-/// called only by [`UpstreamSlot::mint`] and [`UpstreamSlot`]'s `Drop`, under
-/// the registry's write lock, so the latch moves in lockstep with the slot
-/// count it describes.
-static AT_CAP: AtomicBool = AtomicBool::new(false);
-
-/// Mint-side cap tracking: latch `AT_CAP` and bump the transition counter
-/// the first time the slot count hits `max_upstream_downloads`.
-/// `max_upstream_downloads` is read per-call so config reloads take effect.
-/// `AcqRel` pairs with `Release` in [`record_cap_drain`] so two threads
-/// racing the saturation cannot both observe `false` and double-increment
-/// the transition counter.
-fn record_cap_saturation(upstream_slots: usize, max: Option<NonZero<usize>>) {
-    let Some(max) = max else {
-        return;
-    };
-    if upstream_slots >= max.get() {
+/// Mint-side cap tracking, under the registry's write lock: count the
+/// first saturation since its last full drain. The lock also protects the
+/// slot count, so the ordinary latch moves in step with it.
+fn record_cap_saturation(upstream_slots: usize, max: Option<NonZero<usize>>, at_cap: &mut bool) {
+    if max.is_some_and(|max| upstream_slots >= max.get()) {
         metrics::UPSTREAM_DOWNLOAD_CAP_CLOCK.enter();
-        if !AT_CAP.swap(true, Ordering::AcqRel) {
+        if !*at_cap {
+            *at_cap = true;
             metrics::UPSTREAM_DOWNLOAD_CAP_TRANSITIONS.increment();
         }
     }
 }
 
-/// Release-side cap tracking: clear the latch when the last slot is given
-/// back so the next saturation episode can be counted. A release can only
-/// decrease the count, so the latch-set branch is unreachable from here and
-/// is omitted.
-///
-/// `max_upstream_downloads` is deliberately not consulted: with no cap
-/// configured [`record_cap_saturation`] never sets the latch, so the store
-/// is a no-op — and clearing unconditionally also releases a latch left
-/// armed by a config reload that dropped the cap. Keeping the read out of
-/// here is what makes [`UpstreamSlot`]'s drop global-free (and so
-/// unit-testable).
-fn record_cap_drain(upstream_slots: usize) {
-    // Any release takes a set at the cap below it: the time-at-cap span ends
-    // here (a no-op when no span runs), unlike the transition latch, which
-    // waits for a full drain.
+/// Any release stops the time-at-cap span, but only a full drain clears
+/// the transition latch. No config read is needed, even if the cap changed.
+fn record_cap_drain(upstream_slots: usize, at_cap: &mut bool) {
     metrics::UPSTREAM_DOWNLOAD_CAP_CLOCK.leave();
     if upstream_slots == 0 {
-        AT_CAP.store(false, Ordering::Release);
+        *at_cap = false;
     }
 }
 
@@ -715,6 +699,7 @@ impl ActiveDownloads {
             inner: Arc::new(parking_lot::RwLock::new(Registry {
                 entries: HashMap::new(),
                 upstream_slots: 0,
+                at_cap: false,
             })),
         }
     }
@@ -774,7 +759,7 @@ impl ActiveDownloads {
     /// (which reads it from `global_config()`) so this helper can be
     /// driven from unit tests without standing up a full configuration.
     /// The helper is not side-effect-free: minting the slot latches the
-    /// module-private [`AT_CAP`] flag via [`record_cap_saturation`], and it
+    /// registry's saturation flag via [`record_cap_saturation`], and it
     /// bumps the `ACTIVE_UPSTREAM_DOWNLOADS_PEAK`, `LATE_JOINERS_TOTAL`,
     /// `LATE_JOINER_PEAK_PER_DOWNLOAD`, and (on a refused origination)
     /// `UPSTREAM_DOWNLOAD_REJECTED_CAP` global metrics.
@@ -813,6 +798,7 @@ impl ActiveDownloads {
         let Registry {
             entries,
             upstream_slots,
+            at_cap,
         } = &mut *guard;
         // Only the Vacant arm consults it — joins are exempt from the cap.
         // The slot count, not the map length: an entry whose upstream
@@ -849,7 +835,12 @@ impl ActiveDownloads {
                             status,
                             // Under the same lock as the insert and the
                             // capacity check above, so the cap is exact.
-                            slot: UpstreamSlot::mint(upstream_slots, self, max_upstream_downloads),
+                            slot: UpstreamSlot::mint(
+                                upstream_slots,
+                                at_cap,
+                                self,
+                                max_upstream_downloads,
+                            ),
                         }),
                         None,
                     )
@@ -1182,6 +1173,47 @@ mod tests {
         assert!(matches!(third, Admission::AtCapacity { max: _ }));
         drop(second_slot);
         assert_eq!(ad.upstream_slots(), 0);
+    }
+
+    #[test]
+    fn saturation_latches_until_full_drain_and_is_owned_by_each_registry() {
+        let registry = ActiveDownloads::new();
+        let other = ActiveDownloads::new();
+        let max = NonZero::new(2);
+        let mint = |registry: &ActiveDownloads| {
+            let mut state = registry.inner.write();
+            let Registry {
+                upstream_slots,
+                at_cap,
+                ..
+            } = &mut *state;
+            let slot = UpstreamSlot::mint(upstream_slots, at_cap, registry, max);
+            drop(state);
+            slot
+        };
+        let first = mint(&registry);
+        assert!(!registry.inner.read().at_cap);
+        let second = mint(&registry);
+        assert!(registry.inner.read().at_cap);
+        drop(second);
+        assert!(
+            registry.inner.read().at_cap,
+            "partial drain keeps the episode"
+        );
+        let refill = mint(&registry);
+        drop(first);
+        drop(refill);
+        assert!(!registry.inner.read().at_cap, "full drain ends the episode");
+        let first = mint(&registry);
+        let second = mint(&registry);
+        let other_slot = mint(&other);
+        drop(other_slot);
+        assert!(
+            registry.inner.read().at_cap,
+            "another registry cannot clear the latch"
+        );
+        drop(first);
+        drop(second);
     }
 
     #[test]
