@@ -1547,7 +1547,7 @@ async fn download_file_worker(
     barrier: &mut DownloadBarrier,
 ) -> Result<PreciseInstant, DownloadFailure> {
     while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|error| match *error {
+        let frame = frame.map_err(|error| match error {
             RateCheckedBodyErr::RateTimeout(rate) => UpstreamError::rate(rate),
             RateCheckedBodyErr::Inner(error) => upstream_body_error(error),
         })?;

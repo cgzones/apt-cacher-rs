@@ -59,7 +59,7 @@ where
     where
         B::Error: Into<DeliveryFailure>,
     {
-        self.map_err(|err| match *err {
+        self.map_err(|err| match err {
             RateCheckedBodyErr::RateTimeout(rate) => ClientError::rate(rate).into(),
             RateCheckedBodyErr::Inner(err) => err.into(),
         })
@@ -71,7 +71,7 @@ where
     B: Body,
 {
     type Data = B::Data;
-    type Error = Box<RateCheckedBodyErr<B::Error>>;
+    type Error = RateCheckedBodyErr<B::Error>;
 
     #[inline]
     fn size_hint(&self) -> SizeHint {
@@ -97,9 +97,9 @@ where
             self_mut.rchecker.as_ref().and_then(RateChecker::check_fail)
         {
             self_mut.rate_failed.set();
-            return std::task::Poll::Ready(Some(Err(Box::new(RateCheckedBodyErr::RateTimeout(
+            return std::task::Poll::Ready(Some(Err(RateCheckedBodyErr::RateTimeout(
                 download_rate_err,
-            )))));
+            ))));
         }
 
         let msg = self_mut.inner.poll_frame(cx);
@@ -111,7 +111,7 @@ where
             rchecker.add(data.remaining());
         }
 
-        msg.map_err(|e| Box::new(RateCheckedBodyErr::Inner(e)))
+        msg.map_err(RateCheckedBodyErr::Inner)
     }
 }
 
@@ -153,7 +153,7 @@ mod tests {
 
         let breached = match Pin::new(&mut body).poll_frame(&mut cx) {
             Poll::Ready(Some(Err(err))) => {
-                matches!(*err, RateCheckedBodyErr::RateTimeout(_))
+                matches!(err, RateCheckedBodyErr::RateTimeout(_))
             }
             Poll::Ready(Some(Ok(_)) | None) | Poll::Pending => false,
         };
@@ -228,9 +228,10 @@ mod tests {
             assert!(
                 matches!(Pin::new(&mut body).poll_frame(&mut cx), Poll::Ready(Some(Ok(frame))) if frame.is_trailers())
             );
-            assert!(
-                matches!(Pin::new(&mut body).poll_frame(&mut cx), Poll::Ready(Some(Err(error))) if matches!(*error, RateCheckedBodyErr::Inner("source failed")))
-            );
+            assert!(matches!(
+                Pin::new(&mut body).poll_frame(&mut cx),
+                Poll::Ready(Some(Err(RateCheckedBodyErr::Inner("source failed"))))
+            ));
             assert!(matches!(
                 Pin::new(&mut body).poll_frame(&mut cx),
                 Poll::Ready(None)
@@ -239,7 +240,7 @@ mod tests {
     }
 
     /// Without a configured minimum rate the wrapper is a pass-through: the
-    /// inner body's frames arrive unchanged, only re-boxed into the common
+    /// inner body's frames arrive unchanged, only wrapped in the common
     /// error type.
     #[test]
     fn unrated_body_passes_frames_through() {
