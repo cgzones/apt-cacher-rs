@@ -547,6 +547,16 @@ struct ActiveDownloadEntry {
     late_joiners: usize,
 }
 
+impl ActiveDownloadEntry {
+    /// Attach under the registry lock and return the cumulative count. The
+    /// caller records it only after dropping the registry guard, so metric
+    /// updates do not extend the critical section.
+    fn join(&mut self) -> (Arc<tokio::sync::RwLock<ActiveDownloadStatus>>, usize) {
+        self.late_joiners += 1;
+        (Arc::clone(&self.status), self.late_joiners)
+    }
+}
+
 /// The locked state: the entries, and the number of [`UpstreamSlot`]s alive.
 ///
 /// The two are deliberately independent counts rather than one derived from
@@ -773,9 +783,7 @@ impl ActiveDownloads {
         {
             let mut guard = self.inner.write();
             if let Some(entry) = guard.entries.get_mut(&keyref) {
-                entry.late_joiners += 1;
-                let peak = entry.late_joiners;
-                let status = Arc::clone(&entry.status);
+                let (status, peak) = entry.join();
                 drop(guard);
 
                 metrics::LATE_JOINERS_TOTAL.increment();
@@ -808,9 +816,7 @@ impl ActiveDownloads {
         let (outcome, late_joiner_peak) = match entries.entry(key) {
             Entry::Occupied(mut oentry) => {
                 let entry = oentry.get_mut();
-                entry.late_joiners += 1;
-                let peak = entry.late_joiners;
-                let existing_status = Arc::clone(&entry.status);
+                let (existing_status, peak) = entry.join();
                 (
                     Admission::LateJoiner {
                         status: existing_status,
@@ -943,9 +949,7 @@ impl ActiveDownloads {
         // between the two acquisitions.
         let mut guard = self.inner.write();
         let entry = guard.entries.get_mut(&key)?;
-        entry.late_joiners += 1;
-        let peak = entry.late_joiners;
-        let status = Arc::clone(&entry.status);
+        let (status, peak) = entry.join();
         drop(guard);
 
         metrics::LATE_JOINERS_TOTAL.increment();
