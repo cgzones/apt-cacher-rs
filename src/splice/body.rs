@@ -2597,11 +2597,7 @@ mod tests {
     async fn prepared_demotion_keeps_the_original_inode_after_rename() {
         let scratch = ScratchFile::new();
         std::fs::write(&scratch.path, b"prefix-suffix").unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (client, _) = listener.accept().await.unwrap();
+        let (mut peer, client) = crate::test_support::connected_tcp_pair().await;
         let (_sender, receiver) = tokio::sync::watch::channel(());
         let status = Arc::new(tokio::sync::RwLock::new(ActiveDownloadStatus::Finished {
             path: scratch.path.clone(),
@@ -2653,11 +2649,7 @@ mod tests {
             .unwrap();
         writer.write_prefix(b"prefix-").await.unwrap();
         std::fs::remove_file(&*path).unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (client, _) = listener.accept().await.unwrap();
+        let (mut peer, client) = crate::test_support::connected_tcp_pair().await;
         let prepared =
             prepare_file_serve(&client, &writer.tempfile, &path, 7, 6, receiver, status).unwrap();
         // Bytes arriving after demotion remain visible through the captured fd.
@@ -3010,11 +3002,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let _peer = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (client, _) = listener.accept().await.unwrap();
+        let (_peer, client) = crate::test_support::connected_tcp_pair().await;
 
         // A one-second window that one noted byte fills, far below the rate
         // floor: the upstream checker trips on the first check.
@@ -3106,11 +3094,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (mut client, _) = listener.accept().await.unwrap();
+        let (mut peer, mut client) = crate::test_support::connected_tcp_pair().await;
         client.write_all(b"sent").await.unwrap();
         let mut delivered = [0; 4];
         peer.read_exact(&mut delivered).await.unwrap();
@@ -3206,11 +3190,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let _peer = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (client, _) = listener.accept().await.unwrap();
+        let (_peer, client) = crate::test_support::connected_tcp_pair().await;
 
         // One-second windows.
         let mut config = crate::config::Config::default();

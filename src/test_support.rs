@@ -92,3 +92,17 @@ pub(crate) fn pause_blocking_pool(
     ready.recv().unwrap();
     resume
 }
+
+/// A connected loopback TCP pair, returned as (connecting socket, accepted socket).
+#[cfg(feature = "splice")]
+pub(crate) async fn connected_tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback listener");
+    let connected =
+        tokio::net::TcpStream::connect(listener.local_addr().expect("listener address"))
+            .await
+            .expect("loopback connection");
+    let (accepted, _) = listener.accept().await.expect("accept loopback connection");
+    (connected, accepted)
+}

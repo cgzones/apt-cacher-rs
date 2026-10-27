@@ -2879,11 +2879,7 @@ mod transfer_tests {
     #[cfg(feature = "splice")]
     #[tokio::test]
     async fn rated_write_timeout_retains_bytes_accepted_before_the_stall() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (_peer, _address) = listener.accept().await.unwrap();
+        let (client, _peer) = crate::test_support::connected_tcp_pair().await;
         nix::sys::socket::setsockopt(&client, nix::sys::socket::sockopt::SndBuf, &4096).unwrap();
         let body = vec![0; 16 * 1024 * 1024];
         let mut transferred = 0;

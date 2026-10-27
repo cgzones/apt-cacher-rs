@@ -1501,11 +1501,7 @@ mod tests {
 
     #[tokio::test]
     async fn chunked_relay_write_failure_keeps_client_side_and_os_error() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (_peer, _) = listener.accept().await.unwrap();
+        let (mut client, _peer) = crate::test_support::connected_tcp_pair().await;
         client.shutdown().await.unwrap();
         let err = forward_chunked_buf(
             &mut ChunkDecoder::new(1024),
@@ -1529,11 +1525,7 @@ mod tests {
     /// boundaries split the size lines and the chunk data.
     #[tokio::test]
     async fn decoded_chunked_relay_forwards_only_the_payload() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (mut peer, _) = listener.accept().await.unwrap();
+        let (client, mut peer) = crate::test_support::connected_tcp_pair().await;
 
         let mut decoder = ChunkDecoder::new(1024);
         let mut payload = Vec::new();
@@ -1575,11 +1567,7 @@ mod tests {
             for relay in [ChunkedRelay::Raw, ChunkedRelay::Decoded] {
                 // Also exercise one-byte reads, which fragment every trailer line.
                 for split in 1..input.len() {
-                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    let client = TcpStream::connect(listener.local_addr().unwrap())
-                        .await
-                        .unwrap();
-                    let (mut peer, _) = listener.accept().await.unwrap();
+                    let (client, mut peer) = crate::test_support::connected_tcp_pair().await;
                     let mut decoder = ChunkDecoder::new(1024);
                     let mut payload = Vec::new();
                     let mut total = 0;
@@ -1617,11 +1605,7 @@ mod tests {
 
     #[tokio::test]
     async fn raw_chunked_relay_rejects_bytes_after_trailers_without_forwarding_them() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (mut peer, _) = listener.accept().await.unwrap();
+        let (client, mut peer) = crate::test_support::connected_tcp_pair().await;
         let mut total = 0;
         let result = forward_chunked_buf(
             &mut ChunkDecoder::new(1024),
