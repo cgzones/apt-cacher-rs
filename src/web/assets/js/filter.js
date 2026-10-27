@@ -51,7 +51,7 @@
 
   function filterTable(table, box, shown) {
     const terms = ACR.words(box.value);
-    const rows = table.tBodies[0] ? Array.prototype.slice.call(table.tBodies[0].rows) : [];
+    const rows = table.tBodies[0] ? table.tBodies[0].rows : [];
     let visible = 0;
     for (const row of rows) {
       const keep = terms.length === 0 || ACR.matches(row.textContent, terms);
