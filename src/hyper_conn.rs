@@ -1748,7 +1748,7 @@ async fn download_file(
 /// Parse a redirect response's `Location` into a URI.
 ///
 /// The other reasons a redirect is not followed (relative target, unsupported
-/// scheme, host not permitted) are named by [`log_unfollowed_redirect`]; a
+/// scheme, host not permitted) are named by [`redirect_permitted`]; a
 /// `Location` that does not parse -- or is missing entirely -- would otherwise
 /// leave nothing but a bare "failed with code 302" further down. `source` and
 /// `what` only name the mirror and resource for the log line.
@@ -1785,49 +1785,43 @@ fn parse_redirect_location<B>(
     parsed
 }
 
-/// Whether `allowed_mirror_ports` permits the port of a redirect target
-/// that [`parse_redirect_location`] already validated.
-fn redirect_port_permitted(moved_uri: &Uri, moved_auth: &http::uri::Authority) -> bool {
-    uri_authority::port(moved_auth).is_ok_and(|port| {
-        permitted_port(port, moved_uri.scheme() == Some(&http::uri::Scheme::HTTPS))
-    })
-}
-
-/// Log why an upstream redirect was not followed, at the point where the
-/// follow conditions (absolute `http(s)` target naming a permitted host and
-/// port) have already failed.  Shared by the cache-fetch and the
-/// simple-proxy redirect handling so both name the same reason for the same
-/// `Location`.
-fn log_unfollowed_redirect(moved_uri: &Uri) {
-    if moved_uri.scheme().is_none() {
-        // A relative Location (`/pool/...`) is legal per RFC 9110, but this
-        // backend only follows absolute targets. Reported before the scheme
-        // branch below, which would otherwise call it an unsupported scheme.
+/// Evaluate and explain redirect permission once, shared by cache fetches
+/// and passthroughs. Parsing has already checked explicit port validity.
+fn redirect_permitted(moved_uri: &Uri) -> bool {
+    let Some(scheme) = moved_uri.scheme() else {
         debug!("Moved URI `{moved_uri}` is relative; not following the redirect");
-    } else if moved_uri.scheme().is_some_and(|scheme| {
-        *scheme != http::uri::Scheme::HTTP && *scheme != http::uri::Scheme::HTTPS
-    }) {
+        return false;
+    };
+    if *scheme != http::uri::Scheme::HTTP && *scheme != http::uri::Scheme::HTTPS {
         debug!("Scheme of moved URI `{moved_uri}` not supported");
-    } else if let Some(moved_host) = moved_uri.host() {
-        // Cached by the gate that refused it, so the reason costs a lookup.
-        match permitted_host(moved_host) {
-            Err(HostReject::Unsupported(err)) => {
-                // Upstream-controlled, like splice's twin in `follow_redirect`.
-                warn_once_or_info!(
-                    "Upstream sent a redirect to the invalid host `{}` ({err}); not following the redirect",
-                    moved_host.escape_debug()
-                );
-            }
-            Ok(_) => {
-                debug!("Port of moved URI `{moved_uri}` not permitted by `allowed_mirror_ports`");
-            }
-            Err(HostReject::Forbidden) => {
-                debug!("Host `{moved_host}` of moved URI not permitted");
-            }
-        }
-    } else {
-        debug!("Moved URI has no host; not following the redirect");
+        return false;
     }
+    let Some(authority) = moved_uri.authority() else {
+        debug!("Moved URI has no host; not following the redirect");
+        return false;
+    };
+    let moved_host = authority.host();
+    match permitted_host(moved_host) {
+        Err(HostReject::Unsupported(err)) => {
+            warn_once_or_info!(
+                "Upstream sent a redirect to the invalid host `{}` ({err}); not following the redirect",
+                moved_host.escape_debug()
+            );
+            return false;
+        }
+        Err(HostReject::Forbidden) => {
+            debug!("Host `{moved_host}` of moved URI not permitted");
+            return false;
+        }
+        Ok(_) => {}
+    }
+    if !uri_authority::port(authority)
+        .is_ok_and(|port| permitted_port(port, *scheme == http::uri::Scheme::HTTPS))
+    {
+        debug!("Port of moved URI `{moved_uri}` not permitted by `allowed_mirror_ports`");
+        return false;
+    }
+    true
 }
 
 /// Log and build the canonical 503 for a download origination refused by the
@@ -2170,12 +2164,7 @@ async fn serve_new_file_worker(
     {
         debug!("Requested URI: {}, Moved URI: {moved_uri:?}", req.uri());
 
-        if moved_uri.scheme().is_some_and(|scheme| {
-            *scheme == http::uri::Scheme::HTTP || *scheme == http::uri::Scheme::HTTPS
-        }) && let Some(moved_auth) = moved_uri.authority()
-            && permitted_host(moved_auth.host()).is_ok()
-            && redirect_port_permitted(&moved_uri, moved_auth)
-        {
+        if redirect_permitted(&moved_uri) {
             // Derive the Host header from the redirect target so it matches
             // the URI we're actually sending the request to.
             host = host_header_from_uri(&moved_uri);
@@ -2212,8 +2201,6 @@ async fn serve_new_file_worker(
             };
 
             trace!("Forwarded redirected response: {fwd_response:?}");
-        } else {
-            log_unfollowed_redirect(&moved_uri);
         }
     }
 
@@ -3179,12 +3166,7 @@ async fn pre_process_client_request(
     ) {
         debug!("Requested URI: {}, Moved URI: {moved_uri}", parts.uri);
 
-        if moved_uri.scheme().is_some_and(|scheme| {
-            *scheme == http::uri::Scheme::HTTP || *scheme == http::uri::Scheme::HTTPS
-        }) && let Some(moved_auth) = moved_uri.authority()
-            && permitted_host(moved_auth.host()).is_ok()
-            && redirect_port_permitted(&moved_uri, moved_auth)
-        {
+        if redirect_permitted(&moved_uri) {
             // Update the Host header so it matches the redirect target,
             // otherwise the header from the original request would be
             // sent to a different mirror.
@@ -3221,8 +3203,6 @@ async fn pre_process_client_request(
                 },
             );
         }
-
-        log_unfollowed_redirect(&moved_uri);
     }
 
     passthrough_response(
