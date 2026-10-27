@@ -10,7 +10,7 @@ use tracing::trace;
 
 use crate::cache_layout::CacheLayout;
 use crate::cache_paths::{CachePaths, SUBDIR_FLAT_BYHASH, SUBDIR_TMP};
-use crate::cleanup::packages::FetchFailure;
+use crate::cleanup::fetch::FetchFailure;
 use crate::cleanup::sweep::SpanTable;
 use crate::config::Config;
 use crate::database::MirrorEntry;

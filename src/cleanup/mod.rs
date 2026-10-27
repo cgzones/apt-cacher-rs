@@ -1,4 +1,5 @@
 mod engine;
+mod fetch;
 mod model;
 mod packages;
 mod partials;
@@ -8,6 +9,9 @@ mod sweep;
 mod verify;
 
 use engine::run_mirror_units;
+// The hyper-less bridge (`splice/cleanup_bridge.rs`) answers in these.
+#[cfg(not(feature = "hyper"))]
+pub(crate) use fetch::{FetchFailure, IndexAnswer};
 use model::classify_mirror;
 
 use std::{

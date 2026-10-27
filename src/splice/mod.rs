@@ -41,7 +41,7 @@ mod upstream;
 mod volatile;
 
 #[cfg(not(feature = "hyper"))]
-pub(crate) use cleanup_bridge::process_cache_request;
+pub(crate) use cleanup_bridge::cleanup_index_fetch;
 pub(crate) use simple_proxy::splice_simple_proxy;
 #[cfg(feature = "tls_rustls")]
 pub(crate) use upstream::TLS_CLIENT_CONFIG;

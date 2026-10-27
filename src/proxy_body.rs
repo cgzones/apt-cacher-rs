@@ -1,5 +1,5 @@
-//! [`ProxyCacheBody`], the response body every hyper-served response (and
-//! the hyper-less cleanup bridge) is built from: a boxed dynamic body. [`full_body`] and `quick_response` wrap small,
+//! [`ProxyCacheBody`], the response body every hyper-served response is built
+//! from: a boxed dynamic body. [`full_body`] and `quick_response` wrap small,
 //! fully buffered payloads.
 
 #[cfg(feature = "hyper")]

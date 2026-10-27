@@ -2429,7 +2429,7 @@ async fn serve_new_file_worker(
                 .await;
 
             // Demote routine 4xx for cleanup-synthetic clients to DEBUG:
-            // `try_fetch_packages_file` deliberately walks `.xz → .gz → raw`,
+            // `cleanup::fetch` deliberately walks `.xz → .gz → raw`,
             // and on S3-hosted flat repos every miss surfaces as 403 (not
             // 404). At WARN that's three loud lines per cleanup cycle for
             // a benign probe sequence — the cleanup's own DEBUG line on

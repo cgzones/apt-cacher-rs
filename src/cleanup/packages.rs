@@ -3,40 +3,21 @@ use std::io;
 use std::num::NonZero;
 use std::path::Path;
 
-use bytes::Buf as _;
 use hashbrown::HashMap;
-use http::{Method, Request, Response, StatusCode, header::CACHE_CONTROL};
-use http_body_util::{BodyExt as _, Empty};
-use memfd::MemfdOptions;
-use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _, BufWriter};
 use tracing::{debug, error, warn};
 
 use crate::{
-    AppState, Never,
-    cache_layout::{CacheLayout, ConnectionDetails, ResourceKind, dists_debname},
-    client_info::ClientInfo,
+    cache_layout::CacheLayout,
     deb_mirror::Mirror,
-    error::{ErrorReport, UpstreamFetchError},
+    error::ErrorReport,
     index_parser::{Stanza, StanzaStream, hex_encode, structured_lookup_key},
-    limits::{
-        PackagesCompression, check_packages_file_size, decompressed_limit, packages_file_cap,
-        packages_reader,
-    },
+    limits::{PackagesCompression, check_packages_file_size, decompressed_limit, packages_reader},
     metrics,
     mirror_health::{self, MirrorFault},
-    precise_instant::PreciseInstant,
-    proxy_body::ProxyCacheBody,
-    transfer_error::DeliveryFailure,
 };
-// `process_cache_request` has a hyper implementation and a splice-only stub
-// (in `splice/cleanup_bridge.rs`) that bridges to `splice_cleanup_request`;
-// cleanup calls it identically in both builds.
-#[cfg(feature = "hyper")]
-use crate::hyper_conn::process_cache_request;
-#[cfg(not(feature = "hyper"))]
-use crate::splice::process_cache_request;
 
 use super::engine::{SpanClass, UnitStats};
+use super::fetch::FetchedPackages;
 use super::sweep::invalidate_metadata_for;
 use super::verify::{Verdict, verify_cache_file};
 
@@ -63,109 +44,6 @@ impl KeyMapper<'_> {
             Self::RelpathUnderPrefix { prefix } => filename.strip_prefix(prefix),
         }
     }
-}
-
-/// Why buffering a Packages response into its memfd failed.  Every variant is
-/// logged by [`packages_body_to_memfd`]; the caller maps all of them to a
-/// conservative fetch failure (skip the mirror's reconcile this cycle).
-///
-/// `Display` renders the wrapped error through [`ErrorReport`] and exposes no
-/// `source()`.
-#[derive(Debug, thiserror::Error)]
-pub(super) enum PackagesBufferError {
-    #[error("{}", ErrorReport(.0))]
-    Memfd(memfd::Error),
-    /// The response body yielded an error frame (e.g. an upstream rate limit,
-    /// `ContentTooLarge`).
-    #[error("{}", ErrorReport(.0))]
-    Body(DeliveryFailure),
-    /// Writing to or rewinding the memfd failed.
-    #[error("{}", ErrorReport(.0))]
-    Io(io::Error),
-    /// The body exceeded the buffering cap before decompression guards could
-    /// weigh in.
-    #[error("compressed Packages exceeds the size cap of {max} bytes")]
-    TooLarge { max: NonZero<u64> },
-}
-
-/// Buffer `body` into `file`, returning the file (rewound to offset 0) and the
-/// number of bytes written. The caller compares the byte count against the
-/// upstream-announced `Content-Length` as a defensive truncation check. Typed
-/// body failures, including a cancelled delivery producer, propagate as errors.
-///
-/// `max_bytes` bounds how much is buffered before the (post-hoc) decompression
-/// guards in `reduce_file_list` can weigh in: an abusive upstream could
-/// otherwise stream an unbounded compressed (or raw) body straight into memory.
-/// Exceeding it returns `Err` rather than truncating -- a short buffer would
-/// silently shrink the reference set and over-evict -- which the caller maps to
-/// a conservative fetch failure. The check is per-chunk, so at most one extra
-/// buffer is held transiently over the cap.
-async fn body_to_file(
-    body: &mut ProxyCacheBody,
-    file: tokio::fs::File,
-    max_bytes: NonZero<u64>,
-    buffer_size: usize,
-) -> Result<(tokio::fs::File, u64), PackagesBufferError> {
-    let mut writer = BufWriter::with_capacity(buffer_size, file);
-
-    let mut written: u64 = 0;
-    while let Some(next) = body.frame().await {
-        let frame = next.map_err(PackagesBufferError::Body)?;
-        if let Ok(mut chunk) = frame.into_data() {
-            written = written.saturating_add(chunk.remaining() as u64);
-            if written > max_bytes.get() {
-                return Err(PackagesBufferError::TooLarge { max: max_bytes });
-            }
-            writer
-                .write_all_buf(&mut chunk)
-                .await
-                .map_err(PackagesBufferError::Io)?;
-        }
-    }
-
-    writer.flush().await.map_err(PackagesBufferError::Io)?;
-
-    let mut file = writer.into_inner();
-
-    file.rewind().await.map_err(PackagesBufferError::Io)?;
-
-    Ok((file, written))
-}
-
-/// `true` only when the upstream announced an exact `Content-Length` and we
-/// buffered fewer bytes despite the body ending successfully.
-/// `None` (chunked / volatile-unknown / legitimately empty) is never
-/// "incomplete".
-#[must_use]
-pub(super) fn body_is_incomplete(announced: Option<u64>, written: u64) -> bool {
-    matches!(announced, Some(expected) if written < expected)
-}
-
-pub(super) async fn packages_body_to_memfd(
-    memfdname: &str,
-    compression: PackagesCompression,
-    body: &mut ProxyCacheBody,
-    buffer_size: usize,
-) -> Result<(tokio::fs::File, u64), PackagesBufferError> {
-    let memfd = MemfdOptions::new().create(memfdname).map_err(|err| {
-        error!(
-            "Failed to create in-memory file `{memfdname}` for the Packages index; skipping this mirror's reconcile this cycle:  {}",
-            ErrorReport(&err)
-        );
-        PackagesBufferError::Memfd(err)
-    })?;
-    let file = tokio::fs::File::from_std(memfd.into_file());
-    // Cap the buffered body at the most `reduce_file_list` would decode (the
-    // decompressed ceiling for a raw index, the compressed one otherwise), so
-    // memory is bounded before its guards run.
-    body_to_file(body, file, packages_file_cap(compression), buffer_size)
-        .await
-        .inspect_err(|err| {
-            error!(
-                "Failed to write the Packages response to in-memory file `{memfdname}`; skipping this mirror's reconcile this cycle:  {}",
-                ErrorReport(err)
-            );
-        })
 }
 
 /// Per-call context for [`reduce_file_list`]: needed to invalidate
@@ -286,20 +164,14 @@ async fn process_stanza(
 /// set.  Carries the cause only: the resolver receiving it decides the
 /// consequence (bail the mirror, continue with the next index source, fall
 /// back to age-based retention) and logs the one line, with this rendered
-/// through `ErrorReport` after it.  `filename` is the synthetic memfd name
-/// (`DebnameKind::memfd_name`), which identifies the origin's index.
+/// through `ErrorReport` after it.  `filename` is the fetched index's
+/// [`FetchedPackages::name`], which identifies the origin's index.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ReduceError {
     /// A gzip/xz index of zero bytes is malformed (both formats need at least
     /// a header), never "no stanzas" - only a raw index may be empty.
     #[error("compressed Packages index `{filename}` is zero bytes")]
     ZeroSizeCompressed { filename: String },
-    #[error("failed to stat Packages index `{filename}` for the decompression-ratio guard")]
-    Stat {
-        filename: String,
-        #[source]
-        source: io::Error,
-    },
     /// Larger than `limits::packages_file_cap` allows; refused undecoded.
     #[error("Packages index `{filename}` is too large to decode")]
     TooLarge {
@@ -329,26 +201,26 @@ pub(super) enum ReduceError {
 /// [`StanzaStream`] but degrades to a less-populated registry instead.  The
 /// `Err` is the cause alone; the resolver logs it with its consequence.
 pub(super) async fn reduce_file_list(
-    compression: PackagesCompression,
-    file: tokio::fs::File,
-    filename: &str,
+    index: FetchedPackages,
     file_list: &mut HashMap<OsString, SpanClass>,
     ctx: &mut ReduceContext<'_>,
     buffer_size: usize,
 ) -> Result<(), ReduceError> {
     debug_assert!(!file_list.is_empty(), "avoid unnecessary work");
 
-    let mdata = file.metadata().await.map_err(|source| ReduceError::Stat {
-        filename: filename.to_owned(),
+    let FetchedPackages {
+        compression,
+        name: filename,
+        file,
+        len,
+    } = index;
+
+    check_packages_file_size(compression, len).map_err(|source| ReduceError::TooLarge {
+        filename: filename.clone(),
         source,
     })?;
 
-    check_packages_file_size(compression, mdata.len()).map_err(|source| ReduceError::TooLarge {
-        filename: filename.to_owned(),
-        source,
-    })?;
-
-    let Some(compressed_size) = NonZero::new(mdata.len()) else {
+    let Some(compressed_size) = NonZero::new(len) else {
         return match compression {
             // A raw Packages file with zero stanzas is legal (e.g.
             // a freshly-created component with no published debs); the
@@ -360,9 +232,7 @@ pub(super) async fn reduce_file_list(
             // For compressed formats an empty file is malformed:
             // both gzip and xz require at least a header.
             PackagesCompression::Gz | PackagesCompression::Xz => {
-                Err(ReduceError::ZeroSizeCompressed {
-                    filename: filename.to_owned(),
-                })
+                Err(ReduceError::ZeroSizeCompressed { filename })
             }
         };
     };
@@ -391,206 +261,10 @@ pub(super) async fn reduce_file_list(
             }
             Ok(None) => return Ok(()),
             Err(source) => {
-                return Err(ReduceError::Read {
-                    filename: filename.to_owned(),
-                    source,
-                });
+                return Err(ReduceError::Read { filename, source });
             }
         }
     }
-}
-
-/// Which `Packages` index a fetch targets, and therefore how its cached/buffered
-/// file is named. `cache_name` is the on-disk debname under which the fetched
-/// index is cached (capital-P `Packages`); `memfd_name` is the throwaway
-/// in-memory buffer name (lowercase-p `packages`).
-pub(super) enum DebnameKind<'a> {
-    OriginScoped {
-        distribution: &'a str,
-        component: &'a str,
-        architecture: &'a str,
-    },
-    Flat,
-}
-
-impl DebnameKind<'_> {
-    /// The fetched index's resource kind also determines its cache layout.
-    pub(super) const fn resource_kind(&self) -> ResourceKind {
-        match self {
-            Self::OriginScoped { .. } => ResourceKind::Packages,
-            Self::Flat => ResourceKind::FlatMetadata,
-        }
-    }
-
-    fn cache_name(&self, fmt: PackagesCompression) -> String {
-        match self {
-            Self::OriginScoped {
-                distribution,
-                component,
-                architecture,
-            } => dists_debname(
-                distribution,
-                component,
-                architecture,
-                &format!("Packages{}", fmt.extension()),
-            ),
-            Self::Flat => format!("Packages{}", fmt.extension()),
-        }
-    }
-
-    pub(super) fn memfd_name(&self, fmt: PackagesCompression) -> String {
-        match self {
-            Self::OriginScoped {
-                distribution,
-                component,
-                architecture,
-            } => format!(
-                "{distribution}_{component}_{architecture}_packages{}",
-                fmt.extension()
-            ),
-            Self::Flat => format!("flat_packages{}", fmt.extension()),
-        }
-    }
-}
-
-/// Typed reason a cleanup `Packages` fetch failed. Replaces the bare `StatusCode`
-/// error channel so an upstream transport failure surfaces its real reason (e.g.
-/// `... timed out`) in the cleanup decision log instead of a laundered
-/// `502 Bad Gateway`. `status` is retained as the best-known status (a real upstream
-/// code, or a `BAD_GATEWAY` sentinel); `upstream` is `Some` only when the upstream
-/// fetch itself failed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct FetchFailure {
-    pub(super) status: StatusCode,
-    pub(super) upstream: Option<UpstreamFetchError>,
-}
-
-impl std::fmt::Display for FetchFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.upstream {
-            Some(upstream) => upstream.fmt(f),
-            None => write!(f, "{}", self.status),
-        }
-    }
-}
-
-/// Fold one "missing-ish" status (404/403/410) into the best-known one the
-/// fetch reports once every format has failed: a specific 403/410 promotes over
-/// the generic 404, and among non-404 statuses the first one seen wins.
-fn prefer_missing_status(best: Option<StatusCode>, seen: StatusCode) -> StatusCode {
-    let Some(prev) = best else {
-        return seen;
-    };
-    if prev == StatusCode::NOT_FOUND && seen != StatusCode::NOT_FOUND {
-        seen
-    } else {
-        prev
-    }
-}
-
-/// Try each of `.xz`, `.gz`, raw in turn — first format that returns 200 wins.
-/// Each request is a self-issued `process_cache_request` against `base_uri` +
-/// extension; `debname` determines the cache entry name and resource kind.
-pub(super) async fn try_fetch_packages_file(
-    mirror: &Mirror,
-    base_uri: &str,
-    debname: &DebnameKind<'_>,
-    appstate: &AppState,
-) -> Result<(Response<ProxyCacheBody>, PackagesCompression), FetchFailure> {
-    let resource_kind = debname.resource_kind();
-
-    let mut uri_buffer = String::with_capacity(base_uri.len() + 3);
-    // Remember a representative missing-ish status to surface after every
-    // format fails. AWS S3 returns 403 (not 404) for a missing object when
-    // the requester lacks `s3:ListBucket`, so we must not abort the
-    // fallback chain on the first non-200 response — but the caller's
-    // diagnostic log should still see the most informative upstream status
-    // rather than a synthetic 404 (see `prefer_missing_status`).
-    let mut last_missing: Option<StatusCode> = None;
-
-    for pkgfmt in [
-        PackagesCompression::Xz,
-        PackagesCompression::Gz,
-        PackagesCompression::Raw,
-    ] {
-        uri_buffer.clear();
-        uri_buffer.push_str(base_uri);
-        uri_buffer.push_str(pkgfmt.extension());
-        let uri = uri_buffer.as_str();
-
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri(uri)
-            .header(
-                CACHE_CONTROL,
-                format!(
-                    "max-age={}",
-                    crate::limits::VOLATILE_CACHE_MAX_AGE.as_secs()
-                ),
-            )
-            .body(Empty::new())
-            .expect("Request should be valid");
-
-        let conn_details = ConnectionDetails {
-            client: ClientInfo::new_cleanup(),
-            request_received_at: PreciseInstant::now(),
-            mirror: mirror.clone(),
-            upstream_host: mirror.host().clone(),
-            debname: debname.cache_name(pkgfmt),
-            resource_kind,
-            origin_fields: None,
-        };
-
-        let mut response = process_cache_request(conn_details, req, appstate.clone()).await;
-
-        // An upstream-fetch failure (timeout/connect/transport) is laundered into a
-        // synthetic 502 by process_cache_request but carries the real reason as a
-        // response extension. Recover it so the cleanup decision log names the
-        // transport error rather than a misleading "502 Bad Gateway".
-        // The download runner (`guards::ReportedDownloadFailure`) already logged
-        // the failure, once-gated for the connect and head phases -- don't re-warn.
-        if let Some(upstream) = response.extensions_mut().remove::<UpstreamFetchError>() {
-            return Err(FetchFailure {
-                status: StatusCode::BAD_GATEWAY,
-                upstream: Some(upstream),
-            });
-        }
-
-        let status = response.status();
-
-        if status == StatusCode::OK {
-            return Ok((response, pkgfmt));
-        }
-
-        // Treat "missing-ish" upstream statuses as "try the next format":
-        // 404 Not Found, 403 Forbidden (S3 on missing object without
-        // ListBucket), 410 Gone. Anything else (5xx, 401, network failure
-        // mapped to 502 by process_cache_request) is fatal for this format
-        // chain — surface it immediately rather than silently masking it.
-        let _: Never = match status {
-            StatusCode::NOT_FOUND | StatusCode::FORBIDDEN | StatusCode::GONE => {
-                debug!("Cleanup request {uri} unavailable ({status})");
-                last_missing = Some(prefer_missing_status(last_missing, status));
-                continue;
-            }
-            _ => {
-                // The caller logs the same failure with the mirror and the
-                // consequence; keep this one for the format-fallback detail.
-                debug!(
-                    "cleanup request {uri} failed with status code {status}; aborting the Packages format-fallback chain"
-                );
-                return Err(FetchFailure {
-                    status,
-                    upstream: None,
-                });
-            }
-        };
-    }
-
-    Err(FetchFailure {
-        status: last_missing.unwrap_or(StatusCode::NOT_FOUND),
-        upstream: None,
-    })
 }
 
 #[cfg(test)]
@@ -604,10 +278,24 @@ mod tests {
         deb_mirror::MirrorKind,
         index_parser::{HashAlgo, hex_decode_exact, parse_filename_field},
         limits::{MAX_COMPRESSED_PACKAGES_SIZE, MAX_METADATA_LINE_LEN},
-        nonzero,
-        proxy_body::full_body,
         test_support::structured_mirror,
     };
+
+    /// A test fixture as the fetch would hand it over: the whole file,
+    /// sized by a stat.
+    async fn fetched(
+        compression: PackagesCompression,
+        file: tokio::fs::File,
+        name: &str,
+    ) -> FetchedPackages {
+        let len = file.metadata().await.expect("stat fixture").len();
+        FetchedPackages {
+            compression,
+            name: name.to_owned(),
+            file,
+            len,
+        }
+    }
 
     /// A candidate map for the reduce tests: every entry is `Deb`-class and
     /// keyed by its path relative to the `ReduceContext` root.
@@ -615,55 +303,6 @@ mod tests {
         keys.iter()
             .map(|k| (OsString::from(*k), SpanClass::Deb))
             .collect()
-    }
-
-    #[test]
-    fn debname_kind_derives_cache_and_memfd_names() {
-        let o = DebnameKind::OriginScoped {
-            distribution: "bookworm",
-            component: "main",
-            architecture: "amd64",
-        };
-        assert_eq!(
-            o.cache_name(PackagesCompression::Xz),
-            "bookworm_main_amd64_Packages.xz"
-        );
-        assert_eq!(
-            o.memfd_name(PackagesCompression::Xz),
-            "bookworm_main_amd64_packages.xz"
-        );
-        assert_eq!(
-            DebnameKind::Flat.cache_name(PackagesCompression::Gz),
-            "Packages.gz"
-        );
-        assert_eq!(
-            DebnameKind::Flat.memfd_name(PackagesCompression::Gz),
-            "flat_packages.gz"
-        );
-    }
-
-    #[test]
-    fn debname_kind_maps_resource_kind_and_derives_its_layout() {
-        let origin = DebnameKind::OriginScoped {
-            distribution: "bookworm",
-            component: "main",
-            architecture: "amd64",
-        };
-        assert!(matches!(origin.resource_kind(), ResourceKind::Packages));
-        assert!(matches!(
-            DebnameKind::Flat.resource_kind(),
-            ResourceKind::FlatMetadata
-        ));
-        // The index is cached under the layout the serve path derives for the
-        // same kind: `Dists` for a structured index, the flat tree otherwise.
-        assert!(matches!(
-            origin.resource_kind().layout(),
-            CacheLayout::Dists
-        ));
-        assert!(matches!(
-            DebnameKind::Flat.resource_kind().layout(),
-            CacheLayout::Flat
-        ));
     }
 
     #[test]
@@ -682,86 +321,6 @@ mod tests {
         let km = KeyMapper::RelpathUnderPrefix { prefix: "amd64/" };
         assert_eq!(km.map("amd64/pkg.deb"), Some("pkg.deb"));
         assert_eq!(km.map("arm64/sibling.deb"), None);
-    }
-
-    #[test]
-    fn body_is_incomplete_only_flags_short_announced_bodies() {
-        // No announced length (chunked / volatile-unknown / legit empty): the
-        // byte count can't prove truncation, so never "incomplete".
-        assert!(!body_is_incomplete(None, 0));
-        assert!(!body_is_incomplete(None, 1234));
-        // Announced an exact length but buffered fewer bytes -> truncated.
-        assert!(body_is_incomplete(Some(100), 0)); // the reported zero-byte abort
-        assert!(body_is_incomplete(Some(100), 40)); // raw over-eviction guard
-        // Exact length fully buffered.
-        assert!(!body_is_incomplete(Some(100), 100));
-        // Defensive: a zero announced length is never short (the proxy never
-        // actually emits Content-Length: 0, but the predicate must not flag it).
-        assert!(!body_is_incomplete(Some(0), 0));
-    }
-
-    #[tokio::test]
-    async fn packages_body_to_memfd_counts_bytes_and_rewinds() {
-        use tokio::io::AsyncReadExt as _;
-
-        let payload = b"Package: hello\nFilename: pool/main/h/hello/hello_1_amd64.deb\n\n";
-        let mut body = full_body(bytes::Bytes::from_static(payload));
-
-        let (mut file, written) = packages_body_to_memfd(
-            "apt_cacher_rs_test_count",
-            PackagesCompression::Raw,
-            &mut body,
-            BUFFER_SIZE,
-        )
-        .await
-        .expect("buffer body");
-
-        assert_eq!(
-            written,
-            payload.len() as u64,
-            "byte count must match payload"
-        );
-
-        let mut roundtrip = Vec::new();
-        file.read_to_end(&mut roundtrip)
-            .await
-            .expect("read memfd back");
-        assert_eq!(roundtrip, payload, "file must be rewound to offset 0");
-    }
-
-    #[tokio::test]
-    async fn body_to_file_rejects_body_over_cap() {
-        // A single 4 KiB data frame against a 1 KiB cap: the first chunk already
-        // overshoots, so buffering must bail with an error (not truncate, which
-        // would silently shrink the reference set and over-evict).
-        let mut body = full_body(bytes::Bytes::from(vec![b'x'; 4096]));
-        let memfd = MemfdOptions::new()
-            .create("apt_cacher_rs_test_over_cap")
-            .expect("memfd");
-        let file = tokio::fs::File::from_std(memfd.into_file());
-
-        let err = body_to_file(&mut body, file, nonzero!(1024), BUFFER_SIZE)
-            .await
-            .expect_err("a body exceeding the cap must error rather than buffer unbounded");
-        assert!(
-            matches!(err, PackagesBufferError::TooLarge { max } if max.get() == 1024),
-            "expected TooLarge {{ max: 1024 }}, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn body_to_file_accepts_body_at_cap() {
-        // Exactly at the cap: `written > max_bytes` is strict, so this is kept.
-        let mut body = full_body(bytes::Bytes::from(vec![b'y'; 1024]));
-        let memfd = MemfdOptions::new()
-            .create("apt_cacher_rs_test_at_cap")
-            .expect("memfd");
-        let file = tokio::fs::File::from_std(memfd.into_file());
-
-        let (_file, written) = body_to_file(&mut body, file, nonzero!(1024), BUFFER_SIZE)
-            .await
-            .expect("a body exactly at the cap must buffer successfully");
-        assert_eq!(written, 1024);
     }
 
     #[test]
@@ -1014,9 +573,7 @@ mod tests {
         };
 
         let result = reduce_file_list(
-            PackagesCompression::Gz,
-            file,
-            "Packages.gz",
+            fetched(PackagesCompression::Gz, file, "Packages.gz").await,
             &mut file_list,
             &mut ctx,
             BUFFER_SIZE,
@@ -1062,9 +619,7 @@ mod tests {
         };
 
         let err = reduce_file_list(
-            PackagesCompression::Xz,
-            file,
-            "Packages.xz",
+            fetched(PackagesCompression::Xz, file, "Packages.xz").await,
             &mut file_list,
             &mut ctx,
             BUFFER_SIZE,
@@ -1100,9 +655,7 @@ mod tests {
         };
 
         let err = reduce_file_list(
-            PackagesCompression::Gz,
-            file,
-            "Packages.gz",
+            fetched(PackagesCompression::Gz, file, "Packages.gz").await,
             &mut file_list,
             &mut ctx,
             BUFFER_SIZE,
@@ -1170,9 +723,7 @@ mod tests {
         };
 
         reduce_file_list(
-            PackagesCompression::Raw,
-            file,
-            "Packages",
+            fetched(PackagesCompression::Raw, file, "Packages").await,
             &mut file_list,
             &mut ctx,
             BUFFER_SIZE,
@@ -1212,9 +763,7 @@ mod tests {
         };
 
         reduce_file_list(
-            PackagesCompression::Raw,
-            file,
-            "Packages",
+            fetched(PackagesCompression::Raw, file, "Packages").await,
             &mut file_list,
             &mut ctx,
             BUFFER_SIZE,
@@ -1226,67 +775,5 @@ mod tests {
             file_list.contains_key(OsStr::new("keep-me.deb")),
             "empty Packages must leave the candidate list untouched"
         );
-    }
-
-    #[test]
-    fn prefer_missing_status_promotes_specific_over_generic_404() {
-        use http::StatusCode as S;
-        // Nothing seen yet: whatever arrived.
-        assert_eq!(prefer_missing_status(None, S::NOT_FOUND), S::NOT_FOUND);
-        // 403 (S3's "missing object without ListBucket") and 410 are more
-        // informative than the generic 404 and promote over it.
-        assert_eq!(
-            prefer_missing_status(Some(S::NOT_FOUND), S::FORBIDDEN),
-            S::FORBIDDEN
-        );
-        assert_eq!(prefer_missing_status(Some(S::NOT_FOUND), S::GONE), S::GONE);
-        // A 404 never demotes an already-specific status ...
-        assert_eq!(
-            prefer_missing_status(Some(S::FORBIDDEN), S::NOT_FOUND),
-            S::FORBIDDEN
-        );
-        // ... and among non-404 statuses the first one seen wins.
-        assert_eq!(
-            prefer_missing_status(Some(S::FORBIDDEN), S::GONE),
-            S::FORBIDDEN
-        );
-    }
-
-    #[test]
-    fn fetch_failure_display_prefers_upstream_reason() {
-        let with_upstream = FetchFailure {
-            status: StatusCode::BAD_GATEWAY,
-            upstream: Some(UpstreamFetchError {
-                reason: "connection error:  timed out".to_owned(),
-            }),
-        };
-        // The laundered 502 must NOT show; the real transport reason does.
-        assert_eq!(with_upstream.to_string(), "connection error:  timed out");
-
-        let status_only = FetchFailure {
-            status: StatusCode::NOT_FOUND,
-            upstream: None,
-        };
-        assert_eq!(status_only.to_string(), "404 Not Found");
-    }
-
-    #[test]
-    fn fetch_failure_equality_spans_the_whole_struct() {
-        let a = FetchFailure {
-            status: StatusCode::BAD_GATEWAY,
-            upstream: Some(UpstreamFetchError {
-                reason: "timed out".to_owned(),
-            }),
-        };
-        let b = FetchFailure {
-            status: StatusCode::BAD_GATEWAY,
-            upstream: Some(UpstreamFetchError {
-                reason: "connection refused".to_owned(),
-            }),
-        };
-        // Two upstream failures with different reasons are NOT equal (drives the
-        // flat-root suffix-suppression in engine.rs).
-        assert_ne!(a, b);
-        assert_eq!(a, a);
     }
 }

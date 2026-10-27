@@ -25,17 +25,13 @@ use crate::{
     metrics,
 };
 
-use http::{StatusCode, header::CONTENT_LENGTH};
-
+use crate::cleanup::fetch::{DebnameKind, FetchFailure, fetch_packages};
 use crate::cleanup::model::{
     ByHashUnit, CleanupUnit, DistGate, FlatFetch, GroupOutcome, GroupResult, IndexSource,
     MetadataUnit, PartialsUnit, ReconcileFacet, ReconcilePolicy, ReconcileUnit, SkipReason,
     SweepAction, SweepReason, decide_sweep,
 };
-use crate::cleanup::packages::{
-    DebnameKind, FetchFailure, KeyMapper, ReduceContext, ReduceError, body_is_incomplete,
-    packages_body_to_memfd, reduce_file_list, try_fetch_packages_file,
-};
+use crate::cleanup::packages::{KeyMapper, ReduceContext, ReduceError, reduce_file_list};
 use crate::cleanup::partials::cleanup_tmp_dir;
 use crate::cleanup::refs::{
     ByHashReferenceSet, active_origin_distributions, build_byhash_reference_set, byhash_dir_present,
@@ -263,49 +259,18 @@ async fn reduce_against(
         config,
     } = ctx;
 
-    let (mut response, pkgfmt) = match try_fetch_packages_file(
+    let index = match fetch_packages(
         &plan.mirror,
         &plan.base_uri,
         &plan.debname,
         appstate,
+        config.buffer_size,
     )
     .await
     {
-        Ok(r) => r,
+        Ok(index) => index,
         Err(failure) => return Ok(ReduceOutcome::FetchFailed(failure)),
     };
-
-    // The 200 reflects only the upstream *response header*; the body streams
-    // afterwards and can fail or truncate. Capture the announced length so a
-    // complete fetch can be told from a broken one.
-    let announced: Option<u64> = response
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
-
-    let memfdname = plan.debname.memfd_name(pkgfmt);
-    // Typed body failures (rate limits / protocol violations) and memfd/IO
-    // failures: skip the mirror conservatively and retry next cycle
-    // (packages_body_to_memfd already logged the cause).
-    let Ok((file, written)) =
-        packages_body_to_memfd(&memfdname, pkgfmt, response.body_mut(), config.buffer_size).await
-    else {
-        return Ok(ReduceOutcome::FetchFailed(FetchFailure {
-            status: StatusCode::BAD_GATEWAY,
-            upstream: None,
-        }));
-    };
-    if body_is_incomplete(announced, written) {
-        debug!(
-            "Packages index `{memfdname}` truncated (announced {}, buffered {written}); treating as fetch failure",
-            announced.unwrap_or(0)
-        );
-        return Ok(ReduceOutcome::FetchFailed(FetchFailure {
-            status: StatusCode::BAD_GATEWAY,
-            upstream: None,
-        }));
-    }
 
     let mut reduce_ctx = ReduceContext {
         root: tree_root,
@@ -314,15 +279,7 @@ async fn reduce_against(
         tally,
         keymap: plan.keymap,
     };
-    reduce_file_list(
-        pkgfmt,
-        file,
-        &memfdname,
-        candidates,
-        &mut reduce_ctx,
-        config.buffer_size,
-    )
-    .await?;
+    reduce_file_list(index, candidates, &mut reduce_ctx, config.buffer_size).await?;
 
     Ok(if candidates.is_empty() {
         ReduceOutcome::Exhausted

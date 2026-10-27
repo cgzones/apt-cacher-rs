@@ -337,8 +337,8 @@ pub(super) async fn standard_upstream_connect(
                 // hand it to the runner, which logs it once-gated with them; the
                 // two callers that have no runner carry the cause themselves --
                 // `simple_proxy` logs its own once-gated 502 line, and
-                // `cleanup_bridge` passes it on as an `UpstreamFetchError`
-                // extension for cleanup's decision log.
+                // `cleanup_bridge` passes it on as the cause of its
+                // `FetchFailure` for cleanup's decision log.
                 return Err(
                     UpstreamError::connect("connect upstream", err.err, attempt, limit)
                         .with_target(format!(
