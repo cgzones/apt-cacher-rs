@@ -10,43 +10,41 @@
 //!   quota/throttle exemptions, conditional revalidation, cache commits and
 //!   ingest. The adapter recovers the transport cause from the response's
 //!   `UpstreamFetchError` extension and streams the body into a memfd,
-//!   checking it against the announced `Content-Length`. A complete body proves
+//!   checking it against the announced `Content-Length` (`via_hyper`). A complete body proves
 //!   nothing about the cache commit (see `guards.rs`): the adapter never waits
 //!   for it or reads the final cache path.
 //! - hyper-less builds call `splice::cleanup_index_fetch`, which reads a fresh
-//!   cached copy or the uncached upstream body into memory.
+//!   cached copy or the uncached upstream body into memory; the reduce decodes
+//!   those bytes in place (`via_bridge`).
 //!
 //! Only a complete body becomes a [`FetchedPackages`]: a 200 whose body then
 //! fails or comes up short ends the cascade with a [`FetchFailure`], so the
 //! reduce never sees a partial reference set.
 
 use std::future::Future;
-use std::io;
-use std::num::NonZero;
 
-use bytes::Buf as _;
 use http::{StatusCode, Uri};
-use http_body_util::BodyExt as _;
-use memfd::MemfdOptions;
-use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _, BufWriter};
-use tracing::{debug, error};
+use tracing::debug;
 
 use crate::{
     AppState, Never,
     cache_layout::{ConnectionDetails, ResourceKind, dists_debname},
     client_info::ClientInfo,
     deb_mirror::Mirror,
-    error::{ErrorReport, UpstreamFetchError},
-    limits::{PackagesCompression, packages_file_cap},
+    error::UpstreamFetchError,
+    limits::{PackagesCompression, PackagesInput},
     precise_instant::PreciseInstant,
-    proxy_body::ProxyCacheBody,
-    transfer_error::DeliveryFailure,
 };
 
-/// Which `Packages` index a fetch targets, and therefore how its cached/buffered
-/// file is named. `cache_name` is the on-disk debname under which the fetched
-/// index is cached (capital-P `Packages`); `memfd_name` is the throwaway
-/// in-memory buffer name (lowercase-p `packages`).
+#[cfg(not(feature = "hyper"))]
+use via_bridge::fetch_format;
+#[cfg(feature = "hyper")]
+use via_hyper::fetch_format;
+
+/// Which `Packages` index a fetch targets, and therefore how it is named.
+/// `cache_name` is the on-disk debname under which the fetched index is cached
+/// (capital-P `Packages`); `index_name` names the buffered copy (lowercase-p
+/// `packages`): hyper's throwaway memfd and the reduce's log lines.
 pub(super) enum DebnameKind<'a> {
     OriginScoped {
         distribution: &'a str,
@@ -81,7 +79,7 @@ impl DebnameKind<'_> {
         }
     }
 
-    pub(super) fn memfd_name(&self, fmt: PackagesCompression) -> String {
+    pub(super) fn index_name(&self, fmt: PackagesCompression) -> String {
         match self {
             Self::OriginScoped {
                 distribution,
@@ -130,12 +128,13 @@ pub(crate) enum IndexAnswer<B> {
 #[derive(Debug)]
 pub(super) struct FetchedPackages {
     pub(super) compression: PackagesCompression,
-    /// The synthetic memfd name ([`DebnameKind::memfd_name`]), which
-    /// identifies the origin's index in the reduce's log lines.
+    /// [`DebnameKind::index_name`], which identifies the origin's index in
+    /// the reduce's log lines.
     pub(super) name: String,
-    /// The buffered index, rewound to offset 0.
-    pub(super) file: tokio::fs::File,
-    /// Bytes buffered into `file`; the size every cap is checked against.
+    /// The whole index: hyper's memfd, rewound to offset 0, or the bridge's
+    /// bytes.
+    pub(super) input: PackagesInput,
+    /// Bytes in `input`; the size every cap is checked against.
     pub(super) len: u64,
 }
 
@@ -173,7 +172,7 @@ pub(super) async fn fetch_packages(
             resource_kind: debname.resource_kind(),
             origin_fields: None,
         };
-        let name = debname.memfd_name(compression);
+        let name = debname.index_name(compression);
         fetch_format(conn_details, uri, compression, name, appstate, buffer_size)
     })
     .await
@@ -238,241 +237,350 @@ where
     })
 }
 
-/// The conservative failure of a 200 whose body could not be buffered whole;
-/// the cause was logged where it was observed.
-const BODY_FAILURE: FetchFailure = FetchFailure {
-    status: StatusCode::BAD_GATEWAY,
-    upstream: None,
-};
-
-/// One format attempt through hyper's serving path.
+/// Each format attempt through hyper's serving path, buffered into a memfd.
 #[cfg(feature = "hyper")]
-async fn fetch_format(
-    conn_details: ConnectionDetails,
-    uri: Uri,
-    compression: PackagesCompression,
-    name: String,
-    appstate: &AppState,
-    buffer_size: usize,
-) -> Result<IndexAnswer<FetchedPackages>, FetchFailure> {
-    use http::{Method, Request, header::CACHE_CONTROL};
-    use http_body_util::Empty;
+mod via_hyper {
+    use std::io;
+    use std::num::NonZero;
 
-    use crate::hyper_conn::process_cache_request;
-    use crate::limits::VOLATILE_CACHE_MAX_AGE;
+    use bytes::Buf as _;
+    use http::{Method, Request, StatusCode, Uri, header::CACHE_CONTROL};
+    use http_body_util::{BodyExt as _, Empty};
+    use memfd::MemfdOptions;
+    use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _, BufWriter};
+    use tracing::{debug, error};
 
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(uri)
-        .header(
-            CACHE_CONTROL,
-            format!("max-age={}", VOLATILE_CACHE_MAX_AGE.as_secs()),
-        )
-        .body(Empty::new())
-        .expect("Request should be valid");
-
-    let mut response = process_cache_request(conn_details, req, appstate.clone()).await;
-
-    // An upstream-fetch failure (timeout/connect/transport) is laundered into a
-    // synthetic 502 by process_cache_request but carries the real reason as a
-    // response extension. Recover it so the cleanup decision log names the
-    // transport error rather than a misleading "502 Bad Gateway".
-    // The download runner (`guards::ReportedDownloadFailure`) already logged
-    // the failure, once-gated for the connect and head phases -- don't re-warn.
-    if let Some(upstream) = response.extensions_mut().remove::<UpstreamFetchError>() {
-        return Err(FetchFailure {
-            status: StatusCode::BAD_GATEWAY,
-            upstream: Some(upstream),
-        });
-    }
-
-    let status = response.status();
-    if status != StatusCode::OK {
-        return Ok(IndexAnswer::Status(status));
-    }
-
-    // The 200 reflects only the response *header*; the body streams afterwards
-    // and can fail or truncate. Capture the announced length so a complete
-    // fetch can be told from a broken one.
-    let announced: Option<u64> = response
-        .headers()
-        .get(http::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
-
-    // Typed body failures (rate limits, protocol violations, a cancelled
-    // delivery producer) and memfd/IO failures: skip the mirror conservatively
-    // and retry next cycle (packages_body_to_memfd already logged the cause).
-    let Ok((file, len)) =
-        packages_body_to_memfd(&name, compression, response.body_mut(), buffer_size).await
-    else {
-        return Err(BODY_FAILURE);
-    };
-    if body_is_incomplete(announced, len) {
-        debug!(
-            "Packages index `{name}` truncated (announced {}, buffered {len}); treating as fetch failure",
-            announced.unwrap_or(0)
-        );
-        return Err(BODY_FAILURE);
-    }
-
-    Ok(IndexAnswer::Complete(FetchedPackages {
-        compression,
-        name,
-        file,
-        len,
-    }))
-}
-
-/// One format attempt through the hyper-less bridge.
-#[cfg(not(feature = "hyper"))]
-async fn fetch_format(
-    conn_details: ConnectionDetails,
-    uri: Uri,
-    compression: PackagesCompression,
-    name: String,
-    _appstate: &AppState,
-    buffer_size: usize,
-) -> Result<IndexAnswer<FetchedPackages>, FetchFailure> {
-    let body = match crate::splice::cleanup_index_fetch(
-        &conn_details,
-        &uri,
-        packages_file_cap(compression),
-    )
-    .await?
-    {
-        IndexAnswer::Complete(body) => body,
-        IndexAnswer::Status(status) => return Ok(IndexAnswer::Status(status)),
+    use super::{FetchFailure, FetchedPackages, IndexAnswer};
+    use crate::{
+        AppState,
+        cache_layout::ConnectionDetails,
+        error::{ErrorReport, UpstreamFetchError},
+        hyper_conn::process_cache_request,
+        limits::{PackagesCompression, PackagesInput, VOLATILE_CACHE_MAX_AGE, packages_file_cap},
+        proxy_body::ProxyCacheBody,
+        transfer_error::DeliveryFailure,
     };
 
-    let mut body = crate::proxy_body::full_body(body);
-    let Ok((file, len)) = packages_body_to_memfd(&name, compression, &mut body, buffer_size).await
-    else {
-        return Err(BODY_FAILURE);
+    /// The conservative failure of a 200 whose body could not be buffered whole;
+    /// the cause was logged where it was observed.
+    const BODY_FAILURE: FetchFailure = FetchFailure {
+        status: StatusCode::BAD_GATEWAY,
+        upstream: None,
     };
 
-    Ok(IndexAnswer::Complete(FetchedPackages {
-        compression,
-        name,
-        file,
-        len,
-    }))
-}
+    /// One format attempt through hyper's serving path.
+    pub(super) async fn fetch_format(
+        conn_details: ConnectionDetails,
+        uri: Uri,
+        compression: PackagesCompression,
+        name: String,
+        appstate: &AppState,
+        buffer_size: usize,
+    ) -> Result<IndexAnswer<FetchedPackages>, FetchFailure> {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header(
+                CACHE_CONTROL,
+                format!("max-age={}", VOLATILE_CACHE_MAX_AGE.as_secs()),
+            )
+            .body(Empty::new())
+            .expect("Request should be valid");
 
-/// Why buffering a Packages response into its memfd failed.  Every variant is
-/// logged by [`packages_body_to_memfd`]; the caller maps all of them to a
-/// conservative fetch failure (skip the mirror's reconcile this cycle).
-///
-/// `Display` renders the wrapped error through [`ErrorReport`] and exposes no
-/// `source()`.
-#[derive(Debug, thiserror::Error)]
-enum PackagesBufferError {
-    #[error("{}", ErrorReport(.0))]
-    Memfd(memfd::Error),
-    /// The response body yielded an error frame (e.g. an upstream rate limit,
-    /// `ContentTooLarge`).
-    #[error("{}", ErrorReport(.0))]
-    Body(DeliveryFailure),
-    /// Writing to or rewinding the memfd failed.
-    #[error("{}", ErrorReport(.0))]
-    Io(io::Error),
-    /// The body exceeded the buffering cap before decompression guards could
-    /// weigh in.
-    #[error("compressed Packages exceeds the size cap of {max} bytes")]
-    TooLarge { max: NonZero<u64> },
-}
+        let mut response = process_cache_request(conn_details, req, appstate.clone()).await;
 
-/// Buffer `body` into `file`, returning the file (rewound to offset 0) and the
-/// number of bytes written. The caller compares the byte count against the
-/// upstream-announced `Content-Length` as a defensive truncation check. Typed
-/// body failures, including a cancelled delivery producer, propagate as errors.
-///
-/// `max_bytes` bounds how much is buffered before the (post-hoc) decompression
-/// guards in `reduce_file_list` can weigh in: an abusive upstream could
-/// otherwise stream an unbounded compressed (or raw) body straight into memory.
-/// Exceeding it returns `Err` rather than truncating -- a short buffer would
-/// silently shrink the reference set and over-evict -- which the caller maps to
-/// a conservative fetch failure. The check is per-chunk, so at most one extra
-/// buffer is held transiently over the cap.
-async fn body_to_file(
-    body: &mut ProxyCacheBody,
-    file: tokio::fs::File,
-    max_bytes: NonZero<u64>,
-    buffer_size: usize,
-) -> Result<(tokio::fs::File, u64), PackagesBufferError> {
-    let mut writer = BufWriter::with_capacity(buffer_size, file);
+        // An upstream-fetch failure (timeout/connect/transport) is laundered into a
+        // synthetic 502 by process_cache_request but carries the real reason as a
+        // response extension. Recover it so the cleanup decision log names the
+        // transport error rather than a misleading "502 Bad Gateway".
+        // The download runner (`guards::ReportedDownloadFailure`) already logged
+        // the failure, once-gated for the connect and head phases -- don't re-warn.
+        if let Some(upstream) = response.extensions_mut().remove::<UpstreamFetchError>() {
+            return Err(FetchFailure {
+                status: StatusCode::BAD_GATEWAY,
+                upstream: Some(upstream),
+            });
+        }
 
-    let mut written: u64 = 0;
-    while let Some(next) = body.frame().await {
-        let frame = next.map_err(PackagesBufferError::Body)?;
-        if let Ok(mut chunk) = frame.into_data() {
-            written = written.saturating_add(chunk.remaining() as u64);
-            if written > max_bytes.get() {
-                return Err(PackagesBufferError::TooLarge { max: max_bytes });
+        let status = response.status();
+        if status != StatusCode::OK {
+            return Ok(IndexAnswer::Status(status));
+        }
+
+        // The 200 reflects only the response *header*; the body streams afterwards
+        // and can fail or truncate. Capture the announced length so a complete
+        // fetch can be told from a broken one.
+        let announced: Option<u64> = response
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+
+        // Typed body failures (rate limits, protocol violations, a cancelled
+        // delivery producer) and memfd/IO failures: skip the mirror conservatively
+        // and retry next cycle (packages_body_to_memfd already logged the cause).
+        let Ok((file, len)) =
+            packages_body_to_memfd(&name, compression, response.body_mut(), buffer_size).await
+        else {
+            return Err(BODY_FAILURE);
+        };
+        if body_is_incomplete(announced, len) {
+            debug!(
+                "Packages index `{name}` truncated (announced {}, buffered {len}); treating as fetch failure",
+                announced.unwrap_or(0)
+            );
+            return Err(BODY_FAILURE);
+        }
+
+        Ok(IndexAnswer::Complete(FetchedPackages {
+            compression,
+            name,
+            input: PackagesInput::File(file),
+            len,
+        }))
+    }
+
+    /// Why buffering a Packages response into its memfd failed.  Every variant is
+    /// logged by [`packages_body_to_memfd`]; the caller maps all of them to a
+    /// conservative fetch failure (skip the mirror's reconcile this cycle).
+    ///
+    /// `Display` renders the wrapped error through [`ErrorReport`] and exposes no
+    /// `source()`.
+    #[derive(Debug, thiserror::Error)]
+    enum PackagesBufferError {
+        #[error("{}", ErrorReport(.0))]
+        Memfd(memfd::Error),
+        /// The response body yielded an error frame (e.g. an upstream rate limit,
+        /// `ContentTooLarge`).
+        #[error("{}", ErrorReport(.0))]
+        Body(DeliveryFailure),
+        /// Writing to or rewinding the memfd failed.
+        #[error("{}", ErrorReport(.0))]
+        Io(io::Error),
+        /// The body exceeded the buffering cap before decompression guards could
+        /// weigh in.
+        #[error("compressed Packages exceeds the size cap of {max} bytes")]
+        TooLarge { max: NonZero<u64> },
+    }
+
+    /// Buffer `body` into `file`, returning the file (rewound to offset 0) and the
+    /// number of bytes written. The caller compares the byte count against the
+    /// upstream-announced `Content-Length` as a defensive truncation check. Typed
+    /// body failures, including a cancelled delivery producer, propagate as errors.
+    ///
+    /// `max_bytes` bounds how much is buffered before the (post-hoc) decompression
+    /// guards in `reduce_file_list` can weigh in: an abusive upstream could
+    /// otherwise stream an unbounded compressed (or raw) body straight into memory.
+    /// Exceeding it returns `Err` rather than truncating -- a short buffer would
+    /// silently shrink the reference set and over-evict -- which the caller maps to
+    /// a conservative fetch failure. The check is per-chunk, so at most one extra
+    /// buffer is held transiently over the cap.
+    async fn body_to_file(
+        body: &mut ProxyCacheBody,
+        file: tokio::fs::File,
+        max_bytes: NonZero<u64>,
+        buffer_size: usize,
+    ) -> Result<(tokio::fs::File, u64), PackagesBufferError> {
+        let mut writer = BufWriter::with_capacity(buffer_size, file);
+
+        let mut written: u64 = 0;
+        while let Some(next) = body.frame().await {
+            let frame = next.map_err(PackagesBufferError::Body)?;
+            if let Ok(mut chunk) = frame.into_data() {
+                written = written.saturating_add(chunk.remaining() as u64);
+                if written > max_bytes.get() {
+                    return Err(PackagesBufferError::TooLarge { max: max_bytes });
+                }
+                writer
+                    .write_all_buf(&mut chunk)
+                    .await
+                    .map_err(PackagesBufferError::Io)?;
             }
-            writer
-                .write_all_buf(&mut chunk)
+        }
+
+        writer.flush().await.map_err(PackagesBufferError::Io)?;
+
+        let mut file = writer.into_inner();
+
+        file.rewind().await.map_err(PackagesBufferError::Io)?;
+
+        Ok((file, written))
+    }
+
+    /// `true` only when the upstream announced an exact `Content-Length` and we
+    /// buffered fewer bytes despite the body ending successfully.
+    /// `None` (chunked / volatile-unknown / legitimately empty) is never
+    /// "incomplete".
+    #[must_use]
+    fn body_is_incomplete(announced: Option<u64>, written: u64) -> bool {
+        matches!(announced, Some(expected) if written < expected)
+    }
+
+    async fn packages_body_to_memfd(
+        memfdname: &str,
+        compression: PackagesCompression,
+        body: &mut ProxyCacheBody,
+        buffer_size: usize,
+    ) -> Result<(tokio::fs::File, u64), PackagesBufferError> {
+        let memfd = MemfdOptions::new().create(memfdname).map_err(|err| {
+            error!(
+                "Failed to create in-memory file `{memfdname}` for the Packages index; skipping this mirror's reconcile this cycle:  {}",
+                ErrorReport(&err)
+            );
+            PackagesBufferError::Memfd(err)
+        })?;
+        let file = tokio::fs::File::from_std(memfd.into_file());
+        // Cap the buffered body at the most `reduce_file_list` would decode (the
+        // decompressed ceiling for a raw index, the compressed one otherwise), so
+        // memory is bounded before its guards run.
+        body_to_file(body, file, packages_file_cap(compression), buffer_size)
+            .await
+            .inspect_err(|err| {
+                error!(
+                    "Failed to write the Packages response to in-memory file `{memfdname}`; skipping this mirror's reconcile this cycle:  {}",
+                    ErrorReport(err)
+                );
+            })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        use crate::{nonzero, proxy_body::full_body};
+
+        const BUFFER_SIZE: usize = 32 * 1024;
+
+        #[test]
+        fn body_is_incomplete_only_flags_short_announced_bodies() {
+            // No announced length (chunked / volatile-unknown / legit empty): the
+            // byte count can't prove truncation, so never "incomplete".
+            assert!(!body_is_incomplete(None, 0));
+            assert!(!body_is_incomplete(None, 1234));
+            // Announced an exact length but buffered fewer bytes -> truncated.
+            assert!(body_is_incomplete(Some(100), 0)); // the reported zero-byte abort
+            assert!(body_is_incomplete(Some(100), 40)); // raw over-eviction guard
+            // Exact length fully buffered.
+            assert!(!body_is_incomplete(Some(100), 100));
+            // Defensive: a zero announced length is never short (the proxy never
+            // actually emits Content-Length: 0, but the predicate must not flag it).
+            assert!(!body_is_incomplete(Some(0), 0));
+        }
+
+        #[tokio::test]
+        async fn packages_body_to_memfd_counts_bytes_and_rewinds() {
+            use tokio::io::AsyncReadExt as _;
+
+            let payload = b"Package: hello\nFilename: pool/main/h/hello/hello_1_amd64.deb\n\n";
+            let mut body = full_body(bytes::Bytes::from_static(payload));
+
+            let (mut file, written) = packages_body_to_memfd(
+                "apt_cacher_rs_test_count",
+                PackagesCompression::Raw,
+                &mut body,
+                BUFFER_SIZE,
+            )
+            .await
+            .expect("buffer body");
+
+            assert_eq!(
+                written,
+                payload.len() as u64,
+                "byte count must match payload"
+            );
+
+            let mut roundtrip = Vec::new();
+            file.read_to_end(&mut roundtrip)
                 .await
-                .map_err(PackagesBufferError::Io)?;
+                .expect("read memfd back");
+            assert_eq!(roundtrip, payload, "file must be rewound to offset 0");
+        }
+
+        #[tokio::test]
+        async fn body_to_file_rejects_body_over_cap() {
+            // A single 4 KiB data frame against a 1 KiB cap: the first chunk already
+            // overshoots, so buffering must bail with an error (not truncate, which
+            // would silently shrink the reference set and over-evict).
+            let mut body = full_body(bytes::Bytes::from(vec![b'x'; 4096]));
+            let memfd = MemfdOptions::new()
+                .create("apt_cacher_rs_test_over_cap")
+                .expect("memfd");
+            let file = tokio::fs::File::from_std(memfd.into_file());
+
+            let err = body_to_file(&mut body, file, nonzero!(1024), BUFFER_SIZE)
+                .await
+                .expect_err("a body exceeding the cap must error rather than buffer unbounded");
+            assert!(
+                matches!(err, PackagesBufferError::TooLarge { max } if max.get() == 1024),
+                "expected TooLarge {{ max: 1024 }}, got {err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn body_to_file_accepts_body_at_cap() {
+            // Exactly at the cap: `written > max_bytes` is strict, so this is kept.
+            let mut body = full_body(bytes::Bytes::from(vec![b'y'; 1024]));
+            let memfd = MemfdOptions::new()
+                .create("apt_cacher_rs_test_at_cap")
+                .expect("memfd");
+            let file = tokio::fs::File::from_std(memfd.into_file());
+
+            let (_file, written) = body_to_file(&mut body, file, nonzero!(1024), BUFFER_SIZE)
+                .await
+                .expect("a body exactly at the cap must buffer successfully");
+            assert_eq!(written, 1024);
         }
     }
-
-    writer.flush().await.map_err(PackagesBufferError::Io)?;
-
-    let mut file = writer.into_inner();
-
-    file.rewind().await.map_err(PackagesBufferError::Io)?;
-
-    Ok((file, written))
 }
 
-/// `true` only when the upstream announced an exact `Content-Length` and we
-/// buffered fewer bytes despite the body ending successfully.
-/// `None` (chunked / volatile-unknown / legitimately empty) is never
-/// "incomplete".
-#[must_use]
-#[cfg(feature = "hyper")]
-fn body_is_incomplete(announced: Option<u64>, written: u64) -> bool {
-    matches!(announced, Some(expected) if written < expected)
-}
+/// Each format attempt through the hyper-less bridge, whose bytes the reduce
+/// decodes in place.
+#[cfg(not(feature = "hyper"))]
+mod via_bridge {
+    use http::Uri;
 
-async fn packages_body_to_memfd(
-    memfdname: &str,
-    compression: PackagesCompression,
-    body: &mut ProxyCacheBody,
-    buffer_size: usize,
-) -> Result<(tokio::fs::File, u64), PackagesBufferError> {
-    let memfd = MemfdOptions::new().create(memfdname).map_err(|err| {
-        error!(
-            "Failed to create in-memory file `{memfdname}` for the Packages index; skipping this mirror's reconcile this cycle:  {}",
-            ErrorReport(&err)
-        );
-        PackagesBufferError::Memfd(err)
-    })?;
-    let file = tokio::fs::File::from_std(memfd.into_file());
-    // Cap the buffered body at the most `reduce_file_list` would decode (the
-    // decompressed ceiling for a raw index, the compressed one otherwise), so
-    // memory is bounded before its guards run.
-    body_to_file(body, file, packages_file_cap(compression), buffer_size)
-        .await
-        .inspect_err(|err| {
-            error!(
-                "Failed to write the Packages response to in-memory file `{memfdname}`; skipping this mirror's reconcile this cycle:  {}",
-                ErrorReport(err)
-            );
-        })
+    use super::{FetchFailure, FetchedPackages, IndexAnswer};
+    use crate::{
+        AppState,
+        cache_layout::ConnectionDetails,
+        limits::{PackagesCompression, PackagesInput, packages_file_cap},
+        splice::cleanup_index_fetch,
+    };
+
+    pub(super) async fn fetch_format(
+        conn_details: ConnectionDetails,
+        uri: Uri,
+        compression: PackagesCompression,
+        name: String,
+        _appstate: &AppState,
+        _buffer_size: usize,
+    ) -> Result<IndexAnswer<FetchedPackages>, FetchFailure> {
+        Ok(
+            match cleanup_index_fetch(&conn_details, &uri, packages_file_cap(compression)).await? {
+                IndexAnswer::Complete(body) => IndexAnswer::Complete(FetchedPackages {
+                    compression,
+                    name,
+                    len: body.len() as u64,
+                    input: PackagesInput::Bytes(body),
+                }),
+                IndexAnswer::Status(status) => IndexAnswer::Status(status),
+            },
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::{nonzero, proxy_body::full_body};
-
-    const BUFFER_SIZE: usize = 32 * 1024;
+    /// A 200 whose body could not be buffered whole.
+    const BODY_FAILURE: FetchFailure = FetchFailure {
+        status: StatusCode::BAD_GATEWAY,
+        upstream: None,
+    };
 
     #[test]
-    fn debname_kind_derives_cache_and_memfd_names() {
+    fn debname_kind_derives_cache_and_index_names() {
         let o = DebnameKind::OriginScoped {
             distribution: "bookworm",
             component: "main",
@@ -483,7 +591,7 @@ mod tests {
             "bookworm_main_amd64_Packages.xz"
         );
         assert_eq!(
-            o.memfd_name(PackagesCompression::Xz),
+            o.index_name(PackagesCompression::Xz),
             "bookworm_main_amd64_packages.xz"
         );
         assert_eq!(
@@ -491,7 +599,7 @@ mod tests {
             "Packages.gz"
         );
         assert_eq!(
-            DebnameKind::Flat.memfd_name(PackagesCompression::Gz),
+            DebnameKind::Flat.index_name(PackagesCompression::Gz),
             "flat_packages.gz"
         );
     }
@@ -623,87 +731,6 @@ mod tests {
             })
         );
         assert_eq!(requested.len(), 3);
-    }
-
-    #[cfg(feature = "hyper")]
-    #[test]
-    fn body_is_incomplete_only_flags_short_announced_bodies() {
-        // No announced length (chunked / volatile-unknown / legit empty): the
-        // byte count can't prove truncation, so never "incomplete".
-        assert!(!body_is_incomplete(None, 0));
-        assert!(!body_is_incomplete(None, 1234));
-        // Announced an exact length but buffered fewer bytes -> truncated.
-        assert!(body_is_incomplete(Some(100), 0)); // the reported zero-byte abort
-        assert!(body_is_incomplete(Some(100), 40)); // raw over-eviction guard
-        // Exact length fully buffered.
-        assert!(!body_is_incomplete(Some(100), 100));
-        // Defensive: a zero announced length is never short (the proxy never
-        // actually emits Content-Length: 0, but the predicate must not flag it).
-        assert!(!body_is_incomplete(Some(0), 0));
-    }
-
-    #[tokio::test]
-    async fn packages_body_to_memfd_counts_bytes_and_rewinds() {
-        use tokio::io::AsyncReadExt as _;
-
-        let payload = b"Package: hello\nFilename: pool/main/h/hello/hello_1_amd64.deb\n\n";
-        let mut body = full_body(bytes::Bytes::from_static(payload));
-
-        let (mut file, written) = packages_body_to_memfd(
-            "apt_cacher_rs_test_count",
-            PackagesCompression::Raw,
-            &mut body,
-            BUFFER_SIZE,
-        )
-        .await
-        .expect("buffer body");
-
-        assert_eq!(
-            written,
-            payload.len() as u64,
-            "byte count must match payload"
-        );
-
-        let mut roundtrip = Vec::new();
-        file.read_to_end(&mut roundtrip)
-            .await
-            .expect("read memfd back");
-        assert_eq!(roundtrip, payload, "file must be rewound to offset 0");
-    }
-
-    #[tokio::test]
-    async fn body_to_file_rejects_body_over_cap() {
-        // A single 4 KiB data frame against a 1 KiB cap: the first chunk already
-        // overshoots, so buffering must bail with an error (not truncate, which
-        // would silently shrink the reference set and over-evict).
-        let mut body = full_body(bytes::Bytes::from(vec![b'x'; 4096]));
-        let memfd = MemfdOptions::new()
-            .create("apt_cacher_rs_test_over_cap")
-            .expect("memfd");
-        let file = tokio::fs::File::from_std(memfd.into_file());
-
-        let err = body_to_file(&mut body, file, nonzero!(1024), BUFFER_SIZE)
-            .await
-            .expect_err("a body exceeding the cap must error rather than buffer unbounded");
-        assert!(
-            matches!(err, PackagesBufferError::TooLarge { max } if max.get() == 1024),
-            "expected TooLarge {{ max: 1024 }}, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn body_to_file_accepts_body_at_cap() {
-        // Exactly at the cap: `written > max_bytes` is strict, so this is kept.
-        let mut body = full_body(bytes::Bytes::from(vec![b'y'; 1024]));
-        let memfd = MemfdOptions::new()
-            .create("apt_cacher_rs_test_at_cap")
-            .expect("memfd");
-        let file = tokio::fs::File::from_std(memfd.into_file());
-
-        let (_file, written) = body_to_file(&mut body, file, nonzero!(1024), BUFFER_SIZE)
-            .await
-            .expect("a body exactly at the cap must buffer successfully");
-        assert_eq!(written, 1024);
     }
 
     #[test]

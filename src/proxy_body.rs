@@ -1,17 +1,14 @@
 //! [`ProxyCacheBody`], the response body every hyper-served response is built
-//! from: a boxed dynamic body. [`full_body`] and `quick_response` wrap small,
-//! fully buffered payloads.
+//! from (hyper builds only): a boxed dynamic body. [`full_body`] and
+//! [`quick_response`] wrap small, fully buffered payloads.
 
-#[cfg(feature = "hyper")]
 use http::{Response, StatusCode};
 use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
 
-#[cfg(feature = "hyper")]
 use crate::response_head::ResponseHead;
 use crate::transfer_error::DeliveryFailure;
 
 #[must_use]
-#[cfg(feature = "hyper")]
 pub(crate) fn quick_response<T: Into<bytes::Bytes>>(
     status: StatusCode,
     message: T,
@@ -22,7 +19,6 @@ pub(crate) fn quick_response<T: Into<bytes::Bytes>>(
 /// [`quick_response`] that also ends the connection
 /// ([`ResponseHead::into_hyper_closing`]).
 #[must_use]
-#[cfg(feature = "hyper")]
 pub(crate) fn quick_response_closing<T: Into<bytes::Bytes>>(
     status: StatusCode,
     message: T,

@@ -77,6 +77,7 @@ mod passthrough_limiter;
 mod per_ip_counter;
 mod permitted_host_cache;
 mod precise_instant;
+#[cfg(feature = "hyper")]
 mod proxy_body;
 #[cfg(feature = "hyper")]
 mod rate_checked_body;

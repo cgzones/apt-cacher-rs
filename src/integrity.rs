@@ -2106,7 +2106,7 @@ async fn ingest_packages_file(
         }
     };
     let reader = limits::packages_reader(
-        file,
+        limits::PackagesInput::File(file),
         compression,
         limits::decompressed_limit(NonZero::new(compressed_size)),
         buffer_size,

@@ -49,8 +49,8 @@ pub(crate) const MAX_UPSTREAM_HEADERS: usize = 32;
 pub(crate) const MAX_UPSTREAM_READ_BUFFER: usize = 128 * 1024;
 
 /// Absolute ceiling (bytes) on the decompressed output of a `Packages` file,
-/// and so on a raw one, which cleanup buffers whole (memfd, plus a `Vec` in
-/// hyper-less builds) for up to ten mirrors at once. Debian's largest,
+/// and so on a raw one, which cleanup buffers whole (a memfd in hyper builds,
+/// a `Vec` in hyper-less ones) for up to ten mirrors at once. Debian's largest,
 /// `main/binary-amd64/Packages`, decompresses to well under 100 MiB; 256 MiB
 /// leaves room for bigger archives while bounding that buffering at a
 /// quarter of the former 1 GiB.
@@ -60,10 +60,10 @@ pub(crate) const MAX_DECOMPRESSED_PACKAGES_SIZE: NonZero<u64> = nonzero!(256 * 1
 /// before it is decoded or, by cleanup, buffered. Debian's largest,
 /// `main/binary-amd64/Packages.xz`, is ~10 MiB. Without it the
 /// decompressed caps alone admitted a compressed body as large as the
-/// decompressed ceiling, which cleanup
-/// holds in memory (memfd, plus a `Vec` in hyper-less builds) for up to ten
-/// mirrors at once, and whose xz decoder keeps a 16-byte index record per
-/// block (~0.9x the compressed size for a stream of empty blocks).
+/// decompressed ceiling, which cleanup holds in memory (a memfd in hyper
+/// builds, a `Vec` in hyper-less ones) for up to ten mirrors at once, and
+/// whose xz decoder keeps a 16-byte index record per block (~0.9x the
+/// compressed size for a stream of empty blocks).
 pub(crate) const MAX_COMPRESSED_PACKAGES_SIZE: NonZero<u64> = nonzero!(128 * 1024 * 1024);
 
 /// Maximum size (bytes) of a `Release` / `InRelease` file ingested into the
@@ -352,16 +352,60 @@ pub(crate) fn decompressed_limit(compressed_size: Option<NonZero<u64>>) -> NonZe
     }
 }
 
-/// Wrap an open `Packages` file in its decompression layer with the
+/// A `Packages` index to decode: an open file, or bytes already in memory
+/// (cleanup's hyper-less fetch, which reads the whole body anyway).
+#[derive(Debug)]
+pub(crate) enum PackagesInput {
+    File(tokio::fs::File),
+    #[cfg_attr(
+        all(feature = "hyper", not(test)),
+        expect(
+            dead_code,
+            reason = "only cleanup's hyper-less fetch (`cleanup/fetch.rs`) decodes from memory"
+        )
+    )]
+    Bytes(Vec<u8>),
+}
+
+/// [`PackagesInput`] as one [`AsyncRead`] for the raw and gzip ladders.
+enum InputReader {
+    File(tokio::fs::File),
+    Bytes(io::Cursor<Vec<u8>>),
+}
+
+impl From<PackagesInput> for InputReader {
+    fn from(input: PackagesInput) -> Self {
+        match input {
+            PackagesInput::File(file) => Self::File(file),
+            PackagesInput::Bytes(bytes) => Self::Bytes(io::Cursor::new(bytes)),
+        }
+    }
+}
+
+impl AsyncRead for InputReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::File(file) => Pin::new(file).poll_read(cx, buf),
+            Self::Bytes(bytes) => Pin::new(bytes).poll_read(cx, buf),
+        }
+    }
+}
+
+/// Wrap a `Packages` index in its decompression layer with the
 /// decompression-bomb guard applied, ready for [`read_line_capped`].
 ///
 /// `limit` bounds the *decompressed* byte count (see [`decompressed_limit`]), so
 /// the [`LimitedReader`] sits above the decoder, not below it. The gzip layer
 /// is fed from its own [`BufReader`](tokio::io::BufReader) because it benefits
 /// from amortising reads of its compressed input; raw bytes need no such inner
-/// buffer, and the xz decoder reads the file as a `std::fs::File` on its own
-/// blocking thread, in 64 KiB chunks (see `xz_stream`), so it waits for any
-/// in-flight operation on `file` before taking it over.
+/// buffer, and the xz decoder reads the input on its own blocking thread, in
+/// 64 KiB chunks (see `xz_stream`): a file as a `std::fs::File` (so it waits
+/// for any in-flight operation on it before taking it over), in-memory bytes
+/// through a `Cursor`.
 ///
 /// Shared by cleanup's candidate reduce (`cleanup::packages`) and checksum
 /// registry ingest (`integrity`) — the two differ in how they *derive* the
@@ -370,7 +414,7 @@ pub(crate) fn decompressed_limit(compressed_size: Option<NonZero<u64>>) -> NonZe
 /// a path that then streams the whole index through it, in exchange for the
 /// three branches having one home.
 pub(crate) async fn packages_reader(
-    file: tokio::fs::File,
+    input: PackagesInput,
     compression: PackagesCompression,
     limit: NonZero<u64>,
     buffer_size: usize,
@@ -378,18 +422,22 @@ pub(crate) async fn packages_reader(
     match compression {
         PackagesCompression::Raw => Box::new(tokio::io::BufReader::with_capacity(
             buffer_size,
-            LimitedReader::new(file, limit),
+            LimitedReader::new(InputReader::from(input), limit),
         )),
         PackagesCompression::Gz => {
-            let file_reader = tokio::io::BufReader::with_capacity(buffer_size, file);
-            let decoder = async_compression::tokio::bufread::GzipDecoder::new(file_reader);
+            let input_reader =
+                tokio::io::BufReader::with_capacity(buffer_size, InputReader::from(input));
+            let decoder = async_compression::tokio::bufread::GzipDecoder::new(input_reader);
             Box::new(tokio::io::BufReader::with_capacity(
                 buffer_size,
                 LimitedReader::new(decoder, limit),
             ))
         }
         PackagesCompression::Xz => {
-            let decoder = xz_decoder(file.into_std().await);
+            let decoder = match input {
+                PackagesInput::File(file) => xz_decoder(file.into_std().await),
+                PackagesInput::Bytes(bytes) => xz_decoder(io::Cursor::new(bytes)),
+            };
             Box::new(tokio::io::BufReader::with_capacity(
                 buffer_size,
                 LimitedReader::new(decoder, limit),

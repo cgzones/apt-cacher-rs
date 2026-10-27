@@ -211,7 +211,7 @@ pub(super) async fn reduce_file_list(
     let FetchedPackages {
         compression,
         name: filename,
-        file,
+        input,
         len,
     } = index;
 
@@ -238,14 +238,14 @@ pub(super) async fn reduce_file_list(
     };
 
     let reader = packages_reader(
-        file,
+        input,
         compression,
         decompressed_limit(Some(compressed_size)),
         buffer_size,
     )
     .await;
 
-    // `filename` is the synthetic memfd name, so name the mirror as well.
+    // `filename` is the synthetic index name, so name the mirror as well.
     let mut stanzas = StanzaStream::new(
         reader,
         Stanza::new().with_source(format!("mirror {} index `{filename}`", ctx.mirror)),
@@ -277,7 +277,7 @@ mod tests {
         config::ClientHost,
         deb_mirror::MirrorKind,
         index_parser::{HashAlgo, hex_decode_exact, parse_filename_field},
-        limits::{MAX_COMPRESSED_PACKAGES_SIZE, MAX_METADATA_LINE_LEN},
+        limits::{MAX_COMPRESSED_PACKAGES_SIZE, MAX_METADATA_LINE_LEN, PackagesInput},
         test_support::structured_mirror,
     };
 
@@ -292,7 +292,7 @@ mod tests {
         FetchedPackages {
             compression,
             name: name.to_owned(),
-            file,
+            input: PackagesInput::File(file),
             len,
         }
     }
@@ -775,5 +775,238 @@ mod tests {
             file_list.contains_key(OsStr::new("keep-me.deb")),
             "empty Packages must leave the candidate list untouched"
         );
+    }
+
+    /// Contents of the one cached deb [`INDEX_RAW`] vouches for.
+    const KEPT_DEB: &[u8] = b"deb";
+
+    /// A small index: `kept` with the SHA256 of [`KEPT_DEB`], and a
+    /// digest-less `nodigest` (retained without verification).
+    const INDEX_RAW: &[u8] = b"Package: kept\n\
+        Filename: pool/main/k/kept/kept_1_amd64.deb\n\
+        SHA256: 9cfa1468c93fc18652e34a000f0c6614b0fa18f6f4887477ad9b0d36ca6a7eaa\n\
+        \n\
+        Package: nodigest\n\
+        Filename: pool/main/n/nodigest/nodigest_1_amd64.deb\n\
+        \n";
+
+    /// [`INDEX_RAW`] through `xz -c --check=crc32` (the crate depends on no
+    /// xz encoder).
+    const INDEX_XZ: &[u8] = &[
+        0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x01, 0x69, 0x22, 0xde, 0x36, 0x04, 0xc0, 0x96,
+        0x01, 0xcb, 0x01, 0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x76, 0x2a,
+        0xeb, 0x91, 0xe0, 0x00, 0xca, 0x00, 0x8e, 0x5d, 0x00, 0x28, 0x18, 0x48, 0x66, 0xdb, 0xda,
+        0x30, 0x85, 0xfe, 0x16, 0xe8, 0x23, 0xf8, 0x32, 0xd4, 0x22, 0xe4, 0x41, 0x49, 0xd9, 0x0e,
+        0xff, 0x19, 0xb9, 0xa6, 0x03, 0xb2, 0x04, 0x9c, 0x35, 0x24, 0x78, 0x7e, 0x4b, 0xc5, 0x8e,
+        0xb3, 0x46, 0x54, 0x3a, 0xc7, 0x6b, 0x82, 0xd8, 0xda, 0x1e, 0xe9, 0xf6, 0x75, 0x0a, 0x6e,
+        0x94, 0x89, 0xeb, 0xa4, 0x28, 0xbf, 0x63, 0xd3, 0x08, 0x7e, 0x93, 0x47, 0x0f, 0xc9, 0xc0,
+        0x3c, 0x04, 0xf3, 0xbf, 0x97, 0x2a, 0x3d, 0x77, 0x9c, 0xdf, 0x51, 0x6c, 0x4d, 0xee, 0x1b,
+        0xc3, 0x39, 0xca, 0x12, 0x20, 0x11, 0x55, 0x97, 0x1b, 0x1e, 0xff, 0x38, 0x25, 0xc7, 0x57,
+        0xd9, 0xbb, 0x64, 0x5d, 0x50, 0x6c, 0xba, 0x3a, 0xc7, 0x64, 0xae, 0x83, 0xa3, 0x91, 0x6d,
+        0xc2, 0x2d, 0x48, 0xfe, 0xc2, 0xb9, 0x03, 0xc7, 0x8e, 0x87, 0x79, 0x4f, 0x02, 0x7c, 0xb7,
+        0x4d, 0xe6, 0x2a, 0x4d, 0x21, 0x92, 0xea, 0x24, 0x25, 0xd2, 0xc4, 0x0d, 0xde, 0xd3, 0xa2,
+        0x40, 0x00, 0x00, 0x00, 0x49, 0xf4, 0x12, 0xec, 0x00, 0x01, 0xae, 0x01, 0xcb, 0x01, 0x00,
+        0x00, 0xc3, 0x8e, 0xad, 0x7d, 0x3e, 0x30, 0x0d, 0x8b, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x59, 0x5a,
+    ];
+
+    async fn gzip(raw: &[u8]) -> Vec<u8> {
+        use async_compression::tokio::write::GzipEncoder;
+        use tokio::io::AsyncWriteExt as _;
+
+        let mut encoder = GzipEncoder::new(Vec::new());
+        encoder.write_all(raw).await.expect("gzip write");
+        encoder.shutdown().await.expect("gzip finish");
+        encoder.into_inner()
+    }
+
+    async fn encoded_index(compression: PackagesCompression) -> Vec<u8> {
+        match compression {
+            PackagesCompression::Raw => INDEX_RAW.to_vec(),
+            PackagesCompression::Gz => gzip(INDEX_RAW).await,
+            PackagesCompression::Xz => INDEX_XZ.to_vec(),
+        }
+    }
+
+    /// How a test hands the reduce its index: hyper's buffered file, or the
+    /// bridge's bytes.
+    #[derive(Debug, Clone, Copy)]
+    enum Via {
+        File,
+        Bytes,
+    }
+
+    async fn index_via(
+        via: Via,
+        compression: PackagesCompression,
+        bytes: Vec<u8>,
+    ) -> FetchedPackages {
+        match via {
+            Via::File => {
+                let file = tempfile::tempfile().expect("tempfile");
+                let mut file = tokio::fs::File::from_std(file);
+                {
+                    use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
+                    file.write_all(&bytes).await.expect("write index");
+                    file.flush().await.expect("flush index");
+                    file.rewind().await.expect("rewind index");
+                }
+                fetched(compression, file, "packages").await
+            }
+            Via::Bytes => FetchedPackages {
+                compression,
+                name: "packages".to_owned(),
+                len: bytes.len() as u64,
+                input: PackagesInput::Bytes(bytes),
+            },
+        }
+    }
+
+    /// Reduce `keys`, structured-pool candidates below `root`, against
+    /// `index`; returns the outcome and the candidates left.
+    async fn reduce_keys(
+        index: FetchedPackages,
+        root: &Path,
+        keys: &[&str],
+    ) -> (Result<(), ReduceError>, HashMap<OsString, SpanClass>) {
+        let mirror = structured_mirror("example.com", "debian");
+        let mut file_list = cands(keys);
+        let mut tally = UnitStats::default();
+        let mut ctx = ReduceContext {
+            root,
+            mirror: &mirror,
+            layout: CacheLayout::StructuredPool,
+            tally: &mut tally,
+            keymap: KeyMapper::Basename,
+        };
+        let result = reduce_file_list(index, &mut file_list, &mut ctx, BUFFER_SIZE).await;
+        (result, file_list)
+    }
+
+    /// The decode ladder is one for both inputs: every format reduces the
+    /// same candidates whether the index arrives as a file or as bytes,
+    /// verifying the referenced deb and keeping it on disk.
+    #[tokio::test]
+    async fn reduce_file_list_decodes_files_and_bytes_alike() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kept = dir.path().join("kept_1_amd64.deb");
+        tokio::fs::write(&kept, KEPT_DEB).await.expect("write deb");
+
+        for compression in [
+            PackagesCompression::Raw,
+            PackagesCompression::Gz,
+            PackagesCompression::Xz,
+        ] {
+            for via in [Via::File, Via::Bytes] {
+                let index = index_via(via, compression, encoded_index(compression).await).await;
+                let (result, left) = reduce_keys(
+                    index,
+                    dir.path(),
+                    &[
+                        "kept_1_amd64.deb",
+                        "nodigest_1_amd64.deb",
+                        "unreferenced.deb",
+                    ],
+                )
+                .await;
+                assert!(result.is_ok(), "{compression:?} via {via:?}: {result:?}");
+                assert_eq!(
+                    left.keys().collect::<Vec<_>>(),
+                    [OsStr::new("unreferenced.deb")],
+                    "{compression:?} via {via:?}"
+                );
+                assert!(kept.exists(), "a verified deb stays cached");
+            }
+        }
+    }
+
+    /// Once every candidate is referenced the reduce stops reading: a
+    /// malformed tail past that point is never decoded, while it still fails
+    /// a reduce that has candidates left.
+    #[tokio::test]
+    async fn reduce_file_list_stops_reading_once_every_candidate_is_referenced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        tokio::fs::write(dir.path().join("kept_1_amd64.deb"), KEPT_DEB)
+            .await
+            .expect("write deb");
+        let mut raw = INDEX_RAW.to_vec();
+        raw.extend_from_slice(b"Package: \xff\xfe not UTF-8\n\n");
+
+        for via in [Via::File, Via::Bytes] {
+            let index = index_via(via, PackagesCompression::Raw, raw.clone()).await;
+            let (result, left) = reduce_keys(index, dir.path(), &["kept_1_amd64.deb"]).await;
+            assert!(result.is_ok(), "via {via:?}: {result:?}");
+            assert!(left.is_empty());
+
+            let index = index_via(via, PackagesCompression::Raw, raw.clone()).await;
+            let (result, left) =
+                reduce_keys(index, dir.path(), &["kept_1_amd64.deb", "unreferenced.deb"]).await;
+            assert!(
+                matches!(result, Err(ReduceError::Read { .. })),
+                "via {via:?}: {result:?}"
+            );
+            assert!(left.contains_key(OsStr::new("unreferenced.deb")));
+        }
+    }
+
+    /// The guards the file path has hold for in-memory bytes: an empty
+    /// compressed index, a malformed or bomb-sized stream, and an index past
+    /// its compressed cap all fail, an empty raw index is no stanzas.
+    #[tokio::test]
+    async fn reduce_file_list_guards_in_memory_indexes() {
+        let root = Path::new("/nonexistent");
+        let keys = ["keep-me.deb"];
+        let bytes = |compression, bytes: Vec<u8>| index_via(Via::Bytes, compression, bytes);
+
+        let (result, left) = reduce_keys(
+            bytes(PackagesCompression::Raw, Vec::new()).await,
+            root,
+            &keys,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(left.len(), 1);
+
+        for compression in [PackagesCompression::Gz, PackagesCompression::Xz] {
+            let (result, left) =
+                reduce_keys(bytes(compression, Vec::new()).await, root, &keys).await;
+            assert!(
+                matches!(result, Err(ReduceError::ZeroSizeCompressed { .. })),
+                "{compression:?}: {result:?}"
+            );
+            assert_eq!(left.len(), 1);
+
+            let (result, left) = reduce_keys(
+                bytes(compression, b"not a compressed stream".to_vec()).await,
+                root,
+                &keys,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(ReduceError::Read { .. })),
+                "{compression:?}: {result:?}"
+            );
+            assert_eq!(left.len(), 1);
+        }
+
+        // 4 MiB of newlines gzips to a few KiB, far past the ratio cap.
+        let bomb = gzip(&vec![b'\n'; 4 * 1024 * 1024]).await;
+        let (result, _) =
+            reduce_keys(bytes(PackagesCompression::Gz, bomb).await, root, &keys).await;
+        assert!(
+            matches!(result, Err(ReduceError::Read { .. })),
+            "{result:?}"
+        );
+
+        // Zero-filled, so the allocation stays lazy; refused before decoding.
+        let oversized =
+            vec![0; usize::try_from(MAX_COMPRESSED_PACKAGES_SIZE.get() + 1).expect("fits")];
+        let (result, left) =
+            reduce_keys(bytes(PackagesCompression::Xz, oversized).await, root, &keys).await;
+        assert!(
+            matches!(result, Err(ReduceError::TooLarge { .. })),
+            "{result:?}"
+        );
+        assert_eq!(left.len(), 1);
     }
 }
