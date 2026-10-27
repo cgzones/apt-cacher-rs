@@ -63,7 +63,6 @@ libsqlite3-sys = { version = "0.37.0", default-features = false }
 log = "0.4.20"
 lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "xz"] }
 memchr = "2.8"
-memfd = "0.6.4"
 nix = { version = "0.31", features = ["fs", "hostname", "resource", "user"] }
 openssl = { version = "0.10", optional = true }
 parking_lot = "0.13"

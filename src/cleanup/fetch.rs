@@ -246,7 +246,7 @@ mod via_hyper {
     use bytes::Buf as _;
     use http::{Method, Request, StatusCode, Uri, header::CACHE_CONTROL};
     use http_body_util::{BodyExt as _, Empty};
-    use memfd::MemfdOptions;
+    use nix::sys::memfd::{MFdFlags, memfd_create};
     use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _, BufWriter};
     use tracing::{debug, error};
 
@@ -349,7 +349,7 @@ mod via_hyper {
     #[derive(Debug, thiserror::Error)]
     enum PackagesBufferError {
         #[error("{}", ErrorReport(.0))]
-        Memfd(memfd::Error),
+        Memfd(nix::Error),
         /// The response body yielded an error frame (e.g. an upstream rate limit,
         /// `ContentTooLarge`).
         #[error("{}", ErrorReport(.0))]
@@ -416,20 +416,26 @@ mod via_hyper {
         matches!(announced, Some(expected) if written < expected)
     }
 
+    /// A close-on-exec in-memory file named `name` (the name only shows in
+    /// `/proc/<pid>/fd`).
+    fn memfd_file(name: &str) -> nix::Result<tokio::fs::File> {
+        let fd = memfd_create(name, MFdFlags::MFD_CLOEXEC)?;
+        Ok(tokio::fs::File::from_std(std::fs::File::from(fd)))
+    }
+
     async fn packages_body_to_memfd(
         memfdname: &str,
         compression: PackagesCompression,
         body: &mut ProxyCacheBody,
         buffer_size: usize,
     ) -> Result<(tokio::fs::File, u64), PackagesBufferError> {
-        let memfd = MemfdOptions::new().create(memfdname).map_err(|err| {
+        let file = memfd_file(memfdname).map_err(|err| {
             error!(
                 "Failed to create in-memory file `{memfdname}` for the Packages index; skipping this mirror's reconcile this cycle:  {}",
                 ErrorReport(&err)
             );
             PackagesBufferError::Memfd(err)
         })?;
-        let file = tokio::fs::File::from_std(memfd.into_file());
         // Cap the buffered body at the most `reduce_file_list` would decode (the
         // decompressed ceiling for a raw index, the compressed one otherwise), so
         // memory is bounded before its guards run.
@@ -502,10 +508,7 @@ mod via_hyper {
             // overshoots, so buffering must bail with an error (not truncate, which
             // would silently shrink the reference set and over-evict).
             let mut body = full_body(bytes::Bytes::from(vec![b'x'; 4096]));
-            let memfd = MemfdOptions::new()
-                .create("apt_cacher_rs_test_over_cap")
-                .expect("memfd");
-            let file = tokio::fs::File::from_std(memfd.into_file());
+            let file = memfd_file("apt_cacher_rs_test_over_cap").expect("memfd");
 
             let err = body_to_file(&mut body, file, nonzero!(1024), BUFFER_SIZE)
                 .await
@@ -520,10 +523,7 @@ mod via_hyper {
         async fn body_to_file_accepts_body_at_cap() {
             // Exactly at the cap: `written > max_bytes` is strict, so this is kept.
             let mut body = full_body(bytes::Bytes::from(vec![b'y'; 1024]));
-            let memfd = MemfdOptions::new()
-                .create("apt_cacher_rs_test_at_cap")
-                .expect("memfd");
-            let file = tokio::fs::File::from_std(memfd.into_file());
+            let file = memfd_file("apt_cacher_rs_test_at_cap").expect("memfd");
 
             let (_file, written) = body_to_file(&mut body, file, nonzero!(1024), BUFFER_SIZE)
                 .await
