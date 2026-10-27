@@ -930,7 +930,7 @@ pub(crate) fn valid_filename(name: &str) -> bool {
 /// - `http://deb.debian.org/debian/dists/sid/main/source/Sources.diff/T-2024-10-03-1409.04-F-2024-10-03-1409.04.gz`
 ///
 /// A regex-based implementation was considered but rejected: the linear-scan
-/// contains/find approach avoids pulling in the `regex` crate solely for this
+/// contains/segment approach avoids pulling in the `regex` crate solely for this
 /// check and stays linear in the path length with no allocation.
 #[must_use]
 pub(crate) fn is_diff_request_path(uri_path: &str) -> bool {
@@ -942,23 +942,26 @@ pub(crate) fn is_diff_request_path(uri_path: &str) -> bool {
 /// Check whether the path contains a `Translation-XX.diff/T-` segment for any language.
 #[must_use]
 fn contains_translation_diff(uri_path: &str) -> bool {
-    const PREFIX: &str = "/Translation-";
-    const SUFFIX: &str = ".diff/T-";
-
-    let mut haystack = uri_path;
-    while let Some(idx) = haystack.find(PREFIX) {
-        let rest = haystack.split_at(idx + PREFIX.len()).1;
-        if let Some(diff_idx) = rest.find(SUFFIX) {
-            let lang = rest.split_at(diff_idx).0;
+    // Skip the first segment: a match requires the preceding slash. Looking
+    // only at adjacent segments avoids rescanning the whole remaining path
+    // for every malformed Translation prefix.
+    let mut segments = uri_path.split('/').skip(1).peekable();
+    while let Some(segment) = segments.next() {
+        if let Some(lang) = segment
+            .strip_prefix("Translation-")
+            .and_then(|rest| rest.strip_suffix(".diff"))
+        {
             // Language tags in Debian translations are of the form `en`, `de`,
             // `zh_CN`, `pt_BR` - alphanumeric with optional underscore.  Reject
             // arbitrary separator runs (e.g. `---`) that the previous matcher
             // accepted.
-            if !lang.is_empty() && lang.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            if !lang.is_empty()
+                && lang.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && segments.peek().is_some_and(|next| next.starts_with("T-"))
+            {
                 return true;
             }
         }
-        haystack = rest;
     }
     false
 }
@@ -2918,6 +2921,31 @@ mod tests {
         assert!(!is_diff_request_path(
             "/debian/dists/sid/main/source/Sources.diff/Index"
         ));
+    }
+
+    #[test]
+    fn translation_diffs_require_adjacent_segments_and_a_valid_language() {
+        for path in [
+            "/Translation-en.diff/T-",
+            "/Translation-zh_CN.diff/T-patch.gz",
+            "/Translation-bad-lang.diff/T-x/Translation-en.diff/T-good",
+        ] {
+            assert!(contains_translation_diff(path), "{path}");
+        }
+        for path in [
+            "Translation-en.diff/T-x",
+            "/Translation-.diff/T-x",
+            "/Translation-en-US.diff/T-x",
+            "/Translation-en/else.diff/T-x",
+            "/Translation-en.diff//T-x",
+            "/Translation-en.diff/not-a-patch",
+        ] {
+            assert!(!contains_translation_diff(path), "{path}");
+        }
+        let mut repeated = "/Translation-en".repeat(500);
+        assert!(!contains_translation_diff(&repeated));
+        repeated.push_str("/Translation-en.diff/T-good");
+        assert!(contains_translation_diff(&repeated));
     }
 
     #[test]
