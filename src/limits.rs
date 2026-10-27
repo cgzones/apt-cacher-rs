@@ -390,7 +390,17 @@ impl AsyncRead for InputReader {
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::File(file) => Pin::new(file).poll_read(cx, buf),
-            Self::Bytes(bytes) => Pin::new(bytes).poll_read(cx, buf),
+            Self::Bytes(bytes) => {
+                // A memory cursor never waits for I/O. Charge its reads to
+                // Tokio's budget so a large raw/gzip index cannot monopolize
+                // a worker while the parser keeps finding ready bytes.
+                let budget = std::task::ready!(tokio::task::coop::poll_proceed(cx));
+                let read = Pin::new(bytes).poll_read(cx, buf);
+                if read.is_ready() {
+                    budget.made_progress();
+                }
+                read
+            }
         }
     }
 }
@@ -475,6 +485,45 @@ where
 mod tests {
     use super::*;
     use crate::nonzero;
+
+    /// Reading an already-buffered index must still leave room for other
+    /// futures on the worker, even when every input read is immediately ready.
+    #[tokio::test]
+    async fn in_memory_index_reads_yield_to_other_futures() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::AsyncBufReadExt as _;
+
+        let yielded = tokio::spawn(async {
+            let sibling_ran = AtomicBool::new(false);
+            let (observed_sibling, ()) = tokio::join! {
+                biased;
+                async {
+                    let mut reader = packages_reader(
+                        PackagesInput::Bytes(vec![b'x'; 512 * 1024]),
+                        PackagesCompression::Raw,
+                        MAX_DECOMPRESSED_PACKAGES_SIZE,
+                        1024,
+                    ).await;
+                    loop {
+                        let len = reader.fill_buf().await.expect("read memory index").len();
+                        if len == 0 {
+                            break;
+                        }
+                        reader.consume(len);
+                    }
+                    sibling_ran.load(Ordering::Relaxed)
+                },
+                async { sibling_ran.store(true, Ordering::Relaxed); }
+            };
+            observed_sibling
+        })
+        .await
+        .expect("reader task");
+        assert!(
+            yielded,
+            "the index reader must yield before consuming the entire input"
+        );
+    }
 
     #[test]
     fn decompressed_limit_ratio_caps_small_input() {
