@@ -163,8 +163,13 @@ mod tests {
     use super::*;
     use crate::nonzero;
 
+    // Distinct IPs isolate the per-IP map, but these scenarios share the
+    // process-wide connection count and peak even under the standard harness.
+    static CONNECTION_TEST: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn per_ip_cap_refuses_and_releases() {
+        let _serial = CONNECTION_TEST.lock();
         // `CONNECTIONS_PER_IP` is process-wide: use an address no other test
         // touches, and compare the global count against its starting value.
         let ip: IpAddr = "192.0.2.21".parse().expect("test address");
@@ -199,6 +204,7 @@ mod tests {
     /// cannot raise the connected-clients peak.
     #[test]
     fn per_ip_refusal_does_not_raise_the_connected_peak() {
+        let _serial = CONNECTION_TEST.lock();
         let ip: IpAddr = "192.0.2.25".parse().expect("test address");
         let admitted =
             ClientCounter::try_new(ip, Some(nonzero!(1)), None, 128).expect("first admitted");
@@ -218,6 +224,7 @@ mod tests {
     /// and keeps no per-IP state at all.
     #[test]
     fn no_per_ip_cap_keeps_no_per_ip_state() {
+        let _serial = CONNECTION_TEST.lock();
         let ip: IpAddr = "192.0.2.24".parse().expect("test address");
         let before = connected_clients();
 
@@ -234,6 +241,7 @@ mod tests {
 
     #[test]
     fn global_cap_refuses_the_connection_past_the_limit() {
+        let _serial = CONNECTION_TEST.lock();
         let ip: IpAddr = "192.0.2.22".parse().expect("test address");
         let before = connected_clients();
         let max = NonZero::new(before + 1).expect("at least one slot");
