@@ -289,7 +289,7 @@ async fn reduce_against(
     // failures: skip the mirror conservatively and retry next cycle
     // (packages_body_to_memfd already logged the cause).
     let Ok((file, written)) =
-        packages_body_to_memfd(&memfdname, pkgfmt, response.body_mut(), config).await
+        packages_body_to_memfd(&memfdname, pkgfmt, response.body_mut(), config.buffer_size).await
     else {
         return Ok(ReduceOutcome::FetchFailed(FetchFailure {
             status: StatusCode::BAD_GATEWAY,
@@ -320,7 +320,7 @@ async fn reduce_against(
         &memfdname,
         candidates,
         &mut reduce_ctx,
-        config,
+        config.buffer_size,
     )
     .await?;
 

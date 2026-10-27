@@ -15,7 +15,6 @@ use crate::{
     AppState, Never,
     cache_layout::{CacheLayout, ConnectionDetails, ResourceKind, dists_debname},
     client_info::ClientInfo,
-    config::Config,
     deb_mirror::Mirror,
     error::{ErrorReport, UpstreamFetchError},
     index_parser::{Stanza, StanzaStream, hex_encode, structured_lookup_key},
@@ -91,9 +90,8 @@ pub(super) enum PackagesBufferError {
 
 /// Buffer `body` into `file`, returning the file (rewound to offset 0) and the
 /// number of bytes written. The caller compares the byte count against the
-/// upstream-announced `Content-Length` to detect a silently-truncated body (a
-/// download aborted mid-stream closes the delivery channel with a clean EOF, so
-/// the short read surfaces here as `Ok`, not `Err`).
+/// upstream-announced `Content-Length` as a defensive truncation check. Typed
+/// body failures, including a cancelled delivery producer, propagate as errors.
 ///
 /// `max_bytes` bounds how much is buffered before the (post-hoc) decompression
 /// guards in `reduce_file_list` can weigh in: an abusive upstream could
@@ -106,9 +104,9 @@ async fn body_to_file(
     body: &mut ProxyCacheBody,
     file: tokio::fs::File,
     max_bytes: NonZero<u64>,
-    config: &Config,
+    buffer_size: usize,
 ) -> Result<(tokio::fs::File, u64), PackagesBufferError> {
-    let mut writer = BufWriter::with_capacity(config.buffer_size, file);
+    let mut writer = BufWriter::with_capacity(buffer_size, file);
 
     let mut written: u64 = 0;
     while let Some(next) = body.frame().await {
@@ -135,8 +133,8 @@ async fn body_to_file(
 }
 
 /// `true` only when the upstream announced an exact `Content-Length` and we
-/// buffered fewer bytes -- a clean-EOF truncation (e.g. an aborted upstream
-/// download). `None` (chunked / volatile-unknown / legitimately empty) is never
+/// buffered fewer bytes despite the body ending successfully.
+/// `None` (chunked / volatile-unknown / legitimately empty) is never
 /// "incomplete".
 #[must_use]
 pub(super) fn body_is_incomplete(announced: Option<u64>, written: u64) -> bool {
@@ -147,7 +145,7 @@ pub(super) async fn packages_body_to_memfd(
     memfdname: &str,
     compression: PackagesCompression,
     body: &mut ProxyCacheBody,
-    config: &Config,
+    buffer_size: usize,
 ) -> Result<(tokio::fs::File, u64), PackagesBufferError> {
     let memfd = MemfdOptions::new().create(memfdname).map_err(|err| {
         error!(
@@ -160,7 +158,7 @@ pub(super) async fn packages_body_to_memfd(
     // Cap the buffered body at the most `reduce_file_list` would decode (the
     // decompressed ceiling for a raw index, the compressed one otherwise), so
     // memory is bounded before its guards run.
-    body_to_file(body, file, packages_file_cap(compression), config)
+    body_to_file(body, file, packages_file_cap(compression), buffer_size)
         .await
         .inspect_err(|err| {
             error!(
@@ -336,11 +334,9 @@ pub(super) async fn reduce_file_list(
     filename: &str,
     file_list: &mut HashMap<OsString, SpanClass>,
     ctx: &mut ReduceContext<'_>,
-    config: &Config,
+    buffer_size: usize,
 ) -> Result<(), ReduceError> {
     debug_assert!(!file_list.is_empty(), "avoid unnecessary work");
-
-    let buffer_size = config.buffer_size;
 
     let mdata = file.metadata().await.map_err(|source| ReduceError::Stat {
         filename: filename.to_owned(),
@@ -599,6 +595,8 @@ pub(super) async fn try_fetch_packages_file(
 
 #[cfg(test)]
 mod tests {
+    const BUFFER_SIZE: usize = 32 * 1024;
+
     use super::*;
 
     use crate::{
@@ -706,7 +704,6 @@ mod tests {
     async fn packages_body_to_memfd_counts_bytes_and_rewinds() {
         use tokio::io::AsyncReadExt as _;
 
-        let config = Config::default();
         let payload = b"Package: hello\nFilename: pool/main/h/hello/hello_1_amd64.deb\n\n";
         let mut body = full_body(bytes::Bytes::from_static(payload));
 
@@ -714,7 +711,7 @@ mod tests {
             "apt_cacher_rs_test_count",
             PackagesCompression::Raw,
             &mut body,
-            &config,
+            BUFFER_SIZE,
         )
         .await
         .expect("buffer body");
@@ -734,7 +731,6 @@ mod tests {
 
     #[tokio::test]
     async fn body_to_file_rejects_body_over_cap() {
-        let config = Config::default();
         // A single 4 KiB data frame against a 1 KiB cap: the first chunk already
         // overshoots, so buffering must bail with an error (not truncate, which
         // would silently shrink the reference set and over-evict).
@@ -744,7 +740,7 @@ mod tests {
             .expect("memfd");
         let file = tokio::fs::File::from_std(memfd.into_file());
 
-        let err = body_to_file(&mut body, file, nonzero!(1024), &config)
+        let err = body_to_file(&mut body, file, nonzero!(1024), BUFFER_SIZE)
             .await
             .expect_err("a body exceeding the cap must error rather than buffer unbounded");
         assert!(
@@ -755,7 +751,6 @@ mod tests {
 
     #[tokio::test]
     async fn body_to_file_accepts_body_at_cap() {
-        let config = Config::default();
         // Exactly at the cap: `written > max_bytes` is strict, so this is kept.
         let mut body = full_body(bytes::Bytes::from(vec![b'y'; 1024]));
         let memfd = MemfdOptions::new()
@@ -763,7 +758,7 @@ mod tests {
             .expect("memfd");
         let file = tokio::fs::File::from_std(memfd.into_file());
 
-        let (_file, written) = body_to_file(&mut body, file, nonzero!(1024), &config)
+        let (_file, written) = body_to_file(&mut body, file, nonzero!(1024), BUFFER_SIZE)
             .await
             .expect("a body exactly at the cap must buffer successfully");
         assert_eq!(written, 1024);
@@ -997,7 +992,6 @@ mod tests {
             .expect("write fixture");
         let file = tokio::fs::File::open(&path).await.expect("open fixture");
 
-        let config = Config::default();
         // Mirror the EXACT Mirror / ReduceContext construction used by the
         // existing process_stanza_flat_prefix_strips_in_subtree_and_drops_siblings
         // test in this module.
@@ -1025,7 +1019,7 @@ mod tests {
             "Packages.gz",
             &mut file_list,
             &mut ctx,
-            &config,
+            BUFFER_SIZE,
         )
         .await;
         let err = result.expect_err("a decompression bomb must abort reduce_file_list");
@@ -1051,7 +1045,6 @@ mod tests {
         drop(std_file);
         let file = tokio::fs::File::open(&path).await.expect("open fixture");
 
-        let config = Config::default();
         let mirror = Mirror::new(
             ClientHost::new("example.com").expect("valid host"),
             None::<NonZero<u16>>,
@@ -1074,7 +1067,7 @@ mod tests {
             "Packages.xz",
             &mut file_list,
             &mut ctx,
-            &config,
+            BUFFER_SIZE,
         )
         .await
         .expect_err("an oversized compressed index must bail the mirror");
@@ -1095,7 +1088,6 @@ mod tests {
         tokio::fs::write(&path, b"").await.expect("write empty");
         let file = tokio::fs::File::open(&path).await.expect("open empty");
 
-        let config = Config::default();
         let mirror = structured_mirror("example.com", "debian");
         let mut file_list = cands(&["keep-me.deb"]);
         let mut tally = UnitStats::default();
@@ -1113,7 +1105,7 @@ mod tests {
             "Packages.gz",
             &mut file_list,
             &mut ctx,
-            &config,
+            BUFFER_SIZE,
         )
         .await
         .expect_err("an empty compressed index must bail the mirror");
@@ -1159,7 +1151,6 @@ mod tests {
         tokio::fs::write(&path, &raw).await.expect("write fixture");
         let file = tokio::fs::File::open(&path).await.expect("open fixture");
 
-        let config = Config::default();
         let mirror = structured_mirror("example.com", "debian");
         // `dummy_1.0_amd64.deb` is the structured-lookup-key (basename) of
         // the Filename: above; reaching `StanzaStream::complete` with the stanza
@@ -1184,7 +1175,7 @@ mod tests {
             "Packages",
             &mut file_list,
             &mut ctx,
-            &config,
+            BUFFER_SIZE,
         )
         .await
         .expect("oversize lines must be skipped, not aborted");
@@ -1209,7 +1200,6 @@ mod tests {
         tokio::fs::write(&path, b"").await.expect("write empty");
         let file = tokio::fs::File::open(&path).await.expect("open empty");
 
-        let config = Config::default();
         let mirror = structured_mirror("example.com", "debian");
         let mut file_list = cands(&["keep-me.deb"]);
         let mut tally = UnitStats::default();
@@ -1227,7 +1217,7 @@ mod tests {
             "Packages",
             &mut file_list,
             &mut ctx,
-            &config,
+            BUFFER_SIZE,
         )
         .await
         .expect("an empty raw Packages file must be treated as zero stanzas");
