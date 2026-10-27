@@ -106,3 +106,17 @@ pub(crate) async fn connected_tcp_pair() -> (tokio::net::TcpStream, tokio::net::
     let (accepted, _) = listener.accept().await.expect("accept loopback connection");
     (connected, accepted)
 }
+
+/// Permit an IPv6 integration test to skip only when the host lacks IPv6
+/// and this run has not required it (CI sets the environment flag).
+pub(crate) fn assert_ipv6_unavailable(err: &std::io::Error) {
+    assert!(
+        crate::main_loop::is_missing_ipv6(err),
+        "unexpected IPv6 bind failure: {err}"
+    );
+    assert_ne!(
+        std::env::var_os("APT_CACHER_RS_REQUIRE_IPV6").as_deref(),
+        Some(std::ffi::OsStr::new("1")),
+        "IPv6 is required for this test run: {err}"
+    );
+}

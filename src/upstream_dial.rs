@@ -235,7 +235,7 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
-    use crate::main_loop::is_missing_ipv6;
+    use crate::test_support::assert_ipv6_unavailable;
 
     const V6_A: SocketAddr = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::LOCALHOST), 80);
     const V6_B: SocketAddr = SocketAddr::new(
@@ -448,12 +448,7 @@ mod tests {
         let v6 = match v6 {
             Ok(socket) => socket,
             Err(err) => {
-                assert!(is_missing_ipv6(&err), "unexpected IPv6 bind failure: {err}");
-                assert!(
-                    std::env::var_os("APT_CACHER_RS_REQUIRE_IPV6").as_deref()
-                        != Some(std::ffi::OsStr::new("1")),
-                    "IPv6 is required by CI: {err}"
-                );
+                assert_ipv6_unavailable(&err);
                 return;
             }
         };
@@ -483,12 +478,7 @@ mod tests {
         let listener = match tokio::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await {
             Ok(listener) => listener,
             Err(err) => {
-                assert!(is_missing_ipv6(&err), "unexpected IPv6 bind failure: {err}");
-                assert!(
-                    std::env::var_os("APT_CACHER_RS_REQUIRE_IPV6").as_deref()
-                        != Some(std::ffi::OsStr::new("1")),
-                    "IPv6 is required by CI: {err}"
-                );
+                assert_ipv6_unavailable(&err);
                 return;
             }
         };

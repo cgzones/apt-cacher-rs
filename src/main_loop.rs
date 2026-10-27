@@ -866,12 +866,7 @@ mod listener_tests {
         let listener = match bind_socket(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))) {
             Ok(listener) => listener,
             Err(err) => {
-                assert!(is_missing_ipv6(&err), "unexpected IPv6 bind failure: {err}");
-                assert_ne!(
-                    std::env::var("APT_CACHER_RS_REQUIRE_IPV6").as_deref(),
-                    Ok("1"),
-                    "IPv6 is required for this test run: {err}"
-                );
+                crate::test_support::assert_ipv6_unavailable(&err);
                 return;
             }
         };
