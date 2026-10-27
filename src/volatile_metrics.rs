@@ -2,6 +2,8 @@
 //! `ConnectionDetails::count_lookup`; admission and revalidation describe
 //! subsequent stages, not additional lookups. Cleanup never moves these counters.
 
+use http::StatusCode;
+
 use crate::{cache_layout::ConnectionDetails, metrics};
 
 /// Result of attempting to refresh an existing file after an upstream 304.
@@ -60,10 +62,10 @@ impl Revalidation {
         Self { counters }
     }
 
-    pub(crate) fn responded(&mut self, status: u16) {
+    pub(crate) fn responded(&mut self, status: StatusCode) {
         self.finish(match status {
-            304 => 0,
-            200 | 206 => 1,
+            StatusCode::NOT_MODIFIED => 0,
+            StatusCode::OK | StatusCode::PARTIAL_CONTENT => 1,
             _ => 2,
         });
     }
@@ -96,7 +98,12 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            for (status, outcome) in [(304, 0), (200, 1), (206, 1), (404, 2)] {
+            for (status, outcome) in [
+                (StatusCode::NOT_MODIFIED, 0),
+                (StatusCode::OK, 1),
+                (StatusCode::PARTIAL_CONTENT, 1),
+                (StatusCode::NOT_FOUND, 2),
+            ] {
                 let mut observation = Revalidation::with_counters(true, Some(validators), counters);
                 observation.responded(status);
                 // No second terminal outcome, including Drop, may count.
@@ -104,7 +111,11 @@ mod tests {
                 drop(observation);
                 assert_eq!(
                     counters[mode][outcome].get(),
-                    if status == 206 { 2 } else { 1 }
+                    if status == StatusCode::PARTIAL_CONTENT {
+                        2
+                    } else {
+                        1
+                    }
                 );
             }
             let mut failure = Revalidation::with_counters(true, Some(validators), counters);
@@ -120,7 +131,7 @@ mod tests {
         }
         for (enabled, validators) in [(false, Some((true, true))), (true, None)] {
             let mut excluded = Revalidation::with_counters(enabled, validators, counters);
-            excluded.responded(304);
+            excluded.responded(StatusCode::NOT_MODIFIED);
         }
         assert_eq!(
             counters[2][0].get(),
@@ -176,7 +187,7 @@ mod tests {
             renewal.record(&details);
         }
         let mut observation = Revalidation::new(&details, Some((true, true)));
-        observation.responded(304);
+        observation.responded(StatusCode::NOT_MODIFIED);
         drop(observation);
         assert_eq!(
             snapshot(),

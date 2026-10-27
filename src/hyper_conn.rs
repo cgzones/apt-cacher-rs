@@ -2378,7 +2378,7 @@ async fn serve_new_file_worker(
             )
         }
     };
-    revalidation.responded(head.status.as_u16());
+    revalidation.responded(head.status);
     // The final exchange answered with a body or a 304: its time to first
     // byte is the mirror's (splice records it at the same point).
     if plan.is_answered() && !conn_details.client.is_cleanup_synthetic() {

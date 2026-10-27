@@ -1557,7 +1557,7 @@ async fn splice_proxy_drive(
             )
             .await
             .inspect_err(|_| revalidation.failed())?;
-            revalidation.responded(exchange.response.status_code.as_u16());
+            revalidation.responded(exchange.response.status_code);
             Ok((resume, exchange, plan, prev_file_size))
         })
         .await
