@@ -15,7 +15,9 @@
 //! An entry keeps at most [`MAX_ENTRY_LEN`] bytes: some warnings quote
 //! upstream- or client-supplied values, and the ring holds
 //! `logstore_capacity` entries for the life of the process. The console/file
-//! sink still receives the whole line.
+//! sink still receives the whole line. A fragmented record keeps only a
+//! bounded raw prefix while waiting for its newline; leading whitespace in
+//! an oversized fragmented line counts toward that prefix too.
 
 use std::{num::NonZero, sync::Arc};
 
@@ -29,14 +31,29 @@ use crate::{
 /// boundary and marked with [`TRUNCATION_MARK`].
 const MAX_ENTRY_LEN: usize = 4 * 1024;
 
+// Keep enough bytes to complete a UTF-8 scalar crossing the entry boundary.
+const MAX_FRAGMENT_BYTES: usize = MAX_ENTRY_LEN + 3;
+
 const TRUNCATION_MARK: &str = " [truncated]";
 
 /// The ring entry for one raw log line: lossily decoded, trimmed, and cut to
 /// [`MAX_ENTRY_LEN`].
-fn entry_from_line(line: &[u8]) -> String {
+fn entry_from_line(line: &[u8], truncated: bool) -> String {
+    // A cut record can end inside a scalar; drop that partial scalar rather
+    // than decode it to U+FFFD.
+    let line = match line.utf8_chunks().last() {
+        Some(chunk)
+            if truncated
+                && std::str::from_utf8(chunk.invalid())
+                    .is_err_and(|err| err.error_len().is_none()) =>
+        {
+            &line[..line.len() - chunk.invalid().len()]
+        }
+        _ => line,
+    };
     let decoded = String::from_utf8_lossy(line);
     let trimmed = decoded.trim();
-    if trimmed.len() <= MAX_ENTRY_LEN {
+    if trimmed.len() <= MAX_ENTRY_LEN && !truncated {
         return trimmed.to_owned();
     }
     let kept = trimmed
@@ -52,6 +69,7 @@ fn entry_from_line(line: &[u8]) -> String {
 struct LogStoreImpl {
     entries: RingBuffer<String>,
     buffer: Vec<u8>,
+    truncated: bool,
 }
 
 impl LogStoreImpl {
@@ -60,7 +78,22 @@ impl LogStoreImpl {
         Self {
             entries: RingBuffer::new(capacity),
             buffer: Vec::with_capacity(1024),
+            truncated: false,
         }
+    }
+
+    /// Retain a bounded prefix until the newline, discarding the rest of an
+    /// oversized fragmented record. Its eventual entry still carries the mark
+    /// unless only whitespace was discarded, which the trim would drop anyway.
+    /// (A non-ASCII byte counts as content, so trailing Unicode whitespace
+    /// past the cap still marks.)
+    fn append_fragment(&mut self, fragment: &[u8]) {
+        let kept = fragment.len().min(MAX_FRAGMENT_BYTES - self.buffer.len());
+        let (kept, dropped) = fragment.split_at(kept);
+        self.buffer.extend_from_slice(kept);
+        self.truncated |= dropped
+            .iter()
+            .any(|&byte| !(byte.is_ascii() && char::from(byte).is_whitespace()));
     }
 }
 
@@ -68,17 +101,18 @@ impl std::io::Write for LogStoreImpl {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         for fragment in buf.split_inclusive(|&byte| byte == b'\n') {
             let Some(line) = fragment.strip_suffix(b"\n") else {
-                self.buffer.extend_from_slice(fragment);
+                self.append_fragment(fragment);
                 continue;
             };
             // Formatters normally supply complete lines. Borrow those bytes
             // so one oversized warning does not enlarge the scratch buffer.
             let entry = if self.buffer.is_empty() {
-                entry_from_line(line)
+                entry_from_line(line, false)
             } else {
-                self.buffer.extend_from_slice(line);
-                let entry = entry_from_line(&self.buffer);
+                self.append_fragment(line);
+                let entry = entry_from_line(&self.buffer, self.truncated);
                 self.buffer.clear();
+                self.truncated = false;
                 entry
             };
             if self.entries.is_full() {
@@ -227,6 +261,57 @@ mod tests {
             .write_all(format!("{at_cap}\n").as_bytes())
             .expect("write");
         assert_eq!(store.snapshot(), [at_cap]);
+    }
+
+    #[test]
+    fn fragmented_records_are_bounded_and_reset_at_the_next_newline() {
+        let mut store = new_store(4);
+        let prefix = "a".repeat(MAX_ENTRY_LEN - 1);
+        store.write_all(prefix.as_bytes()).unwrap();
+        // Split the scalar at the entry boundary across writes.
+        store.write_all(&[0xc3]).unwrap();
+        store.write_all(&[0xa9]).unwrap();
+        let chunk = vec![b'x'; 1024];
+        for _ in 0..1024 {
+            store.write_all(&chunk).unwrap();
+        }
+        assert!(
+            store.snapshot().is_empty(),
+            "the record still needs its newline"
+        );
+        assert!(store.inner.read().buffer.len() <= MAX_FRAGMENT_BYTES);
+        store.write_all(b"discarded tail\nnext\n").unwrap();
+        assert_eq!(
+            store.snapshot(),
+            [format!("{prefix}{TRUNCATION_MARK}"), "next".to_owned()]
+        );
+
+        // An ordinary fragmented scalar and an exactly-at-cap record stay whole.
+        store.write_all(&[0xc3]).unwrap();
+        store.write_all(&[0xa9, b'\n']).unwrap();
+        let at_cap = "b".repeat(MAX_ENTRY_LEN);
+        for part in at_cap.as_bytes().chunks(1024) {
+            store.write_all(part).unwrap();
+        }
+        store.write_all(b"\n").unwrap();
+        let entries = store.snapshot();
+        assert_eq!(entries[2], "\u{e9}");
+        assert_eq!(entries[3], at_cap);
+
+        // Whitespace past the cap is trimmed, not truncated content.
+        store.write_all(at_cap.as_bytes()).unwrap();
+        store.write_all(b" \t\x0b ").unwrap();
+        store.write_all(b"\n").unwrap();
+        assert_eq!(store.snapshot()[3], at_cap);
+
+        // Leading whitespace shifts the cap into a scalar: the partial scalar
+        // is dropped, not decoded to U+FFFD.
+        let shifted = "a".repeat(MAX_ENTRY_LEN - 8);
+        store.write_all(b"          ").unwrap();
+        store.write_all(shifted.as_bytes()).unwrap();
+        store.write_all("\u{e9} tail".as_bytes()).unwrap();
+        store.write_all(b"\n").unwrap();
+        assert_eq!(store.snapshot()[3], format!("{shifted}{TRUNCATION_MARK}"));
     }
 
     /// Invalid UTF-8 must not lose the record or panic the logging path.
