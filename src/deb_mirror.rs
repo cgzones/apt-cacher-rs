@@ -974,10 +974,10 @@ fn contains_translation_diff(uri_path: &str) -> bool {
 /// Returns `true` if the path is unsafe and should be rejected.
 #[must_use]
 pub(crate) fn is_unsafe_proxy_path(raw_path: &str) -> bool {
-    let decoded = match urlencoding::decode(raw_path) {
+    let decoded = match percent_encoding::percent_decode_str(raw_path).decode_utf8() {
         Ok(d) => d,
         // Failed to decode — reject as unsafe
-        Err(_err @ std::string::FromUtf8Error { .. }) => return true,
+        Err(_err @ std::str::Utf8Error { .. }) => return true,
     };
 
     decoded.split('/').any(is_unsafe_segment)
@@ -994,9 +994,9 @@ pub(crate) fn is_unsafe_proxy_path(raw_path: &str) -> bool {
 /// Returns `true` if the path is unsafe and should be rejected.
 #[must_use]
 pub(crate) fn is_unsafe_cache_path(normalized_path: &str) -> bool {
-    let decoded = match urlencoding::decode(normalized_path) {
+    let decoded = match percent_encoding::percent_decode_str(normalized_path).decode_utf8() {
         Ok(d) => d,
-        Err(_err @ std::string::FromUtf8Error { .. }) => return true,
+        Err(_err @ std::str::Utf8Error { .. }) => return true,
     };
 
     decoded

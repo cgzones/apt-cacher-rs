@@ -1895,7 +1895,8 @@ fn registry_path_from_uri(raw_uri_path: &str) -> Cow<'_, str> {
     let normalized = normalize_uri_path(raw_uri_path);
     if normalized.contains('%') {
         Cow::Owned(
-            urlencoding::decode(normalized.trim_start_matches('/'))
+            percent_encoding::percent_decode_str(normalized.trim_start_matches('/'))
+                .decode_utf8()
                 .expect("classified URI path is valid UTF-8")
                 .into_owned(),
         )

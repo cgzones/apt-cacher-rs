@@ -63,7 +63,7 @@
 use std::{
     borrow::Cow,
     path::{Path, PathBuf},
-    string::FromUtf8Error,
+    str::Utf8Error,
 };
 
 use hashbrown::Equivalent;
@@ -785,7 +785,7 @@ pub(crate) enum ClassifyError<'a> {
     BadEncoding {
         kind: ValidateKind,
         raw: &'a str,
-        source: FromUtf8Error,
+        source: Utf8Error,
     },
     /// The decoded field value did not pass its `valid_*` validator.
     InvalidValue {
@@ -1164,7 +1164,7 @@ fn validate_directories(dirs: &str) -> Result<Option<Cow<'_, str>>, ClassifyErro
 /// allocation; callers needing an owned `String` (e.g. `RequestClass.mirror_path`)
 /// call `.into_owned()` at the move site.
 fn decode_validate(raw: &str, kind: ValidateKind) -> Result<Cow<'_, str>, ClassifyError<'_>> {
-    let decoded = match urlencoding::decode(raw) {
+    let decoded = match percent_encoding::percent_decode_str(raw).decode_utf8() {
         Ok(s) => s,
         Err(source) => {
             return Err(ClassifyError::BadEncoding { kind, raw, source });
