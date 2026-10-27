@@ -181,8 +181,7 @@
       for (const table of ACR.all(root, "table[data-table]")) {
         setupTable(table);
       }
-      const section = root.matches && root.matches("[data-section=metrics]") ?
-        root : (root.querySelector ? root.querySelector("[data-section=metrics]") : null);
+      const section = ACR.findWithin(root, "[data-section=metrics]");
       if (section) {
         setupMetrics(section);
       }

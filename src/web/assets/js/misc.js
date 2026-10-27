@@ -78,8 +78,7 @@
       window.setInterval(tick, TICK_MS);
     },
     enhance: function (root) {
-      const setup = root.matches && root.matches("[data-section=setup]") ?
-        root : (root.querySelector ? root.querySelector("[data-section=setup]") : null);
+      const setup = ACR.findWithin(root, "[data-section=setup]");
       if (setup) {
         copyButton(setup);
       }

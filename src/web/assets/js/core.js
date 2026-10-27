@@ -94,6 +94,13 @@ const ACR = (function () {
     return scope.querySelectorAll(selector);
   }
 
+  /* Enhancements start at document on load, or at a replaced section on
+   * refresh. Include the root itself when it is the requested section. */
+  function findWithin(scope, selector) {
+    return scope.matches && scope.matches(selector) ?
+      scope : (scope.querySelector ? scope.querySelector(selector) : null);
+  }
+
   function words(text) {
     return text.toLowerCase().split(/\s+/).filter(function (word) {
       return word !== "";
@@ -354,6 +361,7 @@ const ACR = (function () {
     el: el,
     svg: svg,
     all: all,
+    findWithin: findWithin,
     words: words,
     matches: matches,
     sectionOf: sectionOf,

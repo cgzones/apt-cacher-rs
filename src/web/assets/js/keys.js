@@ -132,8 +132,7 @@
       if (toolbar && !root.contains(toolbar)) {
         announceAll(toolbar);
       }
-      const footer = root.matches && root.matches("[data-section=footer]") ?
-        root : (root.querySelector ? root.querySelector("[data-section=footer]") : null);
+      const footer = ACR.findWithin(root, "[data-section=footer]");
       if (footer) {
         note(footer);
       }
