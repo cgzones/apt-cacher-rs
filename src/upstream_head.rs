@@ -160,36 +160,7 @@ pub(crate) fn resolve_body_framing<'a>(
         element.trim_matches([' ', '\t'])
     }
 
-    let mut transfer_encodings = Vec::new();
-    let mut content_lengths = Vec::new();
-    for (name, value) in fields {
-        if name.eq_ignore_ascii_case(TRANSFER_ENCODING.as_str()) {
-            transfer_encodings.push(value);
-        } else if name.eq_ignore_ascii_case(CONTENT_LENGTH.as_str()) {
-            content_lengths.push(value);
-        }
-    }
-
-    let mut codings = Vec::new();
-    for value in &transfer_encodings {
-        let value = std::str::from_utf8(value).map_err(|_err @ Utf8Error { .. }| {
-            "non-UTF-8 Transfer-Encoding from upstream".to_owned()
-        })?;
-        // Empty list elements are legal and carry nothing (RFC 9110 §5.6.1).
-        codings.extend(value.split(',').map(trim_ows).filter(|c| !c.is_empty()));
-    }
-    if !transfer_encodings.is_empty() {
-        return match codings.as_slice() {
-            [coding] if coding.eq_ignore_ascii_case("chunked") => Ok(BodyFraming::Chunked),
-            _ => Err(format!(
-                "unsupported Transfer-Encoding `{}` from upstream",
-                codings.join(", ").escape_debug()
-            )),
-        };
-    }
-
-    let mut content_length = None;
-    for value in content_lengths {
+    fn parse_length(value: &[u8], mut length: Option<u64>) -> Result<Option<u64>, String> {
         let value = std::str::from_utf8(value).map_err(|_err @ Utf8Error { .. }| {
             "non-UTF-8 Content-Length from upstream".to_owned()
         })?;
@@ -199,8 +170,7 @@ pub(crate) fn resolve_body_framing<'a>(
                 value.escape_debug()
             )
         };
-        // An empty element (`5,` or an empty value) is junk too: unlike a
-        // list field, `Content-Length` is a single `1*DIGIT`.
+        // An empty element is junk: Content-Length is a single 1*DIGIT.
         for element in value.split(',').map(trim_ows) {
             // `u64::from_str` alone would take a leading `+`.
             if element.is_empty() || !element.bytes().all(|b| b.is_ascii_digit()) {
@@ -209,17 +179,48 @@ pub(crate) fn resolve_body_framing<'a>(
             let len = element
                 .parse::<u64>()
                 .map_err(|_err @ ParseIntError { .. }| unparsable())?;
-            match content_length {
-                Some(prev) if prev != len => {
-                    return Err(format!(
-                        "conflicting Content-Length values {prev} and {len} from upstream"
-                    ));
-                }
-                Some(_) | None => content_length = Some(len),
+            if let Some(prev) = length
+                && prev != len
+            {
+                return Err(format!(
+                    "conflicting Content-Length values {prev} and {len} from upstream"
+                ));
             }
+            length = Some(len);
+        }
+        Ok(length)
+    }
+
+    let mut has_transfer_encoding = false;
+    let mut codings = Vec::new();
+    // Defer a length error: a later Transfer-Encoding still overrides it.
+    let mut content_length = Ok(None);
+    for (name, value) in fields {
+        if name.eq_ignore_ascii_case(TRANSFER_ENCODING.as_str()) {
+            has_transfer_encoding = true;
+            let value = std::str::from_utf8(value).map_err(|_err @ Utf8Error { .. }| {
+                "non-UTF-8 Transfer-Encoding from upstream".to_owned()
+            })?;
+            // Empty coding-list elements carry nothing.
+            codings.extend(value.split(',').map(trim_ows).filter(|c| !c.is_empty()));
+        } else if !has_transfer_encoding
+            && name.eq_ignore_ascii_case(CONTENT_LENGTH.as_str())
+            && let Ok(length) = &content_length
+        {
+            content_length = parse_length(value, *length);
         }
     }
-    Ok(content_length.map_or(BodyFraming::CloseDelimited, BodyFraming::ContentLength))
+    if has_transfer_encoding {
+        return match codings.as_slice() {
+            [coding] if coding.eq_ignore_ascii_case("chunked") => Ok(BodyFraming::Chunked),
+            _ => Err(format!(
+                "unsupported Transfer-Encoding `{}` from upstream",
+                codings.join(", ").escape_debug()
+            )),
+        };
+    }
+    content_length
+        .map(|length| length.map_or(BodyFraming::CloseDelimited, BodyFraming::ContentLength))
 }
 
 /// Which upstream header lines a relay drops: the hop-by-hop headers of RFC
@@ -823,6 +824,21 @@ mod tests {
             Ok(BodyFraming::ContentLength(5))
         );
         assert_eq!(resolve(&[]), Ok(BodyFraming::CloseDelimited));
+    }
+
+    #[test]
+    fn transfer_encoding_overrides_length_errors_in_either_header_order() {
+        for invalid in [&b"junk"[..], b"5, 6", b"+5", b"", b"\xff"] {
+            let length = ("Content-Length", invalid);
+            let coding = ("Transfer-Encoding", &b"chunked"[..]);
+            for fields in [[length, coding], [coding, length]] {
+                assert_eq!(
+                    resolve_body_framing(fields.into_iter()),
+                    Ok(BodyFraming::Chunked)
+                );
+            }
+            assert!(resolve_body_framing([length].into_iter()).is_err());
+        }
     }
 
     #[test]
