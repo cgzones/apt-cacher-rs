@@ -1779,7 +1779,6 @@ async fn splice_proxy_drive(
         conn_details.cached_flavor(),
         || appstate.active_downloads.upstream_slots(),
         total_content_length,
-        &mut rand::rng(),
     ) {
         log_nudge(conn_details, config, "splice proxy: ");
         // Spawn before writing the nudge, as the hyper backend does: a

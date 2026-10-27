@@ -21,10 +21,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rand::{
-    distr::{Alphanumeric, SampleString as _},
-    rngs::SmallRng,
-};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -602,7 +598,7 @@ pub(crate) async fn tokio_tempfile(
     path: &Path,
     mode: u32,
 ) -> Result<(tokio::fs::File, TempPath), CacheError> {
-    let mut rng: SmallRng = rand::make_rng();
+    let mut rng = fastrand::Rng::new();
 
     let mut buf = path.to_path_buf();
 
@@ -610,7 +606,9 @@ pub(crate) async fn tokio_tempfile(
     loop {
         const MAX_RETRIES: u32 = 10;
 
-        let s = Alphanumeric.sample_string(&mut rng, 6);
+        let s: String = std::iter::repeat_with(|| rng.alphanumeric())
+            .take(6)
+            .collect();
 
         assert!(
             buf.set_extension(s),

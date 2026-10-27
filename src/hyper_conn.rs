@@ -2650,7 +2650,6 @@ async fn serve_new_file_worker(
         conn_details.cached_flavor(),
         || appstate.active_downloads.upstream_slots(),
         total_content_length.upper(),
-        &mut rand::rng(),
     ) {
         log_nudge(conn_details, config, "");
         let response = nudge_head(config).into_hyper(full_body(NUDGE_BODY));

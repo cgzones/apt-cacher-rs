@@ -46,6 +46,7 @@ bytes = "1.6.0"
 clap = { version = "4.5.60", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
 coarsetime = "0.1.36"
 const-hex = { version = "1.19.3", default-features = false, features = ["alloc"] }
+fastrand = "2.3.0"
 futures-util = { version = "0.3.30", default-features = false, features = ["std"] }
 hashbrown = "0.17.0"
 http = "1.4.0"
@@ -68,7 +69,6 @@ openssl = { version = "0.10", optional = true }
 parking_lot = "0.13"
 pin-project = { version = "1.1.11", optional = true }
 percent-encoding = "2.3.2"
-rand = "0.10.1"
 rustls = { version = "0.23", optional = true }
 rustls-native-certs = { version = "0.8.4", optional = true }
 tokio-native-tls = { version = "0.3", optional = true }

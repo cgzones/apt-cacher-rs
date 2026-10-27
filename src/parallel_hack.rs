@@ -14,7 +14,6 @@
 
 use std::num::NonZero;
 
-use rand::distr::{Bernoulli, Distribution as _};
 use tracing::debug;
 
 use crate::cache_layout::{CachedFlavor, ConnectionDetails};
@@ -46,7 +45,6 @@ pub(crate) fn should_nudge(
     flavor: CachedFlavor,
     curr_downloads: impl FnOnce() -> usize,
     total_upper: NonZero<u64>,
-    rng: &mut impl rand::Rng,
 ) -> bool {
     if flavor == CachedFlavor::Volatile || !config.experimental_parallel_hack_enabled {
         return false;
@@ -72,8 +70,8 @@ pub(crate) fn should_nudge(
     let p = (curr_downloads.saturating_sub(1) as f64)
         .mul_add(-config.experimental_parallel_hack_factor, 1.0)
         .max(0.0);
-    let d = Bernoulli::new(p).expect("p is valid");
-    d.sample(rng)
+    // `f64()` is uniform in [0, 1): a probability of 1 always nudges, 0 never.
+    fastrand::f64() < p
 }
 
 /// The head of the nudge response: the configured status code, the configured
@@ -110,7 +108,6 @@ pub(crate) fn log_nudge(conn_details: &ConnectionDetails, config: &Config, prefi
 #[cfg(test)]
 mod tests {
     use http::StatusCode;
-    use rand::{SeedableRng as _, rngs::StdRng};
 
     use super::*;
     use crate::nonzero;
@@ -125,10 +122,6 @@ mod tests {
         config
     }
 
-    fn rng() -> StdRng {
-        StdRng::seed_from_u64(0x5eed_1234)
-    }
-
     /// `should_nudge` is sampled repeatedly so a probability of exactly 0 or 1
     /// is asserted as such rather than as a single lucky draw.
     fn nudges(
@@ -137,8 +130,7 @@ mod tests {
         curr: usize,
         total: NonZero<u64>,
     ) -> Vec<bool> {
-        let mut rng = rng();
-        std::iter::repeat_with(|| should_nudge(config, flavor, || curr, total, &mut rng))
+        std::iter::repeat_with(|| should_nudge(config, flavor, || curr, total))
             .take(64)
             .collect()
     }
@@ -246,14 +238,12 @@ mod tests {
         // curr=2, factor=0.5: p = 1 - (2-1)*0.5 = 0.5.
         let mut config = enabled_config();
         config.experimental_parallel_hack_factor = 0.5;
-        let mut rng = rng();
         let draws: Vec<bool> = std::iter::repeat_with(|| {
             should_nudge(
                 &config,
                 CachedFlavor::Permanent,
                 || 2,
                 nonzero!(1_000_000_u64),
-                &mut rng,
             )
         })
         .take(256)
@@ -283,7 +273,6 @@ mod tests {
             CachedFlavor::Permanent,
             probe,
             nonzero!(1_000_000_u64),
-            &mut rng(),
         );
         assert!(
             !called.get(),
@@ -296,7 +285,6 @@ mod tests {
             CachedFlavor::Volatile,
             probe,
             nonzero!(1_000_000_u64),
-            &mut rng(),
         );
         assert!(
             !called.get(),
@@ -304,13 +292,7 @@ mod tests {
         );
 
         for size in [nonzero!(1_u64), nonzero!(1024_u64)] {
-            assert!(!should_nudge(
-                &config,
-                CachedFlavor::Permanent,
-                probe,
-                size,
-                &mut rng(),
-            ));
+            assert!(!should_nudge(&config, CachedFlavor::Permanent, probe, size));
             assert!(
                 !called.get(),
                 "curr_downloads must not be called at or below the size threshold"
