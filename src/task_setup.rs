@@ -1,8 +1,8 @@
 //! One-time cache-directory preparation, run from `main` before the tokio
 //! runtime starts: create the directory, take the single-instance
 //! `flock(2)`, probe for the timestamp and extended-attribute support the
-//! cache relies on, and purge the scratch directory an unclean shutdown
-//! left behind.
+//! cache relies on, purge the scratch directory an unclean shutdown left
+//! behind, and remove the empty scratch directory of a pre-rename version.
 //!
 //! The returned lock is held for the process lifetime; dropping it early
 //! would admit a second instance onto the same cache. [`task_setup`] is the
@@ -237,7 +237,75 @@ fn prepare_cache_dir(cache_path: &Path) -> Result<Flock<std::fs::File>, SetupErr
         );
     }
 
+    // Read after `main` exported its default, so this is the directory
+    // SQLite will actually use.
+    let sqlite_tmpdir = std::env::var_os("SQLITE_TMPDIR");
+    remove_legacy_scratch_dir(cache_path, sqlite_tmpdir.as_deref().map(Path::new));
+
     Ok(cache_lock)
+}
+
+/// Root scratch directory name up to v0.8.0, since replaced by
+/// `cache_paths::SUBDIR_SCRATCH`.  Equal to `SUBDIR_TMP` by coincidence
+/// only: that one names the per-mirror partials directory.
+///
+/// TODO: drop the cleanup a few releases after v0.9.0.
+const LEGACY_SCRATCH_DIR: &str = "tmp";
+
+/// Remove the root scratch directory a v0.8.0 instance left behind, which the
+/// cache scan would otherwise report as an unregistered host on every run.
+///
+/// Only an empty directory is removed: `tmp` is also a valid host name, so a
+/// non-empty one may hold cached files and is left for the scan to report and
+/// the operator to inspect.  An empty one holds nothing either way, and a
+/// host named `tmp` recreates it on its next download.  Runs under the
+/// instance lock before any download starts, so nothing races the removal.
+/// Failures only warn: the leftover is cosmetic and must not block startup.
+///
+/// An operator may have pointed `SQLITE_TMPDIR` (`sqlite_tmpdir`) at the old
+/// directory; it is kept then, as SQLite would otherwise lose its only
+/// writable temp location on a hardened host.
+fn remove_legacy_scratch_dir(cache_path: &Path, sqlite_tmpdir: Option<&Path>) {
+    let path = cache_path.join(LEGACY_SCRATCH_DIR);
+    if sqlite_tmpdir.is_some_and(|tmpdir| same_dir(tmpdir, &path)) {
+        info!(
+            "Keeping former scratch directory `{}`: SQLITE_TMPDIR points at it",
+            path.display()
+        );
+        return;
+    }
+    // `rmdir(2)` never follows a symlink, it fails with `ENOTDIR` instead.
+    match std::fs::remove_dir(&path) {
+        Ok(()) => info!(
+            "Removed empty former scratch directory `{}`",
+            path.display()
+        ),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotADirectory => warn!(
+            "Former scratch directory `{}` is not a directory; leaving it in place for manual inspection",
+            path.display()
+        ),
+        Err(err) => warn!(
+            "Failed to remove former scratch directory `{}`; leaving it in place:  {}",
+            path.display(),
+            ErrorReport(&err)
+        ),
+    }
+}
+
+/// Whether `a` resolves to the same inode as `b`, which is not followed:
+/// catches a relative, symlinked or trailing-slash spelling of the path.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    match (std::fs::metadata(a), std::fs::symlink_metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -286,6 +354,62 @@ mod tests {
             err.to_string().contains("read directory"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn legacy_scratch_dir_is_removed_only_when_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let legacy = tmp.path().join(LEGACY_SCRATCH_DIR);
+
+        // Missing: nothing to do.
+        remove_legacy_scratch_dir(tmp.path(), None);
+
+        std::fs::create_dir(&legacy).expect("create legacy dir");
+        remove_legacy_scratch_dir(tmp.path(), None);
+        assert!(!legacy.exists(), "an empty former scratch dir is removed");
+
+        // Possibly a host named `tmp`: its contents are never touched.
+        let cached = legacy.join("debian/pool/main/f/foo/foo_1_all.deb");
+        std::fs::create_dir_all(cached.parent().expect("parent")).expect("create mirror dir");
+        std::fs::write(&cached, b"x").expect("write cached file");
+        remove_legacy_scratch_dir(tmp.path(), None);
+        assert!(cached.exists(), "a non-empty former scratch dir is kept");
+    }
+
+    #[test]
+    fn legacy_scratch_dir_is_kept_as_sqlite_tmpdir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let legacy = tmp.path().join(LEGACY_SCRATCH_DIR);
+        std::fs::create_dir(&legacy).expect("create legacy dir");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&legacy, &link).expect("symlink");
+
+        for spelling in [legacy.clone(), legacy.join(""), link] {
+            remove_legacy_scratch_dir(tmp.path(), Some(&spelling));
+            assert!(legacy.is_dir(), "kept for SQLITE_TMPDIR={spelling:?}");
+        }
+
+        remove_legacy_scratch_dir(tmp.path(), Some(&tmp.path().join("elsewhere")));
+        assert!(
+            !legacy.exists(),
+            "an unrelated SQLITE_TMPDIR does not keep it"
+        );
+    }
+
+    #[test]
+    fn legacy_scratch_dir_symlink_is_not_followed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("elsewhere");
+        std::fs::create_dir(&target).expect("create target");
+        let legacy = tmp.path().join(LEGACY_SCRATCH_DIR);
+        std::os::unix::fs::symlink(&target, &legacy).expect("symlink");
+
+        remove_legacy_scratch_dir(tmp.path(), None);
+        assert!(
+            legacy.symlink_metadata().is_ok(),
+            "the symlink is left in place"
+        );
+        assert!(target.is_dir(), "the symlink target is left in place");
     }
 
     #[test]
