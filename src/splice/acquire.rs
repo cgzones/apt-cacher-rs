@@ -529,7 +529,10 @@ pub(super) async fn follow_redirect(
         },
         NonZero::get,
     );
-    let dial_endpoint = conn_details.upstream_endpoint();
+    // The endpoint that answered, not the request's mirror: on the
+    // `discard_partial_and_retry` refetch this response came from an earlier
+    // redirect's target.
+    let dial_endpoint = exchange.conn.endpoint();
     let original_port_effective = endpoint_port(dial_endpoint, exchange.conn.is_tls());
     if redirect_scheme == exchange.conn.scheme()
         && moved_domain == *dial_endpoint.host

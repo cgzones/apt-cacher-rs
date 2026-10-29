@@ -229,6 +229,14 @@ pub(super) fn endpoint_port(endpoint: UpstreamEndpoint<'_>, is_tls: bool) -> u16
         .map_or(if is_tls { 443 } else { 80 }, NonZero::get)
 }
 
+/// The inverse of [`endpoint_port`]: a dialled port as an endpoint names it,
+/// `None` for the default of the connection's own scheme, like a [`Mirror`]
+/// named without a port. An explicit `:443` would otherwise reach the `Host`
+/// header and the authority of a URI resolved against the connection.
+fn named_port(port: u16, is_tls: bool) -> Option<NonZero<u16>> {
+    NonZero::new(port).filter(|port| port.get() != if is_tls { 443 } else { 80 })
+}
+
 /// What [`pool_checkout`] found for a key.
 #[cfg_attr(
     feature = "tls_rustls",
@@ -391,6 +399,16 @@ impl ResponseBody {
             host,
             port,
             keep_alive,
+        }
+    }
+
+    /// The endpoint this response came from: after a followed redirect the
+    /// redirect target, not the request's mirror. Its port is `None` for the
+    /// scheme's default ([`named_port`]).
+    pub(super) fn endpoint(&self) -> UpstreamEndpoint<'_> {
+        UpstreamEndpoint {
+            host: &self.host,
+            port: named_port(self.port, self.conn.is_tls()),
         }
     }
 
@@ -930,6 +948,27 @@ mod tests {
         assert_eq!(label(false, true), " (reused)");
         assert_eq!(label(true, false), " (TLS)");
         assert_eq!(label(true, true), " (TLS, reused)");
+    }
+
+    #[test]
+    fn named_port_drops_only_the_connections_own_default() {
+        let host = ClientHost::new("mirror.example").unwrap();
+        for (port, is_tls, named) in [
+            (80, false, None),
+            (443, true, None),
+            (443, false, Some(443)),
+            (80, true, Some(80)),
+            (8080, false, Some(8080)),
+            (8443, true, Some(8443)),
+        ] {
+            let named = named.and_then(NonZero::new);
+            assert_eq!(named_port(port, is_tls), named, "{port} tls={is_tls}");
+            let endpoint = UpstreamEndpoint {
+                host: &host,
+                port: named,
+            };
+            assert_eq!(endpoint_port(endpoint, is_tls), port, "round trip");
+        }
     }
 
     #[test]
