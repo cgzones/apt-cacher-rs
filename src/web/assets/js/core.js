@@ -333,7 +333,6 @@ const ACR = (function () {
         return value.toFixed(digits) + units[i];
       }
     }
-    return String(bytes);
   }
 
   /* `fmt::Age`: the most significant unit only. */
