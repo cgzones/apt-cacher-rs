@@ -367,7 +367,6 @@ const ACR = (function () {
     sectionOf: sectionOf,
     keepScroll: keepScroll,
     state: state,
-    parseState: parseState,
     href: href,
     setState: setState,
     onState: onState,
