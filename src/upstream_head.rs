@@ -314,14 +314,14 @@ impl<'a> UpstreamHead<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ResumeState<'a> {
     /// Bytes already on disk; the requested range starts here.
-    pub(crate) offset: NonZero<u64>,
+    offset: NonZero<u64>,
     /// Total size recorded when the partial was started, if the xattr
     /// survived; a 206 whose `Content-Range` total differs means the upstream
     /// file was replaced.
-    pub(crate) expected_total: Option<u64>,
+    expected_total: Option<u64>,
     /// The stored `ETag` the request sent as `If-Range`; a 206 naming a
     /// different one is not the representation the partial holds.
-    pub(crate) if_range: Option<&'a str>,
+    if_range: Option<&'a str>,
 }
 
 impl<'a> ResumeState<'a> {

@@ -184,7 +184,7 @@ pub(crate) struct MirrorStatEntry {
     pub(crate) host: ClientHost,
     /// Raw port from database. `0` means no explicit port; use `port()` to get `Option<NonZero<u16>>`.
     port: u16,
-    pub(crate) path: String,
+    path: String,
     /// Raw `mirrors_v2.kind` (INTEGER) value; decoded on demand by
     /// [`decode_mirror_kind`].
     kind: i64,

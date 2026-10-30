@@ -200,7 +200,7 @@ pub(crate) struct PartialResume {
 impl PartialResume {
     /// A permanent file with no partial to resume: the download starts at
     /// byte 0 on the deterministic partial path `guard` reserves.
-    pub(crate) fn fresh(guard: TempPath) -> Self {
+    fn fresh(guard: TempPath) -> Self {
         Self {
             offset: 0,
             expected_total: None,
@@ -748,7 +748,7 @@ async fn open_partial_file(
 /// left behind) is unlinked and replaced, not truncated: the download must
 /// start on a new inode, or it would inherit the old attempt's creation date
 /// -- which a synthesized `Last-Modified` reports -- and any xattrs it wrote.
-pub(crate) async fn create_partial_file(
+async fn create_partial_file(
     guard: TempPath,
     mode: u32,
 ) -> Result<(tokio::fs::File, TempPath), CacheError> {

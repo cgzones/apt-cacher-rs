@@ -78,7 +78,7 @@ impl Declined {
     /// The status + body a joiner answers with: the originator's own answer,
     /// except that a relayed upstream body cannot be replayed.
     #[must_use]
-    pub(crate) fn response_parts(self) -> (StatusCode, &'static str) {
+    fn response_parts(self) -> (StatusCode, &'static str) {
         match self {
             Self::Passthrough(status) => (status, status.canonical_reason().unwrap_or("")),
             Self::Rejected(reason) => (StatusCode::BAD_GATEWAY, reason.body()),

@@ -30,7 +30,7 @@ const PROC_SELF_FD: &str = "/proc/self/fd";
 /// `stat(2)`; an older kernel reports 0 there, and the listing is counted
 /// instead. `/proc` is no cache path, so neither goes through `cache_walk`.
 #[must_use]
-pub(crate) fn open_fds() -> Option<u64> {
+fn open_fds() -> Option<u64> {
     let dir = Path::new(PROC_SELF_FD);
     match std::fs::metadata(dir) {
         Ok(mdata) if mdata.size() > 0 => Some(mdata.size()),

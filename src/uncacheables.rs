@@ -17,8 +17,8 @@ pub(crate) const UNCACHEABLES_MAX: NonZero<usize> = nonzero!(20);
 /// path it asked for. The port is part of the identity, as a mirror's is.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Uncacheable {
-    pub(crate) host: ClientHost,
-    pub(crate) port: Option<NonZero<u16>>,
+    host: ClientHost,
+    port: Option<NonZero<u16>>,
     pub(crate) path: String,
 }
 

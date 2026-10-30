@@ -105,7 +105,7 @@ impl CleanupMarker {
     /// marker built from a mismatched pair renders a value that never parses
     /// back and silently disables the memo. Both writers pass the digest they
     /// just compared against, so the pairing is structural today.
-    pub(crate) fn new(identity: FileIdentity, algo: HashAlgo, expected: &[u8]) -> Self {
+    fn new(identity: FileIdentity, algo: HashAlgo, expected: &[u8]) -> Self {
         debug_assert_eq!(
             expected.len(),
             match algo {
@@ -123,7 +123,7 @@ impl CleanupMarker {
 
     /// Whether the marker was stamped for exactly this file identity and
     /// expected digest. A legacy marker never matches.
-    pub(crate) fn matches(&self, identity: FileIdentity, algo: HashAlgo, expected: &[u8]) -> bool {
+    fn matches(&self, identity: FileIdentity, algo: HashAlgo, expected: &[u8]) -> bool {
         let Self {
             identity: stamped,
             algo: my_algo,

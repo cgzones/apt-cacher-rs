@@ -53,7 +53,7 @@ pub(crate) enum Severity {
 /// mirror must not flood WARN); Body failures are ungated (each stalling mirror is operator
 /// signal).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Phase {
+enum Phase {
     Connect,
     Head,
     Body,
@@ -347,7 +347,7 @@ impl UpstreamError {
         )
     }
 
-    pub(crate) fn phase(&self) -> Phase {
+    fn phase(&self) -> Phase {
         match self.failure.phase {
             UpstreamPhase::Connect {
                 attempts: _,
@@ -605,7 +605,7 @@ pub(crate) enum DownloadFailure {
 impl DownloadFailure {
     /// Base severity, before [`Self::conclude`] applies connect/head flood
     /// control.
-    pub(crate) fn severity(&self) -> Severity {
+    fn severity(&self) -> Severity {
         match self {
             Self::Cancelled => Severity::Info,
             Self::Upstream(_) => Severity::Warn,
@@ -712,7 +712,7 @@ impl DeliveryFailure {
     /// The level this failure is reported at, wherever it lands. A shared
     /// download carries the severity of the failure it wraps, so a joiner and
     /// the writer report the same cause at the same level.
-    pub(crate) fn severity(&self) -> Severity {
+    fn severity(&self) -> Severity {
         match self {
             Self::Client(error) => {
                 if error.is_peer_disconnect() || error.is_timeout() {

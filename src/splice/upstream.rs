@@ -500,7 +500,7 @@ impl UpstreamConn {
     ///    uninterpreted ([`Liveness::Uninterpreted`]) and the connection
     ///    untrusted. The no-op waker leaves the readiness state intact for
     ///    the real read that may follow.
-    pub(super) fn check_alive(&mut self, host: &ClientHost, port: u16) -> bool {
+    fn check_alive(&mut self, host: &ClientHost, port: u16) -> bool {
         if let Self::Tls(tls) = self
             && let Some(verdict) = tls_session_liveness(tls)
         {
@@ -762,7 +762,7 @@ pub(super) async fn connect_upstream(
 /// Times out after the configured HTTP timeout; a timeout counts in
 /// `HTTP_TIMEOUT_UPSTREAM_CONNECT` per attempt, a request whose connect fails
 /// for good once more in `UPSTREAM_CONNECT_FAILED` when its failure concludes.
-pub(super) async fn tcp_connect(host: &ClientHost, port: u16) -> std::io::Result<TcpStream> {
+async fn tcp_connect(host: &ClientHost, port: u16) -> std::io::Result<TcpStream> {
     upstream_dial::connect(host.as_str(), port, global_config().http_timeout)
         .await
         .map_err(|err| {

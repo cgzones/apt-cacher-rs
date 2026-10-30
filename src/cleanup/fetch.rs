@@ -56,7 +56,7 @@ pub(super) enum DebnameKind<'a> {
 
 impl DebnameKind<'_> {
     /// The fetched index's resource kind also determines its cache layout.
-    pub(super) const fn resource_kind(&self) -> ResourceKind {
+    const fn resource_kind(&self) -> ResourceKind {
         match self {
             Self::OriginScoped { .. } => ResourceKind::Packages,
             Self::Flat => ResourceKind::FlatMetadata,

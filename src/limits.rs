@@ -75,7 +75,7 @@ pub(crate) const MAX_COMPRESSED_PACKAGES_SIZE: NonZero<u64> = nonzero!(128 * 102
 pub(crate) const MAX_RELEASE_SIZE: NonZero<u64> = nonzero!(8 * 1024 * 1024);
 
 /// Maximum decompressed-to-compressed ratio tolerated for a `Packages` file.
-pub(crate) const MAX_DECOMPRESSION_RATIO: NonZero<u64> = nonzero!(100);
+const MAX_DECOMPRESSION_RATIO: NonZero<u64> = nonzero!(100);
 
 /// Largest LZMA2 dictionary an `.xz` index may declare, 64 MiB (`xz -9`;
 /// Debian's archive tooling uses `-6`, 8 MiB).  The decoder allocates and

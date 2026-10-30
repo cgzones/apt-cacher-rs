@@ -581,7 +581,7 @@ impl CacheMetadataStore {
     /// Number of currently cached entries (the dashboard reads
     /// [`Self::footprint`]).
     #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.inner.read().map.len()
     }
 

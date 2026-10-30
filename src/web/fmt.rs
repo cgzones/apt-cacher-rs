@@ -106,7 +106,7 @@ impl Display for Age {
 /// A duration in its two most significant units: `2 h 13 min`, `45 s`,
 /// `3 d 4 h`. For accumulated spans (time spent at a cap), where the second
 /// unit is what tells two readings apart.
-pub(super) struct Span(pub(super) u64);
+struct Span(u64);
 impl Display for Span {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         const MIN: u64 = 60;
@@ -707,7 +707,7 @@ impl RatioClass {
     /// Construct a `RatioClass` from a ratio of `value` to `limit`. Uses
     /// integer arithmetic only.
     #[must_use]
-    pub(super) const fn new(value: u64, limit: u64) -> Self {
+    const fn new(value: u64, limit: u64) -> Self {
         if limit == 0 {
             return Self::Normal;
         }

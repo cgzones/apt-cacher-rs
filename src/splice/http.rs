@@ -455,7 +455,7 @@ impl UpstreamResponse {
 
     /// The body's fixed length, only when the response is length-delimited
     /// (`Content-Length`). `None` for chunked or close-delimited framing.
-    pub(super) fn content_length(&self) -> Option<u64> {
+    fn content_length(&self) -> Option<u64> {
         match self.framing {
             BodyFraming::ContentLength(n) => Some(n),
             BodyFraming::Chunked | BodyFraming::CloseDelimited => None,

@@ -176,7 +176,7 @@ impl ResourceKind {
     /// `Volatile`; pool packages and content-addressed by-hash blobs are
     /// `Permanent`.
     #[must_use]
-    pub(crate) const fn cached_flavor(self) -> CachedFlavor {
+    const fn cached_flavor(self) -> CachedFlavor {
         match self {
             Self::Pool | Self::ByHash(..) | Self::FlatPool | Self::FlatByHash(..) => {
                 CachedFlavor::Permanent

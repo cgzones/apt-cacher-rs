@@ -53,7 +53,7 @@ impl HttpDate {
 
     /// Current wall-clock time truncated to whole seconds.
     #[must_use]
-    pub(crate) fn now() -> Self {
+    fn now() -> Self {
         Self::clamped(coarsetime::Clock::now_since_epoch().as_secs())
     }
 

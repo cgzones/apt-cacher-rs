@@ -165,7 +165,7 @@ impl ConfigDomainName {
     /// The one host an exact entry names; `None` for a wildcard.
     #[must_use]
     #[inline]
-    pub(crate) const fn host(&self) -> Option<&DomainName> {
+    const fn host(&self) -> Option<&DomainName> {
         match self {
             Self(ConfigDomainNameInner::Exact(host)) => Some(host),
             Self(ConfigDomainNameInner::Wildcard(_)) => None,

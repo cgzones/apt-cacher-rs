@@ -284,8 +284,8 @@ fn series_path<'a>(scope: &'a str, label: &'a str) -> impl Display + 'a {
 /// what the page paints.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct Highlights {
-    pub(super) alerts: usize,
-    pub(super) warnings: usize,
+    alerts: usize,
+    warnings: usize,
 }
 
 impl Highlights {
@@ -549,7 +549,7 @@ impl Entry<'_> {
     }
 
     /// [`Self::figure`] for a byte counter (`data-unit="B"`).
-    pub(super) fn bytes(mut self, value: u64) -> Self {
+    fn bytes(mut self, value: u64) -> Self {
         self.figure = Some((value, Unit::Bytes));
         self
     }

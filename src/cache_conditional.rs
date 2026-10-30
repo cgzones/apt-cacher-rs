@@ -69,8 +69,8 @@ pub(crate) fn volatile_freshness(
 pub(crate) struct RangeRequestHeaders<'a> {
     pub(crate) range: Option<&'a str>,
     pub(crate) if_range: Option<&'a str>,
-    pub(crate) if_none_match: Option<Cow<'a, str>>,
-    pub(crate) if_modified_since: Option<&'a str>,
+    if_none_match: Option<Cow<'a, str>>,
+    if_modified_since: Option<&'a str>,
 }
 
 impl<'a> RangeRequestHeaders<'a> {

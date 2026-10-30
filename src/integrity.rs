@@ -124,7 +124,7 @@ struct VerifyInput<'a> {
     /// Used only if its algorithm is the one the expected digest needs *and*
     /// it covered as many bytes as the finished file holds; otherwise, and
     /// when `None`, the file is re-read and hashed.
-    pub(crate) streamed: Option<StreamedDigest>,
+    streamed: Option<StreamedDigest>,
 }
 
 /// What the downloaded temp file is verified against. The resource-kind ->
@@ -1989,7 +1989,7 @@ fn registry_lookup_key<'a>(
 /// them.
 #[cfg(feature = "splice")]
 #[must_use]
-pub(crate) fn stream_hash_algo(
+fn stream_hash_algo(
     resource_kind: ResourceKind,
     registry_hit: bool,
     verify_enabled: bool,
@@ -2073,10 +2073,9 @@ async fn sniff_packages_compression(path: &Path) -> std::io::Result<PackagesComp
 /// `(Filename, SHA256)` pair into `registry`. Best-effort: a malformed file
 /// just yields fewer entries; errors are logged and returned.
 ///
-/// Guards against decompression bombs: total decompressed output is capped at
-/// the smaller of [`crate::limits::MAX_DECOMPRESSED_PACKAGES_SIZE`] and the
-/// compressed file size multiplied by
-/// [`crate::limits::MAX_DECOMPRESSION_RATIO`] (mirroring `cleanup/packages.rs`).
+/// Guards against decompression bombs: [`crate::limits::decompressed_limit`]
+/// caps total decompressed output using the absolute and expansion-ratio limits
+/// (mirroring `cleanup/packages.rs`).
 /// Per-line length is capped at [`crate::limits::MAX_METADATA_LINE_LEN`].
 /// Hitting either cap stops ingestion gracefully (the registry is just
 /// less-populated).

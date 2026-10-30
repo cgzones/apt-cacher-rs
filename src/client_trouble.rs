@@ -64,7 +64,7 @@ pub(crate) struct ClientTrouble {
     /// The total of the entry this one displaced: an upper bound on the
     /// events this client may have caused before it was tracked. 0 for a
     /// client tracked since its first event.
-    pub(crate) inherited: u64,
+    inherited: u64,
 }
 
 impl ClientTrouble {
@@ -90,7 +90,7 @@ impl ClientTrouble {
     /// The weight the table ranks by: the counted events plus the inherited
     /// estimate.
     #[must_use]
-    pub(crate) const fn total(&self) -> u64 {
+    const fn total(&self) -> u64 {
         self.slow
             + self.disconnect
             + self.cap_refused

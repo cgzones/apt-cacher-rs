@@ -179,7 +179,7 @@ impl Equivalent<SchemeKey> for SchemeKeyRef<'_> {
 /// How long a learned HTTP scheme is remembered before the host is treated
 /// as uncached again, so `Auto` mode probes HTTPS anew. Learned HTTPS is not
 /// aged.
-pub(crate) const HTTP_SCHEME_TTL: coarsetime::Duration = coarsetime::Duration::from_secs(60 * 60);
+const HTTP_SCHEME_TTL: coarsetime::Duration = coarsetime::Duration::from_secs(60 * 60);
 
 /// A cache entry: the scheme and when it was learned.
 #[derive(Clone, Copy, Debug)]

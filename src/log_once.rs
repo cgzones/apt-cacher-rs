@@ -50,7 +50,7 @@ impl KeyedGate {
     /// `true` on `key`'s first use while fewer than `cap` keys have fired.
     /// Only failure paths consult it, so a linear scan over at most `cap`
     /// keys under the lock costs nothing that matters.
-    pub(crate) fn first_fire(&self, key: &str) -> bool {
+    fn first_fire(&self, key: &str) -> bool {
         let mut fired = self.fired.lock();
         if fired.len() >= self.cap || fired.iter().any(|seen| **seen == *key) {
             return false;

@@ -127,22 +127,22 @@ impl CleanupDone {
 /// discrepancy` warn).
 #[derive(Clone, Copy, Default)]
 pub(super) struct UnitStats {
-    pub scanned: u64,
-    pub removed: u64,
-    pub bytes_removed: u64,
+    scanned: u64,
+    removed: u64,
+    bytes_removed: u64,
     /// Subset of `removed` deleted as unreferenced-but-covered by-hash files,
     /// summed by [`run_mirror_units`] into `CleanupDone::removed_unreferenced`
     /// and surfaced as `CLEANUP_BYHASH_UNREFERENCED` by the orchestrator.
-    pub removed_unreferenced: u64,
+    removed_unreferenced: u64,
     /// Bytes of the regular files a `tmp/` reap unlinked (kept partials and
     /// foreign files). The quota counts them like cached files, so the
     /// reconcile subtracts them, but they are not cache evictions: kept out
     /// of `removed`/`bytes_removed` and the metrics fed from those.
-    pub tmp_bytes_removed: u64,
+    tmp_bytes_removed: u64,
     /// Reconcile sweeps bailed for an incomplete reference set (an index that
     /// could not be fetched, parsed or looked up): nothing of that tree is
     /// reclaimed this cycle, which the dashboard labels as a failed step.
-    pub bailed: u64,
+    bailed: u64,
     /// Entries the unit left in place, or directories it left unread, on a
     /// cache I/O failure (an unreadable file type, metadata or timestamp, a
     /// failed unlink or verification), each logged and counted

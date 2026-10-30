@@ -168,14 +168,12 @@ struct FailedRequest {
 /// A terminal [`request_with_retry`] failure carrying the retry context and
 /// the request identity its report needs. `limit` is `Some` only when the
 /// connect-retry loop ran out of budget, which is exactly what separates a
-/// [`Phase::Connect`] failure from a head-phase transport failure — so the
+/// connect-phase failure from a head-phase transport failure — so the
 /// phase is derived here once instead of being guessed at every call site.
 ///
 /// The payload is boxed because it is well past `clippy::result_large_err`'s
 /// threshold and would otherwise widen every `request_with_retry` `Result`,
 /// success path included.
-///
-/// [`Phase::Connect`]: crate::transfer_error::Phase::Connect
 #[derive(Debug)]
 pub(crate) struct RequestFailure(Box<FailedRequest>);
 
