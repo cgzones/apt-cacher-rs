@@ -79,7 +79,7 @@ impl DebnameKind<'_> {
         }
     }
 
-    pub(super) fn index_name(&self, fmt: PackagesCompression) -> String {
+    fn index_name(&self, fmt: PackagesCompression) -> String {
         match self {
             Self::OriginScoped {
                 distribution,

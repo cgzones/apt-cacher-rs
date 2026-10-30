@@ -215,7 +215,7 @@ impl ResourceKind {
     /// `Volatile` kinds, `Package` the permanent pool layouts and `ByHash` the
     /// permanent by-hash ones (a unit test pins the agreement).
     #[must_use]
-    pub(crate) const fn lookup_bucket(self) -> LookupBucket {
+    const fn lookup_bucket(self) -> LookupBucket {
         match self {
             Self::Pool | Self::FlatPool => LookupBucket::Package,
             Self::ByHash(..) | Self::FlatByHash(..) => LookupBucket::ByHash,
@@ -236,7 +236,7 @@ impl ResourceKind {
 /// miss rate points at clients naming one archive under different mirrors
 /// (`aliases`), a by-hash one at index churn.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum LookupBucket {
+enum LookupBucket {
     /// A `.deb` from a structured or flat pool: `PACKAGE_HITS` /
     /// `PACKAGE_MISSES` under `CACHE_HITS` / `CACHE_MISSES`.
     Package,

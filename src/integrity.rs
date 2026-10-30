@@ -1790,16 +1790,16 @@ enum IngestKind {
 
 /// The facts that decide whether and how a cached file is ingested, taken
 /// from a commit's `RenamePlan` or from a request answered from cache.
-pub(crate) struct IndexFile<'a> {
-    pub(crate) resource_kind: ResourceKind,
+struct IndexFile<'a> {
+    resource_kind: ResourceKind,
     /// On-disk leaf name (`_`-joined for structured `Packages`).
-    pub(crate) debname: &'a str,
+    debname: &'a str,
     /// The raw request URI path (`Release`'s directory comes from it).
-    pub(crate) raw_uri_path: &'a str,
+    raw_uri_path: &'a str,
     /// The canonical mirror; its host and path are the registry scope.
-    pub(crate) mirror: &'a Mirror,
+    mirror: &'a Mirror,
     /// The cache file the ingest reads; the ledger key.
-    pub(crate) path: &'a Path,
+    path: &'a Path,
 }
 
 impl<'a> From<&'a RenamePlan> for IndexFile<'a> {

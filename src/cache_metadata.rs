@@ -468,7 +468,7 @@ impl std::fmt::Debug for CacheMetadataStore {
 
 impl CacheMetadataStore {
     #[must_use]
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self {
             inner: parking_lot::RwLock::new(Inner {
                 map: HashMap::new(),

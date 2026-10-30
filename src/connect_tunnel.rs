@@ -53,8 +53,8 @@ use crate::{
 /// `[2001:db8::1]:443`), and its port.
 #[derive(Clone, Debug)]
 pub(crate) struct TunnelTarget {
-    pub(crate) host: DomainName,
-    pub(crate) port: NonZero<u16>,
+    host: DomainName,
+    port: NonZero<u16>,
 }
 
 impl TunnelTarget {
@@ -62,7 +62,7 @@ impl TunnelTarget {
     /// address without brackets, which a resolver would read as a name) and
     /// the port.
     #[must_use]
-    pub(crate) fn dial_addr(&self) -> (&str, u16) {
+    fn dial_addr(&self) -> (&str, u16) {
         let Self { host, port } = self;
         (host.as_str(), port.get())
     }
@@ -265,7 +265,7 @@ pub(crate) fn validate_connect_target(
 
 /// Why [`copy_bidirectional_idle`] stopped relaying.
 #[derive(Debug)]
-pub(crate) enum TunnelCopyError {
+enum TunnelCopyError {
     /// No byte crossed the tunnel in either direction for the idle timeout.
     Idle(Duration),
     /// A read or write on either side failed.
@@ -281,8 +281,8 @@ pub(crate) struct TunnelOutcome {
     /// forwarded itself before the relay started (see `run_connect_tunnel`).
     pub(crate) from_client: u64,
     /// Bytes written to the client from the upstream.
-    pub(crate) from_server: u64,
-    pub(crate) end: Result<(), TunnelCopyError>,
+    from_server: u64,
+    end: Result<(), TunnelCopyError>,
 }
 
 /// Relay `client` and `upstream` into each other until one side closes or

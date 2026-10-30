@@ -70,9 +70,9 @@ impl Scheme {
 
 /// Owned `(host, port)` key for the scheme cache.
 #[derive(Debug, Eq, Hash, PartialEq)]
-pub(crate) struct SchemeKey {
-    pub(crate) host: String,
-    pub(crate) port: Option<u16>,
+struct SchemeKey {
+    host: String,
+    port: Option<u16>,
 }
 
 /// Borrowed lookup key, so hot-path reads avoid allocating a `SchemeKey`.
@@ -130,7 +130,7 @@ impl<'a> From<&'a Authority> for SchemeKeyRef<'a> {
 /// and hyper's upstream request would then key the scheme cache, and match
 /// `http_only_mirrors`, under a name no `Mirror` carries.
 #[must_use]
-pub(crate) fn canonical_authority(auth: &Authority) -> Option<Authority> {
+fn canonical_authority(auth: &Authority) -> Option<Authority> {
     canonicalize(auth, None)
 }
 
@@ -359,16 +359,16 @@ fn https_permitted(key: SchemeKeyRef<'_>, config: &Config) -> bool {
 /// learned HTTP scheme, how long until it expires and `Auto` probes HTTPS
 /// again.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LiveScheme {
-    pub(crate) scheme: Scheme,
+struct LiveScheme {
+    scheme: Scheme,
     /// `Some` for an HTTP entry only; HTTPS entries do not age.
-    pub(crate) expires_in: Option<coarsetime::Duration>,
+    expires_in: Option<coarsetime::Duration>,
 }
 
 /// The live entry for `key`, `None` without one (never learned, evicted
 /// after a terminal failure, or an expired HTTP entry).
 #[must_use]
-pub(crate) fn live_entry(key: SchemeKeyRef<'_>) -> Option<LiveScheme> {
+fn live_entry(key: SchemeKeyRef<'_>) -> Option<LiveScheme> {
     live_entry_at(key, Instant::now())
 }
 

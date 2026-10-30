@@ -64,8 +64,8 @@ pub(crate) struct ScanTotals {
     pub(crate) files: u64,
     /// The `.partial`s in a `tmp/` no download claimed when the scan reached
     /// them; a subset of `files`, their accounted sizes a subset of `bytes`.
-    pub(crate) orphaned_files: u64,
-    pub(crate) orphaned_bytes: u64,
+    orphaned_files: u64,
+    orphaned_bytes: u64,
 }
 
 impl ScanTotals {

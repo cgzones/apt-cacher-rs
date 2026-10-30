@@ -91,7 +91,7 @@ impl HeadError {
 /// `Accept-Encoding: identity`: a request without the field accepts any
 /// content coding (RFC 9110 §12.5.3), and a coded body would be cached,
 /// and relayed, without its `Content-Encoding`.
-pub(super) fn format_http_request(
+fn format_http_request(
     path: &str,
     host_authority: &str,
     resume_offset: u64,
@@ -512,7 +512,7 @@ impl UpstreamResponse {
 
 /// Whether a response with `status` never carries a body, whatever its
 /// framing headers claim (RFC 9112 §6.3: 1xx, 204 and 304).
-pub(super) fn is_bodyless_status(status: StatusCode) -> bool {
+fn is_bodyless_status(status: StatusCode) -> bool {
     status.is_informational()
         || status == StatusCode::NO_CONTENT
         || status == StatusCode::NOT_MODIFIED

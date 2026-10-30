@@ -338,7 +338,7 @@ impl DetailsList {
     }
 
     /// A list whose relative times are measured against `now`: tests pin it.
-    pub(super) fn with_now(now: i64) -> Self {
+    fn with_now(now: i64) -> Self {
         Self::open("details", now)
     }
 

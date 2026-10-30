@@ -293,7 +293,7 @@ impl Stanza {
         (key.len() <= MAX_REGISTRY_KEY_COMPONENT_LEN).then_some(key)
     }
 
-    pub(crate) fn reset(&mut self) {
+    fn reset(&mut self) {
         self.filename.clear();
         self.sha256 = None;
         self.sha512 = None;

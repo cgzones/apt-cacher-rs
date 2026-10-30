@@ -42,14 +42,14 @@ use crate::{
 /// Suites tracked per mirror. A mirror carries a handful (a release and its
 /// `-updates`, `-security`, `-backports` pockets, a few releases); the cap
 /// only bounds a client probing made-up suites.
-pub(crate) const MAX_SUITES: usize = 64;
+const MAX_SUITES: usize = 64;
 
 /// A newest index re-served older than this marks the mirror as behind (at
 /// only another suite's later confirmation, as unconfirmed): two weeks is
 /// long past any archive's publishing cycle, yet short of a
 /// rarely-publishing vendor repository's quiet spell being mistaken for a
 /// sync failure every week.
-pub(crate) const BEHIND_AFTER_SECS: u64 = 14 * 24 * 60 * 60;
+const BEHIND_AFTER_SECS: u64 = 14 * 24 * 60 * 60;
 
 /// One suite's newest parsed `Release`/`InRelease` and its confirmation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

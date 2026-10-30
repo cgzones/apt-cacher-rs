@@ -207,23 +207,23 @@ impl UnitStats {
 
 /// A single fetch-buffer-reduce unit: where to fetch a `Packages` index, how
 /// to name it, and how to map its `Filename:` values onto scanned candidates.
-pub(super) struct FetchPlan<'a> {
-    pub mirror: Mirror,
+struct FetchPlan<'a> {
+    mirror: Mirror,
     // deb-owning mirror used to key `cache_metadata` invalidation on a
     // checksum-mismatch eviction. Equals `mirror` for the structured-pool and
     // co-located flat plans, but differs for the flat-root and strict-flat-pool
     // fallbacks where `mirror` is the (truncated) Packages-fetch mirror while the
     // candidate debs live under the original sub-path mirror.
-    pub owner_mirror: &'a Mirror,
-    pub base_uri: String,
+    owner_mirror: &'a Mirror,
+    base_uri: String,
     // deb-cache layout for metadata invalidation; distinct from the fetched index's layout
-    pub cache_layout: CacheLayout,
-    pub debname: DebnameKind<'a>,
-    pub keymap: KeyMapper<'a>,
+    cache_layout: CacheLayout,
+    debname: DebnameKind<'a>,
+    keymap: KeyMapper<'a>,
 }
 
 /// Outcome of reducing the candidate set against one `Packages` index.
-pub(super) enum ReduceOutcome {
+enum ReduceOutcome {
     /// Index fetched and reduced; candidates remain.
     Reduced,
     /// Index fetched and reduced; no candidates remain.

@@ -235,7 +235,7 @@ impl RequestFailure {
     /// download runner. A URI this proxy failed to rebuild never reached
     /// the mirror: an internal failure, which blames neither the mirror nor
     /// the head phase.
-    pub(crate) fn into_failure(self, operation: &'static str) -> DownloadFailure {
+    fn into_failure(self, operation: &'static str) -> DownloadFailure {
         let FailedRequest {
             error,
             uri,

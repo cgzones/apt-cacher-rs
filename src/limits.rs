@@ -135,14 +135,14 @@ pub(crate) fn content_length_within_cap(
 /// An [`AsyncRead`] adapter that fails with [`io::ErrorKind::InvalidData`] once
 /// more than `limit` total bytes have been read from the inner reader. Used to
 /// bound the decompressed output of upstream `Packages` files.
-pub(crate) struct LimitedReader<R> {
+struct LimitedReader<R> {
     inner: R,
     limit: NonZero<u64>,
     count: u64,
 }
 
 impl<R> LimitedReader<R> {
-    pub(crate) fn new(inner: R, limit: NonZero<u64>) -> Self {
+    fn new(inner: R, limit: NonZero<u64>) -> Self {
         Self {
             inner,
             limit,

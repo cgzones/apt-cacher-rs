@@ -154,7 +154,7 @@ const MAX_HEADERS: usize = 100;
                   add a heap alloc per default-build cache miss"
     )
 )]
-pub(crate) enum ZeroCopyResult {
+enum ZeroCopyResult {
     /// Request was served via sendfile
     Served(ConnectionAction),
 

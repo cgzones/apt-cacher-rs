@@ -138,7 +138,7 @@ const CODE_NAMES: &[(i32, &str)] = &[
 
 /// The symbolic name of a primary or extended SQLite result code, `None`
 /// for a value the bundled `sqlite3.h` does not define.
-pub(crate) fn sqlite_code_name(code: i32) -> Option<&'static str> {
+fn sqlite_code_name(code: i32) -> Option<&'static str> {
     CODE_NAMES
         .binary_search_by_key(&code, |&(c, _)| c)
         .ok()

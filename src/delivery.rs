@@ -42,7 +42,7 @@ pub(crate) enum Mechanism {
 impl Mechanism {
     /// The `via` token of the completion line.
     #[must_use]
-    pub(crate) fn via(self) -> &'static str {
+    fn via(self) -> &'static str {
         match self {
             #[cfg(feature = "hyper")]
             Self::Stream => "stream",

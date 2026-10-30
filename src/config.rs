@@ -309,7 +309,7 @@ impl DomainName {
     /// Return `true` if this domain name is a DNS name, not an address.
     #[must_use]
     #[inline]
-    pub(crate) const fn is_dns(&self) -> bool {
+    const fn is_dns(&self) -> bool {
         match self {
             Self(DomainNameInner::Dns(_)) => true,
             Self(DomainNameInner::Ipv4(..) | DomainNameInner::Ipv6(..)) => false,
@@ -320,7 +320,7 @@ impl DomainName {
     /// which is only reachable through a zone identifier naming the
     /// interface, and the parser refuses zones.
     #[must_use]
-    pub(crate) const fn is_ipv6_link_local(&self) -> bool {
+    const fn is_ipv6_link_local(&self) -> bool {
         match self {
             Self(DomainNameInner::Ipv6(_, addr)) => addr.is_unicast_link_local(),
             Self(DomainNameInner::Dns(_) | DomainNameInner::Ipv4(..)) => false,

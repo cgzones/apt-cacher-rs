@@ -179,9 +179,9 @@ impl RejectReason {
 /// without parsing a TOML document.  `webif_clients` already has the
 /// "inherit `allowed_proxy_clients`" fallback applied.
 pub(crate) struct ClientAcls<'a> {
-    pub(crate) proxy_clients: &'a [IpNetOrAddr],
-    pub(crate) webif_clients: &'a [IpNetOrAddr],
-    pub(crate) webif_hosts: &'a WebifHosts,
+    proxy_clients: &'a [IpNetOrAddr],
+    webif_clients: &'a [IpNetOrAddr],
+    webif_hosts: &'a WebifHosts,
 }
 
 impl<'a> ClientAcls<'a> {

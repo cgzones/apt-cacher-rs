@@ -49,7 +49,7 @@ pub(super) struct Section {
 
 impl Section {
     /// No rows: the section renders collapsed with an empty body.
-    pub(super) const EMPTY: Self = Self {
+    const EMPTY: Self = Self {
         html: String::new(),
         rows: 0,
     };
@@ -82,7 +82,7 @@ pub(super) struct DirStats {
     /// Release, by-hash entries, etc. Disjoint from `deb_files`. Together
     /// they sum to `files`.
     pub(super) metadata_files: usize,
-    pub(super) max_file_size: u64,
+    max_file_size: u64,
     pub(super) oldest_mtime: Option<SystemTime>,
     pub(super) newest_mtime: Option<SystemTime>,
 }
@@ -288,7 +288,7 @@ mod mirror_cells {
     /// (the mirror serves content its index disagrees with), amber for any
     /// other failure class. Its title spells the counts out.
     #[derive(Clone, Copy)]
-    pub(super) struct HealthDot(pub MirrorHealth);
+    pub(super) struct HealthDot(pub(super) MirrorHealth);
     impl Display for HealthDot {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
             let MirrorHealth {
@@ -332,9 +332,9 @@ mod mirror_cells {
     /// host that is dialled for it (each has a scheme of its own). Only a
     /// failed HTTPS probe -- of the mirror or of an alias -- warns.
     pub(super) struct SchemeChip<'a> {
-        pub verdict: SchemeVerdict,
+        pub(super) verdict: SchemeVerdict,
         /// Alias hosts of this mirror with their own verdicts.
-        pub aliases: &'a [(&'a ClientHost, SchemeVerdict)],
+        pub(super) aliases: &'a [(&'a ClientHost, SchemeVerdict)],
     }
     impl Display for SchemeChip<'_> {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -396,8 +396,8 @@ mod mirror_cells {
     /// beside it. Warns once the longest passed `warn_above`, half of
     /// `http_timeout`: the mirror came close to timing out.
     pub(super) struct TtfbCell {
-        pub perf: Option<MirrorPerf>,
-        pub warn_above: Duration,
+        pub(super) perf: Option<MirrorPerf>,
+        pub(super) warn_above: Duration,
     }
     impl Display for TtfbCell {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -433,8 +433,8 @@ mod mirror_cells {
     /// latest is under `warn_below`, twice `min_download_rate`: downloads
     /// from it are close to being cancelled.
     pub(super) struct ThroughputCell {
-        pub perf: Option<MirrorPerf>,
-        pub warn_below: Option<u64>,
+        pub(super) perf: Option<MirrorPerf>,
+        pub(super) warn_below: Option<u64>,
     }
     impl Display for ThroughputCell {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -468,9 +468,9 @@ mod mirror_cells {
     /// suite was served past its `Valid-Until:`. The title lists every
     /// suite.
     pub(super) struct IndexAgeCell<'a> {
-        pub indexes: Option<&'a MirrorIndexes>,
+        pub(super) indexes: Option<&'a MirrorIndexes>,
         /// `verify_checksums`, whose ingest reads the indexes.
-        pub enabled: bool,
+        pub(super) enabled: bool,
     }
     impl Display for IndexAgeCell<'_> {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -527,8 +527,8 @@ mod mirror_cells {
     }
 
     pub(super) struct DirSizeCell {
-        pub size: u64,
-        pub total: u64,
+        pub(super) size: u64,
+        pub(super) total: u64,
     }
     impl Display for DirSizeCell {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -550,9 +550,9 @@ mod mirror_cells {
     }
 
     pub(super) struct AvgMaxCell {
-        pub files: usize,
-        pub size: u64,
-        pub max_file: u64,
+        pub(super) files: usize,
+        pub(super) size: u64,
+        pub(super) max_file: u64,
     }
     impl Display for AvgMaxCell {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -571,8 +571,8 @@ mod mirror_cells {
     }
 
     pub(super) struct EfficiencyCell {
-        pub downloaded: i64,
-        pub delivered: i64,
+        pub(super) downloaded: i64,
+        pub(super) delivered: i64,
     }
     impl Display for EfficiencyCell {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {

@@ -23,9 +23,9 @@ use super::response::{Caching, WebResponse};
 /// One embedded asset.
 pub(super) struct Asset {
     /// The path it is served at, without the version query.
-    pub(super) path: &'static str,
-    pub(super) content_type: &'static str,
-    pub(super) body: &'static str,
+    path: &'static str,
+    content_type: &'static str,
+    body: &'static str,
     /// Hex digits of the body's SHA-256 prefix, computed on first use.
     version: OnceLock<Box<str>>,
 }
@@ -41,7 +41,7 @@ impl Asset {
     }
 
     /// The content hash the page's link carries as `v=`.
-    pub(super) fn version(&self) -> &str {
+    fn version(&self) -> &str {
         self.version.get_or_init(|| version_of(self.body))
     }
 

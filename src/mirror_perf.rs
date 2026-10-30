@@ -48,7 +48,7 @@ use crate::{
 
 /// Downloads smaller than this record no throughput: their span is mostly
 /// round trips, not bandwidth.
-pub(crate) const MIN_THROUGHPUT_BYTES: u64 = 1024 * 1024;
+const MIN_THROUGHPUT_BYTES: u64 = 1024 * 1024;
 
 /// When the attempt that answered started and when its response head was
 /// parsed: the two ends of the time to first byte.
@@ -60,7 +60,7 @@ pub(crate) struct HeadTiming {
 
 impl HeadTiming {
     #[must_use]
-    pub(crate) fn ttfb(self) -> Duration {
+    fn ttfb(self) -> Duration {
         let Self {
             attempt_started,
             head_at,

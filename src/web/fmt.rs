@@ -37,7 +37,7 @@ impl Utc {
 
     /// Take any `OffsetDateTime` and shift it to UTC. Use at the boundary
     /// when receiving a value from foreign code that may not already be UTC.
-    pub(super) fn from_offset(odt: OffsetDateTime) -> Self {
+    fn from_offset(odt: OffsetDateTime) -> Self {
         Self(odt.to_offset(time::UtcOffset::UTC))
     }
 

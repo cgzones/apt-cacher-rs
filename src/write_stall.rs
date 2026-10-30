@@ -17,7 +17,7 @@ use crate::humanfmt::HumanFmt;
 /// can tell a stalled client from a socket-level timeout
 /// ([`is_client_write_stall`]).
 #[derive(Debug)]
-pub(crate) struct ClientWriteStalled {
+struct ClientWriteStalled {
     timeout: Duration,
 }
 
