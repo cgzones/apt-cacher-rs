@@ -102,9 +102,7 @@ impl Body for ChannelBody {
             Poll::Ready(Some(ChannelEvent::Finished(result))) => {
                 self.terminal = true;
                 let result = result.and_then(|()| {
-                    if matches!(self.content_length, ContentLength::Exact(_))
-                        && !self.announced_total_delivered()
-                    {
+                    if matches!(self.content_length, ContentLength::Exact(_)) {
                         Err(CacheError::invalid(
                             "read growing cache file",
                             format!(
