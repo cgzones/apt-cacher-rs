@@ -435,7 +435,8 @@ impl Equivalent<Arc<RegistryScope>> for RegistryScopeRef<'_> {
 /// `Packages` / `Release` index files as they flow through. In-memory only
 /// (lost on restart; an index answered from cache is re-ingested when its
 /// digests are missing, see the module doc). FIFO bulk eviction at the
-/// configured cap.
+/// configured cap, checked once per insert batch (so the count may pass the
+/// cap by up to one batch while that batch holds the lock).
 ///
 /// Two-level layout: essentially all entries of one mirror share the same
 /// `(authority, mirror_path)` pair, so the scope is allocated once per
@@ -738,22 +739,21 @@ impl ChecksumRegistry {
         }
     }
 
-    /// Insert (or refresh) an expected digest. At the cap, evicts the oldest
-    /// ~25% of entries in one pass, taken from the *largest* scope first so
-    /// one oversized (or hostile) index cannot drain the digests of every
-    /// other mirror. Re-inserting an existing key refreshes its
-    /// eviction-order position to most-recent.
+    /// Insert (or refresh) an expected digest: a batch of one.
     #[cfg(test)]
     fn insert(&self, authority: &str, mirror_path: &str, relpath: &str, digest: [u8; 32]) {
         self.insert_many(authority, mirror_path, &[Slot::for_key(relpath, digest)]);
     }
 
-    /// Insert several entries of one scope under one lock.
+    /// Insert (or refresh) a batch of one scope's digests under one lock,
+    /// then evict if the batch pushed the registry past its cap
+    /// ([`Self::evict_over_cap`]). Re-inserting an existing key refreshes
+    /// its eviction-order position to most-recent.
     fn insert_many(&self, authority: &str, mirror_path: &str, slots: &[Slot]) {
         let mut inner = self.inner.lock();
-        for &slot in slots {
-            self.insert_locked(&mut inner, authority, mirror_path, slot);
-        }
+        inner.insert(authority, mirror_path, slots);
+        self.evict_over_cap(&mut inner);
+        drop(inner);
     }
 
     /// Register a `Release`/`InRelease`'s `Packages` entries unless a newer
@@ -792,17 +792,18 @@ impl ChecksumRegistry {
         if !supersedes {
             return false;
         }
-        for &slot in slots {
-            self.insert_locked(&mut inner, authority, mirror_path, slot);
-        }
-        // Eviction may have drained this scope; record the date only if it
-        // still exists (a drained scope rebuilds its dates on re-ingest).
+        inner.insert(authority, mirror_path, slots);
+        // Only on a scope that exists: a `Release` listing no `Packages`
+        // creates none. Recorded before the eviction, which drops the dates
+        // with the scope if it drains it (a drained scope rebuilds its dates
+        // on re-ingest).
         if let Some(state) = inner.map.get_mut(&RegistryScopeRef {
             authority,
             mirror_path,
         }) {
             state.release_dates.insert(release_dir.into(), date);
         }
+        self.evict_over_cap(&mut inner);
         drop(inner);
         true
     }
@@ -933,77 +934,14 @@ impl ChecksumRegistry {
         self.epochs.lock().get(authority, mirror_path)
     }
 
-    /// Insert (or refresh) one expected digest under an already-locked
-    /// `RegistryInner`, evicting when the insert pushes the registry over its
-    /// cap. Shared by `ChecksumRegistry::insert_many` (a `Packages` batch) and
-    /// `ChecksumRegistry::insert_release` (a whole `Release`/`InRelease` batch
-    /// under one lock).
-    fn insert_locked(
-        &self,
-        inner: &mut RegistryInner,
-        authority: &str,
-        mirror_path: &str,
-        slot: Slot,
-    ) {
+    /// Evict once a batch left the registry past its cap. The check runs
+    /// per batch, not per entry, so the registry may hold up to one batch
+    /// over the cap until the end of the batch's lock, and the pass then
+    /// frees what the batch overshot as well ([`evict`]). Taken from the
+    /// *largest* scope first so one oversized (or hostile) index cannot
+    /// drain the digests of every other mirror.
+    fn evict_over_cap(&self, inner: &mut RegistryInner) {
         let cap = self.cap;
-
-        let scope_ref = RegistryScopeRef {
-            authority,
-            mirror_path,
-        };
-        let state = match inner.map.entry_ref(&scope_ref) {
-            EntryRef::Occupied(entry) => entry.into_mut(),
-            EntryRef::Vacant(entry) => entry.insert_with_key(
-                Arc::new(RegistryScope {
-                    authority: authority.to_owned(),
-                    mirror_path: mirror_path.to_owned(),
-                }),
-                ScopeState::default(),
-            ),
-        };
-        let Slot {
-            key,
-            digest: _,
-            kind,
-        } = slot;
-        let seq = state.next_seq();
-        if state.slots.len() == state.slots.capacity() {
-            // Grow in eighths, not by doubling: at 49 bytes a slot, a log
-            // of half a million entries would otherwise reserve 25 MB it
-            // never fills. A reallocation per eighth is one memmove of the
-            // log; an insert is a hash and a probe anyway.
-            state.slots.reserve_exact(state.slots.len() / 8 + 16);
-        }
-        state.slots.push_back(slot);
-        let ScopeState {
-            slots,
-            base,
-            index,
-            hasher,
-            ..
-        } = &mut *state;
-        let (slots, base, hasher) = (&*slots, *base, &*hasher);
-        let hash = fingerprint_hash(hasher, &key);
-        // A live key moves to the new slot; its old one goes stale.
-        let inserted = if let Some(live) = index.find_mut(hash, |&live| {
-            slot_in(slots, base, live).is_some_and(|slot| slot.key == key)
-        }) {
-            *live = seq;
-            false
-        } else {
-            index.insert_unique(hash, seq, |&live| index_hash(hasher, slots, base, live));
-            true
-        };
-        if state.slots.len() > state.len() + stale_allowance(state.len()) {
-            compact_slots(state);
-        }
-        if inserted {
-            if kind == KeyKind::Package {
-                state.packages += 1;
-            }
-            inner.len += 1;
-        }
-
         if inner.len > cap {
             // The dashboard only ever shows the post-eviction count, so a
             // registry permanently sized below its working set looks idle
@@ -1017,6 +955,81 @@ impl ChecksumRegistry {
     }
 }
 
+impl RegistryInner {
+    /// Insert (or refresh) one scope's slots, resolving the scope once for
+    /// the batch. An empty batch creates no scope. Never evicts: the caller
+    /// does, once the whole batch is in ([`ChecksumRegistry::evict_over_cap`]).
+    fn insert(&mut self, authority: &str, mirror_path: &str, slots: &[Slot]) {
+        if slots.is_empty() {
+            return;
+        }
+        let state = match self.map.entry_ref(&RegistryScopeRef {
+            authority,
+            mirror_path,
+        }) {
+            EntryRef::Occupied(entry) => entry.into_mut(),
+            EntryRef::Vacant(entry) => entry.insert_with_key(
+                Arc::new(RegistryScope {
+                    authority: authority.to_owned(),
+                    mirror_path: mirror_path.to_owned(),
+                }),
+                ScopeState::default(),
+            ),
+        };
+        for &slot in slots {
+            if state.insert(slot) {
+                self.len += 1;
+            }
+        }
+    }
+}
+
+impl ScopeState {
+    /// Insert (or refresh) one slot; whether its key is new to the scope.
+    fn insert(&mut self, slot: Slot) -> bool {
+        let Slot {
+            key,
+            digest: _,
+            kind,
+        } = slot;
+        let seq = self.next_seq();
+        if self.slots.len() == self.slots.capacity() {
+            // Grow in eighths, not by doubling: at 49 bytes a slot, a log
+            // of half a million entries would otherwise reserve 25 MB it
+            // never fills. A reallocation per eighth is one memmove of the
+            // log; an insert is a hash and a probe anyway.
+            self.slots.reserve_exact(self.slots.len() / 8 + 16);
+        }
+        self.slots.push_back(slot);
+        let Self {
+            slots,
+            base,
+            index,
+            hasher,
+            ..
+        } = &mut *self;
+        let (slots, base, hasher) = (&*slots, *base, &*hasher);
+        let hash = fingerprint_hash(hasher, &key);
+        // A live key moves to the new slot; its old one goes stale.
+        let inserted = if let Some(live) = index.find_mut(hash, |&live| {
+            slot_in(slots, base, live).is_some_and(|slot| slot.key == key)
+        }) {
+            *live = seq;
+            false
+        } else {
+            index.insert_unique(hash, seq, |&live| index_hash(hasher, slots, base, live));
+            true
+        };
+        if self.slots.len() > self.len() + stale_allowance(self.len()) {
+            compact_slots(self);
+        }
+        if inserted && kind == KeyKind::Package {
+            self.packages += 1;
+        }
+        inserted
+    }
+}
+
 /// The hash of the slot an index entry points at, for the index's own
 /// rehashes. Every index entry points at a present slot: a slot leaves
 /// `slots` only after its index entry is removed (`evict`) or the index is
@@ -1026,13 +1039,15 @@ fn index_hash(hasher: &DefaultHashBuilder, slots: &VecDeque<Slot>, base: u64, se
     fingerprint_hash(hasher, &slot.key)
 }
 
-/// Eviction: free `cap / 4` live entries, always from the scope currently
+/// Eviction: free `cap / 4` live entries, plus however far past `cap + 1`
+/// a batch took the registry -- so every pass leaves the `cap + 1 - cap / 4`
+/// a single insert crossing the cap does -- always from the scope currently
 /// holding the most entries, oldest first. A scope that drains empty is
 /// removed and the next-largest scope pays the remainder. Within a scope,
 /// slots pop from the front; stale ones (re-inserted keys, whose live slot
 /// is newer) are skipped and do not count against the quota.
 fn evict(inner: &mut RegistryInner, cap: usize, epochs: &Mutex<EvictionEpochs>) {
-    let quota = (cap / 4).max(1);
+    let quota = (cap / 4).max(1) + inner.len.saturating_sub(cap + 1);
     let mut live = 0usize;
     while live < quota {
         let Some(scope) = largest_scope(inner) else {
@@ -1143,7 +1158,7 @@ fn largest_scope(inner: &RegistryInner) -> Option<Arc<RegistryScope>> {
 
 /// Rebuild a scope's slot log keeping only the live slots, in their order,
 /// re-sequenced past every sequence handed out so far. Triggered from
-/// `insert_locked` when the log outgrows the live count by
+/// `ScopeState::insert` when the log outgrows the live count by
 /// [`stale_allowance`], so amortized O(1) per insert.
 fn compact_slots(state: &mut ScopeState) {
     // Room for the next growth step too, or the insert that triggered the
@@ -2862,6 +2877,39 @@ mod tests {
         }
         assert!(reg.lookup("b", "m", "b0").is_none(), "b's oldest evicted");
         assert!(reg.lookup("b", "m", "b7").is_some(), "b's newest present");
+    }
+
+    /// The cap is checked once per batch, not per entry: a batch may take
+    /// the registry past the cap, and the one pass at its end frees the
+    /// overshoot as well, landing where a single insert crossing the cap
+    /// would (`cap + 1 - cap / 4`).
+    #[test]
+    fn registry_evicts_once_per_batch_including_the_overshoot() {
+        use std::num::NonZero;
+        let reg = ChecksumRegistry::new(NonZero::new(8).unwrap());
+        for i in 0..4u8 {
+            reg.insert("a", "m", &format!("a{i}"), [i; 32]);
+        }
+        let batch: Vec<Slot> = (0..12u8)
+            .map(|i| Slot::for_key(&format!("b{i}"), [i; 32]))
+            .collect();
+        reg.insert_many("b", "m", &batch);
+
+        // 16 entries at a cap of 8: the pass frees 2 (a quarter of the cap)
+        // plus the 7 past the ninth, all from the largest scope, oldest first.
+        assert_eq!(reg.len(), 7);
+        for i in 0..4u8 {
+            assert!(reg.lookup("a", "m", &format!("a{i}")).is_some(), "a{i}");
+        }
+        for i in 0..12u8 {
+            assert_eq!(
+                reg.lookup("b", "m", &format!("b{i}")).is_some(),
+                i >= 9,
+                "b{i}"
+            );
+        }
+        assert_eq!(reg.scope_epoch("b", "m"), 1, "one pass");
+        assert_eq!(reg.scope_epoch("a", "m"), 0);
     }
 
     #[test]
