@@ -88,7 +88,7 @@ use crate::transfer_error::{
     ReportedDownloadFailure, ReportedUpstream, UpstreamError,
 };
 use crate::upstream_head::{
-    ContentLength, DownloadPlan, RejectReason, ResumeAnomaly, ResumeState, plan_download,
+    ContentLength, DownloadPlan, RejectReason, ResumeGates, ResumeState, plan_download,
     plan_fresh_download,
 };
 use crate::{
@@ -850,33 +850,16 @@ async fn plan_upstream_response(
     ) {
         Ok(plan) => Ok((exchange, plan)),
         Err(anomaly) => {
-            match anomaly {
-                ResumeAnomaly::RangeIgnored => info!(
-                    "splice proxy: server returned 200 instead of 206 for resume of {} from mirror {}, starting fresh",
-                    conn_details.debname, conn_details.mirror
-                ),
-                ResumeAnomaly::RangeNotSatisfiable => warn_once_or_info!(
-                    "splice proxy: server returned 416 for resume of {} from mirror {} (partial {}); discarding the stale partial and retrying fresh",
+            static GATES: ResumeGates = ResumeGates::new();
+            GATES.log(
+                anomaly,
+                format_args!(
+                    "splice proxy: failed to resume {} from mirror {}: {}",
                     conn_details.debname,
                     conn_details.mirror,
-                    HumanFmt::Size(resume.offset)
+                    anomaly.detail(resume.offset)
                 ),
-                ResumeAnomaly::ContentRangeMismatch => warn_once_or_info!(
-                    "splice proxy: invalid or mismatched Content-Range in 206 for {} from mirror {}; discarding the partial and retrying fresh",
-                    conn_details.debname,
-                    conn_details.mirror
-                ),
-                ResumeAnomaly::ETagMismatch => warn_once_or_info!(
-                    "splice proxy: server returned 206 for resume of {} from mirror {} naming an ETag other than the If-Range one; discarding the partial and retrying fresh",
-                    conn_details.debname,
-                    conn_details.mirror
-                ),
-                ResumeAnomaly::NoContentLength => warn_once_or_info!(
-                    "splice proxy: server returned 206 without a Content-Length for resume of {} from mirror {}; discarding the partial and retrying fresh",
-                    conn_details.debname,
-                    conn_details.mirror
-                ),
-            }
+            );
             if anomaly.needs_refetch() {
                 // After a redirect the discard-and-retry talks to the
                 // redirect target, not to the original mirror with the

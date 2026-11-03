@@ -50,8 +50,7 @@ use crate::{
         CacheMiss, CachedFlavor, ConnectionDetails, FetchRole, LookupOutcome, MissReason,
     },
     cache_metadata::{
-        self, InvalidValidator, UpstreamMetadata, check_upstream_validators,
-        write_upstream_metadata,
+        self, UpstreamMetadata, ValidatorGates, check_upstream_validators, write_upstream_metadata,
     },
     cache_quota::QuotaExceeded,
     channel_body::{ChannelBody, ChannelEvent},
@@ -99,7 +98,7 @@ use crate::{
     static_assert,
     transfer_error::{CacheError, DeliveryFailure, DownloadFailure, InternalError, UpstreamError},
     upstream_head::{
-        BodyFraming, ContentLength, DownloadPlan, RejectGates, RelayedHeaders, ResumeAnomaly,
+        BodyFraming, ContentLength, DownloadPlan, RejectGates, RelayedHeaders, ResumeGates,
         ResumeState, UpstreamHead, plan_download, plan_fresh_download, resolve_body_framing,
     },
     upstream_retry::{self, RetryStop},
@@ -2177,33 +2176,16 @@ async fn serve_new_file_worker(
             plan
         }
         Err(anomaly) => {
-            match anomaly {
-                ResumeAnomaly::RangeIgnored => info!(
-                    "Server returned 200 instead of 206 for resume of {} from mirror {}, starting fresh",
-                    conn_details.debname, conn_details.mirror
-                ),
-                ResumeAnomaly::RangeNotSatisfiable => warn_once_or_info!(
-                    "Server returned 416 for resume of {} from mirror {} (partial {}); discarding the stale partial and retrying fresh",
+            static GATES: ResumeGates = ResumeGates::new();
+            GATES.log(
+                anomaly,
+                format_args!(
+                    "Failed to resume {} from mirror {}: {}",
                     conn_details.debname,
                     conn_details.mirror,
-                    HumanFmt::Size(resume_offset)
+                    anomaly.detail(resume_offset)
                 ),
-                ResumeAnomaly::ContentRangeMismatch => warn_once_or_info!(
-                    "Invalid or mismatched Content-Range in 206 for {} from mirror {}; discarding the partial and retrying fresh",
-                    conn_details.debname,
-                    conn_details.mirror
-                ),
-                ResumeAnomaly::ETagMismatch => warn_once_or_info!(
-                    "Server returned 206 for resume of {} from mirror {} naming an ETag other than the If-Range one; discarding the partial and retrying fresh",
-                    conn_details.debname,
-                    conn_details.mirror
-                ),
-                ResumeAnomaly::NoContentLength => warn_once_or_info!(
-                    "Server returned 206 without a Content-Length for resume of {} from mirror {}; discarding the partial and retrying fresh",
-                    conn_details.debname,
-                    conn_details.mirror
-                ),
-            }
+            );
             partial.discard_resume().await;
 
             if anomaly.needs_refetch() {
@@ -2258,24 +2240,17 @@ async fn serve_new_file_worker(
             .headers()
             .get(LAST_MODIFIED)
             .and_then(|hv| std::str::from_utf8(hv.as_bytes()).ok()),
-        |invalid| match invalid {
-            InvalidValidator::ETag(etag) => warn_once_or_info!(
-                "Upstream mirror {} sent an invalid ETag `{}` for {}; discarding it",
-                conn_details.mirror,
-                etag.escape_debug(),
-                conn_details.debname
-            ),
-            InvalidValidator::LastModified(lm) => warn_once_or_info!(
-                "Upstream mirror {} sent an invalid Last-Modified `{}` for {}; discarding it",
-                conn_details.mirror,
-                lm.escape_debug(),
-                conn_details.debname
-            ),
-            InvalidValidator::Oversized { header, len } => warn_once_or_info!(
-                "Upstream mirror {} sent a {len} byte {header} for {}; discarding it",
-                conn_details.mirror,
-                conn_details.debname
-            ),
+        |invalid| {
+            static GATES: ValidatorGates = ValidatorGates::new();
+            log_once::warn_once_or_info_gated(
+                GATES.for_validator(&invalid),
+                format_args!(
+                    "Upstream mirror {} {} for {}; discarding it",
+                    conn_details.mirror,
+                    invalid.detail(),
+                    conn_details.debname
+                ),
+            );
         },
     );
 

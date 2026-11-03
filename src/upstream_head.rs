@@ -49,6 +49,7 @@ use std::{
 };
 
 use http::StatusCode;
+use tracing::info;
 
 use crate::{
     cache_layout::CachedFlavor,
@@ -57,7 +58,7 @@ use crate::{
     http_range::ContentRange,
     humanfmt::HumanFmt,
     limits::{self, VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER},
-    metrics,
+    log_once, metrics,
     mirror_health::{self, MirrorFault},
 };
 
@@ -383,6 +384,98 @@ impl ResumeAnomaly {
             | Self::ContentRangeMismatch
             | Self::ETagMismatch
             | Self::NoContentLength => true,
+        }
+    }
+
+    /// What the upstream did and what the backend does about it, for the
+    /// backends' resume-anomaly line; `partial` is the size of the partial
+    /// file the resume started from.
+    ///
+    /// Rendered after the backend's own subject (which file, which mirror)
+    /// and its subsystem prefix, so it starts lowercase; it carries the
+    /// consequence clause, which differs per anomaly. The once-gates are the
+    /// backend's own ([`ResumeGates`]).
+    #[must_use]
+    pub(crate) const fn detail(self, partial: u64) -> ResumeDetail {
+        ResumeDetail {
+            anomaly: self,
+            partial,
+        }
+    }
+}
+
+/// One flood-control gate per warned [`ResumeAnomaly`], owned by a backend's
+/// resume call site, and the level choice that goes with it.
+///
+/// Per anomaly, like [`RejectGates`]: one mirror's habit of answering 416
+/// must not demote the first `ETag` mismatch of another to INFO.
+/// [`ResumeAnomaly::RangeIgnored`] has no gate: its 200 body is used as is,
+/// a normal fresh download, so it always logs at INFO.
+pub(crate) struct ResumeGates {
+    range_not_satisfiable: AtomicBool,
+    content_range_mismatch: AtomicBool,
+    etag_mismatch: AtomicBool,
+    no_content_length: AtomicBool,
+}
+
+impl ResumeGates {
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self {
+            range_not_satisfiable: AtomicBool::new(false),
+            content_range_mismatch: AtomicBool::new(false),
+            etag_mismatch: AtomicBool::new(false),
+            no_content_length: AtomicBool::new(false),
+        }
+    }
+
+    /// Log `line`, the backend's sentence around [`ResumeAnomaly::detail`],
+    /// at the level `anomaly` takes: INFO for
+    /// [`ResumeAnomaly::RangeIgnored`], otherwise WARN the first time this
+    /// table sees the anomaly and INFO after.
+    pub(crate) fn log(&'static self, anomaly: ResumeAnomaly, line: fmt::Arguments<'_>) {
+        let gate = match anomaly {
+            ResumeAnomaly::RangeIgnored => {
+                info!("{line}");
+                return;
+            }
+            ResumeAnomaly::RangeNotSatisfiable => &self.range_not_satisfiable,
+            ResumeAnomaly::ContentRangeMismatch => &self.content_range_mismatch,
+            ResumeAnomaly::ETagMismatch => &self.etag_mismatch,
+            ResumeAnomaly::NoContentLength => &self.no_content_length,
+        };
+        log_once::warn_once_or_info_gated(gate, line);
+    }
+}
+
+/// [`ResumeAnomaly::detail`]'s renderer.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResumeDetail {
+    anomaly: ResumeAnomaly,
+    partial: u64,
+}
+
+impl Display for ResumeDetail {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self { anomaly, partial } = *self;
+        match anomaly {
+            ResumeAnomaly::RangeIgnored => {
+                f.write_str("server returned 200 instead of 206; starting fresh")
+            }
+            ResumeAnomaly::RangeNotSatisfiable => write!(
+                f,
+                "server returned 416 (partial {}); discarding the stale partial and retrying fresh",
+                HumanFmt::Size(partial)
+            ),
+            ResumeAnomaly::ContentRangeMismatch => f.write_str(
+                "invalid or mismatched Content-Range in the 206; discarding the partial and retrying fresh",
+            ),
+            ResumeAnomaly::ETagMismatch => f.write_str(
+                "server returned 206 naming an ETag other than the If-Range one; discarding the partial and retrying fresh",
+            ),
+            ResumeAnomaly::NoContentLength => f.write_str(
+                "server returned 206 without a Content-Length; discarding the partial and retrying fresh",
+            ),
         }
     }
 }
@@ -1500,15 +1593,70 @@ mod tests {
 
         for reason in reasons {
             assert!(
-                crate::log_once::first_fire(GATES.for_reason(reason)),
+                log_once::first_fire(GATES.for_reason(reason)),
                 "{reason:?} must still have an unspent gate after the earlier reasons fired"
             );
         }
         for reason in reasons {
             assert!(
-                !crate::log_once::first_fire(GATES.for_reason(reason)),
+                !log_once::first_fire(GATES.for_reason(reason)),
                 "{reason:?} must fire at warn level only once"
             );
+        }
+    }
+
+    /// The phrase both backends interpolate after their own subject, with
+    /// its consequence clause.
+    #[test]
+    fn resume_anomaly_detail_names_the_fault_and_the_consequence() {
+        let cases = [
+            (
+                ResumeAnomaly::RangeIgnored,
+                "server returned 200 instead of 206; starting fresh",
+            ),
+            (
+                ResumeAnomaly::RangeNotSatisfiable,
+                "server returned 416 (partial 2.05kB); discarding the stale partial and retrying fresh",
+            ),
+            (
+                ResumeAnomaly::ContentRangeMismatch,
+                "invalid or mismatched Content-Range in the 206; discarding the partial and retrying fresh",
+            ),
+            (
+                ResumeAnomaly::ETagMismatch,
+                "server returned 206 naming an ETag other than the If-Range one; discarding the partial and retrying fresh",
+            ),
+            (
+                ResumeAnomaly::NoContentLength,
+                "server returned 206 without a Content-Length; discarding the partial and retrying fresh",
+            ),
+        ];
+        for (anomaly, phrase) in cases {
+            assert_eq!(anomaly.detail(2048).to_string(), phrase, "{anomaly:?}");
+        }
+    }
+
+    /// A 200 for a resume is always INFO; every other anomaly warns once per
+    /// gate table and kind, so one kind never demotes another's first line.
+    #[test]
+    fn resume_gates_warn_once_per_anomaly() {
+        use tracing::Level;
+
+        static GATES: ResumeGates = ResumeGates::new();
+        let log = |anomaly| {
+            crate::test_support::levels_during(|| GATES.log(anomaly, format_args!("line")))
+        };
+
+        assert_eq!(log(ResumeAnomaly::RangeIgnored), [Level::INFO]);
+        assert_eq!(log(ResumeAnomaly::RangeIgnored), [Level::INFO]);
+        for anomaly in [
+            ResumeAnomaly::RangeNotSatisfiable,
+            ResumeAnomaly::ContentRangeMismatch,
+            ResumeAnomaly::ETagMismatch,
+            ResumeAnomaly::NoContentLength,
+        ] {
+            assert_eq!(log(anomaly), [Level::WARN], "{anomaly:?} warns first");
+            assert_eq!(log(anomaly), [Level::INFO], "{anomaly:?} repeats at INFO");
         }
     }
 }

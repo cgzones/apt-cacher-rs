@@ -77,7 +77,7 @@
 
 use std::{
     path::Path,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, atomic::AtomicBool},
 };
 
 use hashbrown::{Equivalent, HashMap, HashSet};
@@ -291,6 +291,73 @@ pub(crate) enum InvalidValidator<'a> {
     /// never by value, so a hostile upstream cannot put the value (up to the
     /// ~400 KiB a hyper response head may hold) into the log.
     Oversized { header: &'static str, len: usize },
+}
+
+impl InvalidValidator<'_> {
+    /// What the upstream sent, for the backends' warn line: rendered after
+    /// the backend's own subject ("upstream mirror X"), so it starts
+    /// lowercase, and before its "for <file>; discarding it". The once-gates
+    /// are the backend's own ([`ValidatorGates`]).
+    #[must_use]
+    pub(crate) const fn detail(&self) -> InvalidValidatorDetail<'_> {
+        InvalidValidatorDetail(self)
+    }
+}
+
+/// [`InvalidValidator::detail`]'s renderer.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InvalidValidatorDetail<'a>(&'a InvalidValidator<'a>);
+
+impl std::fmt::Display for InvalidValidatorDetail<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self(invalid) = self;
+        match **invalid {
+            InvalidValidator::ETag(etag) => {
+                write!(f, "sent an invalid ETag `{}`", etag.escape_debug())
+            }
+            InvalidValidator::LastModified(lm) => {
+                write!(f, "sent an invalid Last-Modified `{}`", lm.escape_debug())
+            }
+            InvalidValidator::Oversized { header, len } => {
+                write!(f, "sent a {len} byte {header}")
+            }
+        }
+    }
+}
+
+/// One flood-control gate per [`InvalidValidator`] kind, owned by a
+/// backend's validator check: a mirror's malformed `Last-Modified` must not
+/// demote the first invalid `ETag` to INFO. An oversized value is one kind
+/// whichever header carried it.
+pub(crate) struct ValidatorGates {
+    etag: AtomicBool,
+    last_modified: AtomicBool,
+    oversized: AtomicBool,
+}
+
+impl ValidatorGates {
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self {
+            etag: AtomicBool::new(false),
+            last_modified: AtomicBool::new(false),
+            oversized: AtomicBool::new(false),
+        }
+    }
+
+    /// This table's gate for `invalid`, for
+    /// [`log_once::warn_once_or_info_gated`](crate::log_once::warn_once_or_info_gated).
+    #[must_use]
+    pub(crate) const fn for_validator(
+        &'static self,
+        invalid: &InvalidValidator<'_>,
+    ) -> &'static AtomicBool {
+        match invalid {
+            InvalidValidator::ETag(_) => &self.etag,
+            InvalidValidator::LastModified(_) => &self.last_modified,
+            InvalidValidator::Oversized { header: _, len: _ } => &self.oversized,
+        }
+    }
 }
 
 /// Longest upstream validator value [`check_upstream_validators`] inspects:
@@ -1194,5 +1261,44 @@ mod tests {
         assert_eq!(etag, None);
         assert_eq!(lm, None);
         assert_eq!(expected.next(), None);
+    }
+
+    /// The phrase both backends interpolate between "upstream mirror X" and
+    /// "for <file>; discarding it".
+    #[test]
+    fn invalid_validator_detail_quotes_the_value_or_its_length() {
+        assert_eq!(
+            InvalidValidator::ETag("a\nb").detail().to_string(),
+            "sent an invalid ETag `a\\nb`"
+        );
+        assert_eq!(
+            InvalidValidator::LastModified("never").detail().to_string(),
+            "sent an invalid Last-Modified `never`"
+        );
+        assert_eq!(
+            InvalidValidator::Oversized {
+                header: "ETag",
+                len: 2000
+            }
+            .detail()
+            .to_string(),
+            "sent a 2000 byte ETag"
+        );
+    }
+
+    /// One gate per kind: an oversized value shares one whichever header
+    /// carried it.
+    #[test]
+    fn validator_gates_are_per_kind() {
+        static GATES: ValidatorGates = ValidatorGates::new();
+        let gate =
+            |invalid: InvalidValidator<'_>| std::ptr::from_ref(GATES.for_validator(&invalid));
+        let oversized = |header| InvalidValidator::Oversized { header, len: 1 };
+        assert_ne!(
+            gate(InvalidValidator::ETag("x")),
+            gate(InvalidValidator::LastModified("x"))
+        );
+        assert_ne!(gate(InvalidValidator::ETag("x")), gate(oversized("ETag")));
+        assert_eq!(gate(oversized("ETag")), gate(oversized("Last-Modified")));
     }
 }

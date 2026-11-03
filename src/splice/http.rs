@@ -50,8 +50,8 @@ use crate::upstream_head::{
 };
 use crate::{
     build_info::{APP_USER_AGENT, APP_VIA},
-    cache_metadata::{self, InvalidValidator},
-    global_config, metrics, warn_once_or_info,
+    cache_metadata::{self, ValidatorGates},
+    global_config, log_once, metrics,
 };
 
 use super::{
@@ -519,24 +519,17 @@ impl UpstreamResponse {
         let (etag, last_modified) = cache_metadata::check_upstream_validators(
             self.etag.take(),
             self.last_modified.take(),
-            |invalid| match invalid {
-                InvalidValidator::ETag(etag) => warn_once_or_info!(
-                    "splice proxy: upstream mirror {} sent an invalid ETag `{}` for {}; discarding it",
-                    conn_details.mirror,
-                    etag.escape_debug(),
-                    conn_details.debname
-                ),
-                InvalidValidator::LastModified(lm) => warn_once_or_info!(
-                    "splice proxy: upstream mirror {} sent an invalid Last-Modified `{}` for {}; discarding it",
-                    conn_details.mirror,
-                    lm.escape_debug(),
-                    conn_details.debname
-                ),
-                InvalidValidator::Oversized { header, len } => warn_once_or_info!(
-                    "splice proxy: upstream mirror {} sent a {len} byte {header} for {}; discarding it",
-                    conn_details.mirror,
-                    conn_details.debname
-                ),
+            |invalid| {
+                static GATES: ValidatorGates = ValidatorGates::new();
+                log_once::warn_once_or_info_gated(
+                    GATES.for_validator(&invalid),
+                    format_args!(
+                        "splice proxy: upstream mirror {} {} for {}; discarding it",
+                        conn_details.mirror,
+                        invalid.detail(),
+                        conn_details.debname
+                    ),
+                );
             },
         );
         self.etag = etag;
