@@ -10,7 +10,10 @@
 //!
 //! [`SqlxErrorReport`] exists because `sqlx::Error::Database` embeds its
 //! cause in its own `Display` *and* exposes it through `source()`, so
-//! `ErrorReport`'s source walk printed the SQLite error twice.
+//! `ErrorReport`'s source walk printed the SQLite error twice. Every log
+//! line that renders a `sqlx::Error` goes through it, and so does the
+//! `Display` of an error enum wrapping one (`MainLoopError::Database`,
+//! `CacheScanError::Sqlx`), which keeps the `sqlx::Error` off `source()`.
 
 use std::fmt::Display;
 

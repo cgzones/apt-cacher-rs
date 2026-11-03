@@ -58,6 +58,7 @@ use crate::{
     humanfmt::HumanFmt,
     metrics,
     request_dispatch::ClientAcls,
+    sqlite_error::SqlxErrorReport,
     task_cache_scan::{CacheScanError, task_cache_scan},
     warn_once_or_debug, warn_once_or_info,
 };
@@ -118,13 +119,13 @@ fn spawn_cleanup(appstate: &AppState) {
 
 /// Why [`main_loop`] gave up.  Every throw site has already logged the cause
 /// with its context, so `Display` only re-renders the wrapped error (through
-/// [`ErrorReport`], with no `source()`) for `main`'s final
-/// `Failed to run apt-cacher-rs` line.
+/// [`SqlxErrorReport`] or [`ErrorReport`], with no `source()`) for `main`'s
+/// final `Failed to run apt-cacher-rs` line.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum MainLoopError {
     /// Startup-time database access (open, schema init, row cleanup, mirror
     /// reads) failed.
-    #[error("{}", ErrorReport(.0))]
+    #[error("{}", SqlxErrorReport(.0))]
     Database(sqlx::Error),
     /// Signal registration, listener bind, or accept failed.
     #[error("{}", ErrorReport(.0))]
@@ -146,7 +147,7 @@ pub(crate) async fn main_loop(
             error!(
                 "Failed to open database `{}`; aborting startup:  {}",
                 config.database_path.display(),
-                ErrorReport(err)
+                SqlxErrorReport(err)
             );
         })
         .map_err(MainLoopError::Database)?;
@@ -158,7 +159,7 @@ pub(crate) async fn main_loop(
             error!(
                 "Failed to initialize database `{}`; aborting startup:  {}",
                 config.database_path.display(),
-                ErrorReport(err)
+                SqlxErrorReport(err)
             );
         })
         .map_err(MainLoopError::Database)?;
@@ -169,7 +170,7 @@ pub(crate) async fn main_loop(
         .inspect_err(|err| {
             error!(
                 "Failed to clean up invalid usage rows; aborting startup:  {}",
-                ErrorReport(err)
+                SqlxErrorReport(err)
             );
         })
         .map_err(MainLoopError::Database)?;
@@ -180,7 +181,7 @@ pub(crate) async fn main_loop(
         .inspect_err(|err| {
             error!(
                 "Failed to clean up invalid database rows; aborting startup:  {}",
-                ErrorReport(err)
+                SqlxErrorReport(err)
             );
         })
         .map_err(MainLoopError::Database)?;
@@ -196,7 +197,7 @@ pub(crate) async fn main_loop(
         Err(err) => {
             error!(
                 "Failed to fold alias mirror rows into their main rows; aborting startup:  {}",
-                ErrorReport(&err)
+                SqlxErrorReport(&err)
             );
             return Err(MainLoopError::Database(err));
         }
@@ -217,7 +218,7 @@ pub(crate) async fn main_loop(
         .inspect_err(|err| {
             error!(
                 "Failed to load flat-collision mirrors from the database; aborting startup:  {}",
-                ErrorReport(err)
+                SqlxErrorReport(err)
             );
         })
         .map_err(MainLoopError::Database)?;
@@ -256,7 +257,7 @@ pub(crate) async fn main_loop(
         .inspect_err(|err| {
             error!(
                 "Failed to read the mirror rows for the reserved-segment migration check; aborting startup:  {}",
-                ErrorReport(err)
+                SqlxErrorReport(err)
             );
         })
         .map_err(MainLoopError::Database)?;
@@ -419,7 +420,7 @@ pub(crate) async fn main_loop(
                     metrics::DB_OPERATION_FAILED.increment();
                     error!(
                         "Failed to read the mirror list for the scheme-cache warm-up; the scheme cache starts empty and every host's scheme is decided on first use:  {}",
-                        ErrorReport(&err)
+                        SqlxErrorReport(&err)
                     );
                     return;
                 }
@@ -835,6 +836,31 @@ mod accept_error_tests {
         let err = std::io::Error::from_raw_os_error(nix::errno::Errno::EBADF as i32);
         assert!(!is_transient_accept_error(&err));
         assert!(!is_transient_accept_error(&std::io::Error::other("x")));
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    /// `main`'s final line walks `source()` with `ErrorReport`; the
+    /// database variant must render the SQLite cause once, with its name.
+    #[tokio::test]
+    async fn database_error_renders_the_sqlite_cause_once() {
+        use sqlx::Connection as _;
+        let mut db = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("memory database");
+        let err = sqlx::query("SELECT * FROM no_such_table")
+            .execute(&mut db)
+            .await
+            .expect_err("missing table");
+
+        let err = MainLoopError::Database(err);
+        assert_eq!(
+            ErrorReport(&err).to_string(),
+            "error returned from database: (code: 1 SQLITE_ERROR) no such table: no_such_table"
+        );
     }
 }
 

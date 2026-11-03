@@ -28,6 +28,7 @@ use crate::{
     mirror_indexes::{self, MirrorIndexes},
     mirror_perf::MirrorPerf,
     scheme_cache::{self, SchemeKeyRef, SchemeVerdict},
+    sqlite_error::SqlxErrorReport,
     swrite,
     uncacheables::get_uncacheables,
 };
@@ -923,7 +924,7 @@ pub(super) fn db_error_section(label: &'static str, err: &sqlx::Error) -> Sectio
     metrics::DB_OPERATION_FAILED.increment();
     error!(
         "Failed to query the {label} for the dashboard; rendering that section with an error notice:  {}",
-        ErrorReport(err)
+        SqlxErrorReport(err)
     );
     let mut buf = String::new();
     write_section_error(&mut buf, label, err);

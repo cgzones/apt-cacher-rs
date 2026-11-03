@@ -37,6 +37,7 @@ use crate::{
     limits::RETENTION_TIME,
     metrics,
     permitted_host_cache::mirror_permitted,
+    sqlite_error::SqlxErrorReport,
     task_cache_scan::task_cache_scan,
     warn_once_or_debug, xattr_helpers,
 };
@@ -83,7 +84,7 @@ async fn prune_stale_rows(database: &Database, config: &Config) {
             metrics::DB_OPERATION_FAILED.increment();
             error!(
                 "Failed to remove stale origin rows; retaining them until the next cleanup run:  {}",
-                ErrorReport(&err)
+                SqlxErrorReport(&err)
             );
         }
     }
@@ -94,7 +95,7 @@ async fn prune_stale_rows(database: &Database, config: &Config) {
             metrics::DB_OPERATION_FAILED.increment();
             error!(
                 "Failed to look up mirror rows without origins; retaining them until the next cleanup run:  {}",
-                ErrorReport(&err)
+                SqlxErrorReport(&err)
             );
             return;
         }
@@ -119,7 +120,7 @@ async fn prune_stale_rows(database: &Database, config: &Config) {
             metrics::DB_OPERATION_FAILED.increment();
             error!(
                 "Failed to remove {count} mirror rows without origins or cached files; retaining them until the next cleanup run:  {}",
-                ErrorReport(&err)
+                SqlxErrorReport(&err)
             );
             return;
         }
@@ -214,7 +215,7 @@ async fn task_cleanup_impl(appstate: &AppState) {
         metrics::DB_OPERATION_FAILED.increment();
         error!(
             "Failed to clean up invalid database rows; continuing with the cleanup run:  {}",
-            ErrorReport(&err)
+            SqlxErrorReport(&err)
         );
     }
 
@@ -229,7 +230,7 @@ async fn task_cleanup_impl(appstate: &AppState) {
             metrics::DB_OPERATION_FAILED.increment();
             error!(
                 "Failed to delete old usage logs; retaining them until the next cleanup run:  {}",
-                ErrorReport(&err)
+                SqlxErrorReport(&err)
             );
         }
     }
@@ -252,7 +253,7 @@ async fn task_cleanup_impl(appstate: &AppState) {
             metrics::DB_OPERATION_FAILED.increment();
             error!(
                 "Failed to look up the mirrors to clean up; aborting this cleanup run:  {}",
-                ErrorReport(&err)
+                SqlxErrorReport(&err)
             );
             // Earlier steps in this task (cleanup_invalid_rows /
             // delete_usage_logs) may already have run, but no per-mirror
@@ -330,7 +331,7 @@ async fn task_cleanup_impl(appstate: &AppState) {
             error!(
                 "Failed to record the cleanup timestamp for mirror {}; its last-cleanup time stays stale:  {}",
                 cleanup_result.mirror,
-                ErrorReport(&err)
+                SqlxErrorReport(&err)
             );
         }
 

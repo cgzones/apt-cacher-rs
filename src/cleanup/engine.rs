@@ -23,6 +23,7 @@ use crate::{
     limits::RETENTION_TIME,
     log_once::Logged,
     metrics,
+    sqlite_error::SqlxErrorReport,
 };
 
 use crate::cleanup::fetch::{DebnameKind, FetchFailure, fetch_packages};
@@ -370,7 +371,7 @@ async fn read_self_origins(appstate: &AppState, mirror: &Mirror) -> Option<Vec<O
             metrics::DB_OPERATION_FAILED.increment();
             error!(
                 "Failed to look up origins for mirror {mirror}; treating its origin set as unknown for this cycle:  {}",
-                ErrorReport(&err)
+                SqlxErrorReport(&err)
             );
             None
         }
@@ -930,7 +931,7 @@ async fn gate_on_row(
             metrics::DB_OPERATION_FAILED.increment();
             error!(
                 "Failed to check the mirror row of {noun} `{seg}`; continuing with the mirror's remaining index sources:  {}",
-                ErrorReport(&err)
+                SqlxErrorReport(&err)
             );
             Err(GroupResolution::Ran(GroupOutcome::NotApplicable(
                 SkipReason::DbError,
@@ -1042,7 +1043,7 @@ async fn resolve_origin_packages_archive_root(
             metrics::DB_OPERATION_FAILED.increment();
             error!(
                 "Failed to look up the origins of archive root `{root}`; continuing with the mirror's remaining index sources:  {}",
-                ErrorReport(&err)
+                SqlxErrorReport(&err)
             );
             return GroupResolution::Ran(GroupOutcome::NotApplicable(SkipReason::DbError));
         }

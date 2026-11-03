@@ -44,6 +44,7 @@ use crate::{
     global_config, healthcheck, metrics,
     partial_claim::is_claimed,
     partial_file::PARTIAL_SUFFIX,
+    sqlite_error::SqlxErrorReport,
     task_setup, warn_once_or_info,
 };
 
@@ -51,7 +52,7 @@ use crate::{
 pub(crate) enum CacheScanError {
     #[error("{}", ErrorReport(.0))]
     Io(std::io::Error),
-    #[error("{}", ErrorReport(.0))]
+    #[error("{}", SqlxErrorReport(.0))]
     Sqlx(sqlx::Error),
 }
 
@@ -162,7 +163,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
             metrics::DB_OPERATION_FAILED.increment();
             error!(
                 "Failed to fetch the mirrors for the cache scan; abandoning the scan:  {}",
-                ErrorReport(&err)
+                SqlxErrorReport(&err)
             );
             return Err(CacheScanError::Sqlx(err));
         }

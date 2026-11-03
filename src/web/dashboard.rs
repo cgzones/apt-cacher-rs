@@ -37,7 +37,9 @@ use crate::{
     mem_usage::{self, Footprint, ProcessMemory},
     metrics, mirror_health, mirror_indexes, mirror_perf,
     passthrough_limiter::active_relays,
-    permitted_host_cache, scheme_cache, swrite,
+    permitted_host_cache, scheme_cache,
+    sqlite_error::SqlxErrorReport,
+    swrite,
     uncacheables::UNCACHEABLES_MAX,
     verify_throttle, warn_once_or_debug,
 };
@@ -1117,7 +1119,7 @@ fn build_cache_stats_html(
             metrics::DB_OPERATION_FAILED.increment();
             error!(
                 "Failed to query the bandwidth windows; the dashboard reports both as N/A:  {}",
-                ErrorReport(err)
+                SqlxErrorReport(err)
             );
             (None, None)
         }
