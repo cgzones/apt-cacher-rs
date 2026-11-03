@@ -11,17 +11,16 @@
 //! crate already does a single-syscall fast path per read; the hot cost of
 //! an attribute is its value, which `cache_metadata` caches.
 //!
-//! # Runtime requirement
+//! # Blocking
 //!
-//! The [`XattrTarget`] impl for [`tokio::fs::File`] runs every syscall
-//! through [`tokio::task::block_in_place`], which requires a multi-threaded
-//! Tokio runtime - calling the helpers on a tokio file from a
-//! `current_thread` runtime (including `#[tokio::test]` without
-//! `flavor = "multi_thread"`) will **panic**. The [`std::fs::File`] impl
-//! issues the syscall directly and is for callers already on a blocking
-//! thread (cleanup's digest verification and `integrity::verify_temp_file`);
-//! so does [`XattrFile`], which wraps a tokio file for a caller that has
-//! entered `block_in_place` itself to batch several operations.
+//! Every [`XattrTarget`] issues its syscall directly. The [`std::fs::File`]
+//! impl is for callers already on a blocking thread (cleanup's digest
+//! verification and `integrity::verify_temp_file`); [`XattrFile`] wraps a
+//! tokio file for a caller that enters one [`tokio::task::block_in_place`]
+//! section around all the operations it batches on that file (which needs
+//! a multi-threaded runtime). Unit tests also address a [`tokio::fs::File`]
+//! directly, through a test-only impl that wraps each syscall in its own
+//! `block_in_place`.
 
 use std::{
     borrow::Cow,
@@ -39,10 +38,9 @@ use crate::{error::ErrorReport, log_once::warn_once_or_info_gated, warn_once_or_
 
 /// Wrapper to implement [`xattr::FileExt`] for [`tokio::fs::File`].
 ///
-/// As an [`XattrTarget`] it issues the syscall *directly*, unlike the
-/// [`tokio::fs::File`] impl: it is for a caller that has already entered one
-/// [`tokio::task::block_in_place`] section around several attribute
-/// operations on the same file (see
+/// As an [`XattrTarget`] it issues the syscall *directly*: it is for a
+/// caller that has already entered one [`tokio::task::block_in_place`]
+/// section around several attribute operations on the same file (see
 /// `cache_metadata::write_upstream_metadata`), so the download path pays one
 /// worker demotion instead of one per attribute.
 pub(crate) struct XattrFile<'a>(pub(crate) &'a tokio::fs::File);
@@ -56,15 +54,17 @@ impl std::os::fd::AsRawFd for XattrFile<'_> {
 
 impl xattr::FileExt for XattrFile<'_> {}
 
-/// An open file the helpers address by descriptor. The impls differ only in
-/// how the blocking syscall reaches the kernel (see the module doc's
-/// runtime requirement).
+/// An open file the helpers address by descriptor (see the module doc's
+/// blocking section).
 pub(crate) trait XattrTarget {
     fn get(&self, key: &'static str) -> io::Result<Option<Vec<u8>>>;
     fn set(&self, key: &'static str, value: &[u8]) -> io::Result<()>;
     fn remove(&self, key: &'static str) -> io::Result<()>;
 }
 
+/// Test-only: each syscall demotes the worker on its own, which production
+/// code batches through [`XattrFile`] instead.
+#[cfg(test)]
 impl XattrTarget for tokio::fs::File {
     fn get(&self, key: &'static str) -> io::Result<Option<Vec<u8>>> {
         tokio::task::block_in_place(|| XattrFile(self).get_xattr(key))

@@ -312,19 +312,30 @@ async fn prepare_partial_resume_at(
     };
     match open_partial_file(claim, quota).await {
         Ok((file, size, guard)) if size > 0 => {
-            if let Some(if_range) =
-                xattr_helpers::read::<ETag>(&file, &guard).filter(ETag::is_strong)
-            {
-                let if_range = if_range.into_shared();
-                let last_modified = xattr_helpers::read::<LastModified>(&file, &guard)
-                    .map(LastModified::into_parts);
-                let stored = UpstreamMetadata {
-                    etag: Some(if_range),
-                    last_modified,
-                };
+            // One blocking section for the three attributes, as
+            // `cache_metadata::write_upstream_metadata` batches its writes;
+            // the other two are read only behind a strong `ETag`. Without
+            // xattr support every read is `None` without a syscall.
+            let read = || {
+                let xfile = &xattr_helpers::XattrFile(&file);
+                let if_range =
+                    xattr_helpers::read::<ETag>(xfile, &guard).filter(ETag::is_strong)?;
+                let last_modified = xattr_helpers::read::<LastModified>(xfile, &guard);
                 let expected_total =
-                    xattr_helpers::read::<xattr_helpers::ExpectedSize>(&file, &guard)
-                        .map(|xattr_helpers::ExpectedSize(size)| size);
+                    xattr_helpers::read::<xattr_helpers::ExpectedSize>(xfile, &guard);
+                Some((if_range, last_modified, expected_total))
+            };
+            let validators = if xattr_helpers::xattr_supported() {
+                tokio::task::block_in_place(read)
+            } else {
+                None
+            };
+            if let Some((if_range, last_modified, expected_total)) = validators {
+                let stored = UpstreamMetadata {
+                    etag: Some(if_range.into_shared()),
+                    last_modified: last_modified.map(LastModified::into_parts),
+                };
+                let expected_total = expected_total.map(|xattr_helpers::ExpectedSize(size)| size);
                 // The total is only known when the partial carries the
                 // expected-size xattr; narrate its absence instead of
                 // placeholdering it.
