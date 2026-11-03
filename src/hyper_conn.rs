@@ -13,7 +13,7 @@
 
 use std::{
     borrow::Cow, convert::Infallible, fmt, num::NonZero, os::unix::fs::MetadataExt as _,
-    path::Path, path::PathBuf, sync::Arc, time::SystemTime,
+    path::Path, path::PathBuf, sync::Arc,
 };
 
 use futures_util::StreamExt as _;
@@ -44,7 +44,7 @@ use crate::{
     },
     build_info::{APP_USER_AGENT, APP_VIA},
     cache_conditional::{
-        CacheInfo, RangeRequestHeaders, ServeParams, ServePlan, volatile_freshness,
+        CacheInfo, RangeRequestHeaders, ServeParams, ServePlan, check_volatile_hit,
     },
     cache_layout::{
         CacheMiss, CachedFlavor, ConnectionDetails, FetchRole, LookupOutcome, MissReason,
@@ -79,7 +79,6 @@ use crate::{
     humanfmt::HumanFmt,
     hyper_transport::{TransportConnector, is_transport_error},
     integrity::{note_cached_index_touch, note_release_revalidated},
-    limits::VOLATILE_CACHE_MAX_AGE,
     log_once, metrics,
     mirror_perf::{self, HeadTiming},
     parallel_hack::{NUDGE_BODY, log_nudge, nudge_head, should_nudge},
@@ -1332,19 +1331,9 @@ async fn serve_volatile_file(
             return cache_access_failure();
         }
     };
-    let modified_system_time = mdata
-        .modified()
-        .expect("Platform should support modification timestamps via setup check");
 
-    let reason = match volatile_freshness(&file_path, modified_system_time, SystemTime::now()) {
-        Ok(elapsed) => {
-            debug!(
-                "Volatile file `{}` age {} is within the {} freshness window, serving cached version...",
-                file_path.display(),
-                HumanFmt::Time(elapsed),
-                HumanFmt::Time(VOLATILE_CACHE_MAX_AGE)
-            );
-
+    let reason = match check_volatile_hit(&file_path, &mdata) {
+        Ok(()) => {
             // Lookup-site accounting (see `process_cache_request`);
             // cleanup-synthetic probes (task_cleanup's `.xz -> .gz -> raw`
             // walk) count nothing.

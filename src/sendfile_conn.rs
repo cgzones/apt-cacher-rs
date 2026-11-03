@@ -21,7 +21,6 @@ use std::{
     os::{fd::AsFd as _, unix::fs::MetadataExt as _},
     path::Path,
     sync::Arc,
-    time::SystemTime,
 };
 #[cfg(feature = "hyper")]
 use std::{
@@ -59,7 +58,7 @@ use crate::{
         await_serveable,
     },
     build_info::APP_NAME,
-    cache_conditional::{CacheInfo, RangeRequestHeaders, ServePlan, volatile_freshness},
+    cache_conditional::{CacheInfo, RangeRequestHeaders, ServePlan, check_volatile_hit},
     cache_layout::{
         CacheMiss, CachedFlavor, ConnectionDetails, FetchRole, LookupOutcome, MissReason,
     },
@@ -88,7 +87,6 @@ use crate::{
     humanfmt::HumanFmt,
     info_or_warn,
     integrity::note_cached_index_touch,
-    limits::VOLATILE_CACHE_MAX_AGE,
     metrics,
     permitted_host_cache::authorize_cache_access,
     precise_instant::PreciseInstant,
@@ -1302,26 +1300,13 @@ async fn try_sendfile_request(
         if conn_details.cached_flavor() == CachedFlavor::Volatile {
             match regular_file_metadata(&file, &cache_path) {
                 Ok(md) => {
-                    let last_modified = md
-                        .modified()
-                        .expect("Platform should support modification timestamps via setup check");
-                    let elapsed =
-                        match volatile_freshness(&cache_path, last_modified, SystemTime::now()) {
-                            Ok(elapsed) => elapsed,
-                            Err(reason) => {
-                                break 'cache_lookup Err(CacheMiss::StaleVolatile {
-                                    reason,
-                                    file,
-                                    size: md.size(),
-                                });
-                            }
-                        };
-                    debug!(
-                        "Volatile file `{}` age {} is within the {} freshness window, serving cached version...",
-                        cache_path.display(),
-                        HumanFmt::Time(elapsed),
-                        HumanFmt::Time(VOLATILE_CACHE_MAX_AGE)
-                    );
+                    if let Err(reason) = check_volatile_hit(&cache_path, &md) {
+                        break 'cache_lookup Err(CacheMiss::StaleVolatile {
+                            reason,
+                            file,
+                            size: md.size(),
+                        });
+                    }
                     break 'cache_lookup Ok((file, Some(md)));
                 }
                 Err(CacheAccessFailure(_)) => {

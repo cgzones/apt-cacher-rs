@@ -22,6 +22,7 @@ use std::{
 #[cfg(feature = "hyper")]
 use http::HeaderMap;
 use http::StatusCode;
+use tracing::debug;
 
 use crate::cache_layout::{CacheEntryKeyRef, MissReason};
 use crate::cache_metadata;
@@ -32,15 +33,45 @@ use crate::{
     client_info::ClientInfo,
     http_etag::if_none_match,
     http_range::{HttpDate, ParsedRange, cache_file_http_date, compute_age, http_parse_range},
+    humanfmt::HumanFmt,
     limits::VOLATILE_CACHE_MAX_AGE,
     warn_once_or_debug, warn_once_or_info,
 };
+
+/// Whether the volatile cache file at `path`, whose metadata is `metadata`,
+/// may still be served: its age by [`volatile_freshness`], judged at `now`.
+pub(crate) fn volatile_file_freshness(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    now: SystemTime,
+) -> Result<Duration, MissReason> {
+    let modified = metadata
+        .modified()
+        .expect("Platform should support modification timestamps via setup check");
+    volatile_freshness(path, modified, now)
+}
+
+/// The freshness check of a lookup site about to serve a cached volatile
+/// file: [`volatile_file_freshness`] now, logging a fresh copy's age.
+pub(crate) fn check_volatile_hit(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), MissReason> {
+    let age = volatile_file_freshness(path, metadata, SystemTime::now())?;
+    debug!(
+        "Volatile file `{}` age {} is within the {} freshness window, serving cached version...",
+        path.display(),
+        HumanFmt::Time(age),
+        HumanFmt::Time(VOLATILE_CACHE_MAX_AGE)
+    );
+    Ok(())
+}
 
 /// A volatile copy is fresh only within the fixed cache window. Compare raw
 /// timestamps: HTTP-date rounding can turn subsecond mtimes into future dates.
 /// Future timestamps are stale, so clock skew cannot freeze an index in cache;
 /// one is logged against `path`.
-pub(crate) fn volatile_freshness(
+fn volatile_freshness(
     path: &Path,
     modified: SystemTime,
     now: SystemTime,

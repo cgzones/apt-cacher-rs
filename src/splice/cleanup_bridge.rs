@@ -11,7 +11,7 @@ use http::{StatusCode, Uri, uri::PathAndQuery};
 use tokio::io::AsyncReadExt as _;
 use tracing::{debug, error};
 
-use crate::cache_conditional::volatile_freshness;
+use crate::cache_conditional::volatile_file_freshness;
 use crate::cache_layout::ConnectionDetails;
 use crate::cleanup::{FetchFailure, IndexAnswer};
 use crate::deb_mirror::Mirror;
@@ -51,10 +51,7 @@ async fn read_cached_index(
         Err(CacheAccessFailure(_)) => return Some(CACHE_FAILURE),
     };
 
-    let modified = mdata
-        .modified()
-        .expect("Platform should support modification timestamps via setup check");
-    let Ok(elapsed) = volatile_freshness(cache_path, modified, now) else {
+    let Ok(elapsed) = volatile_file_freshness(cache_path, &mdata, now) else {
         return None;
     };
 
