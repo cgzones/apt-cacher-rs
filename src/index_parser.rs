@@ -750,7 +750,7 @@ pub(crate) struct StreamedDigest {
 /// bytes as they are written instead of re-reading the finished file.
 ///
 /// The two `sha2` types are distinct, so the algorithm has to be chosen up
-/// front (`integrity::stream_hash_algo`) and carried. [`Self::finalize`]
+/// front (`integrity::stream_hash_algo_for_download`) and carried. [`Self::finalize`]
 /// returns it alongside the digest and the byte count, which lets the verifier
 /// confirm the digest it is handed was computed with the algorithm it actually
 /// expects, over exactly the file it is about to commit, and fall back to a

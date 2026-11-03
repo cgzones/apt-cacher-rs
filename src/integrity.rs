@@ -105,8 +105,8 @@ pub(crate) enum CommitError {
 /// performs file I/O (it reads and hashes `file`) - it is not a pure
 /// function, but it is free of process-global state.
 struct VerifyInput<'a> {
-    /// `config.verify_checksums`.
-    verify_enabled: bool,
+    /// [`VerifyKind::Unverifiable`] when verification is disabled
+    /// ([`digest_source`] yields no digest then).
     kind: VerifyKind,
     /// The finished temp file, open for reading. Read through its own cursor
     /// (rewound first), which is safe because every other holder of this open
@@ -118,9 +118,9 @@ struct VerifyInput<'a> {
     /// reopened.
     temp_path: &'a Path,
     /// The digest the body loop computed as it wrote the file, when it could
-    /// (the splice-only `stream_hash_algo` picked an algorithm, the download
-    /// did not resume onto a pre-existing prefix, and the bytes passed through
-    /// userspace).
+    /// (the splice-only `stream_hash_algo_for_download` picked an algorithm,
+    /// the download did not resume onto a pre-existing prefix, and the bytes
+    /// passed through userspace).
     /// Used only if its algorithm is the one the expected digest needs *and*
     /// it covered as many bytes as the finished file holds; otherwise, and
     /// when `None`, the file is re-read and hashed.
@@ -190,14 +190,10 @@ enum VerifyOutcome {
 ///
 /// Global-free (no `global_config()`, no registry): all inputs arrive via
 /// [`VerifyInput`], making this unit-testable. It performs file I/O (reads
-/// and hashes `file`) only for [`VerifyKind::Expected`] with
-/// verification enabled; callers on an async worker must wrap that case in
-/// `spawn_blocking` (`verify_and_rename` runs it inside its commit job).
+/// and hashes `file`) only for [`VerifyKind::Expected`]; callers on an async
+/// worker must wrap that case in `spawn_blocking` (`verify_and_rename` runs it
+/// inside its commit job).
 fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
-    if !input.verify_enabled {
-        return VerifyOutcome::Proceed;
-    }
-
     let VerifyKind::Expected {
         algo,
         digest: expected,
@@ -1366,26 +1362,15 @@ pub(crate) async fn verify_and_rename(
     // Build the verification kind. Layer-B/C registry lookups happen here -
     // synchronously, before spawn_blocking - so the pure decision stays
     // global-free. Skipped entirely when verification is disabled.
-    let kind = if verify_enabled {
-        match plan.resource_kind {
-            ResourceKind::ByHash(algo, _) | ResourceKind::FlatByHash(algo, _) => {
-                byhash_verify_kind(algo, &plan.debname)
-            }
-            kind @ (ResourceKind::Pool | ResourceKind::Packages) => {
-                let key = registry_lookup_key(kind, &plan.debname, &plan.raw_uri_path)
-                    .expect("Pool and Packages are the registry-backed kinds");
-                registry_verify_kind(plan, &key)
-            }
-            ResourceKind::Release
-            | ResourceKind::ComponentRelease
-            | ResourceKind::Sources
-            | ResourceKind::Translation
-            | ResourceKind::Icon
-            | ResourceKind::FlatMetadata
-            | ResourceKind::FlatPool => VerifyKind::Unverifiable,
-        }
-    } else {
-        VerifyKind::Unverifiable
+    let kind = match digest_source(
+        plan.resource_kind,
+        &plan.debname,
+        &plan.raw_uri_path,
+        verify_enabled,
+    ) {
+        DigestSource::InUrl(algo) => byhash_verify_kind(algo, &plan.debname),
+        DigestSource::Registry(key) => registry_verify_kind(plan, &key),
+        DigestSource::Absent => VerifyKind::Unverifiable,
     };
 
     // Set just before the rename, so a job that dies is attributed to the
@@ -1422,7 +1407,6 @@ pub(crate) async fn verify_and_rename(
             };
             let bytes_received = verified_meta.len();
             if let VerifyOutcome::Reject(err) = verify_temp_file(&VerifyInput {
-                verify_enabled,
                 kind,
                 file: &file,
                 temp_path: &guard,
@@ -1936,7 +1920,7 @@ fn registry_path_from_uri(raw_uri_path: &str) -> Cow<'_, str> {
 /// from the raw URI path (the parent directory of the `Release` leaf),
 /// normalized like the cache path (`//` runs and `.` segments collapse), so
 /// every spelling of one `Release` registers the keys
-/// [`registry_lookup_key`] looks up.
+/// [`digest_source`] looks up.
 ///
 /// `Release.gpg` is a detached binary PGP signature with no SHA256 section to
 /// ingest, so it's excluded — routing it here would just waste a file open
@@ -1950,37 +1934,57 @@ fn release_dir_from_uri_path(raw_uri_path: &str) -> Option<String> {
     Some(dir.to_owned())
 }
 
-/// The checksum-registry key a download of `resource_kind` is verified
-/// against, or `None` for the kinds that carry their digest in the URL
-/// (a by-hash URL) or have none at all ([`VerifyKind::Unverifiable`]).
-///
-/// One derivation, shared by [`verify_and_rename`]'s commit-time lookup and
-/// the splice-only `stream_hash_algo_for_download`'s pre-download one, so the
-/// two can never disagree about which registry entry decides a download's
-/// digest.
-fn registry_lookup_key<'a>(
+/// Where the digest a download of `resource_kind` is verified against comes
+/// from. See [`digest_source`].
+#[derive(Debug, PartialEq, Eq)]
+enum DigestSource<'a> {
+    /// Self-verifying by-hash URL: the digest is the URL leaf, hashed with
+    /// the algorithm its `<algo>` segment named.
+    InUrl(HashAlgo),
+    /// The checksum registry, under this key, always SHA-256 (layer B: a
+    /// pool `.deb`'s bare basename; layer C: a `Packages` index's
+    /// host-relative path).
+    Registry(Cow<'a, str>),
+    /// No digest: verification is disabled, or the kind has none today
+    /// ([`VerifyKind::Unverifiable`]).
+    Absent,
+}
+
+/// The one `ResourceKind` -> digest-source table, shared by
+/// [`verify_and_rename`]'s commit-time decision and the splice-only
+/// `stream_hash_algo_for_download`'s pre-download one, so the two can never
+/// disagree about which digest decides a download (a new `ResourceKind` is a
+/// compile error here, once). `verify_enabled` is
+/// `global_config().verify_checksums`, passed in so this stays
+/// unit-testable.
+fn digest_source<'a>(
     resource_kind: ResourceKind,
     debname: &'a str,
     raw_uri_path: &'a str,
-) -> Option<Cow<'a, str>> {
+    verify_enabled: bool,
+) -> DigestSource<'a> {
+    if !verify_enabled {
+        return DigestSource::Absent;
+    }
     match resource_kind {
+        ResourceKind::ByHash(algo, _) | ResourceKind::FlatByHash(algo, _) => {
+            DigestSource::InUrl(algo)
+        }
         // Layer B: a pool .deb's key is its bare basename, the form
         // `PendingDigests::push_stanza` registers. Flat-pool downloads are
         // not verified this way, so no flat variant is needed.
-        ResourceKind::Pool => Some(Cow::Borrowed(debname)),
+        ResourceKind::Pool => DigestSource::Registry(Cow::Borrowed(debname)),
         // Layer C: the full host-relative URI path, normalized like the
         // `release_dir` `ingest_release_file` inserted it under
         // ("<release_dir>/<rel>").
-        ResourceKind::Packages => Some(registry_path_from_uri(raw_uri_path)),
-        ResourceKind::ByHash(..)
-        | ResourceKind::FlatByHash(..)
-        | ResourceKind::Release
+        ResourceKind::Packages => DigestSource::Registry(registry_path_from_uri(raw_uri_path)),
+        ResourceKind::Release
         | ResourceKind::ComponentRelease
         | ResourceKind::Sources
         | ResourceKind::Translation
         | ResourceKind::Icon
         | ResourceKind::FlatMetadata
-        | ResourceKind::FlatPool => None,
+        | ResourceKind::FlatPool => DigestSource::Absent,
     }
 }
 
@@ -1989,57 +1993,21 @@ fn registry_lookup_key<'a>(
 /// a body loop can hash incrementally and spare
 /// [`verify_temp_file`] its full re-read of the finished file.
 ///
-/// Deliberately mirrors `verify_and_rename`'s `kind` table arm for arm, and is
-/// exhaustive over `ResourceKind` so a new variant is a compile error in both
-/// places. A disagreement is safe but wasteful: a digest computed with the
+/// A disagreement with the commit-time decision (the registry gained or lost
+/// the digest in between) is safe but wasteful: a digest computed with the
 /// wrong algorithm is ignored ([`verify_temp_file`] compares the algorithm
 /// carried alongside it before trusting it) and falls back to the re-read.
 ///
-/// `registry_hit` is why the `Pool`/`Packages` arm is not simply
-/// `Some(Sha256)`. Those kinds are verified against the in-memory registry,
-/// and when the lookup misses — no `Packages` index ingested for that mirror
-/// yet, the ordinary state on a cold cache — `verify_temp_file` returns before
-/// it hashes anything. Hashing them anyway would not "waste the CPU the
-/// re-read would have spent": there is no re-read to spend it on, so a
+/// The registry probe is why a [`DigestSource::Registry`] kind is not simply
+/// `Some(Sha256)`. When the lookup misses — no `Packages` index ingested for
+/// that mirror yet, the ordinary state on a cold cache — `verify_temp_file`
+/// returns before it hashes anything. Hashing anyway would not "waste the CPU
+/// the re-read would have spent": there is no re-read to spend it on, so a
 /// several-hundred-megabyte `.deb` would be hashed inline on the worker for a
 /// digest nothing ever compares. The window between this call and the commit
 /// is not a correctness concern in either direction — a registry that gains
 /// the digest meanwhile falls back to the re-read, and one that loses it
 /// discards a digest.
-///
-/// Pure: `verify_enabled` is `global_config().verify_checksums` and
-/// `registry_hit` the registry probe, both passed in so this stays
-/// unit-testable. [`stream_hash_algo_for_download`] is the wrapper that reads
-/// them.
-#[cfg(feature = "splice")]
-#[must_use]
-fn stream_hash_algo(
-    resource_kind: ResourceKind,
-    registry_hit: bool,
-    verify_enabled: bool,
-) -> Option<HashAlgo> {
-    if !verify_enabled {
-        return None;
-    }
-    match resource_kind {
-        // Self-verifying: the algorithm is named in the URL.
-        ResourceKind::ByHash(algo, _) | ResourceKind::FlatByHash(algo, _) => Some(algo),
-        // Registry-backed, always SHA-256 (`VerifyKind::Registry`) -- but only
-        // worth computing when the registry already holds the digest.
-        ResourceKind::Pool | ResourceKind::Packages => registry_hit.then_some(HashAlgo::Sha256),
-        // `VerifyKind::Unverifiable`: no digest exists for these today.
-        ResourceKind::Release
-        | ResourceKind::ComponentRelease
-        | ResourceKind::Sources
-        | ResourceKind::Translation
-        | ResourceKind::Icon
-        | ResourceKind::FlatMetadata
-        | ResourceKind::FlatPool => None,
-    }
-}
-
-/// [`stream_hash_algo`] with the two process-global reads it deliberately does
-/// not do itself: `verify_checksums` and the checksum-registry probe.
 ///
 /// Splice-only, like its one caller `splice::splice_proxy_drive`.
 #[cfg(feature = "splice")]
@@ -2051,16 +2019,18 @@ pub(crate) fn stream_hash_algo_for_download(
     authority: &str,
     mirror_path: &str,
 ) -> Option<HashAlgo> {
-    if !global_config().verify_checksums {
-        return None;
+    match digest_source(
+        resource_kind,
+        debname,
+        raw_uri_path,
+        global_config().verify_checksums,
+    ) {
+        DigestSource::InUrl(algo) => Some(algo),
+        DigestSource::Registry(key) => global_checksum_registry()
+            .lookup(authority, mirror_path, &key)
+            .map(|_digest| HashAlgo::Sha256),
+        DigestSource::Absent => None,
     }
-    let registry_hit =
-        registry_lookup_key(resource_kind, debname, raw_uri_path).is_some_and(|key| {
-            global_checksum_registry()
-                .lookup(authority, mirror_path, &key)
-                .is_some()
-        });
-    stream_hash_algo(resource_kind, registry_hit, true)
 }
 
 /// Detect Packages compression by reading magic bytes from the file. Used for
@@ -2430,7 +2400,6 @@ mod tests {
     fn byhash_match_returns_proceed() {
         let f = temp_file_with(b"hello world");
         let plan = VerifyInput {
-            verify_enabled: true,
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             file: f.as_file(),
             temp_path: f.path(),
@@ -2439,102 +2408,57 @@ mod tests {
         assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
     }
 
-    /// The table must agree with `verify_and_rename`'s: exactly the kinds that
-    /// can produce an expected digest opt in, and the by-hash ones take the
-    /// algorithm their URL named rather than assuming SHA-256.
-    #[cfg(feature = "splice")]
+    /// The one digest-source table both the commit-time decision and the
+    /// pre-download hashing read: by-hash kinds take the algorithm their URL
+    /// named rather than assuming SHA-256, the registry-backed kinds name
+    /// the key the ingests register, and everything else has no digest.
     #[test]
-    fn stream_hash_algo_matches_the_verify_table() {
-        // By-hash resources carry their digest in the URL, so the registry is
-        // not consulted for them at all.
-        assert_eq!(
-            stream_hash_algo(
-                ResourceKind::ByHash(HashAlgo::Sha512, ByHashContent::Other),
-                false,
-                true
-            ),
-            Some(HashAlgo::Sha512)
-        );
-        assert_eq!(
-            stream_hash_algo(
-                ResourceKind::FlatByHash(HashAlgo::Sha256, ByHashContent::Other),
-                false,
-                true
-            ),
-            Some(HashAlgo::Sha256)
-        );
-        assert_eq!(
-            stream_hash_algo(ResourceKind::Pool, true, true),
-            Some(HashAlgo::Sha256)
-        );
-        assert_eq!(
-            stream_hash_algo(ResourceKind::Packages, true, true),
-            Some(HashAlgo::Sha256)
-        );
-
-        // Registry-backed kinds with no digest on file: `verify_temp_file`
-        // would return before hashing anything, so hashing the body as it
-        // arrives would buy nothing.
-        assert_eq!(stream_hash_algo(ResourceKind::Pool, false, true), None);
-        assert_eq!(stream_hash_algo(ResourceKind::Packages, false, true), None);
-
-        for kind in [
-            ResourceKind::Release,
-            ResourceKind::ComponentRelease,
-            ResourceKind::Sources,
-            ResourceKind::Translation,
-            ResourceKind::Icon,
-            ResourceKind::FlatMetadata,
-            ResourceKind::FlatPool,
-        ] {
-            assert_eq!(stream_hash_algo(kind, true, true), None, "{kind:?}");
-        }
-
-        // Verification off: nothing is ever hashed.
-        assert_eq!(stream_hash_algo(ResourceKind::Pool, true, false), None);
-        assert_eq!(
-            stream_hash_algo(
-                ResourceKind::ByHash(HashAlgo::Sha512, ByHashContent::Other),
-                true,
-                false
-            ),
-            None
-        );
-    }
-
-    /// The key each registry-backed kind is looked up under, so a change to
-    /// the commit-time lookup and the pre-download one cannot drift apart.
-    #[test]
-    fn registry_lookup_key_covers_the_registry_backed_kinds() {
+    fn digest_source_table() {
         const POOL: &str = "/debian/pool/main/h/hello/hello_1.0_amd64.deb";
 
         assert_eq!(
-            registry_lookup_key(ResourceKind::Pool, "hello_1.0_amd64.deb", POOL).as_deref(),
-            Some("hello_1.0_amd64.deb")
+            digest_source(
+                ResourceKind::ByHash(HashAlgo::Sha512, ByHashContent::Other),
+                "x",
+                POOL,
+                true
+            ),
+            DigestSource::InUrl(HashAlgo::Sha512)
         );
         assert_eq!(
-            registry_lookup_key(
+            digest_source(
+                ResourceKind::FlatByHash(HashAlgo::Sha256, ByHashContent::Other),
+                "x",
+                POOL,
+                true
+            ),
+            DigestSource::InUrl(HashAlgo::Sha256)
+        );
+        assert_eq!(
+            digest_source(ResourceKind::Pool, "hello_1.0_amd64.deb", POOL, true),
+            DigestSource::Registry("hello_1.0_amd64.deb".into())
+        );
+        assert_eq!(
+            digest_source(
                 ResourceKind::Packages,
                 "Packages.xz",
-                "/dists/sid/main/binary-amd64/Packages.xz"
-            )
-            .as_deref(),
-            Some("dists/sid/main/binary-amd64/Packages.xz")
+                "/dists/sid/main/binary-amd64/Packages.xz",
+                true
+            ),
+            DigestSource::Registry("dists/sid/main/binary-amd64/Packages.xz".into())
         );
         // Every spelling of one URL looks up the key a normalized
         // `release_dir` registered.
         assert_eq!(
-            registry_lookup_key(
+            digest_source(
                 ResourceKind::Packages,
                 "Packages.xz",
-                "/debian//dists/./sid/main/binary-amd64/Packages.xz"
-            )
-            .as_deref(),
-            Some("debian/dists/sid/main/binary-amd64/Packages.xz")
+                "/debian//dists/./sid/main/binary-amd64/Packages.xz",
+                true
+            ),
+            DigestSource::Registry("debian/dists/sid/main/binary-amd64/Packages.xz".into())
         );
         for kind in [
-            ResourceKind::ByHash(HashAlgo::Sha256, ByHashContent::Other),
-            ResourceKind::FlatByHash(HashAlgo::Sha256, ByHashContent::Other),
             ResourceKind::Release,
             ResourceKind::ComponentRelease,
             ResourceKind::Sources,
@@ -2543,8 +2467,9 @@ mod tests {
             ResourceKind::FlatMetadata,
             ResourceKind::FlatPool,
         ] {
-            assert!(
-                registry_lookup_key(kind, "hello_1.0_amd64.deb", POOL).is_none(),
+            assert_eq!(
+                digest_source(kind, "hello_1.0_amd64.deb", POOL, true),
+                DigestSource::Absent,
                 "{kind:?}"
             );
         }
@@ -2558,7 +2483,6 @@ mod tests {
     fn streamed_digest_is_used_instead_of_rereading() {
         let f = temp_file_with(b"not hello at all");
         let plan = VerifyInput {
-            verify_enabled: true,
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             file: f.as_file(),
             temp_path: f.path(),
@@ -2576,7 +2500,6 @@ mod tests {
     fn streamed_digest_mismatch_returns_reject() {
         let f = temp_file_with(b"hello world");
         let plan = VerifyInput {
-            verify_enabled: true,
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             file: f.as_file(),
             temp_path: f.path(),
@@ -2599,7 +2522,6 @@ mod tests {
     fn streamed_digest_of_wrong_algo_falls_back_to_reread() {
         let f = temp_file_with(b"hello world");
         let plan = VerifyInput {
-            verify_enabled: true,
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             file: f.as_file(),
             temp_path: f.path(),
@@ -2621,7 +2543,6 @@ mod tests {
     fn streamed_digest_of_wrong_length_falls_back_to_reread() {
         let f = temp_file_with(b"hello world");
         let plan = VerifyInput {
-            verify_enabled: true,
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             file: f.as_file(),
             temp_path: f.path(),
@@ -2639,7 +2560,6 @@ mod tests {
     fn byhash_mismatch_returns_reject() {
         let f = temp_file_with(b"tampered");
         let plan = VerifyInput {
-            verify_enabled: true,
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             file: f.as_file(),
             temp_path: f.path(),
@@ -2651,24 +2571,25 @@ mod tests {
         ));
     }
 
+    /// Verification off: no kind has a digest, so a tampered by-hash file
+    /// becomes [`VerifyKind::Unverifiable`] and proceeds unhashed.
     #[test]
-    fn disabled_returns_proceed_without_hashing() {
-        let f = temp_file_with(b"tampered");
-        let plan = VerifyInput {
-            verify_enabled: false,
-            kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
-            file: f.as_file(),
-            temp_path: f.path(),
-            streamed: None,
-        };
-        assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
+    fn disabled_yields_no_digest_source() {
+        const BYHASH: ResourceKind = ResourceKind::ByHash(HashAlgo::Sha256, ByHashContent::Other);
+        assert_eq!(
+            digest_source(BYHASH, HELLO_SHA256, "/x", false),
+            DigestSource::Absent
+        );
+        assert_eq!(
+            digest_source(ResourceKind::Pool, "hello_1.0_amd64.deb", "/x", false),
+            DigestSource::Absent
+        );
     }
 
     #[test]
     fn non_verifiable_kind_returns_proceed() {
         let f = temp_file_with(b"anything");
         let plan = VerifyInput {
-            verify_enabled: true,
             kind: VerifyKind::Unverifiable,
             file: f.as_file(),
             temp_path: f.path(),
@@ -2687,7 +2608,6 @@ mod tests {
             .open(f.path())
             .expect("open write-only");
         let plan = VerifyInput {
-            verify_enabled: true,
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             file: &write_only,
             temp_path: f.path(),
@@ -2703,7 +2623,6 @@ mod tests {
     fn expected_matching_digest_proceeds() {
         let f = temp_file_with(b"hello world");
         let plan = VerifyInput {
-            verify_enabled: true,
             kind: expect_sha256(HELLO_SHA256),
             file: f.as_file(),
             temp_path: f.path(),
@@ -2716,7 +2635,6 @@ mod tests {
     fn expected_mismatching_digest_rejects() {
         let f = temp_file_with(b"tampered deb");
         let plan = VerifyInput {
-            verify_enabled: true,
             kind: expect_zero_sha256(),
             file: f.as_file(),
             temp_path: f.path(),
@@ -2732,7 +2650,6 @@ mod tests {
     fn pool_with_unknown_digest_proceeds_best_effort() {
         let f = temp_file_with(b"some deb");
         let plan = VerifyInput {
-            verify_enabled: true,
             kind: VerifyKind::Unknown,
             file: f.as_file(),
             temp_path: f.path(),
@@ -3149,7 +3066,6 @@ mod tests {
 
             let f = temp_file_with(b"not hello world");
             let plan = VerifyInput {
-                verify_enabled: true,
                 kind: byhash_verify_kind(algo, &class.debname),
                 file: f.as_file(),
                 temp_path: f.path(),
@@ -3178,7 +3094,6 @@ mod tests {
         );
         let f = temp_file_with(b"hello world");
         let plan = VerifyInput {
-            verify_enabled: true,
             kind,
             file: f.as_file(),
             temp_path: f.path(),
@@ -3205,8 +3120,8 @@ mod tests {
             "/%64ebian//dists/./%73id/%6dain/binary-%61md64/Packages",
         ] {
             assert_eq!(
-                registry_lookup_key(ResourceKind::Packages, "Packages", path).as_deref(),
-                Some("debian/dists/sid/main/binary-amd64/Packages")
+                digest_source(ResourceKind::Packages, "Packages", path, true),
+                DigestSource::Registry("debian/dists/sid/main/binary-amd64/Packages".into())
             );
         }
         assert_eq!(
@@ -3724,7 +3639,6 @@ mod tests {
         };
 
         let outcome = verify_temp_file(&VerifyInput {
-            verify_enabled: true,
             kind: VerifyKind::Expected {
                 algo: HashAlgo::Sha256,
                 digest: digest.to_vec(),
