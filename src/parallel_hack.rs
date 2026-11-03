@@ -6,7 +6,7 @@
 //! Backend-neutral on purpose. The gate ([`should_nudge`]), the response head
 //! ([`nudge_head`]) and the opening debug line ([`log_nudge`]) are pure
 //! functions of the config, so `hyper_conn.rs::serve_new_file` and
-//! `splice/mod.rs::splice_proxy_drive` share one decision, one head and one
+//! `splice/mod.rs::splice_proxy` share one decision, one head and one
 //! wording instead of two drifting copies. What differs is only who keeps
 //! downloading afterwards: hyper's `download_file` is a detached task
 //! already, while splice hands the whole download to

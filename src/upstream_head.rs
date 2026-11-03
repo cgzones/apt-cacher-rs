@@ -1,6 +1,6 @@
 //! Backend-neutral classification of an upstream response head.
 //!
-//! `hyper_conn.rs::serve_new_file` and `splice/mod.rs::splice_proxy_drive`
+//! `hyper_conn.rs::serve_new_file` and `splice/mod.rs::splice_proxy`
 //! fetch the same upstream resources and must reach the same decisions on the
 //! (status, resume state, `Content-Range`, `Content-Length`, cached flavor)
 //! truth table: 304 revalidation, non-2xx relay, resume anomalies, the

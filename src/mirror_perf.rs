@@ -9,7 +9,7 @@
 //! or a resume-anomaly refetch is measured on the last exchange. Recorded
 //! for cached-route fetches the upstream answered with a body or a 304,
 //! at each fetching backend's upstream-head site (hyper's
-//! `serve_new_file_worker`, splice's `splice_proxy_drive`), the same point
+//! `serve_new_file_worker`, splice's `splice_proxy`), the same point
 //! the request earns its `Origin` row. Not recorded: passthroughs, failed
 //! exchanges, other statuses, cleanup's synthetic fetches. One divergence:
 //! splice's Auto-mode HTTPS-to-HTTP fallback happens inside one attempt

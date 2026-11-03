@@ -152,7 +152,7 @@ pub(super) async fn handle_volatile_buffered_download(
     let start = PreciseInstant::now();
 
     // The whole body is already buffered in memory, so -- unlike the streaming
-    // path (`splice_proxy_drive`) -- it lands in the temp file BEFORE the
+    // path (`splice_proxy`) -- it lands in the temp file BEFORE the
     // client is written to. Caching must not depend on the client write, so a
     // late client-write failure never discards an already-downloaded body
     // (late joiners and future requests keep it).

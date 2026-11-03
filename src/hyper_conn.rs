@@ -2218,7 +2218,7 @@ async fn serve_new_file_worker(
     if let Some((_, file_path)) = &cached {
         // Only count "out of date" when upstream actually returned fresh
         // content (mirrors the splice path's non-200/non-206 passthrough in
-        // `splice_proxy_drive`); a 4xx/5xx revalidation is not a fresh body.
+        // `splice_proxy`); a 4xx/5xx revalidation is not a fresh body.
         // Cleanup-synthetic probes bypass the parent counter (they bypass
         // sendfile and never bump VOLATILE_REFETCHED in the default build),
         // so counting them here would let the subset run ahead of the parent;

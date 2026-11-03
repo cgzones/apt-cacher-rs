@@ -1,6 +1,6 @@
 //! The client-less half of the parallel-download hack in splice builds.
 //!
-//! `splice_proxy_drive`'s nudge gate answers the client with a `429` plus
+//! `splice_proxy`'s nudge gate answers the client with a `429` plus
 //! `Retry-After` (see `crate::parallel_hack`) and hands everything the
 //! download still needs -- the upstream connection, the cache target with its
 //! registry entry and quota reservation, the body geometry -- to a
@@ -9,7 +9,7 @@
 //! connection, exactly like any other concurrent request for an in-flight
 //! download.
 //!
-//! `DetachedDownload::run` mirrors the tail of `splice_proxy_drive` from the body-prefix
+//! `DetachedDownload::run` mirrors the tail of `splice_proxy` from the body-prefix
 //! step on, minus every client write: the body loops run in
 //! `ClientStatus::Absent` (see `super::body`), and a failure is attributed by
 //! the same guarded runner as an attached download. No connection is needed
@@ -17,7 +17,7 @@
 //!
 //! The very end is not a mirror but the same code: `CacheTarget::begin_rename`
 //! ends the download, and the commit and the completion line are
-//! `super::commit::CommitTail`, which `splice_proxy_drive` spawns onto a
+//! `super::commit::CommitTail`, which `splice_proxy` spawns onto a
 //! fresh task and this module -- already off the connection -- simply awaits
 //! in place.
 //!
@@ -41,7 +41,7 @@ use super::{
 use crate::cache_conditional::ServeParams;
 
 /// A download whose client has been nudged away: everything
-/// `splice_proxy_drive` had in hand at the gate, owned rather than borrowed,
+/// `splice_proxy` had in hand at the gate, owned rather than borrowed,
 /// so it can outlive the connection task.
 pub(super) struct DetachedDownload {
     /// Owned upstream connection.
@@ -142,7 +142,7 @@ impl DetachedDownload {
 
         upstream.complete();
 
-        // The same tail `splice_proxy_drive` spawns, run in place: this task
+        // The same tail `splice_proxy` spawns, run in place: this task
         // *is* the off-connection context that one has to create. A commit
         // failure already logged its cause and dropped the barrier; nothing is
         // cached, so no DB rows and no completion line. Upstream side only:

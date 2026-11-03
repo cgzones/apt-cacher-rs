@@ -358,7 +358,7 @@ impl CommitTail {
         send_db_command(cmd).await;
 
         // No `Origin` row here: the request earned it at the upstream-head
-        // site (`ConnectionDetails::record_origin` in `splice_proxy_drive`,
+        // site (`ConnectionDetails::record_origin` in `splice_proxy`,
         // the same point as in the hyper backend), with its cleanup-synthetic
         // exemption. A second send from the tail was only ever a duplicate.
 

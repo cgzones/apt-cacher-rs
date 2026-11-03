@@ -772,7 +772,7 @@ pub(super) struct BodyTransfer<'a> {
     peer: Option<ClientInfo>,
 }
 
-/// What a body loop hands back to `splice_proxy_drive`.
+/// What a body loop hands back to `splice_proxy`.
 pub(super) struct BodyOutcome {
     /// How the client came out of the loop.
     pub(super) client: ClientEnd,
@@ -796,7 +796,7 @@ impl<'a> BodyTransfer<'a> {
     ) -> Self {
         let file_start_offset = cache.position();
         let rate_checker = RateChecker::from_config(config);
-        // `REQUESTS_SPLICE` is bumped by `splice_proxy_drive` alongside the
+        // `REQUESTS_SPLICE` is bumped by `splice_proxy` alongside the
         // response-headers emission (next to `record_client_status`), since
         // the body loops are skipped when the entire response fits in the
         // body prefix and we still need to count it. A transfer that ships
@@ -840,38 +840,18 @@ impl<'a> BodyTransfer<'a> {
         Ok(())
     }
 
-    fn publish_cache_progress(&mut self, previous_position: u64) {
-        let written = self.cache.position() - previous_position;
+    /// Run a [`CacheWriter`] operation, then publish the bytes it landed to
+    /// the barrier: every cache write of the body loops goes through here.
+    async fn tracked(
+        &mut self,
+        op: impl AsyncFnOnce(&mut CacheWriter) -> Result<(), DownloadFailure>,
+    ) -> Result<(), DownloadFailure> {
+        let before = self.cache.position();
+        op(&mut *self.cache).await?;
+        let written = self.cache.position() - before;
         if written != 0 {
             self.barrier.ping_batched(written);
         }
-    }
-
-    async fn flush_cache(&mut self) -> Result<(), DownloadFailure> {
-        let before = self.cache.position();
-        self.cache.flush().await?;
-        self.publish_cache_progress(before);
-        Ok(())
-    }
-
-    async fn flush_cache_if_due(&mut self) -> Result<(), DownloadFailure> {
-        let before = self.cache.position();
-        self.cache.flush_if_due().await?;
-        self.publish_cache_progress(before);
-        Ok(())
-    }
-
-    async fn write_cache_chunk(&mut self, buf: &mut Vec<u8>) -> Result<(), DownloadFailure> {
-        let before = self.cache.position();
-        self.cache.write_cache_chunk(buf).await?;
-        self.publish_cache_progress(before);
-        Ok(())
-    }
-
-    async fn write_through(&mut self) -> Result<(), DownloadFailure> {
-        let before = self.cache.position();
-        self.cache.write_through().await?;
-        self.publish_cache_progress(before);
         Ok(())
     }
 
@@ -895,11 +875,13 @@ impl<'a> BodyTransfer<'a> {
                 Err(nix::errno::Errno::EINTR) => {}
                 // `pipe_B` is full; landing it empties it.
                 Err(nix::errno::Errno::EAGAIN) if !self.cache.batch().is_empty() => {
-                    self.flush_cache().await?;
+                    self.tracked(CacheWriter::flush).await?;
                 }
                 // No room in an empty `pipe_B`: land `pipe_A` directly
                 // instead, which is what it holds.
-                Err(nix::errno::Errno::EAGAIN) => return self.write_through().await,
+                Err(nix::errno::Errno::EAGAIN) => {
+                    return self.tracked(CacheWriter::write_through).await;
+                }
                 Err(err) => {
                     return Err(internal_io(errno_to_io_error(
                         err,
@@ -908,7 +890,7 @@ impl<'a> BodyTransfer<'a> {
                 }
             }
         }
-        self.flush_cache_if_due().await
+        self.tracked(CacheWriter::flush_if_due).await
     }
 
     /// Account a chunk just pulled from upstream and return the body-offset
@@ -1121,7 +1103,7 @@ pub(super) async fn splice_proxy_body(
 ) -> Result<BodyOutcome, DownloadFailure> {
     xfer.cache.sink = CacheSink::Pipes(SplicePipes::new().map_err(internal_io)?);
     drive_batches(&mut xfer, upstream).await?;
-    xfer.flush_cache().await?;
+    xfer.tracked(CacheWriter::flush).await?;
     Ok(xfer.finish())
 }
 
@@ -1254,7 +1236,7 @@ async fn drive_batches(
                         () = xfer.cache.batch().until_stale(), if !xfer.cache.batch().is_empty() => true,
                     };
                     if batch_is_stale {
-                        xfer.flush_cache().await?;
+                        xfer.tracked(CacheWriter::flush).await?;
                     }
                     continue;
                 }
@@ -1308,7 +1290,8 @@ async fn drive_batches(
             // see progress without being gated on the first client's send speed.
             // The pwrite lands at `file_offset`, so the batched `pipe_B` bytes
             // (which come earlier in the body) have to be there already.
-            xfer.write_cache_chunk(&mut buf).await?;
+            xfer.tracked(async |cache| cache.write_cache_chunk(&mut buf).await)
+                .await?;
 
             let client_slice = range_slice(&buf, chunk.start, range_filter.skip, range_filter.send);
             if !client_slice.is_empty() {
@@ -1460,7 +1443,7 @@ pub(super) async fn splice_proxy_body_tls(
 ) -> Result<BodyOutcome, DownloadFailure> {
     xfer.cache.sink = CacheSink::Buffer(CacheBatch::with_sink(BufferSink::new(xfer.remaining)));
     drive_reads(&mut xfer, upstream).await?;
-    xfer.flush_cache().await?;
+    xfer.tracked(CacheWriter::flush).await?;
     Ok(xfer.finish())
 }
 
@@ -1495,7 +1478,7 @@ async fn drive_reads(
         // holding unwritten bytes (an early flush left its batch below the
         // threshold) is landed first.
         if xfer.cache.buffer().sink.is_full() {
-            xfer.flush_cache().await?;
+            xfer.tracked(CacheWriter::flush).await?;
         }
         xfer.cache.buffer_mut().sink.recycle();
 
@@ -1588,7 +1571,7 @@ async fn drive_reads(
                 }
             };
             let Some(n) = parked else {
-                xfer.flush_cache().await?;
+                xfer.tracked(CacheWriter::flush).await?;
                 continue;
             };
             if n == 0 {
@@ -1610,7 +1593,7 @@ async fn drive_reads(
         // concurrent clients see progress without being gated on this
         // client's send speed.
         xfer.cache.buffer_mut().queue(got);
-        xfer.flush_cache_if_due().await?;
+        xfer.tracked(CacheWriter::flush_if_due).await?;
 
         // Step 3: deliver the read. It stays in the buffer until the next
         // iteration, landed or not, so the delivery reads it in place.
@@ -1686,7 +1669,7 @@ async fn write_client_or_demote<'a>(
             Ok(n) => {
                 written += n;
                 if let Some(trigger) = xfer.note_client_bytes(n) {
-                    xfer.flush_cache().await?;
+                    xfer.tracked(CacheWriter::flush).await?;
                     xfer.request_demote(client, trigger);
                     return Ok(());
                 }
@@ -1694,7 +1677,7 @@ async fn write_client_or_demote<'a>(
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
                 // Nothing grows the partial while this task waits here, so a
                 // slow client would otherwise throttle every other reader.
-                xfer.flush_cache().await?;
+                xfer.tracked(CacheWriter::flush).await?;
                 if let Err(err) = wait_writable_rated(
                     client,
                     &mut xfer.client_rate_checker,
@@ -2288,7 +2271,7 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), D
                     // failed and the pipe is smaller than
                     // `CacheBatch::FLUSH_THRESHOLD`.
                     Err(nix::errno::Errno::EAGAIN) if !xfer.cache.batch().is_empty() => {
-                        xfer.flush_cache().await?;
+                        xfer.tracked(CacheWriter::flush).await?;
                         continue;
                     }
                     // EAGAIN/EWOULDBLOCK: see module-level static_assert.
@@ -2312,7 +2295,7 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), D
             // A due batch is written before the client splice below, so
             // concurrent clients still see progress without being gated on a
             // potentially slow first client.
-            xfer.flush_cache_if_due().await?;
+            xfer.tracked(CacheWriter::flush_if_due).await?;
 
             // Step 4: splice pipe_A → client (may be slow, but no longer blocks cache)
             // pipe_A always has data on entry (just filled by tee), so try the
@@ -2356,7 +2339,7 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), D
                             // takes over from `client_file_pos` by reading
                             // the partial file, so every byte delivered so
                             // far has to be on disk first.
-                            xfer.flush_cache().await?;
+                            xfer.tracked(CacheWriter::flush).await?;
                             xfer.request_demote(client, trigger);
                             break;
                         }
@@ -2373,7 +2356,7 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), D
                         // other reader until it recovers, times out or is
                         // demoted. Parking on *upstream* is deliberately not a
                         // flush point -- see [`CacheBatch`].
-                        xfer.flush_cache().await?;
+                        xfer.tracked(CacheWriter::flush).await?;
                         clear_pipe_readable_cache(&xfer.cache.pipes().upstream_rx);
                         clear_tcp_writable_cache(client);
                         tokio::select! {
@@ -3126,9 +3109,13 @@ mod tests {
             &config,
         );
         // The range excludes both "xx" and "-outside" from the resumed body.
-        xfer.write_cache_chunk(&mut b"xxsentsuffix-outside".to_vec())
-            .await
-            .unwrap();
+        xfer.tracked(async |cache| {
+            cache
+                .write_cache_chunk(&mut b"xxsentsuffix-outside".to_vec())
+                .await
+        })
+        .await
+        .unwrap();
         assert_eq!(xfer.note_chunk(20), 0..20);
         let trigger = xfer
             .note_client_bytes(4)
@@ -3295,7 +3282,9 @@ mod tests {
         // Model an earlier teed batch whose client bytes have been delivered.
         queue_cache(xfer.cache.pipes_mut(), b"queued-").await;
         let mut boundary = b"boundary-".to_vec();
-        xfer.write_cache_chunk(&mut boundary).await.unwrap();
+        xfer.tracked(async |cache| cache.write_cache_chunk(&mut boundary).await)
+            .await
+            .unwrap();
         assert_eq!(xfer.cache.file_offset, 23);
         assert!(receiver.has_changed().unwrap());
         receiver.borrow_and_update();
@@ -3307,7 +3296,7 @@ mod tests {
         // Switching to cache-only must also land the next queued bytes first.
         queue_cache(xfer.cache.pipes_mut(), b"queued2-").await;
         accumulate(xfer.cache.pipes_mut(), b"tail");
-        xfer.write_through().await.unwrap();
+        xfer.tracked(CacheWriter::write_through).await.unwrap();
         assert_eq!(xfer.cache.file_offset, 35);
         assert!(xfer.cache.batch().is_empty());
         drop(xfer);
@@ -3370,7 +3359,7 @@ mod tests {
             !xfer.cache.batch().is_empty(),
             "small batches wait for the threshold"
         );
-        xfer.flush_cache().await.unwrap();
+        xfer.tracked(CacheWriter::flush).await.unwrap();
         assert_eq!(
             xfer.cache.file_offset,
             i64::try_from(expected.len()).unwrap()

@@ -1992,7 +1992,7 @@ fn digest_source<'a>(
 /// the digest meanwhile falls back to the re-read, and one that loses it
 /// discards a digest.
 ///
-/// Splice-only, like its one caller `splice::splice_proxy_drive`.
+/// Splice-only, like its one caller `splice::splice_proxy`.
 #[cfg(feature = "splice")]
 #[must_use]
 pub(crate) fn stream_hash_algo_for_download(

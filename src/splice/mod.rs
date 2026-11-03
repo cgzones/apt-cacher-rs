@@ -8,9 +8,8 @@
 //! `fsync`, a hash and three DB writes.
 //!
 //! This file owns the entry point the sendfile backend calls
-//! ([`splice_proxy`]) and the types it matches on ([`SpliceProxyOutcome`],
-//! [`SpliceProxyError`]), the
-//! request drive ([`splice_proxy_drive`] and its phase functions) and the
+//! ([`splice_proxy`], the request drive, and its phase functions), the types
+//! it matches on ([`SpliceProxyOutcome`], [`SpliceProxyError`]) and the
 //! per-request state structs ([`ClientConn`], [`CacheTarget`],
 //! [`RateTimestamps`]). The mechanics live in submodules:
 //!
@@ -96,7 +95,7 @@ use crate::upstream_head::{
 };
 use crate::{
     AppState,
-    active_downloads::{ActiveDownloadStatus, Admission, Declined, Origination},
+    active_downloads::{ActiveDownloadStatus, Admission, Declined},
     build_info::APP_VIA,
     cache_metadata::{self, write_upstream_metadata},
     client_counter,
@@ -177,60 +176,6 @@ impl ClientConn<'_> {
 /// Maximum bytes to forward for volatile responses (no Content-Length / chunked non-cacheable).
 const VOLATILE_BODY_MAX: usize = 1024 * 1024;
 
-/// Splice-based proxy: connects to upstream (HTTP or HTTPS), transfers the response body
-/// to the client socket via tee+splice fan-out while caching to disk.
-///
-/// For plain TCP upstreams, the entire path is zero-copy (splice from socket).
-/// For TLS upstreams, the upstream read goes through userspace (decryption), but the
-/// fan-out to client + cache still benefits from tee+splice.
-pub(crate) async fn splice_proxy(
-    client_stream: &TcpStream,
-    conn_version: ConnectionVersion,
-    conn_action: ConnectionAction,
-    conn_details: &ConnectionDetails,
-    upstream_path: &str,
-    appstate: &AppState,
-    client_range: RangeRequestHeaders<'_>,
-) -> Result<SpliceProxyOutcome, SpliceProxyError> {
-    // Register with active downloads to coordinate with concurrent clients.
-    // A `LateJoiner` admission means another download for this key won the race
-    // between sendfile's earlier `attach()` and our `register()` here. It is
-    // an alternate success — the caller retries as a sendfile late joiner
-    // instead of falling all the way back to hyper. No late-joiner double
-    // count, since `attach()` and `register()` are mutually exclusive paths.
-    let origination = match appstate.active_downloads.register(conn_details.key()) {
-        Admission::Originator(origination) => {
-            conn_details.count_fetch_role(FetchRole::Originator);
-            origination
-        }
-        Admission::LateJoiner { status } => {
-            conn_details.count_fetch_role(FetchRole::Joiner);
-            return Ok(SpliceProxyOutcome::Concurrent { status });
-        }
-        Admission::AtCapacity { max } => {
-            conn_details.count_fetch_role(FetchRole::Refused);
-            return Ok(SpliceProxyOutcome::AtCapacity { max });
-        }
-    };
-
-    let client = ClientConn {
-        stream: client_stream,
-        version: conn_version,
-        action: conn_action,
-    };
-
-    // TODO: use become: https://github.com/rust-lang/rust/issues/112788
-    splice_proxy_drive(
-        client,
-        conn_details,
-        upstream_path,
-        appstate,
-        client_range,
-        origination,
-    )
-    .await
-}
-
 /// Serve a cached volatile file after an upstream `304 Not Modified`: refresh
 /// the freshness window via `touch_volatile_mtime_with`, release the init
 /// barrier, then deliver the file with `sendfile(2)`. The file is the
@@ -239,8 +184,7 @@ pub(crate) async fn splice_proxy(
 /// held since `register()` keeps any commit of the same key -- the only way
 /// a cache file is replaced -- from renaming a newer copy in meanwhile. The
 /// per-path bits (status recording, upstream-connection pooling, `debug!`
-/// wording) stay at the call site, and `invalid_tag` carries the call-site
-/// location tag for `SpliceProxyError::Client`. A failed delivery (already
+/// wording) stay at the call site. A failed delivery (already
 /// logged by the sendfile serve) is [`SpliceProxyOutcome::ClientLost`], so the
 /// connection closes instead of waiting for a next request the client, still
 /// owed the rest of this body, will never send.
@@ -250,7 +194,6 @@ async fn serve_volatile_304_via_sendfile(
     stale: StaleCopy,
     client_range: RangeRequestHeaders<'_>,
     mut ibarrier: InitBarrier,
-    invalid_tag: &'static str,
 ) -> Result<SpliceProxyOutcome, SpliceProxyError> {
     if !conn_details.client.is_cleanup_synthetic() {
         metrics::VOLATILE_REFETCHED_UPTODATE.increment();
@@ -284,7 +227,7 @@ async fn serve_volatile_304_via_sendfile(
             Ok(SpliceProxyOutcome::ClientLost)
         }
         SendfileResult::Invalid { status, msg } => client
-            .write_invalid(status, msg, None, invalid_tag)
+            .write_invalid(status, msg, None, "post-304 invalid response")
             .await
             .map(|()| SpliceProxyOutcome::Served),
     }
@@ -384,7 +327,7 @@ fn render_splice_response_head(
 /// `REQUESTS_SPLICE` bump, and returns the instant the first byte headed to
 /// the client (start of the client-rate window). `phase` tags a failed
 /// write, which can only ever be a client failure -- the caller decides what
-/// that ends. `splice_proxy_drive` does not end the download with it: it
+/// that ends. `splice_proxy` does not end the download with it: it
 /// hands the failure to [`lost_prefix_client`], which reports it, half-closes
 /// the socket and keeps the download running cache-only.
 async fn write_splice_response_headers(
@@ -1487,19 +1430,49 @@ async fn transfer_body(
     Ok(BodyTransferred { target, client })
 }
 
-/// Body of [`splice_proxy`] after the originate check has succeeded: the
-/// download as a sequence of phases. Kept as a separate fn returning
-/// `Result<SpliceProxyOutcome, SpliceProxyError>` so the many early returns
-/// scattered through the body do not need to be rewritten just because the
-/// outer success type changed.
-async fn splice_proxy_drive(
-    client: ClientConn<'_>,
+/// Splice-based proxy: connects to upstream (HTTP or HTTPS), transfers the response body
+/// to the client socket via tee+splice fan-out while caching to disk. The
+/// request drive: the download as a sequence of phases.
+///
+/// For plain TCP upstreams, the entire path is zero-copy (splice from socket).
+/// For TLS upstreams, the upstream read goes through userspace (decryption), but the
+/// fan-out to client + cache still benefits from tee+splice.
+pub(crate) async fn splice_proxy(
+    client_stream: &TcpStream,
+    conn_version: ConnectionVersion,
+    conn_action: ConnectionAction,
     conn_details: &ConnectionDetails,
     upstream_path: &str,
     appstate: &AppState,
     client_range: RangeRequestHeaders<'_>,
-    origination: Origination,
 ) -> Result<SpliceProxyOutcome, SpliceProxyError> {
+    // Register with active downloads to coordinate with concurrent clients.
+    // A `LateJoiner` admission means another download for this key won the race
+    // between sendfile's earlier `attach()` and our `register()` here. It is
+    // an alternate success — the caller retries as a sendfile late joiner
+    // instead of falling all the way back to hyper. No late-joiner double
+    // count, since `attach()` and `register()` are mutually exclusive paths.
+    let origination = match appstate.active_downloads.register(conn_details.key()) {
+        Admission::Originator(origination) => {
+            conn_details.count_fetch_role(FetchRole::Originator);
+            origination
+        }
+        Admission::LateJoiner { status } => {
+            conn_details.count_fetch_role(FetchRole::Joiner);
+            return Ok(SpliceProxyOutcome::Concurrent { status });
+        }
+        Admission::AtCapacity { max } => {
+            conn_details.count_fetch_role(FetchRole::Refused);
+            return Ok(SpliceProxyOutcome::AtCapacity { max });
+        }
+    };
+
+    let client = ClientConn {
+        stream: client_stream,
+        version: conn_version,
+        action: conn_action,
+    };
+
     // The dial target: the host the client named (an alias is a real
     // mirror), never the canonical mirror the caches key on.
     let host_authority = conn_details.upstream_authority();
@@ -1635,7 +1608,6 @@ async fn splice_proxy_drive(
                 stale,
                 client_range,
                 ibarrier,
-                "post-304 invalid response",
             )
             .await;
         }
