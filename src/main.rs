@@ -100,7 +100,6 @@ mod tcp_cork_guard;
 #[cfg(test)]
 mod test_support;
 mod transfer_error;
-mod tunnel_limiter;
 mod uncacheables;
 mod upstream_dial;
 mod upstream_head;

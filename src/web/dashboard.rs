@@ -23,6 +23,7 @@ use crate::{
     client_counter::{active_client_downloads, busiest_client_connections, connected_clients},
     client_trouble,
     config::HttpsUpgradeMode,
+    connect_tunnel::{active_tunnels, busiest_client_tunnels},
     database::{
         BandwidthWindows, ClientStatEntry, Database, MirrorStatEntry, OriginEntry, TopPackages,
     },
@@ -37,7 +38,6 @@ use crate::{
     metrics, mirror_health, mirror_indexes, mirror_perf,
     passthrough_limiter::active_relays,
     permitted_host_cache, scheme_cache, swrite,
-    tunnel_limiter::{active_tunnels, busiest_client_tunnels},
     uncacheables::{UNCACHEABLES_MAX, get_uncacheables},
     verify_throttle, warn_once_or_debug,
 };

@@ -15,6 +15,11 @@
 //! empty `https_tunnel_allowed_ports` skips the port check entirely, because
 //! the host list has already bounded the reachable targets by then.
 //!
+//! [`admit`] also owns the tunnel counts: the per-source-IP cap
+//! (`https_tunnel_max_connections_per_client`, a `PerIpCounter`) and the
+//! unconditional active count and peak the dashboard shows, kept whether or
+//! not that cap is configured.
+//!
 //! Established tunnels relay through [`copy_bidirectional_idle`], which
 //! tears the tunnel down after `client_idle_timeout` without a byte in either
 //! direction — otherwise a parked CONNECT socket pins two fds and an upstream
@@ -37,16 +42,39 @@ use tokio::{
 use tracing::{error, info};
 
 use crate::{
+    client_counter::{ActiveCount, ActiveGuard},
     client_info::ClientInfo,
     client_trouble::{self, Trouble},
     config::{Config, DomainName},
     error::{ErrorReport, is_peer_disconnect},
     humanfmt::HumanFmt,
     limits, metrics,
-    tunnel_limiter::{self, ActiveTunnelGuard, TunnelGuard},
+    per_ip_counter::{PerIpCounter, PerIpPermit},
     upstream_dial, uri_authority, warn_once_or_debug, warn_once_or_info,
     write_stall::is_client_write_stall,
 };
+
+/// No per-IP peak gauge: the dashboard's tunnel peak is the *global*
+/// [`metrics::CONNECT_TUNNEL_ACTIVE_PEAK`], maintained by [`ACTIVE_TUNNELS`]
+/// whether or not the per-IP cap is configured.
+static TUNNEL_CONNECTIONS: std::sync::LazyLock<PerIpCounter> =
+    std::sync::LazyLock::new(|| PerIpCounter::new(None, &metrics::TUNNEL_PER_CLIENT_CAP_CLOCK));
+
+/// Every admitted tunnel across all source IPs, capped or not.
+static ACTIVE_TUNNELS: ActiveCount = ActiveCount::new(&metrics::CONNECT_TUNNEL_ACTIVE_PEAK);
+
+/// The most tunnels any single source IP holds right now, the live figure
+/// `https_tunnel_max_connections_per_client` is compared against.
+#[must_use]
+pub(crate) fn busiest_client_tunnels() -> usize {
+    TUNNEL_CONNECTIONS.busiest()
+}
+
+/// Current number of active HTTPS tunnel connections across all clients.
+#[must_use]
+pub(crate) fn active_tunnels() -> usize {
+    ACTIVE_TUNNELS.get()
+}
 
 /// A CONNECT target that passed [`validate_connect_target`]: a permitted
 /// host, parsed like every other host (an IPv6 target arrives bracketed,
@@ -88,15 +116,15 @@ pub(crate) struct ConnectReject {
 /// Backends retain this permit through upgrade, dialing, and the whole relay.
 pub(crate) struct TunnelPermit {
     // Match the backend guards' teardown: stop counting active, then free the slot.
-    _active: ActiveTunnelGuard,
-    _slot: Option<TunnelGuard>,
+    _active: ActiveGuard,
+    _slot: Option<PerIpPermit>,
 }
 
 /// Acquire the configured per-client tunnel slot, recording any refusal.
 pub(crate) fn admit(config: &Config, client: &ClientInfo) -> Result<TunnelPermit, ConnectReject> {
     let slot = if let Some(max) = config.https_tunnel_max_connections_per_client {
         let Some(guard) =
-            tunnel_limiter::try_acquire(client.ip(), max, config.client_ipv6_prefix_len)
+            TUNNEL_CONNECTIONS.try_acquire(client.ip(), max, config.client_ipv6_prefix_len)
         else {
             info!(
                 "Rejecting https tunnel request for client {client}, concurrent connection limit ({max}) reached"
@@ -114,7 +142,7 @@ pub(crate) fn admit(config: &Config, client: &ClientInfo) -> Result<TunnelPermit
     };
     Ok(TunnelPermit {
         _slot: slot,
-        _active: ActiveTunnelGuard::new(),
+        _active: ACTIVE_TUNNELS.enter(),
     })
 }
 
@@ -493,21 +521,21 @@ mod tests {
     fn admission_counts_uncapped_tunnels_and_releases_capped_slots() {
         let mut config = Config::default();
         let client = local_client();
-        let before = tunnel_limiter::active_tunnels();
+        let before = active_tunnels();
         let uncapped = admit(&config, &client)
             .map_err(|rejection| rejection.status)
             .expect("uncapped admission");
-        assert_eq!(tunnel_limiter::active_tunnels(), before + 1);
+        assert_eq!(active_tunnels(), before + 1);
         drop(uncapped);
-        assert_eq!(tunnel_limiter::active_tunnels(), before);
+        assert_eq!(active_tunnels(), before);
         config.https_tunnel_max_connections_per_client = NonZero::new(1);
         let capped = admit(&config, &client)
             .map_err(|rejection| rejection.status)
             .expect("first slot");
         assert!(admit(&config, &client).is_err());
-        assert_eq!(tunnel_limiter::active_tunnels(), before + 1);
+        assert_eq!(active_tunnels(), before + 1);
         drop(capped);
-        assert_eq!(tunnel_limiter::active_tunnels(), before);
+        assert_eq!(active_tunnels(), before);
         assert!(admit(&config, &client).is_ok());
     }
 

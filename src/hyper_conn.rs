@@ -3648,7 +3648,7 @@ mod tests {
         let refused = tokio::net::TcpSocket::new_v4().unwrap();
         refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let target = refused.local_addr().unwrap();
-        let before = crate::tunnel_limiter::active_tunnels();
+        let before = crate::connect_tunnel::active_tunnels();
         let failed = crate::metrics::TUNNEL_TRANSFER_FAILED.get();
         let accepted = crate::metrics::TUNNEL_CONNECTS_TOTAL.get();
         let (mut client, driver, mut done) = connect_server(tunnel_config());
@@ -3663,7 +3663,7 @@ mod tests {
         assert_eq!(body, b"Upstream Error");
         driver.await.unwrap();
         assert!(done.recv().await.is_none());
-        assert_eq!(crate::tunnel_limiter::active_tunnels(), before);
+        assert_eq!(crate::connect_tunnel::active_tunnels(), before);
         assert_eq!(crate::metrics::TUNNEL_TRANSFER_FAILED.get(), failed + 1);
         assert_eq!(crate::metrics::TUNNEL_CONNECTS_TOTAL.get(), accepted + 1);
     }

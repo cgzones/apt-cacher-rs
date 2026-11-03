@@ -11,7 +11,7 @@ use crate::{
 };
 
 static CONNECTED_CLIENTS: AtomicUsize = AtomicUsize::new(0);
-static CLIENT_DOWNLOADS: AtomicUsize = AtomicUsize::new(0);
+static CLIENT_DOWNLOADS: ActiveCount = ActiveCount::new(&metrics::ACTIVE_CLIENT_DOWNLOADS_PEAK);
 
 static CONNECTIONS_PER_IP: std::sync::LazyLock<PerIpCounter> = std::sync::LazyLock::new(|| {
     PerIpCounter::new(
@@ -133,12 +133,62 @@ impl Drop for ClientCounter {
 
 #[must_use]
 pub(crate) fn active_client_downloads() -> usize {
-    CLIENT_DOWNLOADS.load(Ordering::Relaxed)
+    CLIENT_DOWNLOADS.get()
+}
+
+/// A live count of something in progress across all clients, and the peak
+/// gauge it feeds: the unconditional activity counts the dashboard shows
+/// (client downloads here, CONNECT tunnels in `connect_tunnel`), kept
+/// whether or not any cap applies to them.
+pub(crate) struct ActiveCount {
+    count: AtomicUsize,
+    peak: &'static metrics::Peak,
+}
+
+impl ActiveCount {
+    #[must_use]
+    pub(crate) const fn new(peak: &'static metrics::Peak) -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            peak,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn get(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    /// Count one more for the lifetime of the returned guard, sampling the
+    /// peak gauge.
+    pub(crate) fn enter(&'static self) -> ActiveGuard {
+        let current = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak.update(current as u64);
+        ActiveGuard { count: self }
+    }
+}
+
+/// One unit of an [`ActiveCount`], released on drop.
+#[must_use = "dropping the guard right away leaves the count untouched"]
+pub(crate) struct ActiveGuard {
+    count: &'static ActiveCount,
+}
+
+impl std::fmt::Debug for ActiveGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActiveGuard").finish_non_exhaustive()
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.count.count.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct ClientDownload {
-    _private: (),
+    _active: ActiveGuard,
 }
 
 impl ClientDownload {
@@ -146,15 +196,9 @@ impl ClientDownload {
     /// guard; dropping it right away would leave the counter untouched.
     #[must_use]
     pub(crate) fn new() -> Self {
-        let current = CLIENT_DOWNLOADS.fetch_add(1, Ordering::Relaxed) + 1;
-        metrics::ACTIVE_CLIENT_DOWNLOADS_PEAK.update(current as u64);
-        Self { _private: () }
-    }
-}
-
-impl Drop for ClientDownload {
-    fn drop(&mut self) {
-        CLIENT_DOWNLOADS.fetch_sub(1, Ordering::Relaxed);
+        Self {
+            _active: CLIENT_DOWNLOADS.enter(),
+        }
     }
 }
 

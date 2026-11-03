@@ -2,7 +2,7 @@
 //!
 //! Two independent caps are expressed with it -
 //! `max_connections_per_client_ip` ([`crate::client_counter`]) and
-//! `https_tunnel_max_connections_per_client` ([`crate::tunnel_limiter`]) -
+//! `https_tunnel_max_connections_per_client` ([`crate::connect_tunnel`]) -
 //! and each owns its own counter instance, its own refusal metric and its own
 //! composition with a global cap. What they share, and what used to be
 //! written twice, is the bookkeeping: admit while under the cap, and on
