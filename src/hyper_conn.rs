@@ -2820,13 +2820,13 @@ async fn pre_process_client_request_wrapper(
     Ok(response)
 }
 
-/// The response to a shared pre-flight rejection: an authorization refusal
-/// also ends the connection (`RejectReason::is_authorization_refusal`), as
-/// in the sendfile backend.
+/// The response to a shared pre-flight or dispatch rejection, ending the
+/// connection as [`RejectReason::closes_connection`] says, as in the
+/// sendfile backend.
 #[must_use]
 fn reject_response(reason: RejectReason) -> Response<ProxyCacheBody> {
     let (status, msg) = reason.response_parts();
-    if reason.is_authorization_refusal() {
+    if reason.closes_connection() {
         quick_response_closing(status, msg)
     } else {
         quick_response(status, msg)
@@ -2927,8 +2927,7 @@ async fn pre_process_client_request(
             .iter()
             .filter_map(|v| v.to_str().ok());
         if let Err(reason) = preflight_via(via_values, &client) {
-            let (status, msg) = reason.response_parts();
-            return quick_response(status, msg);
+            return reject_response(reason);
         }
 
         let (requested_host, requested_port) = match preflight_target(
@@ -2964,10 +2963,7 @@ async fn pre_process_client_request(
             DispatchOutcome::Cache(conn_details) => {
                 return process_cache_request(conn_details, req, appstate).await;
             }
-            DispatchOutcome::Reject(reason) => {
-                let (status, msg) = reason.response_parts();
-                return quick_response(status, msg);
-            }
+            DispatchOutcome::Reject(reason) => return reject_response(reason),
             DispatchOutcome::Passthrough {
                 reason,
                 requested_host,

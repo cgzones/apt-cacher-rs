@@ -120,31 +120,30 @@ pub(crate) enum RejectReason {
 }
 
 impl RejectReason {
-    /// Whether this is an authorization refusal (the proxy-client or
-    /// web-interface ACL).  Every backend closes the connection after one,
-    /// so a refused client cannot keep its connection slot by asking again.
+    /// Whether the connection ends after this refusal, in every backend.
+    /// Only the pdiff refusal keeps it (per the request's own `Connection`
+    /// semantics): it answers a well-formed request, after which apt fetches
+    /// the full index on the same connection.  An authorization refusal
+    /// closes so a refused client cannot keep its connection slot by asking
+    /// again; every other refusal answers a malformed or hostile request and
+    /// closes to defend against header smuggling.
     #[must_use]
-    #[cfg_attr(
-        not(feature = "hyper"),
-        expect(
-            dead_code,
-            reason = "the sendfile backend spells the same set out in `reject_result`"
-        )
-    )]
-    pub(crate) const fn is_authorization_refusal(self) -> bool {
+    pub(crate) const fn closes_connection(self) -> bool {
         match self {
-            Self::UnauthorizedClient | Self::UnauthorizedWebUi | Self::MisdirectedWebUi => true,
+            Self::DiffRequest => false,
             Self::UnsupportedMethod
             | Self::UnknownMethod
+            | Self::UnauthorizedClient
             | Self::UnsupportedScheme
             | Self::MissingHost
+            | Self::UnauthorizedWebUi
+            | Self::MisdirectedWebUi
             | Self::InvalidPort
             | Self::InvalidTarget
             | Self::BadEncoding
             | Self::InvalidValue
             | Self::UnsafePath
-            | Self::DiffRequest
-            | Self::LoopDetected => false,
+            | Self::LoopDetected => true,
         }
     }
 

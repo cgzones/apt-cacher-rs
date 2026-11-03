@@ -722,12 +722,8 @@ async fn write_webui_response(
     write_all_to_stream(stream, &response.body, WritePhase::Body).await
 }
 
-/// Map a shared pre-flight/dispatch rejection onto the sendfile result type.
-///
-/// A diff-request rejection keeps the connection alive (per the request's
-/// own `Connection` semantics); an authorization refusal (the CONNECT or
-/// web-interface ACL) closes it in both backends, so a refused client
-/// cannot keep its connection slot by asking again; every other 4xx closes to defend against header smuggling.
+/// Map a shared pre-flight/dispatch rejection onto the sendfile result type,
+/// closing the connection as [`RejectReason::closes_connection`] says.
 /// `conn_action` is a closure because `compute_conn_action` logs a warning
 /// for requests carrying a body, which the closing variants never did.
 #[must_use]
@@ -736,29 +732,14 @@ fn reject_result(
     conn_action: impl FnOnce() -> ConnectionAction,
 ) -> ZeroCopyResult {
     let (status, msg) = reason.response_parts();
-    match reason {
-        RejectReason::DiffRequest => ZeroCopyResult::Rejection {
+    if reason.closes_connection() {
+        ZeroCopyResult::Invalid { status, msg }
+    } else {
+        ZeroCopyResult::Rejection {
             status,
             conn_action: conn_action(),
             msg,
-        },
-        RejectReason::UnauthorizedClient
-        | RejectReason::UnauthorizedWebUi
-        | RejectReason::MisdirectedWebUi => ZeroCopyResult::Rejection {
-            status,
-            conn_action: ConnectionAction::Close,
-            msg,
-        },
-        RejectReason::BadEncoding
-        | RejectReason::InvalidValue
-        | RejectReason::UnsafePath
-        | RejectReason::UnsupportedMethod
-        | RejectReason::UnknownMethod
-        | RejectReason::UnsupportedScheme
-        | RejectReason::MissingHost
-        | RejectReason::InvalidPort
-        | RejectReason::InvalidTarget
-        | RejectReason::LoopDetected => ZeroCopyResult::Invalid { status, msg },
+        }
     }
 }
 
