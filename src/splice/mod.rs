@@ -10,8 +10,9 @@
 //! This file owns the entry point the sendfile backend calls
 //! ([`splice_proxy`], the request drive, and its phase functions), the types
 //! it matches on ([`SpliceProxyOutcome`], [`SpliceProxyError`]) and the
-//! per-request state structs ([`ClientConn`], [`CacheTarget`],
-//! [`RateTimestamps`]). The mechanics live in submodules:
+//! per-request state structs ([`CacheTarget`], [`RateTimestamps`]); the
+//! client side is the sendfile backend's [`ClientConn`], extended here by its
+//! splice-only answers. The mechanics live in submodules:
 //!
 //! - [`upstream`]: the `UpstreamConn` enum, the idle pool and `ResponseBody`,
 //!   TCP/TLS connect and connect-error classification.
@@ -66,10 +67,7 @@ use crate::fs_open::{
     regular_file_metadata_typed, tokio_nofollow_options, touch_volatile_mtime_with,
 };
 use crate::guards::{Consequence, DownloadBarrier, InitBarrier};
-use crate::http_helpers::{
-    ConnectionAction, ConnectionVersion, WritePhase, write_416_response, write_all_to_stream,
-    write_invalid_response,
-};
+use crate::http_helpers::{ClientConn, ConnectionAction, WritePhase, write_all_to_stream};
 use crate::http_range::{HttpDate, ParsedRange, cache_file_http_date, http_parse_range};
 use crate::humanfmt::HumanFmt;
 use crate::integrity::{self, note_cached_index_touch, note_release_revalidated};
@@ -136,39 +134,8 @@ struct VolatileCondHeaders {
     if_none_match: Option<Arc<str>>,
 }
 
-/// The client side of a splice exchange: the socket plus the protocol
-/// version and keep-alive decision every response head is rendered with.
-/// `Copy`, so the phase helpers take it by value instead of repeating the
-/// stream/version/action triple in their signatures.
-#[derive(Clone, Copy)]
-struct ClientConn<'a> {
-    stream: &'a TcpStream,
-    version: ConnectionVersion,
-    action: ConnectionAction,
-}
-
+/// The splice-only answers of the client side ([`ClientConn`]).
 impl ClientConn<'_> {
-    /// Answer the request with a proxy-generated error response; `phase`
-    /// tags a failed write.
-    async fn write_invalid(
-        self,
-        status: StatusCode,
-        msg: &'static str,
-        retry_after: Option<Duration>,
-        phase: &'static str,
-    ) -> Result<(), SpliceProxyError> {
-        write_invalid_response(
-            self.stream,
-            self.version,
-            self.action,
-            status,
-            msg,
-            retry_after,
-        )
-        .await
-        .map_err(SpliceProxyError::client(phase))
-    }
-
     /// Decline `ibarrier`'s download as `why` and answer the client what
     /// its joiners answer ([`Declined::response_parts`]); `phase` tags a
     /// failed write.
@@ -180,8 +147,9 @@ impl ClientConn<'_> {
     ) -> Result<(), SpliceProxyError> {
         let _settled = ibarrier.decline(why).await;
         let (status, msg) = why.response_parts();
-        self.write_invalid(status, msg, why.retry_after(), phase)
+        self.write_invalid(status, msg, why.retry_after())
             .await
+            .map_err(SpliceProxyError::client(phase))
     }
 }
 
@@ -224,10 +192,9 @@ async fn serve_volatile_304_via_sendfile(
     // timestamps come from `cache_file_http_date`, which reads btime, and
     // the touch only moves mtime when btime exists.
     match serve_file_via_sendfile(
-        client.stream,
+        client,
         conn_details,
         (file, Some(metadata), &path),
-        (client.version, client.action),
         client_range,
         None,
     )
@@ -236,9 +203,10 @@ async fn serve_volatile_304_via_sendfile(
         SendfileResult::Served(_) => Ok(SpliceProxyOutcome::Served),
         SendfileResult::Closed => Ok(SpliceProxyOutcome::ClientLost),
         SendfileResult::Invalid { status, msg } => client
-            .write_invalid(status, msg, None, "post-304 invalid response")
+            .write_invalid(status, msg, None)
             .await
-            .map(|()| SpliceProxyOutcome::Served),
+            .map(|()| SpliceProxyOutcome::Served)
+            .map_err(SpliceProxyError::client("post-304 invalid response")),
     }
 }
 
@@ -278,7 +246,8 @@ async fn resolve_client_range(
         return Ok(Some(plan));
     }
     let _settled = ibarrier.decline(Declined::RangeNotSatisfiable).await;
-    write_416_response(client.stream, client.version, client.action, total)
+    client
+        .write_416(total)
         .await
         .map_err(SpliceProxyError::client(phase_416))?;
     Ok(None)
@@ -349,7 +318,7 @@ async fn write_splice_response_headers(
     // Start of the client-rate window: the first byte heading to the client.
     let t_client_first = PreciseInstant::now();
     splice_response_head(range, content_type, validators)
-        .write_to(client.stream, client.version, client.action, WireBody::None)
+        .write_to(client, WireBody::None)
         .await
         .map_err(|err| HeaderWriteFailure::io(phase, err))?;
     Ok(t_client_first)
@@ -1011,13 +980,9 @@ async fn reject_upstream_response(
     reason.record_metrics(Some(&conn_details.mirror));
     warn_upstream_reject(reason, conn_details);
     client
-        .write_invalid(
-            StatusCode::BAD_GATEWAY,
-            reason.body(),
-            None,
-            "upstream reject 502",
-        )
+        .write_invalid(StatusCode::BAD_GATEWAY, reason.body(), None)
         .await
+        .map_err(SpliceProxyError::client("upstream reject 502"))
 }
 
 /// The bytes the splice loop has to move once the body prefix that arrived
@@ -1383,9 +1348,7 @@ async fn transfer_body(
 /// For TLS upstreams, the upstream read goes through userspace (decryption), but the
 /// fan-out to client + cache still benefits from tee+splice.
 pub(crate) async fn splice_proxy(
-    client_stream: &TcpStream,
-    conn_version: ConnectionVersion,
-    conn_action: ConnectionAction,
+    client: ClientConn<'_>,
     conn_details: &ConnectionDetails,
     upstream_path: &str,
     appstate: &AppState,
@@ -1410,12 +1373,6 @@ pub(crate) async fn splice_proxy(
             conn_details.count_fetch_role(FetchRole::Refused);
             return Ok(SpliceProxyOutcome::AtCapacity { max });
         }
-    };
-
-    let client = ClientConn {
-        stream: client_stream,
-        version: conn_version,
-        action: conn_action,
     };
 
     // The dial target: the host the client named (an alias is a real
@@ -1729,12 +1686,7 @@ pub(crate) async fn splice_proxy(
         // `REQUESTS_SPLICE` stays unbumped -- no splice response was served;
         // `write_to` records the client-status metric for the nudge itself.
         return nudge_head(config)
-            .write_to(
-                client.stream,
-                client.version,
-                client.action,
-                WireBody::Inline(NUDGE_BODY),
-            )
+            .write_to(client, WireBody::Inline(NUDGE_BODY))
             .await
             .map(|()| SpliceProxyOutcome::Served)
             .map_err(SpliceProxyError::client("parallel hack nudge"));

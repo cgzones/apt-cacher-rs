@@ -52,7 +52,7 @@ use http::StatusCode;
 
 use crate::cache_conditional::CacheInfo;
 #[cfg(feature = "sendfile")]
-use crate::http_helpers::{ConnectionAction, ConnectionVersion};
+use crate::http_helpers::{ClientConn, ConnectionAction, ConnectionVersion};
 
 /// Whether a response advertises the proxy as its origin.
 ///
@@ -439,15 +439,14 @@ impl ResponseHead<'_> {
         out
     }
 
-    /// Write the head (and an inline body, if any) to the raw client stream.
+    /// Write the head (and an inline body, if any) to the raw client stream,
+    /// rendered for `client`'s protocol version and keep-alive decision.
     ///
     /// Records the client status metric; times out after the configured
     /// HTTP timeout.
     pub(crate) async fn write_to(
         &self,
-        stream: &tokio::net::TcpStream,
-        conn_version: ConnectionVersion,
-        conn_action: ConnectionAction,
+        client: ClientConn<'_>,
         body: WireBody<'_>,
     ) -> std::io::Result<()> {
         use tracing::trace;
@@ -457,7 +456,12 @@ impl ResponseHead<'_> {
             metrics,
         };
 
-        let mut response = self.render(conn_version, conn_action);
+        let ClientConn {
+            stream,
+            version,
+            action,
+        } = client;
+        let mut response = self.render(version, action);
         trace!("Outgoing response head:\n{response}");
         if let WireBody::Inline(body) = body {
             response.push_str(body);
@@ -594,7 +598,7 @@ mod tests {
         /// builds: validators and `Age` only.  No `Content-Length` (RFC 9110
         /// §8.6 permits one only when it equals the `200` representation's
         /// length), no `Accept-Ranges`, and no `Server:` — a 304 answers on
-        /// the origin's behalf.  `http_helpers::write_304_response` must
+        /// the origin's behalf.  `http_helpers::ClientConn::write_304` must
         /// stay header-for-header identical; see the `wire` twin of this
         /// test.
         #[test]
@@ -757,7 +761,7 @@ mod tests {
             assert!(header_lines(&wire).contains(&"Retry-After: 42"), "{wire}");
         }
 
-        /// `http_helpers::write_416_response` builds exactly this head: the
+        /// `http_helpers::ClientConn::write_416` builds exactly this head: the
         /// hyper `416` plus the explicit `Content-Length: 0` that frames the
         /// empty body on a keep-alive raw socket.
         #[test]
@@ -780,7 +784,7 @@ mod tests {
             assert!(!has_header(&lines, "Content-Type"), "{wire}");
         }
 
-        /// `http_helpers::write_304_response` builds exactly this head; it
+        /// `http_helpers::ClientConn::write_304` builds exactly this head; it
         /// must stay header-for-header the hyper backend's 304.
         #[test]
         fn not_modified_head_carries_validators_only() {

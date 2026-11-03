@@ -6,7 +6,6 @@
 use std::io::ErrorKind;
 
 use http::StatusCode;
-use tokio::net::TcpStream;
 use tracing::{debug, info, trace};
 
 use super::UpstreamEndpoint;
@@ -15,7 +14,7 @@ use crate::database_task::{DatabaseCommand, send_db_command};
 use crate::deb_mirror::{Origin, OriginSighting};
 use crate::error::ErrorReport;
 use crate::http_helpers::{
-    ConnectionAction, ConnectionVersion, WritePhase, write_all_to_stream, write_invalid_response,
+    ClientConn, ConnectionAction, ConnectionVersion, WritePhase, write_all_to_stream,
 };
 use crate::humanfmt::HumanFmt;
 use crate::limits::MAX_UPSTREAM_HEADERS;
@@ -100,20 +99,14 @@ pub(super) fn rewrite_simple_proxy_headers(
 /// (headers + body) to the client.  No caching, no active-download tracking,
 /// no resume handling — just a transparent relay.
 ///
-/// Returns what becomes of the client connection: `conn_action`, unless the
+/// Returns what becomes of the client connection: `conn.action`, unless the
 /// relayed body was close-delimited and the connection has to close.
 ///
 /// `endpoint` is the upstream the client named and is dialled; a 2xx answer's
 /// `Origin` row is recorded under `canonical_host`, the alias' main host the
 /// dispatcher resolved.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "single call site; the dialled mirror and the canonical host are distinct on purpose"
-)]
 pub(crate) async fn splice_simple_proxy(
-    client_stream: &TcpStream,
-    conn_version: ConnectionVersion,
-    conn_action: ConnectionAction,
+    conn: ClientConn<'_>,
     endpoint: UpstreamEndpoint<'_>,
     canonical_host: ClientHost,
     upstream_path: &str,
@@ -178,27 +171,21 @@ pub(crate) async fn splice_simple_proxy(
             resp.status_code,
             reason.body()
         );
-        return write_invalid_response(
-            client_stream,
-            conn_version,
-            conn_action,
-            StatusCode::BAD_GATEWAY,
-            reason.body(),
-            None,
-        )
-        .await
-        .map(|()| conn_action)
-        .map_err(SpliceProxyError::client("simple-proxy reject 502"));
+        return conn
+            .write_invalid(StatusCode::BAD_GATEWAY, reason.body(), None)
+            .await
+            .map(|()| conn.action)
+            .map_err(SpliceProxyError::client("simple-proxy reject 502"));
     }
 
     // Rewrite response headers: adjust HTTP version and Connection header
     // to match the client's protocol version and keep-alive strategy, which
     // a body relayed close-delimited overrides (a close-delimited upstream
     // body, or a chunked one de-chunked for an HTTP/1.0 client).
-    let conn_action = resp.framing.client_action(conn_action, conn_version);
+    let conn_action = resp.framing.client_action(conn.action, conn.version);
     let rewritten_headers = match rewrite_simple_proxy_headers(
         &hdr_buf[..hdr_end],
-        conn_version,
+        conn.version,
         conn_action,
         resp.status_code,
         resp.framing,
@@ -234,7 +221,7 @@ pub(crate) async fn splice_simple_proxy(
     }
 
     let t_client_first = PreciseInstant::now();
-    write_all_to_stream(client_stream, &rewritten_headers, WritePhase::Header)
+    write_all_to_stream(conn.stream, &rewritten_headers, WritePhase::Header)
         .await
         .map_err(SpliceProxyError::client("simple-proxy headers"))?;
 
@@ -246,8 +233,8 @@ pub(crate) async fn splice_simple_proxy(
         .framing
         .relay_to_client(
             upstream,
-            client_stream,
-            conn_version,
+            conn.stream,
+            conn.version,
             body_prefix,
             VOLATILE_BODY_MAX,
         )

@@ -171,84 +171,98 @@ impl<T: std::fmt::Display> std::fmt::Display for OptHeader<T> {
     }
 }
 
-/// Write a 304 Not Modified response to the stream.
-///
-/// Times out after the configured HTTP timeout.
-pub(crate) async fn write_304_response(
-    stream: &TcpStream,
-    conn_version: ConnectionVersion,
-    conn_action: ConnectionAction,
-    last_modified_str: &str,
-    age: u32,
-    etag: Option<&str>,
-) -> std::io::Result<()> {
-    ResponseHead::not_modified(last_modified_str, etag, age)
-        .write_to(stream, conn_version, conn_action, WireBody::None)
-        .await
+/// The client side of a raw-socket exchange: the socket plus the protocol
+/// version and keep-alive decision every response head is rendered with.
+/// `Copy`, so the serve paths of the sendfile and splice backends take it by
+/// value instead of repeating the stream/version/action triple in their
+/// signatures.
+#[derive(Clone, Copy)]
+pub(crate) struct ClientConn<'a> {
+    pub(crate) stream: &'a TcpStream,
+    pub(crate) version: ConnectionVersion,
+    pub(crate) action: ConnectionAction,
 }
 
-/// Write a 416 Range Not Satisfiable response to the stream.
-///
-/// Times out after the configured HTTP timeout.
-pub(crate) async fn write_416_response(
-    stream: &TcpStream,
-    conn_version: ConnectionVersion,
-    conn_action: ConnectionAction,
-    file_size: u64,
-) -> std::io::Result<()> {
-    // `Content-Length: 0` frames the empty body for keep-alive; hyper emits
-    // the same automatically for its empty body, so the constructor leaves it
-    // to the renderer that needs it.
-    let head = ResponseHead {
-        content_length: Some(0),
-        ..ResponseHead::range_not_satisfiable(file_size)
-    };
-    head.write_to(stream, conn_version, conn_action, WireBody::None)
-        .await
+impl<'a> ClientConn<'a> {
+    #[must_use]
+    pub(crate) fn new(
+        stream: &'a TcpStream,
+        version: ConnectionVersion,
+        action: ConnectionAction,
+    ) -> Self {
+        Self {
+            stream,
+            version,
+            action,
+        }
+    }
+
+    /// Write a 304 Not Modified response.
+    ///
+    /// Times out after the configured HTTP timeout.
+    pub(crate) async fn write_304(
+        self,
+        last_modified_str: &str,
+        age: u32,
+        etag: Option<&str>,
+    ) -> std::io::Result<()> {
+        ResponseHead::not_modified(last_modified_str, etag, age)
+            .write_to(self, WireBody::None)
+            .await
+    }
+
+    /// Write a 416 Range Not Satisfiable response.
+    ///
+    /// Times out after the configured HTTP timeout.
+    pub(crate) async fn write_416(self, file_size: u64) -> std::io::Result<()> {
+        // `Content-Length: 0` frames the empty body for keep-alive; hyper emits
+        // the same automatically for its empty body, so the constructor leaves it
+        // to the renderer that needs it.
+        let head = ResponseHead {
+            content_length: Some(0),
+            ..ResponseHead::range_not_satisfiable(file_size)
+        };
+        head.write_to(self, WireBody::None).await
+    }
+
+    /// Write an error response.
+    ///
+    /// Times out after the configured HTTP timeout.
+    pub(crate) async fn write_invalid(
+        self,
+        status: StatusCode,
+        msg: &'static str,
+        retry_after: Option<std::time::Duration>,
+    ) -> std::io::Result<()> {
+        let head = ResponseHead {
+            content_length: Some(msg.len() as u64),
+            retry_after: retry_after.map(retry_after_secs),
+            ..ResponseHead::error(status)
+        };
+        head.write_to(self, WireBody::Inline(msg)).await
+    }
+
+    /// Write the head of a cache-hit file response whose body follows via
+    /// `sendfile(2)`, from the two objects that describe it: the plan
+    /// [`CacheInfo::plan`] returned and the cached representation's validators.
+    ///
+    /// Uses `send(MSG_MORE)` so the kernel coalesces the head with the first
+    /// `sendfile(2)` body bytes; the splice paths keep their `CorkGuard` instead
+    /// (see `write_splice_response_headers`). Times out after the configured HTTP
+    /// timeout.
+    pub(crate) async fn write_response_headers(
+        self,
+        params: &ServeParams,
+        content_type: &'static str,
+        cache_info: &CacheInfo,
+    ) -> std::io::Result<()> {
+        cached_file_head(params, content_type, cache_info)
+            .write_to(self, WireBody::Follows)
+            .await
+    }
 }
 
-/// Write an error response to the stream.
-///
-/// Times out after the configured HTTP timeout.
-pub(crate) async fn write_invalid_response(
-    stream: &TcpStream,
-    conn_version: ConnectionVersion,
-    conn_action: ConnectionAction,
-    status: StatusCode,
-    msg: &'static str,
-    retry_after: Option<std::time::Duration>,
-) -> std::io::Result<()> {
-    let head = ResponseHead {
-        content_length: Some(msg.len() as u64),
-        retry_after: retry_after.map(retry_after_secs),
-        ..ResponseHead::error(status)
-    };
-    head.write_to(stream, conn_version, conn_action, WireBody::Inline(msg))
-        .await
-}
-
-/// Write the head of a cache-hit file response whose body follows via
-/// `sendfile(2)`, from the two objects that describe it: the plan
-/// [`CacheInfo::plan`] returned and the cached representation's validators.
-///
-/// Uses `send(MSG_MORE)` so the kernel coalesces the head with the first
-/// `sendfile(2)` body bytes; the splice paths keep their `CorkGuard` instead
-/// (see `write_splice_response_headers`). Times out after the configured HTTP
-/// timeout.
-pub(crate) async fn write_response_headers(
-    stream: &TcpStream,
-    conn_version: ConnectionVersion,
-    conn_action: ConnectionAction,
-    params: &ServeParams,
-    content_type: &'static str,
-    cache_info: &CacheInfo,
-) -> std::io::Result<()> {
-    cached_file_head(params, content_type, cache_info)
-        .write_to(stream, conn_version, conn_action, WireBody::Follows)
-        .await
-}
-
-/// The head [`write_response_headers`] writes.
+/// The head [`ClientConn::write_response_headers`] writes.
 pub(crate) fn cached_file_head<'a>(
     params: &'a ServeParams,
     content_type: &'static str,

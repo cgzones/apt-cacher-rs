@@ -80,9 +80,8 @@ use crate::{
     },
     global_config, global_webif_hosts,
     http_helpers::{
-        ConnectionAction, ConnectionVersion, HeadEnd, WritePhase, capped_header_end,
-        leading_empty_lines, write_304_response, write_416_response, write_all_to_stream,
-        write_invalid_response, write_response_headers,
+        ClientConn, ConnectionAction, ConnectionVersion, HeadEnd, WritePhase, capped_header_end,
+        leading_empty_lines, write_all_to_stream,
     },
     http_range::format_http_date,
     humanfmt::HumanFmt,
@@ -289,9 +288,7 @@ pub(crate) async fn handle_sendfile_connection(
                 // CLIENT_STATUS_* even though parsing failed.
                 metrics::REQUESTS_TOTAL.increment();
                 let _ignore = write_request_error_response(
-                    &stream,
-                    conn_version,
-                    ConnectionAction::Close,
+                    ClientConn::new(&stream, conn_version, ConnectionAction::Close),
                     status,
                     body,
                     &buf,
@@ -375,24 +372,20 @@ pub(crate) async fn handle_sendfile_connection(
                     warn_once_or_info!(
                         "Rejecting request from client {client} in the splice-only backend: unsupported sendfile fallback path ({reason}); returning 503"
                     );
-                    let _ignore = write_invalid_response(
-                        &stream,
-                        conn_version,
-                        ConnectionAction::Close,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Request not supported by splice backend",
-                        None,
-                    )
-                    .await;
+                    let _ignore = ClientConn::new(&stream, conn_version, ConnectionAction::Close)
+                        .write_invalid(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "Request not supported by splice backend",
+                            None,
+                        )
+                        .await;
                     graceful_close(&stream).await;
                     return;
                 }
             }
             ZeroCopyResult::Invalid { status, msg } => {
                 if let Err(err) = write_request_error_response(
-                    &stream,
-                    conn_version,
-                    ConnectionAction::Close,
+                    ClientConn::new(&stream, conn_version, ConnectionAction::Close),
                     status,
                     msg,
                     &buf,
@@ -411,9 +404,7 @@ pub(crate) async fn handle_sendfile_connection(
                 msg,
             } => {
                 if let Err(err) = write_request_error_response(
-                    &stream,
-                    conn_version,
-                    conn_action,
+                    ClientConn::new(&stream, conn_version, conn_action),
                     status,
                     msg,
                     &buf,
@@ -463,9 +454,7 @@ pub(crate) async fn handle_sendfile_connection(
 /// Suppress error bodies for HEAD, including errors before parsing completes.
 /// `read_request_headers` has already removed leading empty lines from `buf`.
 async fn write_request_error_response(
-    stream: &TcpStream,
-    conn_version: ConnectionVersion,
-    conn_action: ConnectionAction,
+    conn: ClientConn<'_>,
     status: StatusCode,
     msg: &'static str,
     buf: &[u8],
@@ -480,7 +469,7 @@ async fn write_request_error_response(
     } else {
         WireBody::Inline(msg)
     };
-    head.write_to(stream, conn_version, conn_action, body).await
+    head.write_to(conn, body).await
 }
 
 /// Read HTTP request headers from the stream into the buffer.
@@ -662,16 +651,14 @@ async fn graceful_close(stream: &TcpStream) {
 /// onto the raw `TcpStream` with handwritten headers, so webui responses look
 /// the same regardless of which connection backend served them.
 async fn serve_webui(
-    stream: &TcpStream,
+    conn: ClientConn<'_>,
     uri: &http::Uri,
     appstate: &AppState,
     client: &ClientInfo,
-    conn_version: ConnectionVersion,
-    conn_action: ConnectionAction,
 ) -> ZeroCopyResult {
     let response = serve_web_interface(uri, appstate).await;
 
-    if let Err(err) = write_webui_response(stream, conn_version, conn_action, response).await {
+    if let Err(err) = write_webui_response(conn, response).await {
         log_client_write_failure(*client, "web-interface response", &err);
         return ZeroCopyResult::Closed;
     }
@@ -679,7 +666,7 @@ async fn serve_webui(
     // write completed (the hyper path gates via `WebUiCountedBody`).
     metrics::SERVED_WEBUI.increment();
     metrics::SERVED_TOTAL.increment();
-    ZeroCopyResult::Served(conn_action)
+    ZeroCopyResult::Served(conn.action)
 }
 
 /// Format and write a [`WebResponse`] onto the raw stream.
@@ -688,12 +675,12 @@ async fn serve_webui(
 /// origin-server responses (no `Via:`), so a single `format!` builds the
 /// status-line + headers block with named substitutions, mirroring the
 /// hyper-side `WebResponse::into_hyper_response` constructor.
-async fn write_webui_response(
-    stream: &TcpStream,
-    conn_version: ConnectionVersion,
-    conn_action: ConnectionAction,
-    response: WebResponse,
-) -> std::io::Result<()> {
+async fn write_webui_response(conn: ClientConn<'_>, response: WebResponse) -> std::io::Result<()> {
+    let ClientConn {
+        stream,
+        version: conn_version,
+        action: conn_action,
+    } = conn;
     let date = format_http_date();
     let content_type = response.content_type();
     let body_len = response.body.len();
@@ -871,25 +858,18 @@ fn handle_connect(client: ClientInfo, target: &str) -> ZeroCopyResult {
 /// connect failed *before* `200 Connection Established` was sent, then close.
 /// A write failure is logged and swallowed — the connection is being dropped.
 async fn write_tunnel_upstream_error(
-    stream: &TcpStream,
-    conn_version: ConnectionVersion,
+    conn: ClientConn<'_>,
     client: ClientInfo,
     rejection: ConnectReject,
 ) {
-    if let Err(err) = write_invalid_response(
-        stream,
-        conn_version,
-        ConnectionAction::Close,
-        rejection.status,
-        rejection.msg,
-        None,
-    )
-    .await
+    if let Err(err) = conn
+        .write_invalid(rejection.status, rejection.msg, None)
+        .await
     {
         log_client_write_failure(client, "tunnel 502 response", &err);
         return;
     }
-    graceful_close(stream).await;
+    graceful_close(conn.stream).await;
 }
 
 /// Drive a policy-accepted CONNECT tunnel to completion.
@@ -920,25 +900,23 @@ async fn run_connect_tunnel(
 
     metrics::TUNNEL_CONNECTS_TOTAL.increment();
 
+    // A tunnel head carries no `Connection:` header, and any error answer
+    // closes the connection.
+    let conn = ClientConn::new(&stream, conn_version, ConnectionAction::Close);
+
     let mut upstream = match connect_upstream(config, &client, &target).await {
         Ok(upstream) => upstream,
         Err(rejection) => {
-            write_tunnel_upstream_error(&stream, conn_version, client, rejection).await;
+            write_tunnel_upstream_error(conn, client, rejection).await;
             return;
         }
     };
 
     // Upstream is connected: send `200 Connection Established` so the client may
     // begin its TLS handshake. The head is the same `TunnelEstablished` shape
-    // the hyper backend renders for its CONNECT response; a tunnel head
-    // carries no `Connection:` header, so the action passed is not rendered.
+    // the hyper backend renders for its CONNECT response.
     if let Err(err) = ResponseHead::tunnel_established()
-        .write_to(
-            &stream,
-            conn_version,
-            ConnectionAction::Close,
-            WireBody::None,
-        )
+        .write_to(conn, WireBody::None)
         .await
     {
         // The accepted tunnel failed before relaying, like hyper's failed
@@ -1114,7 +1092,8 @@ async fn try_sendfile_request(
         Ok(RequestTarget::Proxy { host, port }) => (host, port),
         Ok(RequestTarget::WebUi) => {
             let conn_action = compute_conn_action(&req, *conn_version, &client);
-            return serve_webui(stream, &uri, appstate, &client, *conn_version, conn_action).await;
+            let conn = ClientConn::new(stream, *conn_version, conn_action);
+            return serve_webui(conn, &uri, appstate, &client).await;
         }
         Err(reason) => {
             return reject_result(reason, || compute_conn_action(&req, *conn_version, &client));
@@ -1127,6 +1106,7 @@ async fn try_sendfile_request(
     };
 
     let conn_action = compute_conn_action(&req, *conn_version, &client);
+    let conn = ClientConn::new(stream, *conn_version, conn_action);
 
     // Unified dispatch shared with hyper_conn.rs: diff-reject -> normalize
     // -> parse -> classify -> flat-blocklist -> unsafe-path gate.
@@ -1175,9 +1155,7 @@ async fn try_sendfile_request(
                 };
 
                 return match splice_simple_proxy(
-                    stream,
-                    *conn_version,
-                    conn_action,
+                    conn,
                     endpoint,
                     canonical_host,
                     path_and_query,
@@ -1233,11 +1211,9 @@ async fn try_sendfile_request(
         conn_details.count_fetch_role(FetchRole::Joiner);
 
         return serve_unfinished_sendfile(
-            stream,
+            conn,
             conn_details,
             dl_status,
-            *conn_version,
-            conn_action,
             RangeRequestHeaders::extract(req.headers),
         )
         .await;
@@ -1308,10 +1284,9 @@ async fn try_sendfile_request(
             note_cached_index_touch(&conn_details, uri_path, &cache_path);
 
             return serve_file_via_sendfile(
-                stream,
+                conn,
                 &conn_details,
                 (file, mdata, &cache_path),
-                (*conn_version, conn_action),
                 RangeRequestHeaders::extract(req.headers),
                 None,
             )
@@ -1333,9 +1308,7 @@ async fn try_sendfile_request(
         drop(miss);
 
         let outcome = splice_proxy(
-            stream,
-            *conn_version,
-            conn_action,
+            conn,
             &conn_details,
             uri.path_and_query().map_or(uri_path, |pq| pq.as_str()),
             appstate,
@@ -1359,11 +1332,9 @@ async fn try_sendfile_request(
                 // counted above when the cache lookup found no usable file;
                 // `LATE_JOINERS_TOTAL` was bumped inside `originate()`.
                 serve_unfinished_sendfile(
-                    stream,
+                    conn,
                     conn_details,
                     dl_status,
-                    *conn_version,
-                    conn_action,
                     RangeRequestHeaders::extract(req.headers),
                 )
                 .await
@@ -1475,10 +1446,9 @@ pub(crate) enum SendfileResult {
 /// Shared implementation used for both already-cached files and files
 /// that finished downloading while a joining client was waiting.
 pub(crate) async fn serve_file_via_sendfile(
-    stream: &TcpStream,
+    conn: ClientConn<'_>,
     conn_details: &ConnectionDetails,
     source: (tokio::fs::File, Option<std::fs::Metadata>, &Path),
-    conn_settings: (ConnectionVersion, ConnectionAction),
     headers: RangeRequestHeaders<'_>,
     prefetched_upstream_metadata: Option<&cache_metadata::UpstreamMetadata>,
 ) -> SendfileResult {
@@ -1509,9 +1479,8 @@ pub(crate) async fn serve_file_via_sendfile(
     );
 
     serve_planned(
-        stream,
+        conn,
         conn_details,
-        conn_settings,
         headers,
         &cache_info,
         ServeSource {
@@ -1546,9 +1515,8 @@ struct ServeSource<'a> {
 /// answer a 304 or 416 head-only, else write the representation head and
 /// the body via sendfile(2) and finish the delivery.
 async fn serve_planned(
-    stream: &TcpStream,
+    conn: ClientConn<'_>,
     conn_details: &ConnectionDetails,
-    (conn_version, conn_action): (ConnectionVersion, ConnectionAction),
     headers: RangeRequestHeaders<'_>,
     cache_info: &CacheInfo,
     source: ServeSource<'_>,
@@ -1571,15 +1539,13 @@ async fn serve_planned(
     let params = match cache_info.plan(size, &headers, &client) {
         ServePlan::Serve(params) => params,
         ServePlan::NotModified => {
-            if let Err(err) = write_304_response(
-                stream,
-                conn_version,
-                conn_action,
-                &cache_info.last_modified_str,
-                cache_info.age,
-                cache_info.file_etag.as_deref(),
-            )
-            .await
+            if let Err(err) = conn
+                .write_304(
+                    &cache_info.last_modified_str,
+                    cache_info.age,
+                    cache_info.file_etag.as_deref(),
+                )
+                .await
             {
                 log_client_write_failure(client, "304 response", &err);
                 return SendfileResult::Closed;
@@ -1588,14 +1554,14 @@ async fn serve_planned(
                 "Serving 304 Not Modified for {what} file {} from mirror {}{aliased} for {who} {client} via sendfile",
                 conn_details.debname, conn_details.mirror
             );
-            return SendfileResult::Served(conn_action);
+            return SendfileResult::Served(conn.action);
         }
         ServePlan::NotSatisfiable => {
-            if let Err(err) = write_416_response(stream, conn_version, conn_action, size).await {
+            if let Err(err) = conn.write_416(size).await {
                 log_client_write_failure(client, "416 response", &err);
                 return SendfileResult::Closed;
             }
-            return SendfileResult::Served(conn_action);
+            return SendfileResult::Served(conn.action);
         }
     };
     let partial = params.is_partial();
@@ -1617,23 +1583,22 @@ async fn serve_planned(
     };
     hint_sequential_read(file, transfer_size, file_path);
 
-    // Headers are sent with MSG_MORE (see write_response_headers), so the
-    // kernel coalesces them with the first sendfile body bytes — no
-    // TCP_CORK setsockopt pair needed.
+    // Headers are sent with MSG_MORE (see
+    // `ClientConn::write_response_headers`), so the kernel coalesces them
+    // with the first sendfile body bytes — no TCP_CORK setsockopt pair
+    // needed.
 
     // The response starts down this path with its head, as `REQUESTS_SPLICE`
     // and hyper's `REQUESTS_*` count it: a failed head write is a request
     // that started and did not complete.
     metrics::REQUESTS_SENDFILE.increment();
-    if let Err(err) = write_response_headers(
-        stream,
-        conn_version,
-        conn_action,
-        &params,
-        content_type_for_cached_file(&conn_details.debname),
-        cache_info,
-    )
-    .await
+    if let Err(err) = conn
+        .write_response_headers(
+            &params,
+            content_type_for_cached_file(&conn_details.debname),
+            cache_info,
+        )
+        .await
     {
         info_or_warn!(
             is_expected_client_end(&err),
@@ -1646,10 +1611,10 @@ async fn serve_planned(
     let start = PreciseInstant::now();
 
     let transfer_result = match progress {
-        None => async_sendfile(stream, file, content_start, content_length).await,
+        None => async_sendfile(conn.stream, file, content_start, content_length).await,
         Some((receiver, status)) => {
             async_sendfile_unfinished(
-                stream,
+                conn.stream,
                 file,
                 file_path,
                 content_start,
@@ -1671,7 +1636,7 @@ async fn serve_planned(
     )
     .await
     {
-        SendfileResult::Served(conn_action)
+        SendfileResult::Served(conn.action)
     } else {
         SendfileResult::Closed
     }
@@ -2485,11 +2450,9 @@ async fn sendfile_unfinished_transfer(
 /// known `Content-Length` cannot be framed here and is handed to hyper
 /// together with the attached `dl_status` (`HandoffPlan::JoinDownload`).
 async fn serve_unfinished_sendfile(
-    stream: &TcpStream,
+    conn: ClientConn<'_>,
     conn_details: ConnectionDetails,
     dl_status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-    conn_version: ConnectionVersion,
-    conn_action: ConnectionAction,
     headers: RangeRequestHeaders<'_>,
 ) -> ZeroCopyResult {
     // Wait for the download to leave the Init state; a complete copy
@@ -2506,10 +2469,9 @@ async fn serve_unfinished_sendfile(
             }) => (file, path, content_length, rx, meta),
             Ok(Serveable::Complete { file, path, meta }) => {
                 return serve_file_via_sendfile(
-                    stream,
+                    conn,
                     &conn_details,
                     (file, None, &path),
-                    (conn_version, conn_action),
                     headers,
                     meta.as_deref(),
                 )
@@ -2520,17 +2482,8 @@ async fn serve_unfinished_sendfile(
                 // Same answer and keep-alive handling as the pre-upstream
                 // throttle gate (`splice_proxy`).
                 let (status, msg) = failure.response_parts();
-                return match write_invalid_response(
-                    stream,
-                    conn_version,
-                    conn_action,
-                    status,
-                    msg,
-                    failure.retry_after(),
-                )
-                .await
-                {
-                    Ok(()) => ZeroCopyResult::Served(conn_action),
+                return match conn.write_invalid(status, msg, failure.retry_after()).await {
+                    Ok(()) => ZeroCopyResult::Served(conn.action),
                     Err(err) => {
                         debug!(
                             "Failed to write verify-throttle response to client {}:  {}",
@@ -2569,7 +2522,7 @@ async fn serve_unfinished_sendfile(
                 status: dl_status,
             },
             #[cfg(feature = "hyper")]
-            conn_action,
+            conn_action: conn.action,
         };
     };
 
@@ -2591,9 +2544,8 @@ async fn serve_unfinished_sendfile(
     // Range handling uses the total upstream size (not the current partial
     // size on disk).
     serve_planned(
-        stream,
+        conn,
         &conn_details,
-        (conn_version, conn_action),
         headers,
         &cache_info,
         ServeSource {
