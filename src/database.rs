@@ -4,7 +4,6 @@ use std::{
     net::{IpAddr, Ipv6Addr},
     num::{NonZero, TryFromIntError},
     path::{Path, PathBuf},
-    str::FromStr as _,
     time::Duration,
 };
 
@@ -438,9 +437,10 @@ async fn database_file_size(path: &Path) -> Option<u64> {
 
 impl Database {
     pub(crate) async fn connect(path: &Path, slow_timeout: Duration) -> Result<Self, Error> {
-        let url = format!("sqlite://{}", path.display());
-
-        debug!("Opening database `{url}` with slow timeout of {slow_timeout:?}...");
+        debug!(
+            "Opening database `{}` with slow timeout of {slow_timeout:?}...",
+            path.display()
+        );
 
         // WAL lets readers (web interface, cleanup) run concurrently with
         // the batch-flush writer instead of excluding it across pool
@@ -449,7 +449,13 @@ impl Database {
         // never corrupt the file. That loss is fine for reconstructible cache
         // metadata, and it avoids the DELETE-journal churn plus per-flush
         // fsyncs of sqlx's FULL default.
-        let opts = SqliteConnectOptions::from_str(&url)?
+        //
+        // The path goes in as a filename, never through a `sqlite://` URL:
+        // URL parsing cuts at `?` into connection parameters and
+        // percent-decodes, so `/srv/db?mode=memory` would open a throwaway
+        // in-memory database and `%41` would open `A`.
+        let opts = SqliteConnectOptions::new()
+            .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
@@ -1652,6 +1658,49 @@ mod path_check_tests {
         ] {
             assert!(!is_plain_relative_path(bad), "{bad:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use std::time::Duration;
+
+    use super::Database;
+
+    /// `?` and `%` are plain filename bytes: a URL-parsed path would cut
+    /// at `?` into connection parameters (`mode=memory` opening a database
+    /// that never reaches disk) and percent-decode `%41` to `A`.
+    #[tokio::test]
+    async fn opens_the_file_at_the_exact_path() {
+        const NAME: &str = "odd?mode=memory%41.db";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(NAME);
+
+        let db = Database::connect(&path, Duration::from_secs(5))
+            .await
+            .expect("connect");
+        db.init_tables().await.expect("schema");
+        let id = db.insert_mirror_host("deb.example.org", "debian").await;
+        db.conn.close().await;
+
+        assert!(path.is_file(), "the database lives at {}", path.display());
+        for entry in std::fs::read_dir(dir.path()).expect("read_dir") {
+            let name = entry.expect("dir entry").file_name();
+            assert!(
+                name.to_str().is_some_and(|name| name.starts_with(NAME)),
+                "only the named database and its WAL files exist: {name:?}"
+            );
+        }
+
+        let reopened = Database::connect(&path, Duration::from_secs(5))
+            .await
+            .expect("reconnect");
+        let ids = reopened.load_all_mirror_ids().await.expect("mirror ids");
+        assert_eq!(
+            ids.first().map(|&(id, _)| id),
+            Some(id),
+            "the row persisted in the named file"
+        );
     }
 }
 
