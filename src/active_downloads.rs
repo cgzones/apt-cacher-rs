@@ -31,7 +31,7 @@ use std::num::NonZero;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use hashbrown::{HashMap, hash_map::Entry};
+use hashbrown::{Equivalent, HashMap, hash_map::EntryRef};
 use http::StatusCode;
 use tracing::{debug, error, info};
 
@@ -567,7 +567,10 @@ impl ActiveDownloadEntry {
 /// computed by subtracting the other.
 #[derive(Debug)]
 struct Registry {
-    entries: HashMap<CacheEntryKey, ActiveDownloadEntry>,
+    /// Keyed by the same allocation the download's barrier chain names its
+    /// entry with ([`Origination::key`]), so an origination clones the
+    /// borrowed key once.
+    entries: HashMap<Arc<CacheEntryKey>, ActiveDownloadEntry>,
     /// Alive [`UpstreamSlot`] tokens. Written only by [`UpstreamSlot::mint`]
     /// and [`UpstreamSlot`]'s `Drop`, which are also the only places that
     /// move the saturation latch: a count that can only change through those
@@ -575,6 +578,14 @@ struct Registry {
     upstream_slots: usize,
     /// Count a saturation episode once until every slot drains.
     at_cap: bool,
+}
+
+// Lets the registry be looked up by a borrowed key. `Arc<T>: Hash` delegates
+// to `T: Hash`, so the hash matches `CacheEntryKey`'s and the ref's.
+impl Equivalent<Arc<CacheEntryKey>> for CacheEntryKeyRef<'_> {
+    fn equivalent(&self, key: &Arc<CacheEntryKey>) -> bool {
+        <Self as Equivalent<CacheEntryKey>>::equivalent(self, key.as_ref())
+    }
 }
 
 #[derive(Clone)]
@@ -650,12 +661,15 @@ impl Drop for UpstreamSlot {
     }
 }
 
-/// What a successful origination hands its backend: the `Init` ping sender
-/// the barrier drops when it leaves `Init`, the status handle, and the
-/// [`UpstreamSlot`] the download counts against `max_upstream_downloads`
-/// with. Consumed whole by `InitBarrier::new`, so no backend can register a
-/// download without also taking custody of its slot.
+/// What a successful origination hands its backend: the registry key, the
+/// `Init` ping sender the barrier drops when it leaves `Init`, the status
+/// handle, and the [`UpstreamSlot`] the download counts against
+/// `max_upstream_downloads` with. Consumed whole by `InitBarrier::new`, so no
+/// backend can register a download without also taking custody of its slot.
 pub(crate) struct Origination {
+    /// The allocation the registry maps the entry under, shared with the
+    /// barrier chain rather than cloned again.
+    pub(crate) key: Arc<CacheEntryKey>,
     pub(crate) init_tx: tokio::sync::watch::Sender<()>,
     pub(crate) status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     pub(crate) slot: UpstreamSlot,
@@ -723,16 +737,21 @@ impl ActiveDownloads {
         self.inner.read().entries.len()
     }
 
-    /// Entries and the heap they take: the table, each key's mirror and
-    /// name, and each entry's shared status. A `Download` status also owns
-    /// its temp path, whose length the estimate skips (it lives behind an
-    /// async lock).
+    /// Entries and the heap they take: the table, each shared key with its
+    /// mirror and name, and each entry's shared status. A `Download` status
+    /// also owns its temp path, whose length the estimate skips (it lives
+    /// behind an async lock).
     pub(crate) fn footprint(&self) -> Footprint {
         let inner = self.inner.read();
         let keys: usize = inner
             .entries
             .keys()
-            .map(|key| key.mirror.heap_bytes() + key.debname.capacity())
+            .map(|key| {
+                ARC_HEADER
+                    + size_of::<CacheEntryKey>()
+                    + key.mirror.heap_bytes()
+                    + key.debname.capacity()
+            })
             .sum();
         let statuses = inner.entries.len()
             * (ARC_HEADER + size_of::<tokio::sync::RwLock<ActiveDownloadStatus>>());
@@ -751,9 +770,10 @@ impl ActiveDownloads {
         self.inner.read().upstream_slots
     }
 
-    /// Registration with an explicit cap: pre-allocate channel + status,
-    /// perform the `entry()` Occupied / Vacant transition, do the cap-saturation +
-    /// peak + late-joiner accounting, return the neutral [`Admission`].
+    /// Registration with an explicit cap: one `entry_ref` lookup under the
+    /// write lock, the Occupied (join) / Vacant (originate) transition, the
+    /// cap-saturation + peak + late-joiner accounting, and the neutral
+    /// [`Admission`].
     ///
     /// This is also the single enforcement site for
     /// `max_upstream_downloads`: a new origination while `upstream_slots` is
@@ -764,6 +784,10 @@ impl ActiveDownloads {
     /// check-then-insert race can overshoot it. Both backends inherit the
     /// cap through the shared registration method and must map `AtCapacity`
     /// to the canonical 503.
+    ///
+    /// Joining allocates nothing (the lookup borrows the key); an origination
+    /// allocates its owned key, watch channel and status inside the lock --
+    /// three small allocations, which buy the single lock round trip.
     ///
     /// `max_upstream_downloads` is threaded in by [`Self::register`]
     /// (which reads it from `global_config()`) so this helper can be
@@ -778,91 +802,56 @@ impl ActiveDownloads {
         keyref: CacheEntryKeyRef<'_>,
         max_upstream_downloads: Option<NonZero<usize>>,
     ) -> Admission {
-        // First pass with the borrowed key: joining an in-flight download
-        // allocates nothing (no owned key, no channel, no status Arc).
-        {
-            let mut guard = self.inner.write();
-            if let Some(entry) = guard.entries.get_mut(&keyref) {
-                let (status, peak) = entry.join();
-                drop(guard);
-
-                metrics::LATE_JOINERS_TOTAL.increment();
-                metrics::LATE_JOINER_PEAK_PER_DOWNLOAD.update(peak as u64);
-                return Admission::LateJoiner { status };
-            }
-        }
-
-        let key = keyref.to_owned();
-
-        // Pre-allocate channel + status outside the write lock so the
-        // critical section stays as short as possible.
-        let (tx, rx) = tokio::sync::watch::channel(());
-        let status = Arc::new(tokio::sync::RwLock::new(ActiveDownloadStatus::Init(rx)));
-
-        // Re-checked via entry(): another task may have originated the same
-        // download between the two lock acquisitions — then we join late
-        // after all and the pre-allocations are discarded (rare race).
         let mut guard = self.inner.write();
         let Registry {
             entries,
             upstream_slots,
             at_cap,
         } = &mut *guard;
-        // Only the Vacant arm consults it — joins are exempt from the cap.
+        let ventry = match entries.entry_ref(&keyref) {
+            EntryRef::Occupied(mut oentry) => {
+                let (status, peak) = oentry.get_mut().join();
+                drop(guard);
+
+                metrics::LATE_JOINERS_TOTAL.increment();
+                metrics::LATE_JOINER_PEAK_PER_DOWNLOAD.update(peak as u64);
+                return Admission::LateJoiner { status };
+            }
+            EntryRef::Vacant(ventry) => ventry,
+        };
         // The slot count, not the map length: an entry whose upstream
         // connection is already back in the pool holds nothing the cap
         // protects.
-        let at_capacity = max_upstream_downloads.filter(|max| *upstream_slots >= max.get());
-        let (outcome, late_joiner_peak) = match entries.entry(key) {
-            Entry::Occupied(mut oentry) => {
-                let entry = oentry.get_mut();
-                let (existing_status, peak) = entry.join();
-                (
-                    Admission::LateJoiner {
-                        status: existing_status,
-                    },
-                    Some(peak),
-                )
-            }
-            Entry::Vacant(ventry) => {
-                if let Some(max) = at_capacity {
-                    // Refused origination: nothing inserted, the
-                    // pre-allocations are discarded like on the Occupied
-                    // race-loser path.
-                    (Admission::AtCapacity { max }, None)
-                } else {
-                    ventry.insert(ActiveDownloadEntry {
+        let outcome =
+            if let Some(max) = max_upstream_downloads.filter(|max| *upstream_slots >= max.get()) {
+                // Refused origination: nothing inserted.
+                Admission::AtCapacity { max }
+            } else {
+                let key = Arc::new(keyref.to_owned());
+                let (tx, rx) = tokio::sync::watch::channel(());
+                let status = Arc::new(tokio::sync::RwLock::new(ActiveDownloadStatus::Init(rx)));
+                ventry.insert_with_key(
+                    Arc::clone(&key),
+                    ActiveDownloadEntry {
                         status: Arc::clone(&status),
                         late_joiners: 0,
-                    });
-                    (
-                        Admission::Originator(Origination {
-                            init_tx: tx,
-                            status,
-                            // Under the same lock as the insert and the
-                            // capacity check above, so the cap is exact.
-                            slot: UpstreamSlot::mint(
-                                upstream_slots,
-                                at_cap,
-                                self,
-                                max_upstream_downloads,
-                            ),
-                        }),
-                        None,
-                    )
-                }
-            }
-        };
+                    },
+                );
+                Admission::Originator(Origination {
+                    key,
+                    init_tx: tx,
+                    status,
+                    // Under the same lock as the insert and the capacity check
+                    // above, so the cap is exact.
+                    slot: UpstreamSlot::mint(upstream_slots, at_cap, self, max_upstream_downloads),
+                })
+            };
         let upstream_slots = *upstream_slots;
         drop(guard);
 
         metrics::ACTIVE_UPSTREAM_DOWNLOADS_PEAK.update(upstream_slots as u64);
         if matches!(outcome, Admission::AtCapacity { max: _ }) {
             metrics::UPSTREAM_DOWNLOAD_REJECTED_CAP.increment();
-        }
-        if let Some(peak) = late_joiner_peak {
-            metrics::LATE_JOINERS_TOTAL.increment();
-            metrics::LATE_JOINER_PEAK_PER_DOWNLOAD.update(peak as u64);
         }
         outcome
     }
@@ -891,6 +880,7 @@ impl ActiveDownloads {
     ) -> Arc<tokio::sync::RwLock<ActiveDownloadStatus>> {
         match self.lookup_or_insert(key, None) {
             Admission::Originator(Origination {
+                key: _,
                 init_tx: _,
                 status,
                 slot: _,
@@ -1131,6 +1121,7 @@ mod tests {
             Some(max),
         );
         let slot = if let Admission::Originator(Origination {
+            key: _,
             init_tx: _,
             status: _,
             slot,
@@ -1151,6 +1142,7 @@ mod tests {
             Some(max),
         );
         let second_slot = if let Admission::Originator(Origination {
+            key: _,
             init_tx: _,
             status: _,
             slot,

@@ -40,6 +40,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
+use hashbrown::Equivalent as _;
 use tracing::{error, info};
 
 use crate::{
@@ -234,12 +235,17 @@ impl InitBarrier {
         raw_uri_path: &str,
     ) -> Self {
         let Origination {
+            key,
             init_tx,
             status,
             slot,
         } = origination;
+        debug_assert!(
+            conn_details.key().equivalent(key.as_ref()),
+            "the origination was registered for this request's key"
+        );
         Self {
-            key: Arc::new(conn_details.key().to_owned()),
+            key,
             data: Some(InitBarrierData {
                 status,
                 active_downloads,
