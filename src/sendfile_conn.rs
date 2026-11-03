@@ -195,13 +195,10 @@ enum ZeroCopyResult {
         tunnel_guard: crate::connect_tunnel::TunnelPermit,
     },
 
-    /// Sending a message to the client failed.
-    /// Close the connection without any further action.
-    ClientError,
-
-    /// An error occurred after successfully sending the http header.
-    /// Close the connection without any further action.
-    AfterHeaderError,
+    /// Writing to the client failed, before or after the response head went
+    /// out, and the failure is already logged: close the connection
+    /// without any further action.
+    Closed,
 }
 
 impl From<SendfileResult> for ZeroCopyResult {
@@ -209,8 +206,7 @@ impl From<SendfileResult> for ZeroCopyResult {
         match value {
             SendfileResult::Served(ca) => Self::Served(ca),
             SendfileResult::Invalid { status, msg } => Self::Invalid { status, msg },
-            SendfileResult::ClientError => Self::ClientError,
-            SendfileResult::AfterHeaderError => Self::AfterHeaderError,
+            SendfileResult::Closed => Self::Closed,
         }
     }
 }
@@ -455,9 +451,8 @@ pub(crate) async fn handle_sendfile_connection(
                 .await;
                 return;
             }
-            ZeroCopyResult::AfterHeaderError | ZeroCopyResult::ClientError => {
-                // Error occurred, should have been already logged.
-                // The connection should be closed
+            ZeroCopyResult::Closed => {
+                // Already logged; the connection must be closed.
                 return;
             }
         };
@@ -677,7 +672,7 @@ async fn serve_webui(
 
     if let Err(err) = write_webui_response(stream, conn_version, conn_action, response).await {
         log_client_write_failure(*client, "web-interface response", &err);
-        return ZeroCopyResult::AfterHeaderError;
+        return ZeroCopyResult::Closed;
     }
     // `SERVED_*` means "fully delivered": bump only after the synchronous
     // write completed (the hyper path gates via `WebUiCountedBody`).
@@ -1387,7 +1382,7 @@ async fn try_sendfile_request(
             Ok(SpliceProxyOutcome::ServedClosing) => {
                 ZeroCopyResult::Served(ConnectionAction::Close)
             }
-            Ok(SpliceProxyOutcome::ClientLost) => ZeroCopyResult::AfterHeaderError,
+            Ok(SpliceProxyOutcome::ClientLost) => ZeroCopyResult::Closed,
             Ok(SpliceProxyOutcome::Concurrent { status: dl_status }) => {
                 // Race-loser path: another connection registered the
                 // download between our earlier `attach()` (which saw
@@ -1486,15 +1481,15 @@ fn splice_error_outcome(
                     "{prefix}: client error writing {phase} for {subject}; closing the connection"
                 ),
             );
-            ZeroCopyResult::ClientError
+            ZeroCopyResult::Closed
         }
         SpliceProxyError::AfterHeader { phase, failure } => {
             let _reported = failure.conclude(Some(client), format_args!(
                 "{prefix}: response delivery stopped in {phase} for {subject}; closing the connection"
             ));
-            ZeroCopyResult::AfterHeaderError
+            ZeroCopyResult::Closed
         }
-        SpliceProxyError::ReportedAfterHeader(_reported) => ZeroCopyResult::AfterHeaderError,
+        SpliceProxyError::ReportedAfterHeader(_reported) => ZeroCopyResult::Closed,
         SpliceProxyError::ReportedBeforeHeader(reported) => {
             let (status, msg) = reported.failure().response_parts();
             ZeroCopyResult::Invalid { status, msg }
@@ -1508,8 +1503,8 @@ pub(crate) enum SendfileResult {
         msg: &'static str,
     },
     Served(ConnectionAction),
-    AfterHeaderError,
-    ClientError,
+    /// See [`ZeroCopyResult::Closed`].
+    Closed,
 }
 
 /// Serve a file via sendfile(2), handling conditional requests (304),
@@ -1627,7 +1622,7 @@ async fn serve_planned(
             .await
             {
                 log_client_write_failure(client, "304 response", &err);
-                return SendfileResult::ClientError;
+                return SendfileResult::Closed;
             }
             info!(
                 "Serving 304 Not Modified for {what} file {} from mirror {}{aliased} for {who} {client} via sendfile",
@@ -1638,7 +1633,7 @@ async fn serve_planned(
         ServePlan::NotSatisfiable => {
             if let Err(err) = write_416_response(stream, conn_version, conn_action, size).await {
                 log_client_write_failure(client, "416 response", &err);
-                return SendfileResult::ClientError;
+                return SendfileResult::Closed;
             }
             return SendfileResult::Served(conn_action);
         }
@@ -1685,7 +1680,7 @@ async fn serve_planned(
             "Failed to write response headers to {who} {client}; closing the connection:  {}",
             ErrorReport(&err)
         );
-        return SendfileResult::ClientError;
+        return SendfileResult::Closed;
     }
 
     let start = PreciseInstant::now();
@@ -1718,7 +1713,7 @@ async fn serve_planned(
     {
         SendfileResult::Served(conn_action)
     } else {
-        SendfileResult::AfterHeaderError
+        SendfileResult::Closed
     }
 }
 
@@ -2600,7 +2595,7 @@ async fn serve_unfinished_sendfile(
                             conn_details.client,
                             ErrorReport(&err)
                         );
-                        ZeroCopyResult::ClientError
+                        ZeroCopyResult::Closed
                     }
                 };
             }

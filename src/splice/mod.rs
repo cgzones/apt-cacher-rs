@@ -223,9 +223,7 @@ async fn serve_volatile_304_via_sendfile(
     .await
     {
         SendfileResult::Served(_) => Ok(SpliceProxyOutcome::Served),
-        SendfileResult::ClientError | SendfileResult::AfterHeaderError => {
-            Ok(SpliceProxyOutcome::ClientLost)
-        }
+        SendfileResult::Closed => Ok(SpliceProxyOutcome::ClientLost),
         SendfileResult::Invalid { status, msg } => client
             .write_invalid(status, msg, None, "post-304 invalid response")
             .await
