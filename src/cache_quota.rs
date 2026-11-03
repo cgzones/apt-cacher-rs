@@ -67,7 +67,7 @@
 //! a `statvfs(3)` sample at most [`DISK_SAMPLE_TTL`] old (older only while
 //! the one outstanding probe hangs, see
 //! [`CacheQuota::refresh_disk_headroom`]), minus the full
-//! [`disk_needed`] of every reservation still live (`inflight_disk`) or
+//! [`InflightShare::disk`] of every reservation still live (`inflight_disk`) or
 //! ended since the sample was taken (`retired_disk`): a download from a slow
 //! mirror writes for minutes, so a sample taken while it runs shows only
 //! what it wrote so far, and one charged only until the next sample would
@@ -200,10 +200,10 @@ struct Accounting {
     /// `tmp/`, removed partials.
     committed_shrunk: u64,
     /// Sum of the disk bytes the live reservations may write
-    /// ([`disk_needed`]); what a free-space sample cannot fully reflect
+    /// ([`InflightShare::disk`]); what a free-space sample cannot fully reflect
     /// while they run.
     inflight_disk: u64,
-    /// Monotonic sum of [`disk_needed`] over ended reservations: what they
+    /// Monotonic sum of [`InflightShare::disk`] over ended reservations: what they
     /// wrote after a sample was taken, the sample cannot show either.
     retired_disk: u64,
     /// The latest free-space sample of the cache filesystem; `None` until
@@ -272,9 +272,29 @@ impl Accounting {
         }
     }
 
+    /// Add a reservation's contribution to the in-flight tallies.
+    const fn admit(&mut self, share: InflightShare) {
+        let InflightShare {
+            reserved,
+            replaced,
+            unwritten,
+            disk,
+        } = share;
+        self.inflight_reserved = self.inflight_reserved.saturating_add(reserved.get());
+        self.inflight_replaced = self.inflight_replaced.saturating_add(replaced);
+        self.inflight_unwritten = self.inflight_unwritten.saturating_add(unwritten);
+        self.inflight_disk = self.inflight_disk.saturating_add(disk);
+    }
+
     /// Remove a reservation's contribution from the in-flight tallies.
-    fn retire(&mut self, reserved: u64, replaced: u64, unwritten: u64, disk: u64) {
-        self.inflight_reserved = self.inflight_reserved.saturating_sub(reserved);
+    const fn retire(&mut self, share: InflightShare) {
+        let InflightShare {
+            reserved,
+            replaced,
+            unwritten,
+            disk,
+        } = share;
+        self.inflight_reserved = self.inflight_reserved.saturating_sub(reserved.get());
         self.inflight_replaced = self.inflight_replaced.saturating_sub(replaced);
         self.inflight_unwritten = self.inflight_unwritten.saturating_sub(unwritten);
         self.inflight_disk = self.inflight_disk.saturating_sub(disk);
@@ -342,14 +362,6 @@ const fn headroom_allows(free: u64, needed: u64, min_free: u64) -> bool {
     free >= min_free.saturating_add(needed)
 }
 
-/// The disk space a reservation may still consume: all of it, except the
-/// bytes its adopted partial already holds.
-fn disk_needed(reserved: NonZero<u64>, partial: Option<&ReservedPartial>) -> u64 {
-    reserved
-        .get()
-        .saturating_sub(partial.map_or(0, |p| p.adopted))
-}
-
 /// Snapshot of the commit counters taken before a reconcile's scan; see the
 /// module doc.
 #[derive(Clone, Copy)]
@@ -393,24 +405,46 @@ pub(crate) struct Reconciled {
 /// `u64::MAX` only when the sum would overflow, which then rejects via
 /// `> quota`.
 ///
-/// This is the single definition of the formula: both admission checks and
-/// [`CacheQuota::reserve_locked`] (which applies it to `size`) call it, so an
-/// admitted check can never disagree with the reservation it admits.
+/// This is the single definition of the formula: the admission check
+/// ([`CacheQuota::quota_exceeded_by`]) and [`CacheQuota::reserve_locked`] (which applies
+/// it to `size`) call it, so an admitted check can never disagree with the
+/// reservation it admits.
 const fn projected_size(current: u64, prev_file_size: u64, reserved: NonZero<u64>) -> u64 {
     current
         .saturating_sub(prev_file_size)
         .saturating_add(reserved.get())
 }
 
-/// What a reservation replaces: the previous cache file plus the partial it
-/// adopts.
-fn replaced_size(prev_file_size: u64, partial: Option<&ReservedPartial>) -> u64 {
-    prev_file_size.saturating_add(partial.map_or(0, |p| p.adopted))
+/// One reservation's contribution to each in-flight tally of [`Accounting`].
+/// Minting and ending a reservation derive it through the same
+/// [`InflightShare::of`], so [`Accounting::admit`] adds exactly what
+/// [`Accounting::retire`] later takes back.
+#[derive(Clone, Copy, Debug)]
+struct InflightShare {
+    /// The accounted reservation (`inflight_reserved`).
+    reserved: NonZero<u64>,
+    /// What it replaces: the previous cache file plus the partial it adopts
+    /// (`inflight_replaced`).
+    replaced: u64,
+    /// What it may still write into its partial; 0 without one
+    /// (`inflight_unwritten`).
+    unwritten: u64,
+    /// The disk space it may still consume: all of it, except the bytes its
+    /// adopted partial already holds (`inflight_disk`, then `retired_disk`).
+    disk: u64,
 }
 
-/// What a reservation may still write into its partial; 0 without one.
-fn unwritten_size(reserved: NonZero<u64>, partial: Option<&ReservedPartial>) -> u64 {
-    partial.map_or(0, |p| reserved.get().saturating_sub(p.adopted))
+impl InflightShare {
+    /// `reserved` and `prev_file_size` are already accounted sizes.
+    fn of(reserved: NonZero<u64>, prev_file_size: u64, partial: Option<&ReservedPartial>) -> Self {
+        let adopted = partial.map(|p| p.adopted);
+        Self {
+            reserved,
+            replaced: prev_file_size.saturating_add(adopted.unwrap_or(0)),
+            unwritten: adopted.map_or(0, |adopted| reserved.get().saturating_sub(adopted)),
+            disk: reserved.get().saturating_sub(adopted.unwrap_or(0)),
+        }
+    }
 }
 
 impl CacheQuota {
@@ -581,13 +615,11 @@ impl CacheQuota {
     ) -> Result<QuotaReservation, QuotaExceeded> {
         let reserved = accounted_nonzero(content_length.upper());
         let prev_file_size = accounted_size(prev_file_size);
-        let replaced = replaced_size(prev_file_size, partial.as_ref());
+        let share = InflightShare::of(reserved, prev_file_size, partial.as_ref());
         let mg = self.inner.accounting.lock();
         let curr = mg.size;
 
-        if let Some(quota) = self.inner.quota_config
-            && projected_size(curr, replaced, reserved) > quota.get()
-        {
+        if let Some(quota) = self.quota_exceeded_by(&mg, share) {
             drop(mg);
             // A cache sitting at its quota rejects on *every* cacheable
             // miss until cleanup runs, so only the first rejection is a
@@ -596,32 +628,27 @@ impl CacheQuota {
                 "Disk quota reached while reserving space for {debname} (cache size {}, reserving {}, quota {}); rejecting the download with 503",
                 HumanFmt::Size(curr),
                 HumanFmt::Size(reserved.get()),
-                HumanFmt::Size(quota.get()),
+                HumanFmt::Size(quota),
             );
             metrics::DOWNLOAD_REJECTED_QUOTA.increment();
             return Err(QuotaExceeded);
         }
 
-        if let Some(headroom) = &self.inner.headroom
-            && let Some(free) = mg.disk_free_now()
-        {
-            let needed = disk_needed(reserved, partial.as_ref());
-            if !headroom_allows(free, needed, headroom.min_free.get()) {
-                drop(mg);
-                // Like the quota: a nearly full disk rejects every cacheable
-                // miss until space is freed.
-                warn_once_or_info!(
-                    "Low disk space while reserving space for {debname} ({} free on the cache filesystem, needing {}, min_disk_free {}); rejecting the download with 503",
-                    HumanFmt::Size(free),
-                    HumanFmt::Size(needed),
-                    HumanFmt::Size(headroom.min_free.get()),
-                );
-                metrics::DOWNLOAD_REJECTED_QUOTA.increment();
-                return Err(QuotaExceeded);
-            }
+        if let Some((free, min_free)) = self.headroom_short_for(&mg, share) {
+            drop(mg);
+            // Like the quota: a nearly full disk rejects every cacheable
+            // miss until space is freed.
+            warn_once_or_info!(
+                "Low disk space while reserving space for {debname} ({} free on the cache filesystem, needing {}, min_disk_free {}); rejecting the download with 503",
+                HumanFmt::Size(free),
+                HumanFmt::Size(share.disk),
+                HumanFmt::Size(min_free),
+            );
+            metrics::DOWNLOAD_REJECTED_QUOTA.increment();
+            return Err(QuotaExceeded);
         }
 
-        Ok(self.reserve_locked(mg, reserved, prev_file_size, partial, debname))
+        Ok(self.reserve_locked(mg, share, prev_file_size, partial, debname))
     }
 
     /// Reserve space for one of cleanup's own index fetches without
@@ -645,33 +672,43 @@ impl CacheQuota {
     ) -> QuotaReservation {
         let reserved = accounted_nonzero(content_length.upper());
         let prev_file_size = accounted_size(prev_file_size);
-        let replaced = replaced_size(prev_file_size, partial.as_ref());
+        let share = InflightShare::of(reserved, prev_file_size, partial.as_ref());
         let mg = self.inner.accounting.lock();
-        let curr = mg.size;
-        if let Some(quota) = self.inner.quota_config
-            && projected_size(curr, replaced, reserved) > quota.get()
-        {
+        if let Some(quota) = self.quota_exceeded_by(&mg, share) {
             info!(
                 "Disk quota reached while reserving space for cleanup index fetch {debname} (cache size {}, reserving {}, quota {}); admitting it over quota so cleanup can reconcile and free space",
-                HumanFmt::Size(curr),
+                HumanFmt::Size(mg.size),
                 HumanFmt::Size(reserved.get()),
-                HumanFmt::Size(quota.get()),
+                HumanFmt::Size(quota),
             );
         }
-        if let Some(headroom) = &self.inner.headroom
-            && let Some(free) = mg.disk_free_now()
-        {
-            let needed = disk_needed(reserved, partial.as_ref());
-            if !headroom_allows(free, needed, headroom.min_free.get()) {
-                info!(
-                    "Low disk space while reserving space for cleanup index fetch {debname} ({} free on the cache filesystem, needing {}, min_disk_free {}); admitting it so cleanup can reconcile and free space",
-                    HumanFmt::Size(free),
-                    HumanFmt::Size(needed),
-                    HumanFmt::Size(headroom.min_free.get()),
-                );
-            }
+        if let Some((free, min_free)) = self.headroom_short_for(&mg, share) {
+            info!(
+                "Low disk space while reserving space for cleanup index fetch {debname} ({} free on the cache filesystem, needing {}, min_disk_free {}); admitting it so cleanup can reconcile and free space",
+                HumanFmt::Size(free),
+                HumanFmt::Size(share.disk),
+                HumanFmt::Size(min_free),
+            );
         }
-        self.reserve_locked(mg, reserved, prev_file_size, partial, debname)
+        self.reserve_locked(mg, share, prev_file_size, partial, debname)
+    }
+
+    /// The `disk_quota` admitting `share` would exceed ([`projected_size`]),
+    /// if any. Shared by both admission paths, which differ only in what they
+    /// do about it.
+    fn quota_exceeded_by(&self, mg: &Accounting, share: InflightShare) -> Option<u64> {
+        let quota = self.inner.quota_config?.get();
+        (projected_size(mg.size, share.replaced, share.reserved) > quota).then_some(quota)
+    }
+
+    /// `(free, min_disk_free)` when admitting `share` would dig into the
+    /// [`DiskHeadroom`] floor, judged from the latest free-space sample
+    /// ([`Accounting::disk_free_now`]). Shared like
+    /// [`Self::quota_exceeded_by`].
+    fn headroom_short_for(&self, mg: &Accounting, share: InflightShare) -> Option<(u64, u64)> {
+        let min_free = self.inner.headroom.as_ref()?.min_free.get();
+        let free = mg.disk_free_now()?;
+        (!headroom_allows(free, share.disk, min_free)).then_some((free, min_free))
     }
 
     /// Apply a reservation to the accounting and mint its token. Takes the
@@ -680,28 +717,21 @@ impl CacheQuota {
     fn reserve_locked(
         &self,
         mut mg: parking_lot::MutexGuard<'_, Accounting>,
-        reserved: NonZero<u64>,
+        share: InflightShare,
         prev_file_size: u64,
         partial: Option<ReservedPartial>,
         debname: &str,
     ) -> QuotaReservation {
-        let replaced = replaced_size(prev_file_size, partial.as_ref());
         trace!(
-            "Adjusting cache size for file {debname} to be downloaded by {reserved} minus previous file size {prev_file_size} and adopted partial size {}",
-            replaced - prev_file_size
+            "Adjusting cache size for file {debname} to be downloaded by {} minus previous file size {prev_file_size} and adopted partial size {}",
+            share.reserved,
+            share.replaced - prev_file_size
         );
 
         // Reconcile catches any residual drift from `replaced > curr`
         // caller bugs and emits `Repaired cache size discrepancy`.
-        mg.size = projected_size(mg.size, replaced, reserved);
-        mg.inflight_reserved = mg.inflight_reserved.saturating_add(reserved.get());
-        mg.inflight_replaced = mg.inflight_replaced.saturating_add(replaced);
-        mg.inflight_unwritten = mg
-            .inflight_unwritten
-            .saturating_add(unwritten_size(reserved, partial.as_ref()));
-        mg.inflight_disk = mg
-            .inflight_disk
-            .saturating_add(disk_needed(reserved, partial.as_ref()));
+        mg.size = projected_size(mg.size, share.replaced, share.reserved);
+        mg.admit(share);
         let new_size = mg.size;
         drop(mg);
 
@@ -709,7 +739,7 @@ impl CacheQuota {
 
         QuotaReservation {
             quota: self.clone(),
-            reserved,
+            reserved: share.reserved,
             prev_file_size,
             partial: partial.map(Box::new),
             finalized: sticky::Bool::new(),
@@ -879,7 +909,9 @@ impl std::fmt::Debug for CacheQuota {
 #[must_use]
 pub(crate) struct QuotaReservation {
     quota: CacheQuota,
+    /// The accounted reservation.
     reserved: NonZero<u64>,
+    /// The accounted size of the cache file the download replaces.
     prev_file_size: u64,
     /// The partial the download writes into; `None` for a volatile scratch
     /// file. What it holds when the reservation ends unfinalised stays
@@ -890,6 +922,14 @@ pub(crate) struct QuotaReservation {
 }
 
 impl QuotaReservation {
+    /// What this reservation added to the in-flight tallies: re-derived from
+    /// the same inputs, through the same [`InflightShare::of`], as at mint
+    /// time (none of them changes while the reservation lives). Not stored,
+    /// which would widen every download barrier's failure type.
+    fn share(&self) -> InflightShare {
+        InflightShare::of(self.reserved, self.prev_file_size, self.partial.as_deref())
+    }
+
     /// Finalize the reservation after the download landed in the cache.
     ///
     /// Adjusts the accounted size so the net change from acquire + finalize
@@ -913,12 +953,7 @@ impl QuotaReservation {
         let prev = self.prev_file_size;
         let partial = self.partial.as_deref();
         let mut mg = self.quota.inner.accounting.lock();
-        mg.retire(
-            reserved,
-            replaced_size(prev, partial),
-            unwritten_size(self.reserved, partial),
-            disk_needed(self.reserved, partial),
-        );
+        mg.retire(self.share());
         match reserved.cmp(&bytes_received) {
             Ordering::Equal => {}
             Ordering::Greater => {
@@ -969,12 +1004,7 @@ impl Drop for QuotaReservation {
         // which `kept_partial_counts_against_the_disk_quota` waits on to know
         // the reservation has ended: keep the wording stable.
         let mut mg = self.quota.inner.accounting.lock();
-        mg.retire(
-            reserved,
-            replaced_size(prev, partial),
-            unwritten_size(self.reserved, partial),
-            disk_needed(self.reserved, partial),
-        );
+        mg.retire(self.share());
         match reserved.cmp(&restored) {
             Ordering::Equal => {}
             Ordering::Less => {
