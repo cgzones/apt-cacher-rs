@@ -43,7 +43,7 @@ use crate::{
 
 use super::{
     fmt::{
-        Count, Gauge, Level, Nonzero, RelTime, Segment, StackBar, Unit, alert_if, now_epoch,
+        Count, Gauge, Level, Nonzero, Pct, RelTime, Segment, StackBar, Unit, alert_if, now_epoch,
         warn_if,
     },
     table::{DetailsList, Highlights, Kind},
@@ -59,9 +59,7 @@ impl Display for OptPctSuffix {
         if self.total == 0 {
             Ok(())
         } else {
-            #[expect(clippy::cast_precision_loss, reason = "only for display purposes")]
-            let pct = self.num as f64 / self.total as f64 * 100.0;
-            write!(f, " ({pct:.1}%)")
+            write!(f, " ({})", Pct::new(self.num, self.total))
         }
     }
 }

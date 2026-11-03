@@ -499,14 +499,7 @@ impl Display for SavedShare {
         if self.delivered <= 0 {
             return Ok(());
         }
-        write!(
-            f,
-            " ({})",
-            Pct {
-                num: i64::try_from(self.saved).unwrap_or(i64::MAX),
-                den: self.delivered,
-            }
-        )
+        write!(f, " ({})", Pct::new(self.saved, self.delivered))
     }
 }
 

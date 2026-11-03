@@ -281,7 +281,7 @@ mod mirror_cells {
         scheme_cache::{Scheme, SchemeVerdict},
     };
 
-    use super::super::fmt::{Age, HtmlEscape, HtmlEscaped, Latency, Meter, UtcText, warn_if};
+    use super::super::fmt::{Age, HtmlEscape, HtmlEscaped, Latency, Meter, Pct, UtcText, warn_if};
 
     /// The coloured dot in front of a mirror's name: green without a failure
     /// since start, red once one of its files failed checksum verification
@@ -534,9 +534,7 @@ mod mirror_cells {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
             Display::fmt(&HumanFmt::Size(self.size), f)?;
             if self.total > 0 {
-                #[expect(clippy::cast_precision_loss, reason = "only for display purposes")]
-                let pct = self.size as f64 / self.total as f64 * 100.0;
-                write!(f, " ({pct:.1}%)")?;
+                write!(f, " ({})", Pct::new(self.size, self.total))?;
                 Display::fmt(
                     &Meter {
                         value: self.size,
@@ -579,10 +577,14 @@ mod mirror_cells {
             if self.delivered == 0 {
                 f.write_str("N/A")
             } else {
-                #[expect(clippy::cast_precision_loss, reason = "only for display purposes")]
-                let pct = (self.delivered.saturating_sub(self.downloaded)) as f64
-                    / self.delivered as f64
-                    * 100.0;
+                // Not `Pct`'s own rendering, which reads a negative
+                // `delivered` (a corrupt database) as N/A: this cell has
+                // always printed what the division gives.
+                let pct = Pct::new(
+                    self.delivered.saturating_sub(self.downloaded),
+                    self.delivered,
+                )
+                .percent();
                 write!(f, "{pct:.1}%")?;
                 #[expect(
                     clippy::cast_possible_truncation,

@@ -239,11 +239,10 @@ impl Display for Saturation {
             write!(f, "at cap {}", Span(at_cap.as_secs()))?;
         }
         if attempts > 0 {
-            #[expect(clippy::cast_precision_loss, reason = "only for display purposes")]
-            let pct = refused as f64 / attempts as f64 * 100.0;
             write!(
                 f,
-                "; {verb} {pct:.1}% ({} of {})",
+                "; {verb} {} ({} of {})",
+                Pct::new(refused, attempts),
                 Count(refused),
                 Count(attempts)
             )?;
@@ -894,19 +893,38 @@ impl Display for MinRate {
     }
 }
 
-/// Percentage with one decimal; `"N/A"` if denominator is non-positive.
+/// A share as a percentage with one decimal, `42.5%`; `"N/A"` if the
+/// denominator is non-positive. The one rendering of a share on the page:
+/// each caller keeps its own policy for an empty whole (`N/A`, nothing, no
+/// suffix) and renders this only past it.
 pub(super) struct Pct {
-    pub(super) num: i64,
-    pub(super) den: i64,
+    num: i128,
+    den: i128,
+}
+impl Pct {
+    /// Any mix of signed and unsigned counts: widening to `i128` is exact,
+    /// so the share is the one `num as f64 / den as f64` gives.
+    pub(super) fn new(num: impl Into<i128>, den: impl Into<i128>) -> Self {
+        Self {
+            num: num.into(),
+            den: den.into(),
+        }
+    }
+
+    /// The share in percent, unrounded, for a caller that also draws it.
+    pub(super) fn percent(&self) -> f64 {
+        let Self { num, den } = *self;
+        #[expect(clippy::cast_precision_loss, reason = "only for display purposes")]
+        let pct = num as f64 / den as f64 * 100.0;
+        pct
+    }
 }
 impl Display for Pct {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         if self.den <= 0 {
             f.write_str("N/A")
         } else {
-            #[expect(clippy::cast_precision_loss, reason = "only for display purposes")]
-            let pct = self.num as f64 / self.den as f64 * 100.0;
-            write!(f, "{pct:.1}%")
+            write!(f, "{:.1}%", self.percent())
         }
     }
 }
@@ -926,11 +944,10 @@ impl Display for CacheHitRatio {
             // than deliveries can be on record; a hit ratio cannot be
             // negative.
             let hits = self.hits.clamp(0, self.total);
-            #[expect(clippy::cast_precision_loss, reason = "only for display purposes")]
-            let pct = hits as f64 / self.total as f64 * 100.0;
             write!(
                 f,
-                "{pct:.1}% ({} / {})",
+                "{} ({} / {})",
+                Pct::new(hits, self.total),
                 Count::db(hits),
                 Count::db(self.total)
             )
@@ -972,16 +989,15 @@ impl Display for DiskUsage {
         match self.quota {
             None => Display::fmt(&HumanFmt::Size(self.cache_size), f),
             Some(q) => {
-                #[expect(clippy::cast_precision_loss, reason = "only for display purposes")]
-                let pct = self.cache_size as f64 / q as f64 * 100.0;
                 let peak_bps = metrics::CACHE_QUOTA_UTIL_PEAK_BPS.get();
                 #[expect(clippy::cast_precision_loss, reason = "only for display purposes")]
                 let peak_pct = peak_bps as f64 / 100.0;
                 let class = RatioClass::new(self.cache_size, q);
                 let inner = format_args!(
-                    "{} / {} ({pct:.1}%, peak {peak_pct:.1}%)",
+                    "{} / {} ({}, peak {peak_pct:.1}%)",
                     HumanFmt::Size(self.cache_size),
-                    HumanFmt::Size(q)
+                    HumanFmt::Size(q),
+                    Pct::new(self.cache_size, q)
                 );
                 Display::fmt(
                     &Colorize {
@@ -1353,9 +1369,10 @@ mod tests {
 
     #[test]
     fn percentages_guard_non_positive_denominators() {
-        assert_eq!(render(Pct { num: 1, den: 0 }), "N/A");
-        assert_eq!(render(Pct { num: 1, den: -5 }), "N/A");
-        assert_eq!(render(Pct { num: 1, den: 4 }), "25.0%");
+        assert_eq!(render(Pct::new(1, 0)), "N/A");
+        assert_eq!(render(Pct::new(1, -5)), "N/A");
+        assert_eq!(render(Pct::new(1, 4)), "25.0%");
+        assert_eq!(render(Pct::new(2_u64, 3_u64)), "66.7%");
         assert_eq!(render(CacheHitRatio { hits: 1, total: 0 }), "N/A");
         assert_eq!(render(CacheHitRatio { hits: 3, total: 4 }), "75.0% (3 / 4)");
     }
