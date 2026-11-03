@@ -66,7 +66,7 @@ use crate::error::ErrorReport;
 use crate::fs_open::{
     regular_file_metadata_typed, tokio_nofollow_options, touch_volatile_mtime_with,
 };
-use crate::guards::{Consequence, DownloadBarrier, FailedDownload, InitBarrier};
+use crate::guards::{Consequence, DownloadBarrier, InitBarrier};
 use crate::http_helpers::{
     ConnectionAction, ConnectionVersion, OptHeader, WritePhase, write_416_response,
     write_all_to_stream, write_invalid_response,
@@ -446,6 +446,47 @@ struct CacheTarget {
     /// The validators the response head carries and a client `If-Range` is
     /// resolved against.
     validators: HeadValidators,
+}
+
+impl CacheTarget {
+    /// Run `work` on the writer under the download runner (`DownloadBarrier::run`),
+    /// which owns the barrier while `work` borrows it and the writer. A
+    /// failure is concluded by the runner first; only then are the bytes
+    /// already received but not yet in the file salvaged
+    /// ([`CacheWriter::salvage`], a no-op before a body loop installed its
+    /// batch), and the failed download publishes it. The target is gone with
+    /// the failure.
+    async fn run<T>(
+        self,
+        consequence: Consequence,
+        work: impl AsyncFnOnce(&mut CacheWriter, &mut DownloadBarrier) -> Result<T, DownloadFailure>,
+    ) -> Result<(Self, T), ReportedDownloadFailure> {
+        let Self {
+            mut writer,
+            dbarrier,
+            temppath,
+            dest_path,
+            validators,
+        } = self;
+        match dbarrier
+            .run(consequence, async |barrier| {
+                work(&mut writer, barrier).await
+            })
+            .await
+        {
+            Ok((dbarrier, value)) => Ok((
+                Self {
+                    writer,
+                    dbarrier,
+                    temppath,
+                    dest_path,
+                    validators,
+                },
+                value,
+            )),
+            Err(failed) => Err(failed.salvage(async || writer.salvage().await).await),
+        }
+    }
 }
 
 /// The validators of a splice-served head: the download's settled metadata
@@ -1281,28 +1322,14 @@ async fn land_in_cache(
     if len == 0 {
         return Ok(target);
     }
-    let CacheTarget {
-        mut writer,
-        dbarrier,
-        temppath,
-        dest_path,
-        validators,
-    } = target;
-    let (dbarrier, ()) = dbarrier
-        .run(consequence, async |barrier| {
-            write(&mut writer).await?;
+    let (target, ()) = target
+        .run(consequence, async |writer, barrier| {
+            write(writer).await?;
             barrier.ping_batched(len as u64);
             Ok(())
         })
-        .await
-        .map_err(FailedDownload::into_reported)?;
-    Ok(CacheTarget {
-        writer,
-        dbarrier,
-        temppath,
-        dest_path,
-        validators,
-    })
+        .await?;
+    Ok(target)
 }
 
 /// Cache the new prefix even when an earlier client write failed. Only an
@@ -1423,18 +1450,17 @@ async fn transfer_body(
     // A failure is concluded before the first salvage await, including TLS
     // bytes consumed into the writer's batch but not yet appended to the
     // partial.
-    let CacheTarget {
-        mut writer,
-        dbarrier,
-        temppath,
-        dest_path,
-        validators,
-    } = target;
-    let outcome = dbarrier
-        .run(consequence, async |barrier| {
+    let (
+        target,
+        BodyOutcome {
+            client,
+            client_bytes,
+        },
+    ) = target
+        .run(consequence, async |writer, barrier| {
             let xfer = BodyTransfer::new(
                 client,
-                &mut writer,
+                writer,
                 barrier,
                 range_filter,
                 splice_count,
@@ -1447,26 +1473,7 @@ async fn transfer_body(
                 splice_proxy_body_tls(xfer, upstream).await
             }
         })
-        .await;
-    let (
-        dbarrier,
-        BodyOutcome {
-            client,
-            client_bytes,
-        },
-    ) = match outcome {
-        Ok(outcome) => outcome,
-        Err(failed) => {
-            return Err(failed.salvage(async || writer.salvage().await).await);
-        }
-    };
-    let target = CacheTarget {
-        writer,
-        dbarrier,
-        temppath,
-        dest_path,
-        validators,
-    };
+        .await?;
     // Every body byte is on disk now (the loops' final `cache.flush`); the
     // readers learn that from `begin_rename`, which every caller reaches
     // next: its flush of the last sub-`PING_BATCH_THRESHOLD` chunk and its
