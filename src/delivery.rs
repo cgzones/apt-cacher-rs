@@ -108,7 +108,7 @@ pub(crate) enum Role {
 }
 
 impl Role {
-    fn words(self) -> (&'static str, &'static str) {
+    pub(crate) fn words(self) -> (&'static str, &'static str) {
         match self {
             Self::Cached => ("cached", "client"),
             #[cfg(feature = "hyper")]

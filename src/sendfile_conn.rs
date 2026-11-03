@@ -1502,54 +1502,6 @@ fn splice_error_outcome(
     }
 }
 
-/// Evaluate conditional request headers (If-None-Match, If-Modified-Since) and
-/// Range headers via [`CacheInfo::plan`], writing 304 or 416 responses
-/// directly to the stream when the plan says so.
-///
-/// Returns [`ServePlan::Serve`] when the caller should send the file body.
-/// For either other successful plan, the bodyless response is already written.
-async fn evaluate_conditional_and_range(
-    stream: &TcpStream,
-    client: &ClientInfo,
-    conn_version: ConnectionVersion,
-    conn_action: ConnectionAction,
-    cache_info: &CacheInfo,
-    file_size: u64,
-    headers: RangeRequestHeaders<'_>,
-) -> Result<ServePlan, SendfileResult> {
-    let params = match cache_info.plan(file_size, &headers, client) {
-        ServePlan::Serve(params) => params,
-        ServePlan::NotModified => {
-            if let Err(err) = write_304_response(
-                stream,
-                conn_version,
-                conn_action,
-                &cache_info.last_modified_str,
-                cache_info.age,
-                cache_info.file_etag.as_deref(),
-            )
-            .await
-            {
-                log_client_write_failure(*client, "304 response", &err);
-                return Err(SendfileResult::ClientError);
-            }
-
-            return Ok(ServePlan::NotModified);
-        }
-        ServePlan::NotSatisfiable => {
-            if let Err(err) = write_416_response(stream, conn_version, conn_action, file_size).await
-            {
-                log_client_write_failure(*client, "416 response", &err);
-                return Err(SendfileResult::ClientError);
-            }
-
-            return Ok(ServePlan::NotSatisfiable);
-        }
-    };
-
-    Ok(ServePlan::Serve(params))
-}
-
 pub(crate) enum SendfileResult {
     Invalid {
         status: StatusCode,
@@ -1575,7 +1527,6 @@ pub(crate) async fn serve_file_via_sendfile(
     prefetched_upstream_metadata: Option<&cache_metadata::UpstreamMetadata>,
 ) -> SendfileResult {
     let (file, prefetched_mdata, file_path) = source;
-    let (conn_version, conn_action) = conn_settings;
 
     // The volatile-hit path already fetched (and is_file-validated) the
     // metadata for its staleness check; don't pay a second fstat here.
@@ -1593,8 +1544,6 @@ pub(crate) async fn serve_file_via_sendfile(
         }
     };
 
-    let file_size = mdata.len();
-
     let cache_info = CacheInfo::resolve(
         &file,
         file_path,
@@ -1603,42 +1552,115 @@ pub(crate) async fn serve_file_via_sendfile(
         prefetched_upstream_metadata,
     );
 
-    let params = match evaluate_conditional_and_range(
+    serve_planned(
         stream,
-        &conn_details.client,
-        conn_version,
-        conn_action,
-        &cache_info,
-        file_size,
+        conn_details,
+        aliased,
+        conn_settings,
         headers,
+        &cache_info,
+        ServeSource {
+            file: &file,
+            path: file_path,
+            size: mdata.len(),
+            progress: None,
+        },
     )
     .await
-    {
-        Ok(ServePlan::NotModified) => {
+}
+
+/// The file a sendfile serve delivers from.
+struct ServeSource<'a> {
+    file: &'a tokio::fs::File,
+    path: &'a Path,
+    /// The representation's full size, which the client's `Range` resolves
+    /// against: the file's length, or for a download still in flight the
+    /// size it will reach.
+    size: u64,
+    /// `None` for a complete cache file; for an in-flight download, the
+    /// receiver of its progress pings and its status, which
+    /// [`async_sendfile_unfinished`] follows until the download ends.
+    progress: Option<(
+        tokio::sync::watch::Receiver<()>,
+        Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+    )>,
+}
+
+/// The serve tail shared by cached files and joined downloads: resolve the
+/// client's conditional and `Range` headers via [`CacheInfo::plan`] and
+/// answer a 304 or 416 head-only, else write the representation head and
+/// the body via sendfile(2) and finish the delivery.
+async fn serve_planned(
+    stream: &TcpStream,
+    conn_details: &ConnectionDetails,
+    aliased: &str,
+    (conn_version, conn_action): (ConnectionVersion, ConnectionAction),
+    headers: RangeRequestHeaders<'_>,
+    cache_info: &CacheInfo,
+    source: ServeSource<'_>,
+) -> SendfileResult {
+    let ServeSource {
+        file,
+        path: file_path,
+        size,
+        progress,
+    } = source;
+    let client = conn_details.client;
+    let role = if progress.is_some() {
+        Role::LateJoiner
+    } else {
+        Role::Cached
+    };
+    let (what, who) = role.words();
+
+    let params = match cache_info.plan(size, &headers, &client) {
+        ServePlan::Serve(params) => params,
+        ServePlan::NotModified => {
+            if let Err(err) = write_304_response(
+                stream,
+                conn_version,
+                conn_action,
+                &cache_info.last_modified_str,
+                cache_info.age,
+                cache_info.file_etag.as_deref(),
+            )
+            .await
+            {
+                log_client_write_failure(client, "304 response", &err);
+                return SendfileResult::ClientError;
+            }
             info!(
-                "Serving 304 Not Modified for cached file {} from mirror {}{aliased} for client {} via sendfile",
-                conn_details.debname, conn_details.mirror, conn_details.client
+                "Serving 304 Not Modified for {what} file {} from mirror {}{aliased} for {who} {client} via sendfile",
+                conn_details.debname, conn_details.mirror
             );
             return SendfileResult::Served(conn_action);
         }
-        Ok(ServePlan::NotSatisfiable) => {
+        ServePlan::NotSatisfiable => {
+            if let Err(err) = write_416_response(stream, conn_version, conn_action, size).await {
+                log_client_write_failure(client, "416 response", &err);
+                return SendfileResult::ClientError;
+            }
             return SendfileResult::Served(conn_action);
         }
-        Ok(ServePlan::Serve(params)) => params,
-        Err(result) => return result,
     };
     let partial = params.is_partial();
     let content_start = params.content_start;
     let content_length = params.content_length;
 
     debug!(
-        "Serving cached file {} from mirror {}{aliased} for client {} via sendfile...",
-        conn_details.debname, conn_details.mirror, conn_details.client,
+        "Serving {what} file {} from mirror {}{aliased} for {who} {client} via sendfile...",
+        conn_details.debname, conn_details.mirror
     );
 
     // sendfile streams the file linearly through the kernel, so help the
-    // page-cache readahead window grow before the splice loop starts.
-    hint_sequential_read(&file, content_length, file_path);
+    // page-cache readahead window grow before the loop starts. A growing
+    // file's final size is unknown, so it is always hinted.
+    let transfer_size = if progress.is_some() {
+        u64::MAX
+    } else {
+        content_length
+    };
+    hint_sequential_read(file, transfer_size, file_path);
 
     // Headers are sent with MSG_MORE (see write_response_headers), so the
     // kernel coalesces them with the first sendfile body bytes — no
@@ -1654,22 +1676,39 @@ pub(crate) async fn serve_file_via_sendfile(
         conn_action,
         &params,
         content_type_for_cached_file(&conn_details.debname),
-        &cache_info,
+        cache_info,
     )
     .await
     {
-        log_client_write_failure(conn_details.client, "response headers", &err);
+        info_or_warn!(
+            is_expected_client_end(&err),
+            "Failed to write response headers to {who} {client}; closing the connection:  {}",
+            ErrorReport(&err)
+        );
         return SendfileResult::ClientError;
     }
 
     let start = PreciseInstant::now();
 
-    // Use sendfile(2) to transfer the file body
-    let transfer_result = async_sendfile(stream, &file, content_start, content_length).await;
+    let transfer_result = match progress {
+        None => async_sendfile(stream, file, content_start, content_length).await,
+        Some((receiver, status)) => {
+            async_sendfile_unfinished(
+                stream,
+                file,
+                file_path,
+                content_start,
+                content_length,
+                receiver,
+                status,
+            )
+            .await
+        }
+    };
 
     if finish_sendfile_serve(
         conn_details,
-        Role::Cached,
+        role,
         content_length,
         partial,
         start.elapsed(),
@@ -2611,97 +2650,24 @@ async fn serve_unfinished_sendfile(
     // having its xattrs written concurrently).
     let cache_info = CacheInfo::with_meta(&metadata, &status_meta);
 
-    // Range handling uses the total upstream size (not the current partial size on disk).
-    let params = match evaluate_conditional_and_range(
+    // Range handling uses the total upstream size (not the current partial
+    // size on disk).
+    serve_planned(
         stream,
-        &conn_details.client,
-        conn_version,
-        conn_action,
-        &cache_info,
-        exact_size.get(),
-        headers,
-    )
-    .await
-    {
-        Ok(ServePlan::NotModified) => {
-            info!(
-                "Serving 304 Not Modified for downloading file {} from mirror {}{aliased} for joining client {} via sendfile",
-                conn_details.debname, conn_details.mirror, conn_details.client
-            );
-            return ZeroCopyResult::Served(conn_action);
-        }
-        Ok(ServePlan::NotSatisfiable) => {
-            return ZeroCopyResult::Served(conn_action);
-        }
-        Ok(ServePlan::Serve(params)) => params,
-        Err(result) => return result.into(),
-    };
-    let partial = params.is_partial();
-    let content_start = params.content_start;
-    let content_length = params.content_length;
-
-    debug!(
-        "Serving downloading file {} from mirror {}{aliased} for joining client {} via sendfile...",
-        conn_details.debname, conn_details.mirror, conn_details.client
-    );
-
-    // Joining clients also stream the partial cache file linearly via sendfile,
-    // so warm the kernel readahead window before the loop starts.  The final
-    // size is unknown (file still growing), so always hint.
-    hint_sequential_read(&file, u64::MAX, &file_path);
-
-    // Headers go out with MSG_MORE (see write_response_headers); the first
-    // sendfile body bytes complete the held segment — no TCP_CORK pair.
-
-    // Counted when the response starts, before its head (see
-    // `serve_file_via_sendfile`'s bump).
-    metrics::REQUESTS_SENDFILE.increment();
-    if let Err(err) = write_response_headers(
-        stream,
-        conn_version,
-        conn_action,
-        &params,
-        content_type_for_cached_file(&conn_details.debname),
-        &cache_info,
-    )
-    .await
-    {
-        info_or_warn!(
-            is_expected_client_end(&err),
-            "Failed to write response headers to joining client {}; closing the connection:  {}",
-            conn_details.client,
-            ErrorReport(&err)
-        );
-        return ZeroCopyResult::ClientError;
-    }
-
-    let start = PreciseInstant::now();
-
-    let transfer_result = async_sendfile_unfinished(
-        stream,
-        &file,
-        &file_path,
-        content_start,
-        content_length,
-        receiver,
-        dl_status,
-    )
-    .await;
-
-    if finish_sendfile_serve(
         &conn_details,
-        Role::LateJoiner,
-        content_length,
-        partial,
-        start.elapsed(),
-        transfer_result,
+        aliased,
+        (conn_version, conn_action),
+        headers,
+        &cache_info,
+        ServeSource {
+            file: &file,
+            path: &file_path,
+            size: exact_size.get(),
+            progress: Some((receiver, dl_status)),
+        },
     )
     .await
-    {
-        ZeroCopyResult::Served(conn_action)
-    } else {
-        ZeroCopyResult::AfterHeaderError
-    }
+    .into()
 }
 
 /// A stream that may have prepended data from a previous read.
