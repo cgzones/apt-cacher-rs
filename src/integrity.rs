@@ -1497,7 +1497,7 @@ const PACKAGES_INGEST_CONCURRENCY: usize = 2;
 
 static PACKAGES_INGEST_PERMITS: Semaphore = Semaphore::const_new(PACKAGES_INGEST_CONCURRENCY);
 
-/// `Packages`/`PackagesSniff` ingests that may wait for a decode permit at
+/// `Packages` ingests that may wait for a decode permit at
 /// once. The permits bound the CPU, not the line in front of them: without a
 /// bound, a mirror serving cap-sized indexes would queue one task per
 /// committed or touched index and push every later ingest back by one full
@@ -1506,7 +1506,7 @@ static PACKAGES_INGEST_PERMITS: Semaphore = Semaphore::const_new(PACKAGES_INGEST
 /// tens for a multi-suite, multi-arch Debian mirror).
 const INGEST_QUEUE: usize = 64;
 
-/// One slot per scheduled `Packages`/`PackagesSniff` ingest, from before its
+/// One slot per scheduled `Packages` ingest, from before its
 /// spawn to its end: the decode permits plus the line. Taken synchronously
 /// in [`admit`], so a burst of touches can never hold more `Packages`-kind
 /// paths `Running` in the ingest ledger than this (the ledger cap never
@@ -1528,12 +1528,12 @@ const RELEASE_INGEST_QUEUE: usize = 16;
 static RELEASE_INGEST_SLOTS: Semaphore = Semaphore::const_new(RELEASE_INGEST_QUEUE);
 
 /// The admission pool a job of `kind` draws its slot from: `Release` jobs
-/// get their own pool ([`RELEASE_INGEST_SLOTS`]); `Packages`/`PackagesSniff`
-/// share [`INGEST_SLOTS`] (see both statics' docs for why they are split).
+/// get their own pool ([`RELEASE_INGEST_SLOTS`]); `Packages` jobs share
+/// [`INGEST_SLOTS`] (see both statics' docs for why they are split).
 fn ingest_pool(kind: &IngestKind) -> &'static Semaphore {
     match kind {
         IngestKind::Release { release_dir: _ } => &RELEASE_INGEST_SLOTS,
-        IngestKind::Packages { .. } | IngestKind::PackagesSniff => &INGEST_SLOTS,
+        IngestKind::Packages { compression: _ } => &INGEST_SLOTS,
     }
 }
 
@@ -1698,8 +1698,7 @@ async fn run_ingest_job(
 }
 
 /// One ingest of `dest`: dispatches on `kind` to the matching parse
-/// (`Packages`, sniffed-compression `Packages`, or `Release`), under a
-/// decode permit for the two `Packages` variants.
+/// (`Packages` or `Release`), under a decode permit for `Packages`.
 async fn ingest_once(
     registry: &ChecksumRegistry,
     kind: &IngestKind,
@@ -1721,21 +1720,6 @@ async fn ingest_once(
                     buffer_size,
                 ),
             )
-            .await
-        }
-        IngestKind::PackagesSniff => {
-            with_decode_permit(&PACKAGES_INGEST_PERMITS, async {
-                let compression = sniff_packages_compression(dest).await?;
-                ingest_packages_file(
-                    registry,
-                    authority,
-                    mirror_path,
-                    dest,
-                    compression,
-                    buffer_size,
-                )
-                .await
-            })
             .await
         }
         IngestKind::Release { release_dir } => {
@@ -1781,14 +1765,13 @@ fn log_ingest_result(
 /// that feeds no registry entries.
 enum IngestKind {
     Packages {
-        compression: PackagesCompression,
+        /// `None`: compression unknown (by-hash URL leaf is a hex digest);
+        /// the ingest sniffs magic bytes before parsing. Required because
+        /// modern APT with `Acquire::By-Hash: yes` fetches `Packages.xz`
+        /// (typically) via `/by-hash/SHA256/<hex>` URLs that carry no
+        /// extension, so the filename-based detection used elsewhere fails.
+        compression: Option<PackagesCompression>,
     },
-    /// Compression unknown (by-hash URL leaf is a hex digest); the spawned
-    /// task sniffs magic bytes before parsing. Required because modern APT
-    /// with `Acquire::By-Hash: yes` fetches `Packages.xz` (typically) via
-    /// `/by-hash/SHA256/<hex>` URLs that carry no extension, so the
-    /// filename-based detection used elsewhere fails.
-    PackagesSniff,
     Release {
         release_dir: String,
     },
@@ -1845,7 +1828,9 @@ fn ingest_kind(file: &IndexFile<'_>) -> Option<IngestKind> {
         if compression.is_none() {
             log_unsupported_packages_compression(leaf, file.mirror.host().as_str());
         }
-        compression.map(|compression| IngestKind::Packages { compression })
+        compression.map(|compression| IngestKind::Packages {
+            compression: Some(compression),
+        })
     };
 
     #[expect(clippy::match_same_arms, reason = "prefer clarity")]
@@ -1867,7 +1852,9 @@ fn ingest_kind(file: &IndexFile<'_>) -> Option<IngestKind> {
         // validated `by-hash/` hangs in, judged once by the classifier,
         // distinguishes a binary Packages index from Contents/dep11/i18n
         // by-hash content.
-        ResourceKind::ByHash(_, ByHashContent::MaybePackages) => Some(IngestKind::PackagesSniff),
+        ResourceKind::ByHash(_, ByHashContent::MaybePackages) => {
+            Some(IngestKind::Packages { compression: None })
+        }
         // Like `FlatMetadata`: nothing reads a flat repository's digests.
         ResourceKind::FlatByHash(_, ByHashContent::MaybePackages | ByHashContent::Other)
         | ResourceKind::ByHash(_, ByHashContent::Other) => None,
@@ -2037,9 +2024,13 @@ pub(crate) fn stream_hash_algo_for_download(
 /// genuinely raw Packages file with no magic is parsed normally; a corrupt or
 /// unexpected payload yields zero stanzas, which is the same outcome as the
 /// pre-sniff behaviour for any non-`.xz`/non-`.gz` content).
-async fn sniff_packages_compression(path: &Path) -> std::io::Result<PackagesCompression> {
-    use tokio::io::AsyncReadExt as _;
-    let mut file = tokio_nofollow_options().read(true).open(path).await?;
+///
+/// Reads `file` from its start and rewinds it after, so the caller parses
+/// the same descriptor.
+async fn sniff_packages_compression(
+    file: &mut tokio::fs::File,
+) -> std::io::Result<PackagesCompression> {
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
     // Fill up to 6 magic bytes, tolerating short reads (a single `read` may
     // return fewer bytes than requested) and early EOF (a genuinely tiny raw
     // `Packages` file is valid and classifies as `Raw`, not an error).
@@ -2051,6 +2042,7 @@ async fn sniff_packages_compression(path: &Path) -> std::io::Result<PackagesComp
             read => n += read,
         }
     }
+    file.rewind().await?;
     // gzip: 1F 8B; xz: FD 37 7A 58 5A 00.
     if n >= 2 && buf[0] == 0x1F && buf[1] == 0x8B {
         Ok(PackagesCompression::Gz)
@@ -2063,7 +2055,9 @@ async fn sniff_packages_compression(path: &Path) -> std::io::Result<PackagesComp
 
 /// Stream a (possibly compressed) `Packages` file and insert every
 /// `(Filename, SHA256)` pair into `registry`. Best-effort: a malformed file
-/// just yields fewer entries; errors are logged and returned.
+/// just yields fewer entries; errors are logged and returned. A `None`
+/// `compression` is sniffed from the opened file's magic bytes
+/// ([`sniff_packages_compression`]).
 ///
 /// Guards against decompression bombs: [`crate::limits::decompressed_limit`]
 /// caps total decompressed output using the absolute and expansion-ratio limits
@@ -2076,10 +2070,14 @@ async fn ingest_packages_file(
     authority: &str,
     mirror_path: &str,
     path: &Path,
-    compression: PackagesCompression,
+    compression: Option<PackagesCompression>,
     buffer_size: usize,
 ) -> std::io::Result<()> {
-    let file = tokio_nofollow_options().read(true).open(path).await?;
+    let mut file = tokio_nofollow_options().read(true).open(path).await?;
+    let compression = match compression {
+        Some(compression) => compression,
+        None => sniff_packages_compression(&mut file).await?,
+    };
 
     // Compute the decompressed-output ceiling from the compressed file size.
     // Fall back to the absolute cap if stat fails (non-fatal).
@@ -3038,7 +3036,7 @@ mod tests {
                 mirror: &structured_mirror("h", &class.mirror_path),
                 path: Path::new("/cache/x"),
             });
-            let sniffed = matches!(kind, Some(IngestKind::PackagesSniff));
+            let sniffed = matches!(kind, Some(IngestKind::Packages { compression: None }));
             assert!(sniffed || kind.is_none(), "{path}: unexpected ingest kind");
             assert_eq!(sniffed, expected, "{path}");
         }
@@ -3393,7 +3391,7 @@ mod tests {
             "deb.debian.org",
             "debian",
             f.path(),
-            PackagesCompression::Raw,
+            Some(PackagesCompression::Raw),
             64 * 1024,
         )
         .await
@@ -3435,7 +3433,7 @@ mod tests {
             "deb.debian.org",
             "debian",
             f.path(),
-            PackagesCompression::Raw,
+            Some(PackagesCompression::Raw),
             64 * 1024,
         )
         .await
@@ -3479,7 +3477,7 @@ mod tests {
             MirrorKind::Structured,
         );
         let kind = IngestKind::Packages {
-            compression: PackagesCompression::Raw,
+            compression: Some(PackagesCompression::Raw),
         };
 
         let result = ingest_once(&reg, &kind, &mirror, f.path(), 64 * 1024).await;
@@ -3515,7 +3513,7 @@ mod tests {
             "deb.debian.org",
             "debian",
             f.path(),
-            PackagesCompression::Raw,
+            Some(PackagesCompression::Raw),
             64 * 1024,
         )
         .await
@@ -3544,7 +3542,7 @@ mod tests {
             "deb.debian.org",
             "debian",
             f.path(),
-            PackagesCompression::Xz,
+            Some(PackagesCompression::Xz),
             64 * 1024,
         )
         .await
@@ -3581,7 +3579,7 @@ mod tests {
             "deb.debian.org",
             "debian",
             f.path(),
-            PackagesCompression::Gz,
+            Some(PackagesCompression::Gz),
             64 * 1024,
         )
         .await
@@ -3592,6 +3590,33 @@ mod tests {
         assert!(
             err.to_string().contains("decompressed size exceeds limit"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// A by-hash `Packages` (no extension) is sniffed on the descriptor the
+    /// parse then reads: the magic bytes read for the sniff must not be
+    /// lost to the decoder.
+    #[tokio::test]
+    async fn ingest_packages_sniffs_the_compression_it_parses() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let reg = ChecksumRegistry::new(NonZero::new(100).expect("non-zero"));
+        let sha = [0x5au8; 32];
+        let packages = format!(
+            "Package: a\nFilename: pool/main/a/a/a_1_amd64.deb\nSHA256: {}\n",
+            index_parser::hex_encode(&sha),
+        );
+        let mut encoder = async_compression::tokio::write::GzipEncoder::new(Vec::<u8>::new());
+        encoder.write_all(packages.as_bytes()).await.expect("write");
+        encoder.shutdown().await.expect("shutdown");
+        let f = temp_file_with(&encoder.into_inner());
+
+        ingest_packages_file(&reg, "deb.debian.org", "debian", f.path(), None, 64 * 1024)
+            .await
+            .expect("ingest ok");
+        assert_eq!(
+            reg.lookup("deb.debian.org", "debian", "a_1_amd64.deb"),
+            Some(sha)
         );
     }
 
@@ -3819,9 +3844,9 @@ mod tests {
             release_dir: "debian/dists/sid".to_owned(),
         };
         let packages = IngestKind::Packages {
-            compression: PackagesCompression::Xz,
+            compression: Some(PackagesCompression::Xz),
         };
-        let sniff = IngestKind::PackagesSniff;
+        let sniff = IngestKind::Packages { compression: None };
         assert!(std::ptr::eq(
             ingest_pool(&release),
             &raw const RELEASE_INGEST_SLOTS
@@ -3850,8 +3875,7 @@ mod tests {
                 "/debian/dists/sid/main/binary-amd64/Packages.xz"
             )),
             Some(IngestKind::Packages {
-                compression: PackagesCompression::Xz,
-                ..
+                compression: Some(PackagesCompression::Xz),
             })
         ));
         assert!(matches!(
@@ -3860,7 +3884,7 @@ mod tests {
                 "abcd",
                 "/debian/dists/sid/main/binary-amd64/by-hash/SHA256/abcd"
             )),
-            Some(IngestKind::PackagesSniff)
+            Some(IngestKind::Packages { compression: None })
         ));
         // A flat repository's indexes feed no registry.
         assert!(
