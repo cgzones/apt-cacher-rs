@@ -326,35 +326,43 @@ pub(crate) async fn await_serveable(
     status: &Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     conn_details: &ConnectionDetails,
 ) -> Result<Serveable, JoinFailure> {
+    /// Open the file a joiner serves from; `Ok(None)` if it is gone
+    /// (`ENOENT`), which each state treats differently, so that is left to
+    /// the caller. Any other failure is counted and logged here.
     async fn open(
         what: &str,
         path: &std::path::Path,
         conn_details: &ConnectionDetails,
-    ) -> std::io::Result<tokio::fs::File> {
-        tokio_nofollow_options()
-            .read(true)
-            .open(path)
-            .await
-            .inspect_err(|err| {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    // Removed since it was published (cleanup evicting a
-                    // finished file): a concurrent removal, not an I/O
-                    // failure, so it counts nothing.
-                    info!(
-                        "The {what} file `{}` vanished before joining client {} could open it; returning 500",
-                        path.display(),
-                        conn_details.client,
-                    );
-                    return;
-                }
-                count_cache_failure(err);
+    ) -> Result<Option<tokio::fs::File>, JoinFailure> {
+        match tokio_nofollow_options().read(true).open(path).await {
+            Ok(file) => Ok(Some(file)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => {
+                count_cache_failure(&err);
                 error!(
                     "Failed to open {what} file `{}` for joining client {}; returning 500:  {}",
                     path.display(),
                     conn_details.client,
-                    ErrorReport(err)
+                    ErrorReport(&err)
                 );
-            })
+                Err(JoinFailure::CacheAccess)
+            }
+        }
+    }
+
+    /// Removed since it was published (cleanup evicting a finished file): a
+    /// concurrent removal, not an I/O failure, so it counts nothing.
+    fn vanished(
+        what: &str,
+        path: &std::path::Path,
+        conn_details: &ConnectionDetails,
+    ) -> JoinFailure {
+        info!(
+            "The {what} file `{}` vanished before joining client {} could open it; returning 500",
+            path.display(),
+            conn_details.client,
+        );
+        JoinFailure::CacheAccess
     }
 
     let mut init_waited = false;
@@ -394,8 +402,8 @@ pub(crate) async fn await_serveable(
                 rx,
                 meta,
             } => {
-                let Ok(file) = open("downloading", path, conn_details).await else {
-                    return Err(JoinFailure::CacheAccess);
+                let Some(file) = open("downloading", path, conn_details).await? else {
+                    return Err(vanished("downloading", path, conn_details));
                 };
                 let serveable = Serveable::InProgress {
                     file,
@@ -411,22 +419,9 @@ pub(crate) async fn await_serveable(
                 let path = path.clone();
                 let meta = Some(Arc::clone(meta));
                 drop(st);
-                let file = match tokio_nofollow_options().read(true).open(&path).await {
-                    Ok(f) => f,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        // Lost the rename race; re-read status.
-                        continue;
-                    }
-                    Err(err) => {
-                        count_cache_failure(&err);
-                        error!(
-                            "Failed to open verifying file `{}` for joining client {}; returning 500:  {}",
-                            path.display(),
-                            conn_details.client,
-                            ErrorReport(&err)
-                        );
-                        return Err(JoinFailure::CacheAccess);
-                    }
+                let Some(file) = open("verifying", &path, conn_details).await? else {
+                    // Lost the rename race; re-read status.
+                    continue;
                 };
                 return Ok(Serveable::Complete { file, path, meta });
             }
@@ -434,8 +429,8 @@ pub(crate) async fn await_serveable(
                 let path = path.clone();
                 let meta = meta.clone();
                 drop(st);
-                let Ok(file) = open("finished", &path, conn_details).await else {
-                    return Err(JoinFailure::CacheAccess);
+                let Some(file) = open("finished", &path, conn_details).await? else {
+                    return Err(vanished("finished", &path, conn_details));
                 };
                 return Ok(Serveable::Complete { file, path, meta });
             }
