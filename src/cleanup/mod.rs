@@ -16,10 +16,7 @@ use model::classify_mirror;
 
 use std::{
     path::Path,
-    sync::{
-        LazyLock,
-        atomic::{AtomicI64, Ordering},
-    },
+    sync::atomic::{AtomicBool, AtomicI64, Ordering},
     time::Duration,
 };
 
@@ -158,36 +155,45 @@ pub(crate) fn next_cleanup_epoch() -> i64 {
     NEXT_CLEANUP_EPOCH.load(Ordering::Relaxed)
 }
 
+/// Whether a cleanup run is in progress; set by [`task_cleanup`], cleared by
+/// its [`ActiveGuard`].
+static TASK_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// RAII guard that releases the `task_cleanup` active flag on drop, so a
 /// panic inside `task_cleanup_impl` cannot leave the flag stuck `true`
 /// (which would block every subsequent scheduled run).
-struct ActiveGuard<'a>(&'a parking_lot::Mutex<bool>);
+struct ActiveGuard;
 
-impl Drop for ActiveGuard<'_> {
+impl Drop for ActiveGuard {
     fn drop(&mut self) {
-        let mut val = self.0.lock();
-        debug_assert!(*val, "cleanup state must be active after completion");
-        *val = false;
+        let was_active = TASK_ACTIVE.swap(false, Ordering::AcqRel);
+        debug_assert!(was_active, "cleanup state must be active after completion");
     }
 }
 
 pub(crate) async fn task_cleanup(appstate: &AppState) {
-    static TASK_ACTIVE: LazyLock<parking_lot::Mutex<bool>> =
-        LazyLock::new(|| parking_lot::Mutex::new(false));
-
-    let mutex = &*TASK_ACTIVE;
-
-    {
-        let mut val = mutex.lock();
-        if *val {
-            info!("Skipping cleanup task since already in progress");
-            return;
-        }
-        *val = true;
+    if TASK_ACTIVE.swap(true, Ordering::AcqRel) {
+        info!("Skipping cleanup task since already in progress");
+        return;
     }
-    let _guard = ActiveGuard(mutex);
+    let _guard = ActiveGuard;
 
     task_cleanup_impl(appstate).await;
+}
+
+/// Publish one run's `LAST_CLEANUP_*` figures for the dashboard, the finish
+/// timestamp last.
+fn publish_last_run(
+    elapsed: coarsetime::Duration,
+    files_removed: u64,
+    bytes_removed: u64,
+    failures: u64,
+) {
+    metrics::LAST_CLEANUP_DURATION_SECS.set(elapsed.as_secs());
+    metrics::LAST_CLEANUP_FILES_REMOVED.set(files_removed);
+    metrics::LAST_CLEANUP_BYTES_RECLAIMED.set(bytes_removed);
+    metrics::LAST_CLEANUP_FAILURES.set(failures);
+    metrics::LAST_CLEANUP_FINISHED_AT.set(coarsetime::Clock::now_since_epoch().as_secs());
 }
 
 async fn task_cleanup_impl(appstate: &AppState) {
@@ -252,12 +258,7 @@ async fn task_cleanup_impl(appstate: &AppState) {
             // delete_usage_logs) may already have run, but no per-mirror
             // cleanup work was done; record the failed-run state so the
             // dashboard does not display stale prior-run values.
-            let elapsed = start.elapsed();
-            metrics::LAST_CLEANUP_DURATION_SECS.set(elapsed.as_secs());
-            metrics::LAST_CLEANUP_FILES_REMOVED.set(0);
-            metrics::LAST_CLEANUP_BYTES_RECLAIMED.set(0);
-            metrics::LAST_CLEANUP_FAILURES.set(metrics::CLEANUP_ABORTED);
-            metrics::LAST_CLEANUP_FINISHED_AT.set(coarsetime::Clock::now_since_epoch().as_secs());
+            publish_last_run(start.elapsed(), 0, 0, metrics::CLEANUP_ABORTED);
             return;
         }
     };
@@ -402,11 +403,7 @@ async fn task_cleanup_impl(appstate: &AppState) {
     metrics::CLEANUP_EVICTIONS.increment_by(files_removed);
     metrics::CLEANUP_BYTES_RECLAIMED.increment_by(bytes_removed);
     metrics::CLEANUP_BYHASH_UNREFERENCED.increment_by(removed_unreferenced);
-    metrics::LAST_CLEANUP_DURATION_SECS.set(elapsed.as_secs());
-    metrics::LAST_CLEANUP_FILES_REMOVED.set(files_removed);
-    metrics::LAST_CLEANUP_BYTES_RECLAIMED.set(bytes_removed);
-    metrics::LAST_CLEANUP_FAILURES.set(failures);
-    metrics::LAST_CLEANUP_FINISHED_AT.set(coarsetime::Clock::now_since_epoch().as_secs());
+    publish_last_run(elapsed, files_removed, bytes_removed, failures);
 
     // Second invalidation: the per-mirror units above removed rows of their
     // own, and the pre-pass one is long stale by now. Cleanup is the only
