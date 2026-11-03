@@ -41,7 +41,6 @@ use crate::{
         nested_paths_per_row,
     },
     error::ErrorReport,
-    fs_open::probe_dir,
     global_config, healthcheck, metrics,
     partial_claim::is_claimed,
     partial_file::PARTIAL_SUFFIX,
@@ -261,24 +260,14 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
 
         // The host-level `flat/` subtree is a sibling of mirror dirs.
         // Scan once per host regardless of how many mirror rows live
-        // under it — flat content is owned at the host level.
+        // under it — flat content is owned at the host level. The confined
+        // walk vets its root itself: an absent one is an empty tree, a
+        // symlink there is reported like any the walk lists, and a
+        // non-directory fails its read.
         let flat_path = paths.flat_root(bucket.host, bucket.port);
-        match probe_dir(&flat_path, "host-level flat root").await {
-            Ok(true) => {
-                let (_outcome, flat_totals) =
-                    scan_tree(cache_path, &flat_path, &FLAT_WALK, Level::Flat, "", &[]).await;
-                totals += flat_totals;
-            }
-            Ok(false) => {}
-            Err(err) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to probe host-level flat root `{}`; excluding its subtree from the cache size:  {}",
-                    flat_path.display(),
-                    ErrorReport(&err)
-                );
-            }
-        }
+        let (_outcome, flat_totals) =
+            scan_tree(cache_path, &flat_path, &FLAT_WALK, Level::Flat, "", &[]).await;
+        totals += flat_totals;
     }
 
     match walker.finish() {
@@ -634,5 +623,44 @@ mod layout_totals_tests {
         .await;
         assert_eq!((totals.bytes, totals.files), (0, 0));
         assert_eq!(metrics::CACHE_NON_REGULAR.get(), before + 1);
+    }
+
+    /// The host-level flat root is walked without a probe first: the
+    /// confined walk counts an absent root as an empty tree, reports a
+    /// symlink there like any listed one (`CACHE_NON_REGULAR`) and a
+    /// regular file as an unreadable directory (`CACHE_IO_FAILURE`), and
+    /// counts nothing behind either.
+    #[tokio::test]
+    async fn the_flat_root_is_vetted_by_its_walk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = dir.path().join("example.org");
+        let flat = host.join("flat");
+        std::fs::create_dir(&host).expect("mkdir");
+        let scan = async || scan_tree(dir.path(), &flat, &FLAT_WALK, Level::Flat, "", &[]).await;
+
+        let (outcome, totals) = scan().await;
+        assert!(matches!(outcome, WalkOutcome::RootMissing), "{outcome:?}");
+        assert_eq!(totals.files, 0);
+
+        let outside = tempfile::tempdir().expect("tempdir");
+        file(&outside.path().join("repo/a_1.0_all.deb"), 10);
+        std::os::unix::fs::symlink(outside.path(), &flat).expect("symlink");
+        let (non_regular, io_failure) = (
+            metrics::CACHE_NON_REGULAR.get(),
+            metrics::CACHE_IO_FAILURE.get(),
+        );
+        let (outcome, totals) = scan().await;
+        assert!(matches!(outcome, WalkOutcome::Complete), "{outcome:?}");
+        assert_eq!((totals.bytes, totals.files), (0, 0));
+        assert_eq!(metrics::CACHE_NON_REGULAR.get(), non_regular + 1);
+        assert_eq!(metrics::CACHE_IO_FAILURE.get(), io_failure);
+
+        std::fs::remove_file(&flat).expect("unlink symlink");
+        file(&flat, 10);
+        let (outcome, totals) = scan().await;
+        assert!(matches!(outcome, WalkOutcome::Complete), "{outcome:?}");
+        assert_eq!((totals.bytes, totals.files), (0, 0));
+        assert_eq!(metrics::CACHE_NON_REGULAR.get(), non_regular + 1);
+        assert_eq!(metrics::CACHE_IO_FAILURE.get(), io_failure + 1);
     }
 }

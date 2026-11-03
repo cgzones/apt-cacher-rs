@@ -11,11 +11,11 @@ use crate::cache_walk::{
 };
 use crate::database::OriginEntry;
 use crate::error::ErrorReport;
-use crate::fs_open::{count_cache_failure, probe_dir};
+use crate::fs_open::count_cache_failure;
 use crate::index_parser::{ByHashRef, HashAlgo, hex_decode_exact, parse_release_byhash_digests};
 use crate::integrity::read_release_to_string;
 use crate::log_once::Logged;
-use crate::warn_once_or_debug;
+use crate::{metrics, warn_once_or_debug};
 
 use super::engine::CleanupUnitError;
 
@@ -253,18 +253,38 @@ pub(super) fn active_origin_distributions(origins: Option<&[OriginEntry]>) -> Op
     Some(dists)
 }
 
-/// Whether a per-layout by-hash tree exists as a real directory. A hard I/O
+/// Whether a per-layout by-hash tree exists as a real directory, by `lstat`
+/// so a hostile symlink cannot redirect the walk outside the cache tree. An
+/// absent root is silently absent (a fresh mirror has none); a symlinked or
+/// non-directory one is absent with a warning, the symlink also counted
+/// (`CACHE_NON_REGULAR`) like every symlink a cache walk meets. A hard I/O
 /// error is logged (and counted) here and abandons the unit, so the tree is
-/// left unswept this cycle and the run reports the failed step. `probe_dir`
-/// reports a symlinked / non-directory root as absent with its own warning.
+/// left unswept this cycle and the run reports the failed step.
 pub(super) async fn byhash_dir_present(path: &Path) -> Result<bool, CleanupUnitError> {
-    probe_dir(path, "by-hash cleanup").await.map_err(|err| {
-        CleanupUnitError(Logged::cache_io_failure(format_args!(
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(md) if md.file_type().is_dir() => Ok(true),
+        Ok(md) if md.file_type().is_symlink() => {
+            metrics::CACHE_NON_REGULAR.increment();
+            warn!(
+                "Skipping by-hash cleanup because root is a symlink: `{}`",
+                path.display()
+            );
+            Ok(false)
+        }
+        Ok(_) => {
+            warn!(
+                "Skipping by-hash cleanup because root is not a directory: `{}`",
+                path.display()
+            );
+            Ok(false)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(CleanupUnitError(Logged::cache_io_failure(format_args!(
             "Failed to probe by-hash directory `{}`; abandoning its by-hash cleanup this cycle:  {}",
             path.display(),
             ErrorReport(&err)
-        )))
-    })
+        )))),
+    }
 }
 
 #[cfg(test)]
@@ -603,5 +623,33 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    /// A by-hash root that is not a real directory is absent; a symlink
+    /// there counts as non-regular, like every symlink a cache walk meets.
+    #[tokio::test]
+    async fn byhash_dir_present_counts_a_symlinked_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("by-hash");
+        let link = dir.path().join("link");
+        let file = dir.path().join("file");
+        std::fs::create_dir(&real).expect("mkdir");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        std::fs::write(&file, b"x").expect("write");
+
+        let non_regular = metrics::CACHE_NON_REGULAR.get();
+        for (path, present) in [
+            (&real, true),
+            (&dir.path().join("absent"), false),
+            (&file, false),
+        ] {
+            let got = byhash_dir_present(path).await.expect("probed");
+            assert_eq!(got, present, "{}", path.display());
+        }
+        assert_eq!(metrics::CACHE_NON_REGULAR.get(), non_regular);
+
+        let got = byhash_dir_present(&link).await.expect("probed");
+        assert!(!got, "a symlinked root is absent");
+        assert_eq!(metrics::CACHE_NON_REGULAR.get(), non_regular + 1);
     }
 }

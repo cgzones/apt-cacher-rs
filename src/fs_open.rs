@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::transfer_error::CacheError;
 use crate::volatile_metrics::Renewal;
@@ -76,40 +76,6 @@ pub(crate) fn open_cached_file_inline(path: &Path) -> std::io::Result<tokio::fs:
 /// `custom_flags` caveat.
 pub(crate) fn tokio_nofollow_options() -> tokio::fs::OpenOptions {
     nofollow_options().into()
-}
-
-/// Probe whether `path` is a real directory.
-///
-/// Uses `symlink_metadata` (lstat semantics) so a hostile symlink cannot
-/// redirect a subsequent walk outside the cache tree.  On symlink / non-dir
-/// the function logs a warning naming the operator-facing `purpose` (used to
-/// build messages like *"Skipping {purpose} because root is a symlink: …"*),
-/// and returns `Ok(false)` so the caller can treat the path as absent.
-/// `NotFound` is reported as `Ok(false)` without logging — many callers
-/// expect the path to be missing on fresh installs.
-///
-/// On any other I/O error, the error is returned untouched so the caller
-/// can choose to log + propagate or log + swallow.
-pub(crate) async fn probe_dir(path: &Path, purpose: &'static str) -> std::io::Result<bool> {
-    match tokio::fs::symlink_metadata(path).await {
-        Ok(md) if md.file_type().is_dir() => Ok(true),
-        Ok(md) if md.file_type().is_symlink() => {
-            warn!(
-                "Skipping {purpose} because root is a symlink: `{}`",
-                path.display()
-            );
-            Ok(false)
-        }
-        Ok(_) => {
-            warn!(
-                "Skipping {purpose} because root is not a directory: `{}`",
-                path.display()
-            );
-            Ok(false)
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err),
-    }
 }
 
 /// Whether a failed syscall on a cache path failed because something other
