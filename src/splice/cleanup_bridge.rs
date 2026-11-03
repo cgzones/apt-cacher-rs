@@ -29,6 +29,7 @@ use crate::transfer_error::UpstreamError;
 use crate::warn_once_or_info;
 
 use super::acquire::{UpstreamExchange, standard_upstream_connect};
+use super::http::UpstreamRequest;
 
 /// A cache anomaly, answered like the hyper backend's `serve_volatile_file`
 /// answers it: a 500, which ends cleanup's format cascade.
@@ -153,11 +154,7 @@ async fn cleanup_upstream_fetch(
     let host_authority = mirror.format_authority();
     let exchange = match standard_upstream_connect(
         mirror.into(),
-        host_authority,
-        upstream_path,
-        0,
-        None,
-        None,
+        UpstreamRequest::plain(host_authority, upstream_path),
         None,
     )
     .await

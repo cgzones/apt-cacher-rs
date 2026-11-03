@@ -16,7 +16,7 @@
 use std::{
     future::Future,
     io::ErrorKind,
-    num::{ParseIntError, Saturating},
+    num::{NonZero, ParseIntError, Saturating},
     ops::Range,
     time::Duration,
 };
@@ -84,6 +84,53 @@ impl HeadError {
     }
 }
 
+/// The conditions an upstream `GET` carries beyond the plain request.
+/// `Default` is a plain, unconditional request.
+#[derive(Clone, Copy, Default)]
+pub(super) struct RequestConditions<'a> {
+    /// Resume a partial at this offset (`Range: bytes=N-`), with the
+    /// partial's `If-Range` validator if it has one. An `If-Range` only ever
+    /// goes with a `Range`.
+    resume: Option<(NonZero<u64>, Option<&'a str>)>,
+    /// Volatile revalidation of a stale cached copy.
+    volatile: Option<&'a VolatileCondHeaders>,
+}
+
+impl<'a> RequestConditions<'a> {
+    /// Resume from `resume_offset` (none at `0`, which drops `if_range`)
+    /// and revalidate against `volatile`, each when given.
+    pub(super) fn new(
+        resume_offset: u64,
+        if_range: Option<&'a str>,
+        volatile: Option<&'a VolatileCondHeaders>,
+    ) -> Self {
+        Self {
+            resume: NonZero::new(resume_offset).map(|offset| (offset, if_range)),
+            volatile,
+        }
+    }
+}
+
+/// One upstream `GET`: the `Host` authority, the request target and its
+/// conditions.
+#[derive(Clone, Copy)]
+pub(super) struct UpstreamRequest<'a> {
+    pub(super) authority: &'a str,
+    pub(super) path: &'a str,
+    pub(super) conditions: RequestConditions<'a>,
+}
+
+impl<'a> UpstreamRequest<'a> {
+    /// A plain, unconditional `GET` of `path` from `authority`.
+    pub(super) fn plain(authority: &'a str, path: &'a str) -> Self {
+        Self {
+            authority,
+            path,
+            conditions: RequestConditions::default(),
+        }
+    }
+}
+
 /// Format an HTTP GET request for the upstream mirror. Always keep-alive:
 /// whether the connection is pooled afterwards is the response's say
 /// (`UpstreamResponse::connection_close`). `Via` names this proxy, so a
@@ -91,15 +138,14 @@ impl HeadError {
 /// `Accept-Encoding: identity`: a request without the field accepts any
 /// content coding (RFC 9110 §12.5.3), and a coded body would be cached,
 /// and relayed, without its `Content-Encoding`.
-fn format_http_request(
-    path: &str,
-    host_authority: &str,
-    resume_offset: u64,
-    resume_if_range: Option<&str>,
-    volatile_cond: Option<&VolatileCondHeaders>,
-) -> String {
+fn format_http_request(request: UpstreamRequest<'_>) -> String {
+    let UpstreamRequest {
+        authority: host_authority,
+        path,
+        conditions: RequestConditions { resume, volatile },
+    } = request;
     let range_header = std::fmt::from_fn(|f| {
-        if resume_offset > 0 {
+        if let Some((resume_offset, resume_if_range)) = resume {
             write!(
                 f,
                 "Range: bytes={resume_offset}-\r\n{}",
@@ -109,7 +155,7 @@ fn format_http_request(
         Ok(())
     });
     let volatile_headers = std::fmt::from_fn(|f| {
-        if let Some(vc) = volatile_cond {
+        if let Some(vc) = volatile {
             write!(
                 f,
                 "{}Cache-Control: max-age=300\r\n{}",
@@ -138,24 +184,14 @@ fn format_http_request(
 /// Times out after the configured HTTP timeout.
 async fn send_upstream_request(
     upstream: &mut UpstreamConn,
-    host_authority: &str,
-    path: &str,
-    resume_offset: u64,
-    resume_if_range: Option<&str>,
-    volatile_cond: Option<&VolatileCondHeaders>,
+    request: UpstreamRequest<'_>,
 ) -> std::io::Result<()> {
     async fn write_and_flush(upstream: &mut UpstreamConn, data: &[u8]) -> std::io::Result<()> {
         upstream.write_all(data).await?;
         upstream.flush().await
     }
 
-    let request = format_http_request(
-        path,
-        host_authority,
-        resume_offset,
-        resume_if_range,
-        volatile_cond,
-    );
+    let request = format_http_request(request);
 
     let http_timeout = global_config().http_timeout;
     match tokio::time::timeout(http_timeout, write_and_flush(upstream, request.as_bytes())).await {
@@ -625,22 +661,11 @@ pub(super) fn parse_upstream_response(
 /// Times out after the configured HTTP timeout.
 pub(super) async fn send_and_read_headers(
     up: &mut UpstreamConn,
-    host_authority: &str,
-    upstream_path: &str,
-    resume_offset: u64,
-    resume_if_range: Option<&str>,
-    volatile_cond: Option<&VolatileCondHeaders>,
+    request: UpstreamRequest<'_>,
 ) -> Result<(UpstreamResponse, BytesMut, usize), HeadError> {
-    send_upstream_request(
-        up,
-        host_authority,
-        upstream_path,
-        resume_offset,
-        resume_if_range,
-        volatile_cond,
-    )
-    .await
-    .map_err(HeadError::Transport)?;
+    send_upstream_request(up, request)
+        .await
+        .map_err(HeadError::Transport)?;
     let request_sent_at = PreciseInstant::now();
 
     let mut hdr_buf = BytesMut::with_capacity(MAX_UPSTREAM_HEADER_SIZE);
@@ -1487,13 +1512,11 @@ mod tests {
                  Cache-Control: max-age=300\r\nIf-None-Match: \"index-v2\"\r\n",
             ),
         ] {
-            let request = format_http_request(
-                "/debian/dists/stable/InRelease?mirror=1",
-                "[2001:db8::1]:8080",
-                offset,
-                if_range,
-                volatile,
-            );
+            let request = format_http_request(UpstreamRequest {
+                authority: "[2001:db8::1]:8080",
+                path: "/debian/dists/stable/InRelease?mirror=1",
+                conditions: RequestConditions::new(offset, if_range, volatile),
+            });
             let expected = format!("{preamble}{headers}\r\n");
             assert_eq!(request.as_bytes(), expected.as_bytes(), "{case}");
         }

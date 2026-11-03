@@ -117,7 +117,7 @@ use body::{
 };
 use commit::{CompletionBytes, Served};
 use detached::DetachedDownload;
-use http::UpstreamResponse;
+use http::{RequestConditions, UpstreamRequest, UpstreamResponse};
 use simple_proxy::rewrite_simple_proxy_headers;
 use upstream::{ConnLabel, ResponseBody};
 use volatile::handle_volatile_buffered_download;
@@ -854,9 +854,7 @@ async fn plan_upstream_response(
             exchange,
             conn_details,
             upstream_path,
-            resume.offset,
-            resume.partial.if_range(),
-            volatile_cond,
+            RequestConditions::new(resume.offset, resume.partial.if_range(), volatile_cond),
         ))
         .await?
     } else {
@@ -1515,11 +1513,15 @@ pub(crate) async fn splice_proxy(
             );
             let exchange = standard_upstream_connect(
                 conn_details.upstream_endpoint(),
-                &host_authority,
-                upstream_path,
-                resume.offset,
-                resume.partial.if_range(),
-                volatile_cond.as_ref(),
+                UpstreamRequest {
+                    authority: &host_authority,
+                    path: upstream_path,
+                    conditions: RequestConditions::new(
+                        resume.offset,
+                        resume.partial.if_range(),
+                        volatile_cond.as_ref(),
+                    ),
+                },
                 None,
             )
             .await

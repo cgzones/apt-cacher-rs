@@ -27,6 +27,7 @@ use crate::{
 };
 
 use super::acquire::{UpstreamExchange, standard_upstream_connect};
+use super::http::UpstreamRequest;
 use super::{SpliceProxyError, VOLATILE_BODY_MAX};
 use crate::transfer_error::UpstreamError;
 use crate::upstream_head::{BodyFraming, RelayedHeaders};
@@ -142,7 +143,11 @@ pub(crate) async fn splice_simple_proxy(
         reused: _,
         // A passthrough records no time to first byte (`mirror_perf`).
         attempt_started: _,
-    } = standard_upstream_connect(endpoint, &host_authority, upstream_path, 0, None, None, None)
+    } = standard_upstream_connect(
+        endpoint,
+        UpstreamRequest::plain(&host_authority, upstream_path),
+        None,
+    )
         .await
         .map_err(|err| {
             // The report names the attempted target itself.

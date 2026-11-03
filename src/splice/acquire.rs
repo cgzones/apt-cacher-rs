@@ -30,8 +30,10 @@ use crate::{
     scheme_cache, upstream_retry, warn_once_or_info,
 };
 
-use super::VolatileCondHeaders;
-use super::http::{HeadError, MAX_ERROR_BODY_DRAIN, UpstreamResponse, send_and_read_headers};
+use super::http::{
+    HeadError, MAX_ERROR_BODY_DRAIN, RequestConditions, UpstreamRequest, UpstreamResponse,
+    send_and_read_headers,
+};
 use super::upstream::{
     ConnLabel, PoolCheckout, ResponseBody, Transience, UpstreamConn, UpstreamEndpoint,
     connect_upstream, endpoint_port, pool_checkout,
@@ -178,13 +180,14 @@ fn cache_scheme(endpoint: UpstreamEndpoint<'_>, scheme: Scheme) {
 /// Times out after the configured HTTP timeout.
 pub(super) async fn standard_upstream_connect(
     endpoint: UpstreamEndpoint<'_>,
-    host_authority: &str,
-    upstream_path: &str,
-    resume_offset: u64,
-    resume_if_range: Option<&str>,
-    volatile_cond: Option<&VolatileCondHeaders>,
+    request: UpstreamRequest<'_>,
     scheme_override: Option<Scheme>,
 ) -> Result<UpstreamExchange, UpstreamError> {
+    let UpstreamRequest {
+        authority: host_authority,
+        path: upstream_path,
+        conditions: _,
+    } = request;
     // Resolve the scheme decision ONCE per connect: it drives the pool-lookup
     // key, the HTTPS-upgrade accounting, and the connect itself. A forced
     // scheme (an `https://` redirect target, a refetch keeping its discarded
@@ -208,16 +211,7 @@ pub(super) async fn standard_upstream_connect(
         match pool_checkout(endpoint.host, port, is_tls) {
             PoolCheckout::Live(mut pooled) => {
                 let attempt_started = PreciseInstant::now();
-                match send_and_read_headers(
-                    &mut pooled,
-                    host_authority,
-                    upstream_path,
-                    resume_offset,
-                    resume_if_range,
-                    volatile_cond,
-                )
-                .await
-                {
+                match send_and_read_headers(&mut pooled, request).await {
                     Ok(head) => {
                         metrics::POOL_REUSED.increment();
                         return Ok(UpstreamExchange::new(
@@ -374,19 +368,12 @@ pub(super) async fn standard_upstream_connect(
         }
     }
 
-    let head = send_and_read_headers(
-        &mut up,
-        host_authority,
-        upstream_path,
-        resume_offset,
-        resume_if_range,
-        volatile_cond,
-    )
-    .await
-    .map_err(|err| {
-        err.into_upstream()
-            .with_target(format!("{scheme}://{host_authority}{upstream_path}"))
-    })?;
+    let head = send_and_read_headers(&mut up, request)
+        .await
+        .map_err(|err| {
+            err.into_upstream()
+                .with_target(format!("{scheme}://{host_authority}{upstream_path}"))
+        })?;
 
     let port = endpoint_port(endpoint, up.is_tls());
     Ok(UpstreamExchange::new(
@@ -425,13 +412,14 @@ impl RedirectTarget {
 /// falls through to the non-200 forwarding path.
 ///
 /// Times out after the configured HTTP timeout.
+///
+/// `original_path` is the target of the request that drew the redirect;
+/// the target is fetched with the same `conditions`.
 pub(super) async fn follow_redirect(
     exchange: UpstreamExchange,
     conn_details: &ConnectionDetails,
     original_path: &str,
-    resume_offset: u64,
-    resume_if_range: Option<&str>,
-    volatile_cond: Option<&VolatileCondHeaders>,
+    conditions: RequestConditions<'_>,
 ) -> Result<(UpstreamExchange, Option<RedirectTarget>), UpstreamError> {
     let status = exchange.response.status_code;
     let Some(location) = exchange.response.location.as_deref() else {
@@ -572,11 +560,11 @@ pub(super) async fn follow_redirect(
     };
     let exchange = standard_upstream_connect(
         endpoint,
-        &redirect_authority,
-        moved_path,
-        resume_offset,
-        resume_if_range,
-        volatile_cond,
+        UpstreamRequest {
+            authority: &redirect_authority,
+            path: moved_path,
+            conditions,
+        },
         redirect_override,
     )
     .await
@@ -640,11 +628,7 @@ pub(super) async fn discard_partial_and_retry(
     partial.discard_resume().await;
     let mut exchange = standard_upstream_connect(
         endpoint,
-        host_authority,
-        upstream_path,
-        0,
-        None,
-        None,
+        UpstreamRequest::plain(host_authority, upstream_path),
         Some(scheme),
     )
     .await?;
@@ -657,9 +641,7 @@ pub(super) async fn discard_partial_and_retry(
             exchange,
             conn_details,
             upstream_path,
-            0,
-            None,
-            None,
+            RequestConditions::default(),
         ))
         .await?;
     }
