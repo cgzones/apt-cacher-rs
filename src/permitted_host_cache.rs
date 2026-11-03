@@ -10,7 +10,6 @@ use crate::{
     global_config,
     mem_usage::Footprint,
     metrics,
-    request_dispatch::client_permitted,
     uri_authority::HTTP_DEFAULT_PORT,
     warn_once_or_info,
 };
@@ -157,24 +156,16 @@ pub(crate) fn port_permitted(
     allowed.is_empty() || allowed.binary_search_by_key(&port, |p| p.get()).is_ok()
 }
 
+/// The mirror allowlists for an absolute-form `GET` whose client already
+/// passed `allowed_proxy_clients` (`request_dispatch::preflight_target`).
 /// `requested_port` is the request target's (`None` for the `http`
-/// default), checked after the client and the host so a refused client
-/// learns nothing about the mirror policy.
+/// default), checked after the host.
 pub(crate) fn authorize_cache_access(
     client: &ClientInfo,
     requested_host: &str,
     requested_port: Option<NonZero<u16>>,
 ) -> Result<ClientHost, (StatusCode, &'static str)> {
     let config = global_config();
-
-    if !client_permitted(&config.allowed_proxy_clients, client) {
-        warn_once_or_info!(
-            "Unauthorized proxy client {client} (not permitted by `allowed_proxy_clients`); rejecting with 403"
-        );
-        metrics::AUTHZ_REJECTED_CLIENT.increment();
-        client_trouble::record(client, Trouble::Unauthorized);
-        return Err((StatusCode::FORBIDDEN, "Unauthorized client"));
-    }
 
     let host = finalize_host_result(permitted_host(requested_host), requested_host, client)?;
 

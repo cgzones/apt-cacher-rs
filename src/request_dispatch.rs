@@ -4,9 +4,9 @@
 //!
 //! The pre-flight ([`preflight_method`] + [`preflight_target`]) is the
 //! backend-independent part of "is this a request we serve at all": method
-//! gate, proxy-client ACL for `CONNECT`, URI scheme and target-form gates,
-//! the HTTP/1.1 `Host` requirement, the web-interface ACL and `Host` name
-//! gate, and the port sanity check.  Both functions are pure over their
+//! gate, URI scheme and target-form gates, the HTTP/1.1 `Host` requirement,
+//! the proxy-client ACL (for `CONNECT` and absolute-form `GET` alike), the
+//! web-interface ACL and `Host` name gate, and the port sanity check.  Both functions are pure over their
 //! parameters (no `global_config()`); the backends feed them the
 //! already-parsed request line and map the shared [`RejectReason`] onto their
 //! response type.  The host allowlist stays in
@@ -77,8 +77,8 @@ pub(crate) enum RejectReason {
     /// A method this proxy does not recognize at all: 501 (RFC 9110
     /// §15.6.2).  Methods are case-sensitive, so `get` is one.
     UnknownMethod,
-    /// A `CONNECT` from a client outside `allowed_proxy_clients`.  (A `GET`
-    /// from such a client is refused by `authorize_cache_access` instead.)
+    /// A `CONNECT` or absolute-form `GET` from a client outside
+    /// `allowed_proxy_clients`.
     UnauthorizedClient,
     /// Absolute-form `GET` with a scheme other than `http` (HTTPS goes
     /// through `CONNECT`).
@@ -239,7 +239,7 @@ pub(crate) enum RequestKind {
 
 /// Method gate shared by both backends: `GET` and `CONNECT` are the only
 /// methods served, and `CONNECT` additionally passes the proxy-client ACL
-/// here (the `GET` path enforces it inside `authorize_cache_access`).  Any
+/// here (a `GET` passes it in [`preflight_target`]).  Any
 /// other method HTTP defines is refused with 405, an unrecognized one with
 /// 501 (RFC 9110 §15.5.6, §15.6.2).
 ///
@@ -254,10 +254,7 @@ pub(crate) fn preflight_method(
         "GET" => Ok(RequestKind::Get),
         "CONNECT" => {
             if !client_permitted(acls.proxy_clients, client) {
-                warn_once_or_info!("Unauthorized proxy client {client}; returning 403");
-                metrics::AUTHZ_REJECTED_CLIENT.increment();
-                client_trouble::record(client, Trouble::Unauthorized);
-                return Err(RejectReason::UnauthorizedClient);
+                return Err(refuse_proxy_client(client));
             }
             Ok(RequestKind::Connect)
         }
@@ -275,6 +272,16 @@ pub(crate) fn preflight_method(
             Err(RejectReason::UnknownMethod)
         }
     }
+}
+
+/// Refuse a client outside `allowed_proxy_clients`: the one log line, metric
+/// and trouble record of both proxy-client gates (`CONNECT` in
+/// [`preflight_method`], absolute-form `GET` in [`preflight_target`]).
+fn refuse_proxy_client(client: &ClientInfo) -> RejectReason {
+    warn_once_or_info!("Unauthorized proxy client {client}; returning 403");
+    metrics::AUTHZ_REJECTED_CLIENT.increment();
+    client_trouble::record(client, Trouble::Unauthorized);
+    RejectReason::UnauthorizedClient
 }
 
 /// Validate the request fields before method dispatch, including cache hits
@@ -365,10 +372,10 @@ pub(crate) enum RequestTarget<'a> {
     /// Origin-form request (no authority): the local web interface.  The
     /// web-interface ACL has passed.
     WebUi,
-    /// Absolute-form request to a mirror.  `host` is the raw authority host,
-    /// still to be validated by `permitted_host_cache::authorize_cache_access`
-    /// (which also enforces `allowed_proxy_clients`); `port` is `None` for
-    /// the default port.
+    /// Absolute-form request to a mirror from a client permitted by
+    /// `allowed_proxy_clients`.  `host` is the raw authority host, still to
+    /// be validated by `permitted_host_cache::authorize_cache_access`;
+    /// `port` is `None` for the default port.
     Proxy {
         host: &'a str,
         port: Option<NonZero<u16>>,
@@ -377,8 +384,9 @@ pub(crate) enum RequestTarget<'a> {
 
 /// Target gate shared by both backends for a `GET`: scheme check, the
 /// absolute-path requirement, the HTTP/1.1 `Host` requirement, web-interface
-/// ACL and `Host` name gate for origin-form requests, and the port sanity
-/// check for absolute-form ones.
+/// ACL and `Host` name gate for origin-form requests, and the proxy-client
+/// ACL and then the port sanity check for absolute-form ones (a refused
+/// client gets its 403 whatever port it named).
 ///
 /// `host_header` yields the raw value of the request's `Host` header, if
 /// any.  It is only consulted for origin-form requests, so the sendfile
@@ -447,6 +455,10 @@ pub(crate) fn preflight_target<'a, 'h>(
         }
         return Ok(RequestTarget::WebUi);
     };
+
+    if !client_permitted(acls.proxy_clients, client) {
+        return Err(refuse_proxy_client(client));
+    }
 
     let port = match uri_authority::port(authority) {
         // The scheme is `http` (checked above), whose default port names the
@@ -1101,11 +1113,38 @@ mod tests {
             .unwrap();
 
         // Absolute-form requests need no Host header even on HTTP/1.1, and
-        // the ACLs are left to authorize_cache_access.
+        // the web-interface ACL does not apply to them; the proxy-client
+        // ACL does.
+        let proxy_only = ClientAcls {
+            proxy_clients: OPEN_ACLS.proxy_clients,
+            ..OTHER_HOST_ACLS
+        };
         assert!(matches!(
-            preflight_target(&uri, true, || None, &client, &OTHER_HOST_ACLS),
+            preflight_target(&uri, true, || None, &client, &proxy_only),
             Ok(RequestTarget::Proxy { .. })
         ));
+        assert_eq!(
+            preflight_target(&uri, true, || None, &client, &OTHER_HOST_ACLS).unwrap_err(),
+            RejectReason::UnauthorizedClient
+        );
+    }
+
+    /// The proxy-client ACL runs before the port check: a refused client
+    /// gets its 403 whatever port it named, never the 400 that would tell
+    /// it the request was malformed.
+    #[test]
+    fn preflight_target_refuses_an_unauthorized_client_before_the_port_check() {
+        for port in ["0", "65536", "nonsense", "8080"] {
+            let uri: Uri = format!("http://deb.example.com:{port}/debian/dists/sid/Release")
+                .parse()
+                .expect("authority syntax");
+            assert_eq!(
+                preflight_target(&uri, true, || None, &local_client(), &OTHER_HOST_ACLS)
+                    .unwrap_err(),
+                RejectReason::UnauthorizedClient,
+                "{uri}"
+            );
+        }
     }
 
     #[test]

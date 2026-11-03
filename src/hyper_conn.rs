@@ -2946,8 +2946,8 @@ async fn pre_process_client_request(
             Err(reason) => return reject_response(reason),
         };
 
-        // Closing, like the sendfile backend: a refused proxy client must
-        // not keep its connection slot by asking again.
+        // Closing, like the sendfile backend: a client refused a mirror or
+        // port must not keep its connection to probe further ones.
         let requested_host = match authorize_cache_access(&client, requested_host, requested_port) {
             Ok(rh) => rh,
             Err((status, msg)) => return quick_response_closing(status, msg),
