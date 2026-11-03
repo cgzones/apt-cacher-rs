@@ -38,7 +38,7 @@ use crate::{
     metrics, mirror_health, mirror_indexes, mirror_perf,
     passthrough_limiter::active_relays,
     permitted_host_cache, scheme_cache, swrite,
-    uncacheables::{UNCACHEABLES_MAX, get_uncacheables},
+    uncacheables::UNCACHEABLES_MAX,
     verify_throttle, warn_once_or_debug,
 };
 
@@ -1110,8 +1110,6 @@ fn build_cache_stats_html(
         .saturating_sub(total_download_count)
         .max(0);
 
-    let uncacheable_count = get_uncacheables().len();
-
     // One statement covers both windows, so they succeed or fail together.
     let (bandwidth_day, bandwidth_week) = match bandwidth_result {
         Ok(windows) => (Some(windows.day), Some(windows.week)),
@@ -1142,14 +1140,8 @@ fn build_cache_stats_html(
     t.entry("Bandwidth (last 7d)")
         .kind(Kind::Persisted)
         .value(Window(bandwidth_week));
-    t.entry("Uncacheable Resources")
-        .kind(Kind::Live)
-        .tip("Recently seen uncacheable (host, path) resources the Uncacheables section lists, against the fixed number it keeps; the oldest makes room for the newest.")
-        .value(Gauge {
-            current: uncacheable_count as u64,
-            cap: Some(UNCACHEABLES_MAX.get() as u64),
-            peak: None,
-        });
+    // No row for the uncacheables kept against their cap: that is the
+    // Uncacheables section's own count chip.
     t.entry("Cached Files")
         .kind(Kind::Live)
         .tip("From a walk of the mirror directories, cached for up to a minute.")
