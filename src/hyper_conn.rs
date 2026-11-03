@@ -2795,13 +2795,7 @@ pub(crate) enum HandoffPlan {
     /// Dispatch declined to cache; `record_uncacheable` already ran inside
     /// the dispatcher.  Hyper forwards the request uncached.
     #[cfg(not(feature = "splice"))]
-    Passthrough {
-        reason: PassthroughReason,
-        requested_host: ClientHost,
-        canonical_host: ClientHost,
-        requested_port: Option<NonZero<u16>>,
-        request_received_at: PreciseInstant,
-    },
+    Passthrough(PassthroughRequest),
 }
 
 #[inline]
@@ -2870,14 +2864,15 @@ fn strip_request_body(client: ClientInfo, req: Request<Incoming>) -> Request<Emp
 /// Carries what the forwarding tail needs, whichever verdict produced it:
 /// the sendfile backend's `HandoffPlan::Passthrough` or this backend's own
 /// [`dispatch_request`].
-struct PassthroughRequest {
-    reason: PassthroughReason,
-    requested_host: ClientHost,
+#[derive(Debug)]
+pub(crate) struct PassthroughRequest {
+    pub(crate) reason: PassthroughReason,
+    pub(crate) requested_host: ClientHost,
     /// The host the passthrough's `Origin` row is recorded under, resolved
     /// by the dispatcher (`DispatchOutcome::Passthrough`).
-    canonical_host: ClientHost,
-    requested_port: Option<NonZero<u16>>,
-    request_received_at: PreciseInstant,
+    pub(crate) canonical_host: ClientHost,
+    pub(crate) requested_port: Option<NonZero<u16>>,
+    pub(crate) request_received_at: PreciseInstant,
 }
 
 /// Entry point for every request hyper serves.  With a [`HandoffPlan`] the
@@ -2917,19 +2912,7 @@ async fn pre_process_client_request(
                 .await;
         }
         #[cfg(not(feature = "splice"))]
-        Some(HandoffPlan::Passthrough {
-            reason,
-            requested_host,
-            canonical_host,
-            requested_port,
-            request_received_at,
-        }) => Some(PassthroughRequest {
-            reason,
-            requested_host,
-            canonical_host,
-            requested_port,
-            request_received_at,
-        }),
+        Some(HandoffPlan::Passthrough(passthrough)) => Some(passthrough),
         None => None,
     };
 

@@ -42,6 +42,8 @@ use tokio::io::{AsyncWriteExt as _, Interest};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, trace};
 
+#[cfg(not(feature = "splice"))]
+use crate::hyper_conn::PassthroughRequest;
 #[cfg(feature = "hyper")]
 use crate::hyper_conn::{HandoffPlan, handle_hyper_connection, serve_handoff_request};
 #[cfg(feature = "splice")]
@@ -1224,13 +1226,13 @@ async fn try_sendfile_request(
                 // continues from the dispatch verdict.
                 return ZeroCopyResult::NotApplicable {
                     reason: reason.label(),
-                    plan: HandoffPlan::Passthrough {
+                    plan: HandoffPlan::Passthrough(PassthroughRequest {
                         reason,
                         requested_host,
                         canonical_host,
                         requested_port,
                         request_received_at,
-                    },
+                    }),
                     conn_action,
                 };
             }
