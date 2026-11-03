@@ -450,6 +450,20 @@ pub(crate) async fn packages_reader(
     limit: NonZero<u64>,
     buffer_size: usize,
 ) -> Box<dyn AsyncBufRead + Unpin + Send> {
+    let input_cap = packages_file_cap(compression);
+    wrap_packages(input, compression, limit, input_cap, buffer_size).await
+}
+
+/// [`packages_reader`] with the compressed-input cap as a parameter, so the
+/// tests can cross it without a 128 MiB fixture. Raw input has no
+/// compressed side; `limit` bounds it.
+async fn wrap_packages(
+    input: PackagesInput,
+    compression: PackagesCompression,
+    limit: NonZero<u64>,
+    input_cap: NonZero<u64>,
+    buffer_size: usize,
+) -> Box<dyn AsyncBufRead + Unpin + Send> {
     match compression {
         PackagesCompression::Raw => Box::new(tokio::io::BufReader::with_capacity(
             buffer_size,
@@ -458,7 +472,7 @@ pub(crate) async fn packages_reader(
         PackagesCompression::Gz => {
             let input_reader = tokio::io::BufReader::with_capacity(
                 buffer_size,
-                LimitedReader::compressed(InputReader::from(input), packages_file_cap(compression)),
+                LimitedReader::compressed(InputReader::from(input), input_cap),
             );
             let decoder = async_compression::tokio::bufread::GzipDecoder::new(input_reader);
             Box::new(tokio::io::BufReader::with_capacity(
@@ -467,13 +481,12 @@ pub(crate) async fn packages_reader(
             ))
         }
         PackagesCompression::Xz => {
-            let cap = packages_file_cap(compression);
             let decoder = match input {
                 PackagesInput::File(file) => {
-                    xz_decoder(LimitedReader::compressed(file.into_std().await, cap))
+                    xz_decoder(LimitedReader::compressed(file.into_std().await, input_cap))
                 }
                 PackagesInput::Bytes(bytes) => {
-                    xz_decoder(LimitedReader::compressed(io::Cursor::new(bytes), cap))
+                    xz_decoder(LimitedReader::compressed(io::Cursor::new(bytes), input_cap))
                 }
             };
             Box::new(tokio::io::BufReader::with_capacity(
@@ -647,6 +660,74 @@ mod tests {
             .await
             .expect("reading exactly `limit` bytes must succeed");
         assert_eq!(out.len(), 100);
+    }
+
+    /// Decodes `encoded` through [`wrap_packages`] with `input_cap`.
+    async fn decode_capped(
+        encoded: &[u8],
+        compression: PackagesCompression,
+        input_cap: u64,
+    ) -> io::Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt as _;
+        let file = tempfile::tempfile().expect("temp file");
+        let mut file = tokio::fs::File::from_std(file);
+        tokio::io::AsyncWriteExt::write_all(&mut file, encoded)
+            .await
+            .expect("write fixture");
+        tokio::io::AsyncSeekExt::rewind(&mut file)
+            .await
+            .expect("rewind fixture");
+        let mut reader = wrap_packages(
+            PackagesInput::File(file),
+            compression,
+            MAX_DECOMPRESSED_PACKAGES_SIZE,
+            NonZero::new(input_cap).expect("non-zero cap"),
+            1024,
+        )
+        .await;
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.map(|_| out)
+    }
+
+    /// Both decoders read their input through the compressed cap: an index
+    /// one byte over it fails, one exactly at it decodes.
+    #[tokio::test]
+    async fn compressed_input_is_held_to_the_cap() {
+        use async_compression::tokio::write::GzipEncoder;
+        use tokio::io::AsyncWriteExt as _;
+
+        let mut encoder = GzipEncoder::new(Vec::new());
+        encoder
+            .write_all(b"hello world\n")
+            .await
+            .expect("gzip write");
+        encoder.shutdown().await.expect("gzip finish");
+        let gz = encoder.into_inner();
+        let xz = crate::xz_stream::tests::HELLO_XZ;
+
+        for (compression, encoded) in [
+            (PackagesCompression::Gz, &gz[..]),
+            (PackagesCompression::Xz, xz),
+        ] {
+            let len = encoded.len() as u64;
+            let out = decode_capped(encoded, compression, len)
+                .await
+                .expect("an index at the cap decodes");
+            assert_eq!(out, b"hello world\n", "{compression:?}");
+            let err = decode_capped(encoded, compression, len - 1)
+                .await
+                .expect_err("an index over the cap must fail");
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidData,
+                "{compression:?}: {err}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("compressed Packages index exceeds"),
+                "{compression:?}: {err}"
+            );
+        }
     }
 
     #[test]

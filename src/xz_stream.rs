@@ -155,7 +155,8 @@ impl<R: io::Read, F: Fn() -> bool> io::Read for HangUpCheck<R, F> {
 }
 
 /// Pump `input` through a memory-limited [`XzReader`] into `output` until the
-/// stream ends.  A truncated stream surfaces as `UnexpectedEof`.
+/// stream ends.  A truncated stream fails, mostly as `UnexpectedEof` (a cut
+/// inside a following stream's magic bytes is `InvalidData`).
 ///
 /// Gives up with `BrokenPipe` at the first input refill after `abandoned`
 /// reports that the consumer is gone.
@@ -228,7 +229,7 @@ impl AsyncRead for XzDecoderStream {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::Cursor;
 
     use std::sync::Arc;
@@ -239,7 +240,7 @@ mod tests {
     use tokio::io::AsyncReadExt as _;
 
     /// `printf 'hello world\n' | xz -c --check=crc32` — 72 bytes.
-    const HELLO_XZ: &[u8] = &[
+    pub(crate) const HELLO_XZ: &[u8] = &[
         0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x01, 0x69, 0x22, 0xde, 0x36, 0x04, 0xc0, 0x10,
         0x0c, 0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7b, 0xb0,
         0x54, 0x28, 0x01, 0x00, 0x0b, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x77, 0x6f, 0x72, 0x6c,
