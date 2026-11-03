@@ -89,6 +89,7 @@ use crate::{
     precise_instant::PreciseInstant,
     proxy_body::{ProxyCacheBody, full_body, quick_response, quick_response_closing},
     rate_checked_body::{MaybeRated, RateCheckedBodyErr},
+    rate_checker::RateChecker,
     rate_log,
     request_dispatch::{
         ClientAcls, DispatchOutcome, PassthroughReason, RejectReason, RequestKind, RequestTarget,
@@ -750,9 +751,7 @@ where
     B: Body<Data = bytes::Bytes> + Send + Sync + 'static,
     B::Error: Into<DeliveryFailure>,
 {
-    let config = global_config();
-    let rated = MaybeRated::new(body, config.min_download_rate, config.rate_check_timeframe)
-        .into_client_body();
+    let rated = MaybeRated::new(body, RateChecker::from_config(global_config())).into_client_body();
     ProxyCacheBody::new(AccountedBody::new(rated, subject))
 }
 
@@ -1565,7 +1564,7 @@ async fn download_file(
         writer: tokio::io::BufWriter::with_capacity(config.buffer_size, outfile),
         path: &outpath,
     };
-    let mut body = MaybeRated::new(body, config.min_download_rate, config.rate_check_timeframe);
+    let mut body = MaybeRated::new(body, RateChecker::from_config(config));
     let result = dbarrier
         // Detached from the connection that started it: the client either
         // already has its response or joins the registry entry.

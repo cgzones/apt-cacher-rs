@@ -1,5 +1,3 @@
-use std::num::NonZero;
-
 use bytes::Buf as _;
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt as _;
@@ -40,16 +38,13 @@ impl<B> MaybeRated<B>
 where
     B: Body,
 {
-    /// Check the body rate only when a minimum is configured.
+    /// Check the body rate only when `rate_checker` is set (see
+    /// [`RateChecker::from_config`]).
     #[must_use]
-    pub(crate) fn new(
-        body: B,
-        min_download_rate: Option<NonZero<usize>>,
-        timeframe: NonZero<usize>,
-    ) -> Self {
+    pub(crate) fn new(body: B, rate_checker: Option<RateChecker>) -> Self {
         Self {
             inner: body,
-            rchecker: min_download_rate.map(|rate| RateChecker::with_timeframe(rate, timeframe)),
+            rchecker: rate_checker,
             rate_failed: sticky::Bool::new(),
         }
     }
@@ -130,8 +125,7 @@ mod tests {
     fn breaching_body() -> MaybeRated<Full<bytes::Bytes>> {
         let mut body = MaybeRated::new(
             Full::new(bytes::Bytes::from_static(b"payload")),
-            Some(nonzero!(1000)),
-            nonzero!(1),
+            Some(RateChecker::with_timeframe(nonzero!(1000), nonzero!(1))),
         );
         // A single sample fills the one-second window: 1 B/s, far below the
         // 1000 B/s minimum.
@@ -222,7 +216,10 @@ mod tests {
                 http_body_util::StreamBody::new(futures_util::stream::poll_fn(move |_| {
                     frames.next().expect("one poll per scripted frame")
                 }));
-            let mut body = MaybeRated::new(source, minimum, nonzero!(1));
+            let mut body = MaybeRated::new(
+                source,
+                minimum.map(|rate| RateChecker::with_timeframe(rate, nonzero!(1))),
+            );
             let mut cx = Context::from_waker(std::task::Waker::noop());
             assert!(Pin::new(&mut body).poll_frame(&mut cx).is_pending());
             assert!(
@@ -244,11 +241,7 @@ mod tests {
     /// error type.
     #[test]
     fn unrated_body_passes_frames_through() {
-        let mut body = MaybeRated::new(
-            Full::new(bytes::Bytes::from_static(b"payload")),
-            None,
-            nonzero!(1),
-        );
+        let mut body = MaybeRated::new(Full::new(bytes::Bytes::from_static(b"payload")), None);
         assert!(body.rchecker.is_none());
 
         let waker = std::task::Waker::noop();
