@@ -54,8 +54,8 @@ use super::{
     },
     response::WebResponse,
     table::{
-        DetailsList, Highlights, Kind, Rows, write_collapsible_details,
-        write_collapsible_details_badged, write_collapsible_section, write_section,
+        DetailsList, Highlights, Kind, Rows, write_collapsible_details, write_collapsible_section,
+        write_section,
     },
     tables::{
         DirStats, MirrorSnapshots, Section, TOP_PACKAGES_LIMIT, TopPackagesView,
@@ -1256,47 +1256,6 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
 
     body.push_str(&data.hero_html);
 
-    write_collapsible_section(
-        &mut body,
-        "Mirrors",
-        "mirrors",
-        Rows {
-            shown: data.mirror.rows,
-            total: None,
-        },
-        options.open.contains("mirrors"),
-        "No mirror has served a request yet.",
-        &data.mirror.html,
-    );
-    write_collapsible_section(
-        &mut body,
-        "Origins",
-        "origins",
-        Rows {
-            shown: data.origin.rows,
-            total: None,
-        },
-        options.open.contains("origins"),
-        "No Packages index has been fetched yet, so no distribution, component or architecture is known.",
-        &data.origin.html,
-    );
-    write_collapsible_section(
-        &mut body,
-        "Clients",
-        "clients",
-        Rows {
-            shown: data.client.rows,
-            total: None,
-        },
-        options.open.contains("clients"),
-        "No client has fetched anything through this proxy yet.",
-        &data.client.html,
-    );
-
-    let total_package_rows = data
-        .top_packages_by_count
-        .rows
-        .max(data.top_packages_by_size.rows);
     // Left empty when neither half rendered anything, so the section falls
     // through to its empty note. Emitting the grid unconditionally would
     // make the note unreachable and leave a fresh install looking at two
@@ -1317,79 +1276,106 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
             data.top_packages_by_size.html,
         );
     }
-    write_collapsible_section(
-        &mut body,
-        "Top Packages",
-        "packages",
-        Rows {
-            shown: total_package_rows,
-            total: None,
-        },
-        options.open.contains("packages"),
-        "No package has been delivered yet.",
-        &top_packages_body,
-    );
-
-    write_collapsible_section(
-        &mut body,
-        "Uncacheables",
-        "uncacheables",
-        Rows {
-            shown: data.uncacheable.rows,
-            total: Some(UNCACHEABLES_MAX.get()),
-        },
-        options.open.contains("uncacheables"),
-        "Nothing has been requested that the cache had to pass through untouched.",
-        &data.uncacheable.html,
-    );
+    let uncapped = |shown| Rows { shown, total: None };
+    for (title, key, rows, empty_note, html) in [
+        (
+            "Mirrors",
+            "mirrors",
+            uncapped(data.mirror.rows),
+            "No mirror has served a request yet.",
+            data.mirror.html.as_str(),
+        ),
+        (
+            "Origins",
+            "origins",
+            uncapped(data.origin.rows),
+            "No Packages index has been fetched yet, so no distribution, component or architecture is known.",
+            &data.origin.html,
+        ),
+        (
+            "Clients",
+            "clients",
+            uncapped(data.client.rows),
+            "No client has fetched anything through this proxy yet.",
+            &data.client.html,
+        ),
+        (
+            "Top Packages",
+            "packages",
+            uncapped(
+                data.top_packages_by_count
+                    .rows
+                    .max(data.top_packages_by_size.rows),
+            ),
+            "No package has been delivered yet.",
+            &top_packages_body,
+        ),
+        (
+            "Uncacheables",
+            "uncacheables",
+            Rows {
+                shown: data.uncacheable.rows,
+                total: Some(UNCACHEABLES_MAX.get()),
+            },
+            "Nothing has been requested that the cache had to pass through untouched.",
+            &data.uncacheable.html,
+        ),
+    ] {
+        write_collapsible_section(
+            &mut body,
+            title,
+            key,
+            rows,
+            options.open.contains(key),
+            empty_note,
+            html,
+        );
+    }
 
     // Reference and diagnostics last: read once at setup, or when something
     // is wrong. Configuration in particular used to sit second, above the
     // figures anyone actually opens this page for.
-    write_section(
-        &mut body,
-        "Cache Statistics",
-        "cache-statistics",
-        &data.cache_stats_html,
-    );
-    write_section(&mut body, "Capacity", "capacity", &data.capacity_html);
-    write_section(&mut body, "Memory", "memory", &data.memory_html);
-    write_section(
-        &mut body,
-        "Daemon Status",
-        "daemon-status",
-        &data.daemon_status_html,
-    );
+    for (title, key, html) in [
+        (
+            "Cache Statistics",
+            "cache-statistics",
+            &data.cache_stats_html,
+        ),
+        ("Capacity", "capacity", &data.capacity_html),
+        ("Memory", "memory", &data.memory_html),
+        ("Daemon Status", "daemon-status", &data.daemon_status_html),
+    ] {
+        write_section(&mut body, title, key, html);
+    }
     // Collapsed by default, so each carries a keep-open link: without script
     // a section the reader opened would otherwise close on every
     // auto-refresh. The script hides the links; it keeps sections open
     // itself.
-    let pin = |key| PinLink { key, options };
-    write_collapsible_details(
-        &mut body,
-        "Maintenance",
-        "maintenance",
-        options.open.contains("maintenance"),
-        pin("maintenance"),
-        &data.maintenance_html,
-    );
-    write_collapsible_details(
-        &mut body,
-        "Configuration",
-        "configuration",
-        options.open.contains("configuration"),
-        pin("configuration"),
-        &data.configuration_html,
-    );
-    write_collapsible_details_badged(
-        &mut body,
-        "Metrics",
-        "metrics",
-        options.open.contains("metrics"),
-        data.metrics_highlights,
-        pin("metrics"),
-        &data.metrics_html,
-    );
+    for (title, key, badge, html) in [
+        ("Maintenance", "maintenance", None, &data.maintenance_html),
+        (
+            "Configuration",
+            "configuration",
+            None,
+            &data.configuration_html,
+        ),
+        (
+            "Metrics",
+            "metrics",
+            Some(data.metrics_highlights),
+            &data.metrics_html,
+        ),
+    ] {
+        write_collapsible_details(
+            &mut body,
+            title,
+            key,
+            options.open.contains(key),
+            badge,
+            PinLink { key, options },
+            html,
+        );
+    }
 
     swrite!(
         body,

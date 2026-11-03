@@ -694,7 +694,9 @@ pub(super) fn write_section(out: &mut String, title: &'static str, key: &'static
     );
 }
 
-/// Append a titled `<details>` section around an already-rendered body.
+/// Append a titled `<details>` section around an already-rendered body,
+/// with `badge` (if any) beside the title, readable while the section is
+/// collapsed.
 ///
 /// The row-table sections go through [`write_collapsible_section`], which
 /// derives `open` from the row count and needs an empty-state note; this is
@@ -708,36 +710,19 @@ pub(super) fn write_collapsible_details(
     title: &'static str,
     key: &'static str,
     open: bool,
-    pin: impl Display,
-    body: &str,
-) {
-    write_collapsible_details_badged(out, title, key, open, "", pin, body);
-}
-
-/// [`write_collapsible_details`] with `badge` beside the title, readable
-/// while the section is collapsed.
-pub(super) fn write_collapsible_details_badged(
-    out: &mut String,
-    title: &'static str,
-    key: &'static str,
-    open: bool,
-    badge: impl Display,
+    badge: Option<impl Display>,
     pin: impl Display,
     body: &str,
 ) {
     let open_attr = if open { " open" } else { "" };
-    let mut badge_html = String::new();
-    swrite!(badge_html, "{badge}");
-    let badge_wrapped = fmt::from_fn(|f| {
-        if !badge_html.is_empty() {
-            write!(f, " <span class=\"count\">{badge_html}</span>")?;
-        }
-        Ok(())
+    let badge = fmt::from_fn(move |f| match &badge {
+        Some(badge) => write!(f, " <span class=\"count\">{badge}</span>"),
+        None => Ok(()),
     });
     swrite!(
         out,
         "<div class=\"section\" data-section=\"{key}\"><details{open_attr}>\
-         <summary><h2 id=\"{key}-head\">{title}</h2>{badge_wrapped} {pin}</summary>\
+         <summary><h2 id=\"{key}-head\">{title}</h2>{badge} {pin}</summary>\
          {body}</details></div>"
     );
 }
@@ -818,7 +803,7 @@ pub(super) fn write_section_error(out: &mut String, what: &'static str, err: &sq
 #[cfg(test)]
 mod tests {
     use super::{
-        DetailsList, Highlights, Kind, Rows, Table, when, write_collapsible_details_badged,
+        DetailsList, Highlights, Kind, Rows, Table, when, write_collapsible_details,
         write_collapsible_section, write_section,
     };
     use crate::web::fmt::{Count, Level, Nonzero};
@@ -1109,7 +1094,15 @@ mod tests {
             "<div class=\"section\" data-section=\"plain\"><h2 id=\"plain-head\">Plain</h2><p>b</p></div>"
         );
         let mut out = String::new();
-        write_collapsible_details_badged(&mut out, "Folded", "folded", false, "3", "", "<p>b</p>");
+        write_collapsible_details(
+            &mut out,
+            "Folded",
+            "folded",
+            false,
+            Some("3"),
+            "",
+            "<p>b</p>",
+        );
         assert!(
             out.starts_with(
                 "<div class=\"section\" data-section=\"folded\"><details><summary><h2 id=\"folded-head\">Folded</h2>"
