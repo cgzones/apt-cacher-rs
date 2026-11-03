@@ -15,7 +15,6 @@ pub(crate) use fetch::{FetchFailure, IndexAnswer};
 use model::classify_mirror;
 
 use std::{
-    num::NonZero,
     path::Path,
     sync::{
         LazyLock,
@@ -26,16 +25,15 @@ use std::{
 
 use coarsetime::Instant;
 use futures_util::StreamExt as _;
-use hashbrown::HashMap;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     AppState,
     cache_paths::CachePaths,
-    config::{CacheHost, Config},
+    config::Config,
     database::Database,
     database_task,
-    deb_mirror::{Mirror, derive_nested_paths},
+    deb_mirror::{Mirror, nested_paths_per_row},
     error::ErrorReport,
     global_cache_quota, global_config,
     humanfmt::HumanFmt,
@@ -273,37 +271,9 @@ async fn task_cleanup_impl(appstate: &AppState) {
     // walks the on-disk flat subtree recursively, and these nested mirror roots
     // bound that walk so a parent mirror's cleanup does not age-evict files
     // belonging to a nested mirror (which has its own Packages index and its own
-    // cleanup run).
-    //
-    // Paths are bucketed by (cache_host, port) and each bucket sorted once, so a
-    // mirror's derivation is O(k) over its host's siblings instead of O(n) over
-    // every mirror.  Rows are canonical (alias-resolved at dispatch, legacy rows
-    // folded at startup), so the row host *is* the `<cache>/<host>/…` tree the
-    // nesting bucket must follow.
-    let mut paths_by_host: HashMap<(&CacheHost, Option<NonZero<u16>>), Vec<&str>> = HashMap::new();
-    for entry in &mirrors {
-        let key = (entry.host.as_cache_host(), entry.port());
-        paths_by_host
-            .entry(key)
-            .or_default()
-            .push(entry.path.as_str());
-    }
-    for paths in paths_by_host.values_mut() {
-        paths.sort_unstable();
-    }
-
-    // Materialise each mirror's nested-paths list to owned data so the
-    // `paths_by_host` borrow on `mirrors` can end before we consume
-    // `mirrors` in the per-future move below.
-    let nested_per_mirror: Vec<Vec<String>> = mirrors
-        .iter()
-        .map(|mirror| {
-            let key = (mirror.host.as_cache_host(), mirror.port());
-            let host_paths = paths_by_host.get(&key).map_or_default(Vec::as_slice);
-            derive_nested_paths(&mirror.path, host_paths)
-        })
-        .collect();
-    drop(paths_by_host);
+    // cleanup run).  Owned, so `mirrors` can be consumed by the per-future move
+    // below.
+    let nested_per_mirror = nested_paths_per_row(&mirrors);
 
     let cleanup_tasks = mirrors
         .into_iter()

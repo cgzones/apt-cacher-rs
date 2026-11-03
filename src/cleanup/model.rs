@@ -174,7 +174,7 @@ pub(super) enum Walk {
         /// `tmp/` for flat mirrors).
         skip_subdirs: &'static [&'static str],
         /// Mirror paths of registered siblings that live *inside* this
-        /// mirror's path (`deb_mirror::derive_nested_paths`). When the walk
+        /// mirror's path (`deb_mirror::nested_paths_per_row`). When the walk
         /// reaches a directory whose mirror-path equivalent is at or inside
         /// one of these, the subtree is skipped (the nested mirror owns it
         /// and runs its own cleanup).
@@ -451,7 +451,7 @@ fn flat_root_split(mirror_path: &str) -> Option<(&str, String)> {
 /// have no structured pool tree, dists tree, or dists by-hash tree on disk.
 ///
 /// `nested` is the caller's pre-computed list of sibling mirror paths nested
-/// under `entry.path` (`deb_mirror::derive_nested_paths`); it becomes the
+/// under `entry.path` (`deb_mirror::nested_paths_per_row`); it becomes the
 /// [`ReconcileFacet::FlatTree`] unit's walk boundaries.
 ///
 /// Every unit root is a [`CachePaths::entry_dir`] / [`CachePaths::tmp_dir`]

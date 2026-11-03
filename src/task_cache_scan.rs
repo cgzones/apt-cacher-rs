@@ -6,7 +6,7 @@
 //! the shared [`Walker`], and what a directory means at each depth
 //! ([`Level`]) to `cache_tree`, which the dashboard's size walk shares; this
 //! module supplies which subtrees belong to a *different* mirror row
-//! ([`derive_nested_paths`], shared with cleanup so both agree on where a
+//! ([`nested_paths_per_row`], shared with cleanup so both agree on where a
 //! mirror's tree ends) and which hold partial downloads (`tmp/`). Those are
 //! tallied like cached files: `cache_quota`
 //! counts the kept partials a failed download leaves behind, which cleanup
@@ -22,7 +22,7 @@
 //! it.  A successful scan publishes that figure for the dashboard
 //! (`metrics::ORPHANED_PARTIAL_*`).
 
-use std::{borrow::Cow, net::Ipv6Addr, num::NonZero, path::Path};
+use std::{net::Ipv6Addr, num::NonZero, path::Path};
 
 use hashbrown::HashMap;
 use tracing::{debug, error, trace};
@@ -36,7 +36,10 @@ use crate::{
     },
     config::CacheHost,
     database::{Database, MirrorEntry},
-    deb_mirror::{MirrorKind, NestedMirrorRelation, derive_nested_paths, nested_mirror_relation},
+    deb_mirror::{
+        MirrorKind, NestedMirrorRelation, mirror_relative_path, nested_mirror_relation,
+        nested_paths_per_row,
+    },
     error::ErrorReport,
     fs_open::probe_dir,
     global_config, healthcheck, metrics,
@@ -107,13 +110,12 @@ impl std::ops::AddAssign for ScanTotals {
 
 /// The mirror rows sharing one `{host[:port]}` cache directory, keyed by that
 /// directory's name: the resolved host the name came from (so the host-level
-/// `flat/` root is derived once per bucket) and every row that lives under it.
+/// `flat/` root is derived once per bucket) and every row that lives under it,
+/// with its nested-mirror boundaries ([`nested_paths_per_row`]).
 struct HostBucket<'a> {
     host: &'a CacheHost,
     port: Option<NonZero<u16>>,
-    mirrors: Vec<&'a MirrorEntry>,
-    /// Every row's mirror path, sorted as [`derive_nested_paths`] requires.
-    paths: Vec<&'a str>,
+    mirrors: Vec<(&'a MirrorEntry, &'a [String])>,
 }
 
 static CACHE_ROOT_WALK: WalkContext = WalkContext {
@@ -174,26 +176,21 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
 
     // Group mirrors by alias-resolved host directory name once, so each cache
     // entry is matched via an O(1) HashMap lookup instead of an inner O(m)
-    // scan, and each row's nested-mirror set costs one sorted-prefix scan of
-    // its own bucket rather than an O(n) scan per directory entry.  Keys are
-    // owned `String`s because the `Cow` from `format_authority` may borrow
-    // from local data (the formatted port).
+    // scan.  Keys are owned `String`s because the `Cow` from
+    // `format_authority` may borrow from local data (the formatted port).
+    let nested = nested_paths_per_row(&mirrors);
     let mut mirrors_by_dir: HashMap<String, HostBucket<'_>> = HashMap::with_capacity(mirrors.len());
-    for mirror in &mirrors {
+    for (mirror, nested) in mirrors.iter().zip(&nested) {
         let site = mirror.site();
-        let bucket = mirrors_by_dir
+        mirrors_by_dir
             .entry(site.host.format_authority(site.port).into_owned())
             .or_insert_with(|| HostBucket {
                 host: site.host,
                 port: site.port,
                 mirrors: Vec::new(),
-                paths: Vec::new(),
-            });
-        bucket.mirrors.push(mirror);
-        bucket.paths.push(mirror.path.as_str());
-    }
-    for bucket in mirrors_by_dir.values_mut() {
-        bucket.paths.sort_unstable();
+            })
+            .mirrors
+            .push((mirror, nested));
     }
 
     let mut totals = ScanTotals::default();
@@ -257,10 +254,9 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
             paths.host_dir(bucket.host, bucket.port),
             "the walked host directory must be the one CachePaths derives for its bucket"
         );
-        for mirror in &bucket.mirrors {
-            let nested = derive_nested_paths(&mirror.path, &bucket.paths);
+        for &(mirror, nested) in &bucket.mirrors {
             let mirror_dir = paths.mirror_dir(mirror.site());
-            totals += scan_mirror_dir(cache_path, &mirror_dir, mirror, &nested).await;
+            totals += scan_mirror_dir(cache_path, &mirror_dir, mirror, nested).await;
         }
 
         // The host-level `flat/` subtree is a sibling of mirror dirs.
@@ -296,7 +292,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
 
 /// Tally one mirror row's `<host>/<mirror_path>/` tree at `mirror_path`
 /// (`CachePaths::mirror_dir`).  `nested` lists the registered mirror paths
-/// strictly below `mirror.path` on this host (see `derive_nested_paths`),
+/// strictly below `mirror.path` on this host (see `nested_paths_per_row`),
 /// which the walk treats as foreign territory.
 #[must_use]
 async fn scan_mirror_dir(
@@ -431,11 +427,7 @@ fn classify_mirror_subdir(entry: &Entry<'_, Level>, mirror_path: &str, nested: &
         entry.report_unexpected("not counting it or its contents towards the cache size");
         return;
     };
-    let expected = if mirror_path.is_empty() {
-        Cow::Borrowed(name_str)
-    } else {
-        Cow::Owned(format!("{mirror_path}/{name_str}"))
-    };
+    let expected = mirror_relative_path(mirror_path, name_str);
     match nested_mirror_relation(&expected, nested) {
         NestedMirrorRelation::Boundary => trace!(
             "Skipping `{}` - it is a sub-mirror of `{mirror_path}`",

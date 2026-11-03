@@ -4,14 +4,15 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use hashbrown::HashMap;
 use tracing::debug;
 
 use crate::{
     cache_layout::{MAX_DEBNAME_LEN, classify_request},
     cache_paths::MirrorSite,
     client_info::ClientInfo,
-    config::ClientHost,
-    database,
+    config::{CacheHost, ClientHost},
+    database::{self, MirrorEntry},
     flat_blocklist::path_collides_with_flat_layout,
     index_parser::HashAlgo,
 };
@@ -1221,10 +1222,9 @@ fn path_starts_with_segment(path: &str, prefix: &str) -> bool {
 /// is a safe termination optimisation, since entries sharing the byte prefix
 /// are contiguous in lexicographic order.
 ///
-/// The result feeds [`nested_mirror_relation`] in both the startup cache scan
-/// and the cleanup walks, so the two agree on where one mirror's tree ends.
+/// Callers go through [`nested_paths_per_row`].
 #[must_use]
-pub(crate) fn derive_nested_paths(mirror_path: &str, host_paths_sorted: &[&str]) -> Vec<String> {
+fn derive_nested_paths(mirror_path: &str, host_paths_sorted: &[&str]) -> Vec<String> {
     if mirror_path.is_empty() {
         return host_paths_sorted
             .iter()
@@ -1246,10 +1246,60 @@ pub(crate) fn derive_nested_paths(mirror_path: &str, host_paths_sorted: &[&str])
         .collect()
 }
 
+/// The [`derive_nested_paths`] of every row of `mirrors`, in row order: the
+/// paths of the other rows nested inside it, which bound its walks.
+///
+/// Rows are bucketed by `(host, port)` and each bucket sorted once, so a
+/// row's derivation is O(k) over its host's siblings instead of O(n) over
+/// every row.  Rows are canonical (alias-resolved at dispatch, legacy rows
+/// folded at startup), so the row host *is* the `<cache>/<host>/` tree the
+/// bucket must follow.
+///
+/// The startup cache scan and cleanup both derive their boundaries here and
+/// match directories against them with [`nested_mirror_relation`], so the
+/// two agree on where one mirror's tree ends (or the quota reconcile reports
+/// a spurious `Repaired cache size discrepancy`).
+#[must_use]
+pub(crate) fn nested_paths_per_row(mirrors: &[MirrorEntry]) -> Vec<Vec<String>> {
+    let mut paths_by_host: HashMap<(&CacheHost, Option<NonZero<u16>>), Vec<&str>> = HashMap::new();
+    for entry in mirrors {
+        let site = entry.site();
+        paths_by_host
+            .entry((site.host, site.port))
+            .or_default()
+            .push(site.path);
+    }
+    for paths in paths_by_host.values_mut() {
+        paths.sort_unstable();
+    }
+    mirrors
+        .iter()
+        .map(|entry| {
+            let site = entry.site();
+            let host_paths = paths_by_host
+                .get(&(site.host, site.port))
+                .map_or_default(Vec::as_slice);
+            derive_nested_paths(site.path, host_paths)
+        })
+        .collect()
+}
+
+/// The mirror-path equivalent of the directory `rel` (relative to the mirror
+/// directory of `mirror_path`), the `candidate` [`nested_mirror_relation`]
+/// matches: `<mirror_path>/<rel>`, or `rel` alone for a host-root mirror.
+#[must_use]
+pub(crate) fn mirror_relative_path<'a>(mirror_path: &str, rel: &'a str) -> Cow<'a, str> {
+    if mirror_path.is_empty() {
+        Cow::Borrowed(rel)
+    } else {
+        Cow::Owned(format!("{mirror_path}/{rel}"))
+    }
+}
+
 /// How a directory found inside a mirror's tree relates to the mirrors
-/// registered *below* that mirror on the same host (the
-/// [`derive_nested_paths`] output).  `candidate` is the directory's
-/// mirror-path equivalent (`<mirror_path>/<relative dir>`); matching is
+/// registered *below* that mirror on the same host (its
+/// [`nested_paths_per_row`] entry).  `candidate` is the directory's
+/// mirror-path equivalent ([`mirror_relative_path`]); matching is
 /// segment-aligned, so `apt-tools` never relates to `apt`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NestedMirrorRelation {

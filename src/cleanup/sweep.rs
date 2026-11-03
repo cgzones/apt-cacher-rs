@@ -26,7 +26,7 @@ use super::scan::remove_non_regular;
 /// so basename + the cleanup mirror is the exact key — as long as the file's
 /// directory equals the cleanup mirror's registered path. That holds for every
 /// deb reached through its own mirror row: each flat-deb URL directory registers
-/// a row that `derive_nested_paths` turns into a walk boundary, so the handling
+/// a row that `nested_paths_per_row` turns into a walk boundary, so the handling
 /// task always sees a single-segment relpath. The one gap is the recursive-scan
 /// safety net: a deb nested *below* the cleanup mirror's path whose own row is
 /// missing (e.g. pruned by `cleanup_invalid_rows`, or a DB reset with files left

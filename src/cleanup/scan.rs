@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -10,7 +9,9 @@ use crate::cache_walk::{
 };
 use crate::cleanup::engine::{CleanupUnitError, SpanClass};
 use crate::cleanup::model::{TreeSpec, Walk};
-use crate::deb_mirror::{NestedMirrorRelation, is_deb_package, nested_mirror_relation};
+use crate::deb_mirror::{
+    NestedMirrorRelation, is_deb_package, mirror_relative_path, nested_mirror_relation,
+};
 use crate::error::ErrorReport;
 use crate::metrics;
 
@@ -154,11 +155,7 @@ pub(super) async fn scan_candidates(
                         // the lossy conversion is exact.
                         let rel_path = entry.rel_path();
                         let rel = rel_path.to_string_lossy();
-                        let candidate: Cow<'_, str> = if mirror_path.is_empty() {
-                            rel
-                        } else {
-                            Cow::Owned(format!("{mirror_path}/{rel}"))
-                        };
+                        let candidate = mirror_relative_path(mirror_path, &rel);
                         match nested_mirror_relation(&candidate, boundaries) {
                             NestedMirrorRelation::Boundary => trace!(
                                 "Skipping `{}` during flat cleanup: nested mirror root for `{candidate}`",
