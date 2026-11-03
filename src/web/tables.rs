@@ -763,7 +763,6 @@ pub(super) async fn build_mirror_table(
             "Client Deliveries",
             "Cache Efficiency",
             "Disk Space",
-            "File Count",
             "Avg / Max Size",
             "Debs / Metadata",
             MIRROR_HEALTH_HEADERS[0],
@@ -774,7 +773,7 @@ pub(super) async fn build_mirror_table(
             MIRROR_PERF_HEADERS[1],
             MIRROR_INDEX_HEADER,
         ],
-        &[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        &[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
     );
 
     // The per-mirror failure counts join by the `MirrorUri` rendering
@@ -843,7 +842,6 @@ pub(super) async fn build_mirror_table(
                 size: stats.size,
                 total: aggregate.size,
             } => Some(stats.size),
-            Count::len(stats.files()) => Some(stats.files()),
             AvgMaxCell {
                 files: stats.files(),
                 size: stats.size,
@@ -890,7 +888,7 @@ pub(super) async fn build_mirror_table(
             Some(key),
         );
         // From Last Seen to Debs / Metadata.
-        table.na_cells(10);
+        table.na_cells(9);
         health_cells(&mut table, mirror_health);
         // Time to First Byte, Throughput and Newest Index: never answered,
         // so never measured.
@@ -1414,6 +1412,45 @@ mod tests {
             )),
             "{}",
             section.html
+        );
+    }
+
+    /// The Mirrors table has no File Count column (the Debs / Metadata
+    /// column shows both of its terms), and its right-aligned columns are
+    /// still the figures: a mirror without a persisted row lines its `N/A`s
+    /// and failure counts up under them.
+    #[tokio::test]
+    async fn mirrors_table_columns_line_up_without_a_file_count() {
+        let health = MirrorHealth {
+            unreachable: 1,
+            protocol: 0,
+            checksum: 0,
+            slow: 0,
+        };
+        let snapshots = MirrorSnapshots {
+            health: HashMap::from([(Box::from("deb.example.org/debian"), health)]),
+            perf: HashMap::new(),
+            indexes: HashMap::new(),
+        };
+        let (section, _) =
+            build_mirror_table(&[], &snapshots, 1_700_000_000, &Config::default()).await;
+        assert_eq!(section.rows, 1);
+        let html = section.html;
+        assert!(!html.contains("File Count"), "{html}");
+        assert_eq!(html.matches("<th ").count(), 17, "{html}");
+        assert_eq!(html.matches("<th scope=\"col\" class=\"num\">").count(), 12);
+        let na = "<td>N/A</td>";
+        let num_na = "<td class=\"num\">N/A</td>";
+        let zero = "<td class=\"num\" data-sort=\"0\">0</td>";
+        assert!(
+            html.contains(&format!(
+                "deb.example.org/debian</span></td>{}{}\
+                 <td class=\"num\" data-sort=\"1\"><span class=\"warn\">1</span></td>\
+                 {zero}{zero}{zero}{num_na}{num_na}{na}</tr>",
+                na.repeat(3),
+                num_na.repeat(6),
+            )),
+            "{html}"
         );
     }
 
