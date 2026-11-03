@@ -132,6 +132,59 @@ pub(crate) enum BodyFraming {
     CloseDelimited,
 }
 
+/// A list element with its surrounding `OWS` trimmed (RFC 9110 §5.6.1).
+fn trim_ows(element: &str) -> &str {
+    element.trim_matches([' ', '\t'])
+}
+
+/// Why [`parse_content_length_list`] refused a `Content-Length` field line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContentLengthError {
+    NonUtf8,
+    /// An element that is not a `1*DIGIT` fitting a `u64`. Implies the line
+    /// was valid UTF-8.
+    Unparsable,
+    /// Two elements, on this line or across lines, disagree.
+    Conflict {
+        prev: u64,
+        len: u64,
+    },
+}
+
+/// Fold one `Content-Length` field line into `prev`, the length its earlier
+/// lines resolved to: every element of its comma list must be the same
+/// `1*DIGIT`, and agree with `prev` (RFC 9110 §8.6 allows collapsing
+/// identical duplicates). The one rule for both directions -- a client's
+/// request (`request_dispatch::preflight_headers`) and an upstream's head
+/// ([`resolve_body_framing`]) -- so request-smuggling rules cannot drift
+/// between them; each caller words the refusal itself.
+pub(crate) fn parse_content_length_list(
+    value: &[u8],
+    prev: Option<u64>,
+) -> Result<u64, ContentLengthError> {
+    let value = std::str::from_utf8(value)
+        .map_err(|_err @ Utf8Error { .. }| ContentLengthError::NonUtf8)?;
+    let mut length = prev;
+    // An empty element is junk: Content-Length is a single 1*DIGIT. The
+    // split yields at least one element, so an `Ok` always carries a value.
+    for element in value.split(',').map(trim_ows) {
+        // `u64::from_str` alone would take a leading `+`.
+        if element.is_empty() || !element.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ContentLengthError::Unparsable);
+        }
+        let len = element
+            .parse::<u64>()
+            .map_err(|_err @ ParseIntError { .. }| ContentLengthError::Unparsable)?;
+        if let Some(prev) = length
+            && prev != len
+        {
+            return Err(ContentLengthError::Conflict { prev, len });
+        }
+        length = Some(len);
+    }
+    Ok(length.expect("split yields at least one element"))
+}
+
 /// Resolve the body framing from *every* `Transfer-Encoding` and
 /// `Content-Length` field line (`fields` yields each line's name and value)
 /// of an upstream head, or refuse the head.
@@ -156,40 +209,20 @@ pub(crate) fn resolve_body_framing<'a>(
 ) -> Result<BodyFraming, String> {
     use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 
-    /// A list element with its surrounding `OWS` trimmed (RFC 9110 §5.6.1).
-    fn trim_ows(element: &str) -> &str {
-        element.trim_matches([' ', '\t'])
-    }
-
-    fn parse_length(value: &[u8], mut length: Option<u64>) -> Result<Option<u64>, String> {
-        let value = std::str::from_utf8(value).map_err(|_err @ Utf8Error { .. }| {
-            "non-UTF-8 Content-Length from upstream".to_owned()
-        })?;
-        let unparsable = || {
-            format!(
-                "unparsable Content-Length `{}` from upstream",
-                value.escape_debug()
-            )
-        };
-        // An empty element is junk: Content-Length is a single 1*DIGIT.
-        for element in value.split(',').map(trim_ows) {
-            // `u64::from_str` alone would take a leading `+`.
-            if element.is_empty() || !element.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(unparsable());
-            }
-            let len = element
-                .parse::<u64>()
-                .map_err(|_err @ ParseIntError { .. }| unparsable())?;
-            if let Some(prev) = length
-                && prev != len
-            {
-                return Err(format!(
-                    "conflicting Content-Length values {prev} and {len} from upstream"
-                ));
-            }
-            length = Some(len);
-        }
-        Ok(length)
+    fn parse_length(value: &[u8], length: Option<u64>) -> Result<Option<u64>, String> {
+        parse_content_length_list(value, length)
+            .map(Some)
+            .map_err(|err| match err {
+                ContentLengthError::NonUtf8 => "non-UTF-8 Content-Length from upstream".to_owned(),
+                // Unparsable implies valid UTF-8, so the lossy view is exact.
+                ContentLengthError::Unparsable => format!(
+                    "unparsable Content-Length `{}` from upstream",
+                    String::from_utf8_lossy(value).escape_debug()
+                ),
+                ContentLengthError::Conflict { prev, len } => {
+                    format!("conflicting Content-Length values {prev} and {len} from upstream")
+                }
+            })
     }
 
     let mut has_transfer_encoding = false;

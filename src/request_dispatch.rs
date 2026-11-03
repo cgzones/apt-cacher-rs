@@ -58,6 +58,7 @@ use crate::{
     global_config, info_once, metrics,
     precise_instant::PreciseInstant,
     uncacheables::record_uncacheable,
+    upstream_head::{ContentLengthError, parse_content_length_list},
     uri_authority, warn_once_or_debug, warn_once_or_info,
     web::host_gate::WebifHosts,
 };
@@ -314,20 +315,16 @@ pub(crate) fn preflight_headers<'a>(
                 uri_authority::port(&authority).map_err(|_err| "Invalid port")?;
             }
         } else if name.eq_ignore_ascii_case("content-length") {
-            let value = str::from_utf8(value).map_err(|_utf8err| "Invalid Content-Length")?;
-            for part in value.split(',') {
-                let part = part.trim_matches([' ', '\t']);
-                if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
-                    return Err("Invalid Content-Length");
-                }
-                let parsed = part
-                    .parse::<u64>()
-                    .map_err(|_parserr| "Invalid Content-Length")?;
-                if length.is_some_and(|length| length != parsed) {
-                    return Err("Conflicting Content-Length");
-                }
-                length = Some(parsed);
-            }
+            length = Some(
+                parse_content_length_list(value, length).map_err(|err| match err {
+                    ContentLengthError::NonUtf8 | ContentLengthError::Unparsable => {
+                        "Invalid Content-Length"
+                    }
+                    ContentLengthError::Conflict { prev: _, len: _ } => {
+                        "Conflicting Content-Length"
+                    }
+                })?,
+            );
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             if transfer_encoding || !value.eq_ignore_ascii_case(b"chunked") || !is_http11 {
                 return Err("Unsupported request Transfer-Encoding");
@@ -863,6 +860,28 @@ mod tests {
                 admitted,
                 "proxy {proxy_clients:?}, webif {webif_clients:?}"
             );
+        }
+    }
+
+    #[test]
+    fn preflight_headers_words_content_length_refusals() {
+        /// The `Content-Length` lines of one request, and the verdict.
+        type Case = (&'static [&'static [u8]], Result<(), &'static str>);
+        let cases: [Case; 9] = [
+            (&[b"5"], Ok(())),
+            (&[b"5, 5", b" 5\t"], Ok(())),
+            (&[b"5", b"6"], Err("Conflicting Content-Length")),
+            (&[b"5, 6"], Err("Conflicting Content-Length")),
+            (&[b"+5"], Err("Invalid Content-Length")),
+            (&[b"5,"], Err("Invalid Content-Length")),
+            (&[b""], Err("Invalid Content-Length")),
+            (&[b"99999999999999999999"], Err("Invalid Content-Length")),
+            (&[b"\xff"], Err("Invalid Content-Length")),
+        ];
+        for (values, expected) in cases {
+            let headers = std::iter::once(("Host", &b"localhost"[..]))
+                .chain(values.iter().map(|value| ("Content-Length", *value)));
+            assert_eq!(preflight_headers(true, headers), expected, "{values:?}");
         }
     }
 
