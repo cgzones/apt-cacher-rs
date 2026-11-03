@@ -9,77 +9,46 @@
 //! to remove the C `liblzma`/`liblzma-sys` dependency.
 //!
 //! The decoder is built through `new_mem_limit`: the LZMA2 dictionary size
-//! comes verbatim from the (untrusted) block header and is allocated before
-//! any output reaches the callers' decompression caps.
+//! comes verbatim from the (untrusted) block header, and the decoder's
+//! window grows with the decoded output up to it.
 //! [`crate::limits::MAX_XZ_DICT_SIZE`] bounds it.
 //!
-//! `XzStream` rather than the `Read`-adapter `XzReader`, although the latter
-//! takes the same memory limit since lzma-rust2 0.21: `XzReader`'s index
-//! parser reserves and fills a record vector sized by the (untrusted) index
-//! record count before comparing it with the blocks it decoded, and never
-//! checks a record against its block.  An index yields no output, so none of
-//! the callers' decompression caps see it; a few dozen bytes can claim 2^31
-//! records.  `XzStream` rejects a count that differs from the decoded block
+//! `XzStream` rather than the `Read`-adapter `XzReader`: the push-style
+//! decoder hands control back to the decode loop after every call, which is
+//! where the loop checks whether the consumer hung up, while one
+//! `XzReader::read` decodes until it has output or the input ends. The
+//! decoder otherwise notices a hang-up only when it next *writes*, which an
+//! output-free stream (empty blocks, 18 bytes each) never does. `XzStream`
+//! also rejects an index record count that differs from the decoded block
 //! count before reading a single record, and validates each record as it
 //! arrives.
 //!
-//! The memory limit bounds one block, not the work a stream can demand:
-//! `XzStream` builds a fresh LZMA2 decoder for every block and allocates and
-//! zero-fills the block's declared dictionary on first use, reusing nothing.
-//! An empty block is 18 bytes and yields no output, so a stream of them
-//! never reaches the output caps while each block costs a dictionary's worth
-//! of page faults and `memset` -- measured with lzma-rust2 0.21 at the 64 MiB
-//! cap, ~35 ms per block under glibc malloc and ~3 ms under mimalloc, i.e.
-//! a 10 MiB `Packages.xz` holding a blocking thread for hours. The decode
-//! loop therefore stops on two conditions checked between `process` calls,
-//! each call being handed at most [`PROCESS_SLICE`] input bytes so that no
-//! single call can run long past a check: the consumer hung up (the
-//! decoder otherwise notices only when it next *writes*, which an
-//! output-free stream never does), or the thread's CPU time exceeds
-//! [`MAX_XZ_DECODE_CPU`]. CPU time rather than wall time, so neither a
-//! consumer that is slow to drain the pipe nor a loaded host counts against
-//! the budget. Reading the CPU clock is a syscall (`getrusage`), so the loop
-//! reads it only once [`CPU_CHECK_INTERVAL`] of (vDSO, syscall-free) wall
-//! time has passed since the last reading: a thread cannot burn more CPU
-//! time than wall time passes, so the budget is still caught within that
-//! interval and one slice of crossing it.
+//! The callers' size caps alone bound what a stream can cost: an
+//! output-free one by the compressed cap, any other by the decompressed
+//! one. Up to lzma-rust2 0.21 every block allocated and zero-filled its
+//! declared dictionary up front, ~35 ms of CPU per empty block at the
+//! 64 MiB cap, which the decode loop answered with a CPU budget. Since 0.22
+//! the window grows with the output, a million empty blocks (18 MB of
+//! input) decode in 0.17 s of CPU (measured with 0.25), and the budget is
+//! gone.
 
 use std::future::Future as _;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
 
-use coarsetime::Instant;
 use lzma_rust2::{Action, Status, XzStream};
-use nix::sys::resource::{UsageWho, getrusage};
-use nix::sys::time::TimeValLike as _;
 use tokio::io::{AsyncRead, DuplexStream, ReadBuf};
 use tokio::sync::oneshot;
 use tokio_util::io::SyncIoBridge;
 
 use crate::humanfmt::HumanFmt;
-use crate::limits::{MAX_XZ_DECODE_CPU, MAX_XZ_DICT_SIZE};
+use crate::limits::MAX_XZ_DICT_SIZE;
 
 /// Internal pipe capacity. 64 KiB amortises copy syscalls between the blocking
 /// decoder thread and the async consumer without buffering meaningful amounts
 /// of memory.
 const PIPE_CAPACITY: usize = 64 * 1024;
-
-/// Most input bytes one `XzStream::process` call is given, which bounds how
-/// long a call can run between two checks of the decode loop's stop
-/// conditions: 1 KiB holds at most 56 empty blocks, ~2 s of dictionary
-/// setup at the 64 MiB cap under glibc. Slicing costs a legitimate decode
-/// nothing measurable (a 15 MiB `Packages.xz`: same CPU time at 1 KiB as at
-/// 64 KiB slices).
-const PROCESS_SLICE: usize = 1024;
-
-/// Least wall time between two readings of the decode thread's CPU time (see
-/// the module doc). Reading it per slice cost ~10k `getrusage` calls per
-/// 10 MiB `Packages.xz`; at 10 ms it is ~50 per 500 ms decode, while a
-/// decode overrunning [`MAX_XZ_DECODE_CPU`] is still stopped within 10 ms
-/// (plus the coarse clock's tick and one slice) of crossing it.
-const CPU_CHECK_INTERVAL: coarsetime::Duration = coarsetime::Duration::from_millis(10);
 
 /// Async wrapper over a blocking [`XzStream`] decode.
 ///
@@ -111,10 +80,8 @@ where
         // the result send (BufWriter's Drop swallows them).
         let mut bridge_out =
             io::BufWriter::with_capacity(PIPE_CAPACITY, SyncIoBridge::new(write_half));
-        let result = decode_stream(&mut input, &mut bridge_out, MAX_XZ_DECODE_CPU, || {
-            err_tx.is_closed()
-        })
-        .and_then(|()| io::Write::flush(&mut bridge_out));
+        let result = decode_stream(&mut input, &mut bridge_out, || err_tx.is_closed())
+            .and_then(|()| io::Write::flush(&mut bridge_out));
         // Drop the write half BEFORE sending the result so the consumer sees
         // EOF on `inner` before polling `tail`. Without this, the consumer can
         // observe Pending on the oneshot while the duplex still has an open
@@ -134,36 +101,46 @@ where
 }
 
 /// The decoder's memory limit in KiB: the dictionary cap plus the fixed
-/// per-block overhead `lzma_rust2` adds on top (its 64 KiB range-decoder
-/// buffer and a few dozen KiB of state; one MiB of slack keeps a `-9` index
-/// decodable without tracking the crate's exact formula).
+/// per-block overhead `lzma_rust2` counts on top for `XzStream` (40 KiB of
+/// decoder state as of 0.25; one MiB of slack keeps a `-9` index decodable
+/// without tracking the crate's exact formula).
 fn xz_mem_limit_kb() -> u32 {
     let dict_kib = MAX_XZ_DICT_SIZE.get() / 1024 + 1024;
     u32::try_from(dict_kib).expect("64 MiB in KiB fits u32")
 }
 
-/// CPU time (user + system) the calling thread has consumed so far.
-fn thread_cpu_time() -> io::Result<Duration> {
-    let usage = getrusage(UsageWho::RUSAGE_THREAD).map_err(io::Error::from)?;
-    let micros = usage.user_time().num_microseconds() + usage.system_time().num_microseconds();
-    Ok(Duration::from_micros(u64::try_from(micros).unwrap_or(0)))
+/// Names the figures behind a memory-limit refusal, which the crate reports
+/// only as `needed memory too big for mem_limit_kb`. Any other error,
+/// including a genuine allocation failure below the limit, passes through.
+fn explain_mem_limit(err: io::Error, stream: &XzStream) -> io::Error {
+    if err.kind() != io::ErrorKind::OutOfMemory {
+        return err;
+    }
+    let limit_kib = stream.mem_limit();
+    match stream.memory_usage() {
+        Some(need_kib) if need_kib > limit_kib => io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!(
+                "xz block declares a dictionary needing {} of decoder memory, above the {} limit",
+                HumanFmt::BinarySize(u64::from(need_kib) * 1024),
+                HumanFmt::BinarySize(u64::from(limit_kib) * 1024)
+            ),
+        ),
+        Some(_) | None => err,
+    }
 }
 
 /// Pump `input` through a memory-limited [`XzStream`] into `output` until the
 /// stream ends.  A truncated stream surfaces as `UnexpectedEof`.
 ///
-/// Gives up with `TimedOut` once this thread has spent more than
-/// `cpu_budget` of CPU time since the call began, and with `BrokenPipe` as
-/// soon as `abandoned` reports that the consumer is gone (see the module
-/// doc for why both are needed).
+/// Gives up with `BrokenPipe` as soon as `abandoned` reports that the
+/// consumer is gone (see the module doc for why that needs a check).
 fn decode_stream(
     input: &mut impl io::Read,
     output: &mut impl io::Write,
-    cpu_budget: Duration,
     abandoned: impl Fn() -> bool,
 ) -> io::Result<()> {
-    // Not `XzReader`: see the module doc (its index parser allocates from the
-    // untrusted record count before the count-vs-blocks check).
+    // Not `XzReader`: see the module doc.
     let mut stream =
         XzStream::new_mem_limit(/* allow_multiple_streams = */ true, xz_mem_limit_kb());
     // Input is read in `PIPE_CAPACITY` chunks: one read per 64 KiB, not one
@@ -173,8 +150,6 @@ fn decode_stream(
     let mut in_len = 0;
     let mut in_pos = 0;
     let mut eof = false;
-    let cpu_start = thread_cpu_time()?;
-    let mut last_cpu_check = Instant::now();
 
     loop {
         if abandoned() {
@@ -183,27 +158,19 @@ fn decode_stream(
                 "xz consumer went away; abandoning the decode",
             ));
         }
-        let now = Instant::now();
-        if now.duration_since(last_cpu_check) >= CPU_CHECK_INTERVAL {
-            last_cpu_check = now;
-            if thread_cpu_time()?.saturating_sub(cpu_start) > cpu_budget {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "xz stream exceeded the decoding CPU budget of {}",
-                        HumanFmt::Time(cpu_budget)
-                    ),
-                ));
-            }
-        }
         if in_pos == in_len && !eof {
             in_len = input.read(&mut in_buf)?;
             in_pos = 0;
             eof = in_len == 0;
         }
         let action = if eof { Action::Finish } else { Action::Run };
-        let in_end = in_len.min(in_pos + PROCESS_SLICE);
-        let step = stream.process(&in_buf[in_pos..in_end], &mut out_buf, action)?;
+        // Since lzma-rust2 0.25 a memory-limit refusal is not terminal for
+        // the stream, and a call that produced output before reaching the
+        // refused block header returns that output as `Ok`: the refusal then
+        // comes from the next call, which re-reads the same header.
+        let step = stream
+            .process(&in_buf[in_pos..in_len], &mut out_buf, action)
+            .map_err(|err| explain_mem_limit(err, &stream))?;
         in_pos += step.bytes_consumed;
         output.write_all(&out_buf[..step.bytes_produced])?;
         match step.status {
@@ -261,6 +228,10 @@ impl AsyncRead for XzDecoderStream {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use super::*;
     use tokio::io::AsyncReadExt as _;
@@ -325,14 +296,36 @@ mod tests {
             .await
             .expect_err("a dictionary above the cap must be refused");
         assert_eq!(err.kind(), io::ErrorKind::OutOfMemory, "{err}");
+        assert!(
+            err.to_string()
+                .contains("needing 128MiB of decoder memory, above the 65.0MiB limit"),
+            "the refusal must name both figures: {err}"
+        );
         assert!(out.is_empty(), "nothing must be decoded");
+    }
+
+    #[tokio::test]
+    async fn oversized_dictionary_after_output_is_still_refused() {
+        // lzma-rust2 0.25 hands back the output decoded before a refused
+        // block header as `Ok` and defers the refusal to the next call; the
+        // decode must still end in the refusal, not hang or report EOF.
+        let input = [HELLO_XZ, BIG_DICT_XZ].concat();
+        let mut decoder = xz_decoder(Cursor::new(input));
+        let mut out = Vec::new();
+        let err = tokio::time::timeout(Duration::from_secs(10), decoder.read_to_end(&mut out))
+            .await
+            .expect("the deferred refusal must end the decode")
+            .expect_err("a dictionary above the cap must be refused after earlier output");
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory, "{err}");
+        assert_eq!(&out, b"hello world\n");
     }
 
     /// A stream header followed straight by an index (indicator 0x00, so
     /// zero blocks) whose record count claims 2^31 records, then nothing.
-    /// `XzReader`'s index parser reserves `count * 16` bytes (32 GiB) before
-    /// it compares the count with the blocks it saw; the decoder must reject
-    /// the mismatch from the count alone.
+    /// `XzReader`'s index parser before lzma-rust2 0.22 reserved
+    /// `count * 16` bytes (32 GiB) for it before comparing the count with the
+    /// blocks it saw; the decoder must reject the mismatch from the count
+    /// alone.
     const HOSTILE_INDEX_XZ: &[u8] = &[
         0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x01, 0x69, 0x22, 0xde, 0x36, 0x00, 0x80, 0x80,
         0x80, 0x80, 0x08,
@@ -533,51 +526,74 @@ mod tests {
         out
     }
 
-    /// Property byte of a 1 MiB LZMA2 dictionary: small enough to keep the
-    /// tests cheap, and the per-block cost scales with it either way.
+    /// Property byte of a 1 MiB LZMA2 dictionary.
     const DICT_1MIB: u8 = 0x10;
 
     #[test]
-    fn empty_blocks_decode_to_nothing_within_the_budget() {
-        // The fixture itself is a valid stream: what stops the tests below
-        // is the budget or the hang-up, never a malformed input.
+    fn empty_blocks_decode_to_nothing() {
+        // The fixture itself is a valid stream: what stops the hang-up test
+        // below is the hang-up, never a malformed input.
         let xz = empty_blocks_xz(3, DICT_1MIB);
         let mut out = Vec::new();
-        decode_stream(
-            &mut Cursor::new(&xz[..]),
-            &mut out,
-            MAX_XZ_DECODE_CPU,
-            || false,
-        )
-        .expect("three empty blocks form a valid stream");
+        decode_stream(&mut Cursor::new(&xz[..]), &mut out, || false)
+            .expect("three empty blocks form a valid stream");
         assert_eq!(out, [] as [u8; 0]);
     }
 
-    #[test]
-    fn empty_blocks_are_abandoned_at_the_cpu_budget() {
-        // 100k empty blocks, 1.8 MB of input and no output: the output caps
-        // never engage, and setting up 100k dictionaries takes far longer
-        // than the budget.
-        let xz = empty_blocks_xz(100_000, DICT_1MIB);
-        let mut input = Cursor::new(&xz[..]);
-        let mut out = Vec::new();
-        let err = decode_stream(&mut input, &mut out, Duration::from_millis(20), || false)
-            .expect_err("an output-free stream must not outlive its CPU budget");
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
-        assert_eq!(out, [] as [u8; 0]);
-        assert!(
-            input.position() < xz.len() as u64,
-            "the decode must stop early, read {} of {} bytes",
-            input.position(),
-            xz.len()
-        );
+    /// An xz stream that does not end: a stream header, then empty blocks
+    /// until `limit` bytes were served, then a read error. It decodes to
+    /// nothing and reaches no footer, so only the hang-up check ends its
+    /// decode early; the limit turns a broken check into a test failure
+    /// within seconds instead of a decode thread spinning forever.
+    struct EmptyBlocksUntil {
+        /// A stream header followed by one empty block.
+        pattern: Vec<u8>,
+        pos: usize,
+        limit: usize,
+        /// Bytes handed out so far, readable after the decode dropped this.
+        served: Arc<AtomicUsize>,
+    }
+
+    /// Length of the stream header in [`EmptyBlocksUntil::pattern`].
+    const STREAM_HEADER_LEN: usize = 12;
+
+    impl EmptyBlocksUntil {
+        fn new(limit: usize, served: Arc<AtomicUsize>) -> Self {
+            // Header, one 12-byte block header and its 4 bytes of LZMA2 end
+            // marker and padding; the index and footer are cut off.
+            let mut pattern = empty_blocks_xz(1, DICT_1MIB);
+            pattern.truncate(STREAM_HEADER_LEN + 16);
+            Self {
+                pattern,
+                pos: 0,
+                limit,
+                served,
+            }
+        }
+    }
+
+    impl io::Read for EmptyBlocksUntil {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.served.load(Ordering::Relaxed) >= self.limit {
+                return Err(io::Error::other("test input limit reached"));
+            }
+            self.served.fetch_add(buf.len(), Ordering::Relaxed);
+            for byte in buf.iter_mut() {
+                *byte = self.pattern[self.pos];
+                self.pos += 1;
+                if self.pos == self.pattern.len() {
+                    self.pos = STREAM_HEADER_LEN;
+                }
+            }
+            Ok(buf.len())
+        }
     }
 
     #[test]
     fn abandoned_decode_stops_before_reading() {
         let mut input = Cursor::new(HELLO_XZ);
         let mut out = Vec::new();
-        let err = decode_stream(&mut input, &mut out, MAX_XZ_DECODE_CPU, || true)
+        let err = decode_stream(&mut input, &mut out, || true)
             .expect_err("a decode nobody reads must stop");
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{err}");
         assert_eq!(input.position(), 0);
@@ -604,14 +620,15 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_the_decoder_stops_an_output_free_decode() {
-        // The blocking decode never writes, so before the hang-up check it
-        // only noticed a dropped reader once the whole stream (or the CPU
-        // budget) was spent.
+        // The input does not end and the blocking decode never writes, so
+        // without the hang-up check the decode runs until the input's limit.
+        const LIMIT: usize = 16 * 1024 * 1024;
+        let served = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = oneshot::channel();
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
         let input = DropSignal {
-            inner: Cursor::new(empty_blocks_xz(100_000, DICT_1MIB)),
+            inner: EmptyBlocksUntil::new(LIMIT, Arc::clone(&served)),
             _dropped: tx,
             first_read: Some((started_tx, release_rx)),
         };
@@ -622,10 +639,17 @@ mod tests {
             .expect("first read signalled");
         drop(decoder);
         release_tx.send(()).expect("blocking reader awaits release");
-        let closed = tokio::time::timeout(Duration::from_secs(10), rx).await;
+        let closed = tokio::time::timeout(Duration::from_secs(30), rx).await;
         assert!(
             matches!(closed, Ok(Err(_))),
-            "the blocking decode must let go of its input once the reader is dropped"
+            "the blocking decode must let go of its input"
+        );
+        // The hang-up is noticed at the first check after the one read the
+        // decode was blocked in.
+        let served = served.load(Ordering::Relaxed);
+        assert!(
+            served <= PIPE_CAPACITY,
+            "the decode must stop once the reader is dropped, read {served} bytes"
         );
     }
 

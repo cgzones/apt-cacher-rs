@@ -33,8 +33,8 @@ use crate::mem_usage::Footprint;
 pub(crate) enum Outcome {
     /// Every digest was registered.
     Ingested,
-    /// The file can never ingest (too large, corrupt, over the CPU budget);
-    /// not retried until a commit replaces it.
+    /// The file can never ingest (too large or corrupt); not retried until a
+    /// commit replaces it.
     Failed,
     /// Not ingested for a reason that may pass (queue full, an I/O error);
     /// the next claim runs it again.

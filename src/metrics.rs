@@ -400,8 +400,8 @@ pub(crate) static INGEST_TOUCH_TRIGGERED: Counter = Counter::new();
 /// Index ingests skipped because the line in front of the ingest permits
 /// was full; each is retried on the index's next request.
 pub(crate) static INGEST_SKIPPED_QUEUE_FULL: Signal = Signal::new();
-/// Index files whose ingest failed for good (too large, corrupt, over the
-/// CPU budget); not retried until a commit replaces the file.
+/// Index files whose ingest failed for good (too large or corrupt); not
+/// retried until a commit replaces the file.
 pub(crate) static INGEST_FAILED_MARKED: Signal = Signal::new();
 
 /// Body-write failures attributed to the client (`BrokenPipe` /

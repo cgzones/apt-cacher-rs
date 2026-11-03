@@ -78,23 +78,14 @@ pub(crate) const MAX_RELEASE_SIZE: NonZero<u64> = nonzero!(8 * 1024 * 1024);
 const MAX_DECOMPRESSION_RATIO: NonZero<u64> = nonzero!(100);
 
 /// Largest LZMA2 dictionary an `.xz` index may declare, 64 MiB (`xz -9`;
-/// Debian's archive tooling uses `-6`, 8 MiB).  The decoder allocates and
-/// zero-fills the dictionary from the block header *before* the output
-/// caps above see a single byte, so a hostile ~200-byte `Packages.xz` could
-/// otherwise commit up to 4 GiB per concurrent ingest.  Enforced through
-/// `lzma_rust2::XzStream::new_mem_limit` in `xz_stream`.
+/// Debian's archive tooling uses `-6`, 8 MiB).  The decoder's window grows
+/// with the decoded output up to the declared dictionary (lzma-rust2 0.21
+/// and earlier allocated it whole from the block header, letting a hostile
+/// ~200-byte `Packages.xz` commit up to 4 GiB), so without this cap one
+/// ingest could hold a window as large as
+/// [`MAX_DECOMPRESSED_PACKAGES_SIZE`]; with it, at most 64 MiB.  Enforced
+/// through `lzma_rust2::XzStream::new_mem_limit` in `xz_stream`.
 pub(crate) const MAX_XZ_DICT_SIZE: NonZero<u64> = nonzero!(64 * 1024 * 1024);
-
-/// CPU time one `.xz` index decode may spend before it is abandoned.  The
-/// dictionary cap bounds a block's memory, not how many blocks a stream
-/// holds: every block allocates and zero-fills its dictionary afresh, and an
-/// empty block costs 18 input bytes and yields no output, so neither the
-/// output caps nor the ratio guard ever see it (see `xz_stream`).  A
-/// 70 MiB synthetic `Packages` (larger than Debian's `main/binary-amd64`)
-/// decodes in 1.1-1.5 s of CPU on a desktop core, so 30 s leaves a factor
-/// of twenty for slow hardware, while bounding what one hostile index can
-/// cost.
-pub(crate) const MAX_XZ_DECODE_CPU: Duration = Duration::from_secs(30);
 
 /// Idle upstream connections kept per host, by the splice backend's own pool
 /// and the hyper client's alike. Each one holds a socket and its read buffer

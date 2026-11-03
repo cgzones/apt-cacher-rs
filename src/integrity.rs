@@ -1480,8 +1480,8 @@ pub(crate) async fn verify_and_rename(
 
 /// How many `Packages` ingests decode at once. A commit or a touch schedules
 /// one, and by-hash indexes are distinct resources, so an upstream serving
-/// many small hostile `.xz` files would otherwise hold one blocking-pool
-/// thread each for up to [`limits::MAX_XZ_DECODE_CPU`] and starve every
+/// many hostile indexes would otherwise hold one blocking-pool thread each
+/// for a full decode up to the size caps (seconds each) and starve every
 /// other `spawn_blocking` user (`tokio::fs`, verification). Two keep an
 /// `apt update` over several components flowing while bounding that.
 /// `Release` ingest reads a capped, uncompressed file and takes no decode
@@ -1493,9 +1493,9 @@ static PACKAGES_INGEST_PERMITS: Semaphore = Semaphore::const_new(PACKAGES_INGEST
 
 /// `Packages`/`PackagesSniff` ingests that may wait for a decode permit at
 /// once. The permits bound the CPU, not the line in front of them: without a
-/// bound, a mirror serving budget-burning indexes would queue one task per
-/// committed or touched index and push every later ingest back by one
-/// [`limits::MAX_XZ_DECODE_CPU`] turn each. Sixty-four holds the burst the
+/// bound, a mirror serving cap-sized indexes would queue one task per
+/// committed or touched index and push every later ingest back by one full
+/// decode each. Sixty-four holds the burst the
 /// first `apt update` after a restart touches (every live index at once:
 /// tens for a multi-suite, multi-arch Debian mirror).
 const INGEST_QUEUE: usize = 64;
@@ -1877,7 +1877,7 @@ fn ingest_kind(file: &IndexFile<'_>) -> Option<IngestKind> {
 /// The ledger outcome of one admitted ingest run. An error carrying an OS
 /// errno is the file system failing (or cleanup removing the file) and may
 /// pass; every other error was built by the decode pipeline itself -- a size
-/// or bomb cap, a corrupt stream, the xz CPU budget, an over-cap or non-UTF-8
+/// or bomb cap, a corrupt stream, an over-cap or non-UTF-8
 /// `Release` -- and repeats on the same bytes.
 fn ingest_outcome(result: &std::io::Result<()>) -> Outcome {
     match result {
@@ -3830,11 +3830,11 @@ mod tests {
         let gone = std::io::Error::from_raw_os_error(nix::libc::ENOENT);
         let cap = limits::check_packages_file_size(PackagesCompression::Xz, u64::MAX)
             .expect_err("over the cap");
-        let budget = std::io::Error::new(std::io::ErrorKind::TimedOut, "xz budget");
+        let corrupt = std::io::Error::new(std::io::ErrorKind::InvalidData, "corrupt xz");
         assert_eq!(ingest_outcome(&Err(os)), Outcome::Retry);
         assert_eq!(ingest_outcome(&Err(gone)), Outcome::Retry);
         assert_eq!(ingest_outcome(&Err(cap)), Outcome::Failed);
-        assert_eq!(ingest_outcome(&Err(budget)), Outcome::Failed);
+        assert_eq!(ingest_outcome(&Err(corrupt)), Outcome::Failed);
         assert_eq!(ingest_outcome(&Ok(())), Outcome::Ingested);
     }
 

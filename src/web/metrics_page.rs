@@ -967,7 +967,7 @@ fn build_integrity_group(g: &mut Groups) {
         );
         t.signal(
             "Ingests Failed (not retried)",
-            "Index files that can never ingest (too large, corrupt, over the decode CPU budget); retried only once the file is replaced. The log names the file.",
+            "Index files that can never ingest (too large or corrupt); retried only once the file is replaced. The log names the file.",
             Level::Alert,
             &metrics::INGEST_FAILED_MARKED,
         );
