@@ -662,7 +662,7 @@ impl RejectGates {
     }
 
     /// This table's gate for `reason`, for
-    /// [`log_once::warn_once_or_info_gated`](crate::log_once::warn_once_or_info_gated).
+    /// [`log_once::warn_once_or_info_gated`].
     /// The exhaustive match makes a new [`RejectReason`] variant a compile
     /// error here rather than a silently shared gate.
     #[must_use]

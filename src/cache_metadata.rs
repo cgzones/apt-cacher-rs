@@ -296,7 +296,7 @@ pub(crate) enum InvalidValidator<'a> {
 impl InvalidValidator<'_> {
     /// What the upstream sent, for the backends' warn line: rendered after
     /// the backend's own subject ("upstream mirror X"), so it starts
-    /// lowercase, and before its "for <file>; discarding it". The once-gates
+    /// lowercase, and before its "for `<file>`; discarding it". The once-gates
     /// are the backend's own ([`ValidatorGates`]).
     #[must_use]
     pub(crate) const fn detail(&self) -> InvalidValidatorDetail<'_> {
