@@ -103,7 +103,9 @@ use crate::{
         ResumeState, UpstreamHead, plan_download, plan_fresh_download, resolve_body_framing,
     },
     upstream_retry::{self, RetryStop},
-    uri_authority, warn_once_or_debug, warn_once_or_info, warn_once_or_info_logged,
+    uri_authority,
+    volatile_metrics::Revalidation,
+    warn_once_or_debug, warn_once_or_info, warn_once_or_info_logged,
     web::serve_web_interface,
 };
 #[cfg(feature = "tls_rustls")]
@@ -1924,6 +1926,24 @@ fn build_fwd_request(
     request
 }
 
+/// One upstream exchange of [`serve_new_file_worker`] (its first request, a
+/// followed redirect, the refetch after a resume anomaly), with the instant
+/// its request was sent. A failure ends the revalidation as failed.
+async fn fetch_upstream(
+    client: &HttpClient,
+    request: Request<Empty<bytes::Bytes>>,
+    revalidation: &mut Revalidation,
+) -> Result<(UpstreamExchange, PreciseInstant), DownloadFailure> {
+    let sent = PreciseInstant::now();
+    match request_with_retry(client, request, Traffic::Proxied).await {
+        Ok(exchange) => Ok((exchange, sent)),
+        Err(error) => {
+            revalidation.failed();
+            Err(error.into_failure("request upstream response"))
+        }
+    }
+}
+
 /// Runs inline in the connection future (`InitBarrier::run` no longer boxes
 /// it), which puts it within roughly 2 KiB of clippy's 16 KiB `large_futures`
 /// threshold. Hence the by-reference parameters below: growing this body, or
@@ -2056,25 +2076,21 @@ async fn serve_new_file_worker(
     );
     trace!("Forwarded request: {fwd_request:?}");
 
-    let mut revalidation = crate::volatile_metrics::Revalidation::new(
+    let mut revalidation = Revalidation::new(
         conn_details,
         revalidate.map(|meta| (meta.etag.is_some(), meta.last_modified.is_some())),
     );
-    let mut upstream_request_sent = PreciseInstant::now();
     // The timing of the exchange whose answer is used: replaced below with
     // every followed redirect and refetch, like the response.
-    let UpstreamExchange {
-        response: mut fwd_response,
-        timing: mut head_timing,
-        framing: mut body_framing,
-        ..
-    } = match request_with_retry(&appstate.https_client, fwd_request, Traffic::Proxied).await {
-        Ok(exchange) => exchange,
-        Err(error) => {
-            revalidation.failed();
-            return Err(error.into_failure("request upstream response"));
-        }
-    };
+    let (
+        UpstreamExchange {
+            response: mut fwd_response,
+            timing: mut head_timing,
+            framing: mut body_framing,
+            ..
+        },
+        mut upstream_request_sent,
+    ) = fetch_upstream(&appstate.https_client, fwd_request, &mut revalidation).await?;
 
     trace!("Forwarded response: {fwd_response:?}");
 
@@ -2105,25 +2121,20 @@ async fn serve_new_file_worker(
 
             trace!("Forwarded redirected request: {redirected_request:?}");
 
-            upstream_request_sent = PreciseInstant::now();
-            UpstreamExchange {
-                response: fwd_response,
-                timing: head_timing,
-                framing: body_framing,
-                ..
-            } = match request_with_retry(
+            (
+                UpstreamExchange {
+                    response: fwd_response,
+                    timing: head_timing,
+                    framing: body_framing,
+                    ..
+                },
+                upstream_request_sent,
+            ) = fetch_upstream(
                 &appstate.https_client,
                 redirected_request,
-                Traffic::Proxied,
+                &mut revalidation,
             )
-            .await
-            {
-                Ok(exchange) => exchange,
-                Err(error) => {
-                    revalidation.failed();
-                    return Err(error.into_failure("request upstream response"));
-                }
-            };
+            .await?;
 
             trace!("Forwarded redirected response: {fwd_response:?}");
         }
@@ -2217,25 +2228,16 @@ async fn serve_new_file_worker(
                 let retry_request =
                     build_fwd_request(Uri::clone(&req_uri), Some(&host), None, 0, None);
 
-                upstream_request_sent = PreciseInstant::now();
-                UpstreamExchange {
-                    response: fwd_response,
-                    timing: head_timing,
-                    framing: body_framing,
-                    ..
-                } = match request_with_retry(
-                    &appstate.https_client,
-                    retry_request,
-                    Traffic::Proxied,
-                )
-                .await
-                {
-                    Ok(exchange) => exchange,
-                    Err(error) => {
-                        revalidation.failed();
-                        return Err(error.into_failure("request upstream response"));
-                    }
-                };
+                (
+                    UpstreamExchange {
+                        response: fwd_response,
+                        timing: head_timing,
+                        framing: body_framing,
+                        ..
+                    },
+                    upstream_request_sent,
+                ) = fetch_upstream(&appstate.https_client, retry_request, &mut revalidation)
+                    .await?;
                 head = UpstreamHead::from_response(&fwd_response, body_framing);
             }
 
