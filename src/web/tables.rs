@@ -621,9 +621,23 @@ const MIRROR_PERF_HEADERS: [&str; 2] = [
     "<span title=\"Body bytes per second of the latest committed download of 1 MiB or more from this mirror, and the fastest since start. A lower bound while a client is attached: splice builds pace a download to its client until it is demoted, so a slow client (see the Clients table) reads here too. Warns while the latest is under twice min_download_rate: downloads from this mirror are close to being cancelled; if no client is slow, switch to a faster mirror, or lower min_download_rate.\">Throughput</span> <span class=\"scope\">since start</span>",
 ];
 
-/// One failure-count cell of the Mirrors table.
-fn health_cell(value: u64, level: Level) -> Nonzero {
-    Nonzero { value, level }
+/// The Mirrors table's failure-count cells, one per
+/// [`MIRROR_HEALTH_HEADERS`] column.
+fn health_cells(table: &mut Table, health: MirrorHealth) {
+    let MirrorHealth {
+        unreachable,
+        protocol,
+        checksum,
+        slow,
+    } = health;
+    for (value, level) in [
+        (unreachable, Level::Warn),
+        (protocol, Level::Warn),
+        (checksum, Level::Alert),
+        (slow, Level::Warn),
+    ] {
+        table.cell_keyed(Nonzero { value, level }, Some(value));
+    }
 }
 
 /// The Mirrors table's name column: what the dot and the chip in front of
@@ -764,7 +778,7 @@ pub(super) async fn build_mirror_table(
     // The per-mirror failure counts join by the `MirrorUri` rendering
     // (`mirror_registry`'s snapshot key); a failing mirror without a row of
     // its own is appended below the persisted ones.
-    let mut unmatched: Vec<(&str, &MirrorHealth)> =
+    let mut unmatched: HashMap<&str, &MirrorHealth> =
         health.iter().map(|(key, h)| (key.as_ref(), h)).collect();
     let mut key = String::new();
     for (mirror, stats) in sorted.iter().zip(&dir_stats) {
@@ -773,7 +787,7 @@ pub(super) async fn build_mirror_table(
         key.clear();
         swrite!(key, "{}", mirror.uri());
         let mirror_health = health.get(key.as_str()).copied().unwrap_or_default();
-        unmatched.retain(|(k, _)| *k != key);
+        unmatched.remove(key.as_str());
         let (verdict, aliases) = scheme_verdicts(mirror, config);
         let mirror_perf = perf.get(key.as_str()).copied();
         let suites = indexes.get(key.as_str());
@@ -782,9 +796,9 @@ pub(super) async fn build_mirror_table(
             .and_then(mirror_indexes::assess)
             .and_then(|age| age.freshest_lag);
 
+        table.start_row_marked(Freshness::of(mirror.last_seen, now_epoch).row_class());
         tr!(
-            marked Freshness::of(mirror.last_seen, now_epoch).row_class(),
-            table,
+            cells table,
             // The dot makes the cell markup, which `Table::cell` never titles,
             // so the name carries its own title for when it is cut off. The
             // name stays last in the cell.
@@ -838,10 +852,10 @@ pub(super) async fn build_mirror_table(
                 Count::len(stats.deb_files),
                 Count::len(stats.metadata_files)
             ) => Some(stats.deb_files),
-            health_cell(mirror_health.unreachable, Level::Warn) => Some(mirror_health.unreachable),
-            health_cell(mirror_health.protocol, Level::Warn) => Some(mirror_health.protocol),
-            health_cell(mirror_health.checksum, Level::Alert) => Some(mirror_health.checksum),
-            health_cell(mirror_health.slow, Level::Warn) => Some(mirror_health.slow),
+        );
+        health_cells(&mut table, mirror_health);
+        tr!(
+            cells table,
             TtfbCell {
                 perf: mirror_perf,
                 warn_above: ttfb_warn_above,
@@ -855,39 +869,31 @@ pub(super) async fn build_mirror_table(
                 enabled: config.verify_checksums,
             } => index_lag,
         );
+        table.end_row();
     }
 
     // A mirror that failed before it ever answered has no persisted row:
     // everything but its failure counts is unknown, its scheme chip
     // included (the row has only the rendered name to go by).
+    let mut unmatched: Vec<_> = unmatched.into_iter().collect();
     unmatched.sort_unstable_by_key(|(key, _)| *key);
-    for (key, mirror_health) in &unmatched {
-        tr!(
-            table,
+    for &(key, &mirror_health) in &unmatched {
+        table.start_row();
+        table.cell_keyed(
             format_args!(
                 "{}<span title=\"{key}\">{key}</span>",
-                HealthDot(**mirror_health),
+                HealthDot(mirror_health),
                 key = HtmlEscape(key)
-            ) => Some(*key),
-            "N/A",
-            "N/A",
-            "N/A",
-            "N/A",
-            "N/A",
-            "N/A",
-            "N/A",
-            "N/A",
-            "N/A",
-            "N/A",
-            health_cell(mirror_health.unreachable, Level::Warn) => Some(mirror_health.unreachable),
-            health_cell(mirror_health.protocol, Level::Warn) => Some(mirror_health.protocol),
-            health_cell(mirror_health.checksum, Level::Alert) => Some(mirror_health.checksum),
-            health_cell(mirror_health.slow, Level::Warn) => Some(mirror_health.slow),
-            // Never answered, so never measured.
-            "N/A",
-            "N/A",
-            "N/A",
+            ),
+            Some(key),
         );
+        // From Last Seen to Debs / Metadata.
+        table.na_cells(10);
+        health_cells(&mut table, mirror_health);
+        // Time to First Byte, Throughput and Newest Index: never answered,
+        // so never measured.
+        table.na_cells(3);
+        table.end_row();
     }
 
     let rows = sorted.len() + unmatched.len();
@@ -1004,6 +1010,23 @@ const CLIENT_TROUBLE_HEADERS: [&str; 5] = [
     "<span title=\"Requests and CONNECT tunnels for a mirror outside allowed_mirrors or https_tunnel_allowed_mirrors: usually a repository in this client's sources that this proxy does not serve. Add the mirror, or remove it from the client. Not highlighted: a client with such an entry is refused on every update.\">Refused (mirror)</span> <span class=\"scope\">since start</span>",
 ];
 
+/// The Clients table's trouble cells, one per [`CLIENT_TROUBLE_HEADERS`]
+/// column.
+fn trouble_cells(table: &mut Table, counts: &ClientTrouble) {
+    let warn = |value| Nonzero {
+        value,
+        level: Level::Warn,
+    };
+    tr!(
+        cells *table,
+        warn(counts.slow) => Some(counts.slow),
+        Count(counts.disconnect) => Some(counts.disconnect),
+        warn(counts.cap_refused) => Some(counts.cap_refused),
+        warn(counts.unauthorized) => Some(counts.unauthorized),
+        Count(counts.mirror_refused) => Some(counts.mirror_refused),
+    );
+}
+
 /// See [`render_origin_table`] on why the rows are borrowed. `trouble` is
 /// the heavy-hitter snapshot; a tracked client without a persisted row (one
 /// that was only ever refused, say) is appended with N/A in the persisted
@@ -1037,10 +1060,6 @@ pub(super) fn render_client_table(
         &[2, 3, 4, 5, 6, 7, 8, 9],
     );
 
-    let warn = |value| Nonzero {
-        value,
-        level: Level::Warn,
-    };
     let mut unmatched: Vec<&ClientTrouble> = trouble.iter().collect();
     for client in &sorted {
         let downloaded = as_size(client.total_downloaded);
@@ -1051,9 +1070,9 @@ pub(super) fn render_client_table(
             .copied()
             .unwrap_or_else(|| ClientTrouble::none(client.client_ip));
         unmatched.retain(|t| t.ip != client.client_ip);
+        table.start_row_marked(Freshness::of(client.last_seen, now_epoch).row_class());
         tr!(
-            marked Freshness::of(client.last_seen, now_epoch).row_class(),
-            table,
+            cells table,
             // Unkeyed: the address sorts as its text.
             client.client_ip,
             FmtLastSeenHealth {
@@ -1063,28 +1082,18 @@ pub(super) fn render_client_table(
             HumanFmt::Size(downloaded) => Some(downloaded),
             HumanFmt::Size(delivered) => Some(delivered),
             Count::db(client.request_count) => Some(as_size(client.request_count)),
-            warn(counts.slow) => Some(counts.slow),
-            Count(counts.disconnect) => Some(counts.disconnect),
-            warn(counts.cap_refused) => Some(counts.cap_refused),
-            warn(counts.unauthorized) => Some(counts.unauthorized),
-            Count(counts.mirror_refused) => Some(counts.mirror_refused),
         );
+        trouble_cells(&mut table, &counts);
+        table.end_row();
     }
     // Heaviest first, as the snapshot came.
     for counts in &unmatched {
-        tr!(
-            table,
-            counts.ip,
-            "N/A",
-            "N/A",
-            "N/A",
-            "N/A",
-            warn(counts.slow) => Some(counts.slow),
-            Count(counts.disconnect) => Some(counts.disconnect),
-            warn(counts.cap_refused) => Some(counts.cap_refused),
-            warn(counts.unauthorized) => Some(counts.unauthorized),
-            Count(counts.mirror_refused) => Some(counts.mirror_refused),
-        );
+        table.start_row();
+        tr!(cells table, counts.ip);
+        // From Last Seen to Requests.
+        table.na_cells(4);
+        trouble_cells(&mut table, counts);
+        table.end_row();
     }
 
     Section {
@@ -1359,6 +1368,51 @@ mod tests {
         for key in &keys {
             cache.remove(key);
         }
+    }
+
+    /// A tracked client without a persisted row is appended with `N/A` in
+    /// every persisted column; both rows carry the trouble cells.
+    #[test]
+    fn clients_without_a_row_fill_the_persisted_columns_with_na() {
+        let persisted: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let tracked: std::net::IpAddr = "192.0.2.2".parse().unwrap();
+        let mut trouble = ClientTrouble::none(tracked);
+        trouble.slow = 2;
+        trouble.mirror_refused = 3;
+        let section = render_client_table(
+            &[ClientStatEntry {
+                client_ip: persisted,
+                last_seen: 0,
+                total_downloaded: 1000,
+                total_delivered: 3000,
+                request_count: 4,
+            }],
+            &[trouble],
+            1_700_000_000,
+        );
+        assert_eq!(section.rows, 2);
+        let zero = "<td class=\"num\" data-sort=\"0\">0</td>";
+        assert!(
+            section.html.contains(&format!(
+                "<td>192.0.2.1</td><td>N/A</td>\
+                 <td class=\"num\" data-sort=\"1000\">1.00kB</td>\
+                 <td class=\"num\" data-sort=\"3000\">3.00kB</td>\
+                 <td class=\"num\" data-sort=\"4\">4</td>{}</tr>",
+                zero.repeat(5)
+            )),
+            "{}",
+            section.html
+        );
+        assert!(
+            section.html.contains(&format!(
+                "<tr><td>192.0.2.2</td><td>N/A</td>{}\
+                 <td class=\"num\" data-sort=\"2\"><span class=\"warn\">2</span></td>\
+                 {zero}{zero}{zero}<td class=\"num\" data-sort=\"3\">3</td></tr>",
+                "<td class=\"num\">N/A</td>".repeat(3)
+            )),
+            "{}",
+            section.html
+        );
     }
 
     #[test]

@@ -33,6 +33,8 @@ pub(super) struct Table {
     numeric: u64,
     /// The column the next [`Table::cell`] fills.
     column: usize,
+    /// How many columns the header row has, which every row fills.
+    columns: usize,
 }
 
 impl Table {
@@ -79,6 +81,7 @@ impl Table {
             scratch: String::with_capacity(128),
             numeric,
             column: 0,
+            columns: headers.len(),
         }
     }
 
@@ -127,6 +130,7 @@ impl Table {
             scratch,
             numeric,
             column,
+            columns: _,
         } = self;
         scratch.clear();
         swrite!(scratch, "{value}");
@@ -147,7 +151,15 @@ impl Table {
         swrite!(out, ">{scratch}</td>");
     }
 
+    /// `n` cells reading `N/A`: values the row has no source for.
+    pub(super) fn na_cells(&mut self, n: usize) {
+        for _ in 0..n {
+            self.cell("N/A");
+        }
+    }
+
     pub(super) fn end_row(&mut self) {
+        debug_assert_eq!(self.column, self.columns, "a row fills every column");
         self.out.push_str("</tr>");
     }
 
@@ -158,7 +170,8 @@ impl Table {
 }
 
 /// Append a row of cells, each formatted via `format_args!`. The `marked`
-/// form carries a state class on the `<tr>`. A cell written
+/// form carries a state class on the `<tr>`; the `cells` form appends the
+/// cells to a row the caller opened and closes. A cell written
 /// `value => key` carries its sort key (an `Option`, see
 /// [`Table::cell_keyed`]).
 macro_rules! tr {
@@ -168,6 +181,10 @@ macro_rules! tr {
     (@cell $t:ident, $cell:expr) => {
         $t.cell(format_args!("{}", $cell))
     };
+    (cells $table:expr, $($cell:expr $(=> $key:expr)?),* $(,)?) => {{
+        let t = &mut $table;
+        $( tr!(@cell t, $cell $(=> $key)?); )*
+    }};
     ($table:expr, $($cell:expr $(=> $key:expr)?),* $(,)?) => {{
         let t = &mut $table;
         t.start_row();
@@ -811,7 +828,7 @@ mod tests {
     #[test]
     fn cell_titles_only_long_plain_values() {
         let long = "a value well past the title threshold";
-        let mut table = Table::new("t", &["H"]);
+        let mut table = Table::new("t", &["A", "B", "C"]);
         table.start_row();
         table.cell("short");
         table.cell(long);
