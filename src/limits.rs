@@ -61,9 +61,7 @@ pub(crate) const MAX_DECOMPRESSED_PACKAGES_SIZE: NonZero<u64> = nonzero!(256 * 1
 /// `main/binary-amd64/Packages.xz`, is ~10 MiB. Without it the
 /// decompressed caps alone admitted a compressed body as large as the
 /// decompressed ceiling, which cleanup holds in memory (a memfd in hyper
-/// builds, a `Vec` in hyper-less ones) for up to ten mirrors at once, and
-/// whose xz decoder keeps a 16-byte index record per block (~0.9x the
-/// compressed size for a stream of empty blocks).
+/// builds, a `Vec` in hyper-less ones) for up to ten mirrors at once.
 pub(crate) const MAX_COMPRESSED_PACKAGES_SIZE: NonZero<u64> = nonzero!(128 * 1024 * 1024);
 
 /// Maximum size (bytes) of a `Release` / `InRelease` file ingested into the
@@ -84,7 +82,7 @@ const MAX_DECOMPRESSION_RATIO: NonZero<u64> = nonzero!(100);
 /// ~200-byte `Packages.xz` commit up to 4 GiB), so without this cap one
 /// ingest could hold a window as large as
 /// [`MAX_DECOMPRESSED_PACKAGES_SIZE`]; with it, at most 64 MiB.  Enforced
-/// through `lzma_rust2::XzStream::new_mem_limit` in `xz_stream`.
+/// through `lzma_rust2::XzReader::new_mem_limit` in `xz_stream`.
 pub(crate) const MAX_XZ_DICT_SIZE: NonZero<u64> = nonzero!(64 * 1024 * 1024);
 
 /// Idle upstream connections kept per host, by the splice backend's own pool

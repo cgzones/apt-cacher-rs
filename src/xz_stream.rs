@@ -1,43 +1,47 @@
 //! Pure-Rust XZ streaming decompressor.
 //!
-//! Drives `lzma_rust2::XzStream` (the push-style decoder) in a tokio blocking
-//! task feeding a `tokio::io::duplex` pipe, so callers can treat it as any
-//! other `AsyncRead`. The task reads its input synchronously, so the input is
-//! a blocking reader (the `Packages.xz` file as a `std::fs::File`): a
+//! Drives `lzma_rust2::XzReader` in a tokio blocking task feeding a
+//! `tokio::io::duplex` pipe, so callers can treat it as any other
+//! `AsyncRead`. The task reads its input synchronously, so the input is a
+//! blocking reader (the `Packages.xz` file as a `std::fs::File`): a
 //! `tokio::fs::File` behind a `SyncIoBridge` would run every read as a second
-//! blocking-pool task that the decode thread sits blocked on. Replaces `async_compression::tokio::bufread::XzDecoder`
-//! to remove the C `liblzma`/`liblzma-sys` dependency.
+//! blocking-pool task that the decode thread sits blocked on. Replaces
+//! `async_compression::tokio::bufread::XzDecoder` to remove the C
+//! `liblzma`/`liblzma-sys` dependency.
 //!
 //! The decoder is built through `new_mem_limit`: the LZMA2 dictionary size
 //! comes verbatim from the (untrusted) block header, and the decoder's
 //! window grows with the decoded output up to it.
 //! [`crate::limits::MAX_XZ_DICT_SIZE`] bounds it.
 //!
-//! `XzStream` rather than the `Read`-adapter `XzReader`: the push-style
-//! decoder hands control back to the decode loop after every call, which is
-//! where the loop checks whether the consumer hung up, while one
-//! `XzReader::read` decodes until it has output or the input ends. The
-//! decoder otherwise notices a hang-up only when it next *writes*, which an
-//! output-free stream (empty blocks, 18 bytes each) never does. `XzStream`
-//! also rejects an index record count that differs from the decoded block
-//! count before reading a single record, and validates each record as it
-//! arrives.
+//! One `XzReader::read` decodes until it has output or the input ends, and
+//! the decoder otherwise notices a consumer that went away only when it
+//! next *writes*, which an output-free stream (empty blocks, 18 bytes each)
+//! never does. The hang-up check therefore sits in the input
+//! ([`HangUpCheck`]), consulted on every 64 KiB refill. `XzReader` rather
+//! than the push-style `XzStream`: the latter keeps 16 bytes per block until
+//! the index (~0.9x the compressed size for a stream of empty blocks) to
+//! check each index record against its block, where `XzReader` keeps a block
+//! count and compares only the record count. A corrupt payload fails either
+//! way, on its block's own check.
 //!
 //! The callers' size caps alone bound what a stream can cost: an
 //! output-free one by the compressed cap, any other by the decompressed
 //! one. Up to lzma-rust2 0.21 every block allocated and zero-filled its
 //! declared dictionary up front, ~35 ms of CPU per empty block at the
 //! 64 MiB cap, which the decode loop answered with a CPU budget. Since 0.22
-//! the window grows with the output, a million empty blocks (18 MB of
-//! input) decode in 0.17 s of CPU (measured with 0.25), and the budget is
-//! gone.
+//! the window grows with the output: an empty block costs ~1 us of CPU
+//! (measured with 0.25), so a stream of them at
+//! [`crate::limits::MAX_COMPRESSED_PACKAGES_SIZE`] holds the thread for
+//! ~7 s, the same order as decoding
+//! [`crate::limits::MAX_DECOMPRESSED_PACKAGES_SIZE`] of real index (~5 s).
 
 use std::future::Future as _;
-use std::io;
+use std::io::{self, Read as _};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use lzma_rust2::{Action, Status, XzStream};
+use lzma_rust2::XzReader;
 use tokio::io::{AsyncRead, DuplexStream, ReadBuf};
 use tokio::sync::oneshot;
 use tokio_util::io::SyncIoBridge;
@@ -50,7 +54,7 @@ use crate::limits::MAX_XZ_DICT_SIZE;
 /// of memory.
 const PIPE_CAPACITY: usize = 64 * 1024;
 
-/// Async wrapper over a blocking [`XzStream`] decode.
+/// Async wrapper over a blocking [`XzReader`] decode.
 ///
 /// EOF on the inner pipe triggers a poll of `tail` to surface any terminal
 /// `io::Error` the decoder produced; a clean decode reports the EOF verbatim.
@@ -72,7 +76,6 @@ where
     let (err_tx, err_rx) = oneshot::channel::<io::Result<()>>();
 
     tokio::task::spawn_blocking(move || {
-        let mut input = reader;
         // Buffer up to the duplex capacity: writing straight through would
         // cross the bridge in small pieces, each a block_on round-trip
         // between the blocking thread and the runtime — the BufWriter cuts
@@ -80,7 +83,7 @@ where
         // the result send (BufWriter's Drop swallows them).
         let mut bridge_out =
             io::BufWriter::with_capacity(PIPE_CAPACITY, SyncIoBridge::new(write_half));
-        let result = decode_stream(&mut input, &mut bridge_out, || err_tx.is_closed())
+        let result = decode_stream(reader, &mut bridge_out, || err_tx.is_closed())
             .and_then(|()| io::Write::flush(&mut bridge_out));
         // Drop the write half BEFORE sending the result so the consumer sees
         // EOF on `inner` before polling `tail`. Without this, the consumer can
@@ -101,88 +104,83 @@ where
 }
 
 /// The decoder's memory limit in KiB: the dictionary cap plus the fixed
-/// per-block overhead `lzma_rust2` counts on top for `XzStream` (40 KiB of
-/// decoder state as of 0.25; one MiB of slack keeps a `-9` index decodable
-/// without tracking the crate's exact formula).
+/// per-block overhead `lzma_rust2` counts on top for `XzReader` (its 64 KiB
+/// input buffer and 40 KiB of decoder state as of 0.25; one MiB of slack
+/// keeps a `-9` index decodable without tracking the crate's exact
+/// formula).
 fn xz_mem_limit_kb() -> u32 {
     let dict_kib = MAX_XZ_DICT_SIZE.get() / 1024 + 1024;
     u32::try_from(dict_kib).expect("64 MiB in KiB fits u32")
 }
 
-/// Names the figures behind a memory-limit refusal, which the crate reports
-/// only as `needed memory too big for mem_limit_kb`. Any other error,
-/// including a genuine allocation failure below the limit, passes through.
-fn explain_mem_limit(err: io::Error, stream: &XzStream) -> io::Error {
+/// Adds the limit to an out-of-memory error, which the crate words as
+/// `needed memory too big for mem_limit_kb` for a refused dictionary and
+/// without figures: `XzReader` does not say what the block needed. Any
+/// other error passes through.
+fn name_mem_limit(err: io::Error) -> io::Error {
     if err.kind() != io::ErrorKind::OutOfMemory {
         return err;
     }
-    let limit_kib = stream.mem_limit();
-    match stream.memory_usage() {
-        Some(need_kib) if need_kib > limit_kib => io::Error::new(
-            io::ErrorKind::OutOfMemory,
-            format!(
-                "xz block declares a dictionary needing {} of decoder memory, above the {} limit",
-                HumanFmt::BinarySize(u64::from(need_kib) * 1024),
-                HumanFmt::BinarySize(u64::from(limit_kib) * 1024)
-            ),
+    io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        format!(
+            "xz decode out of memory under the {} decoder limit: {err}",
+            HumanFmt::BinarySize(u64::from(xz_mem_limit_kb()) * 1024)
         ),
-        Some(_) | None => err,
-    }
+    )
 }
 
-/// Pump `input` through a memory-limited [`XzStream`] into `output` until the
-/// stream ends.  A truncated stream surfaces as `UnexpectedEof`.
-///
-/// Gives up with `BrokenPipe` as soon as `abandoned` reports that the
-/// consumer is gone (see the module doc for why that needs a check).
-fn decode_stream(
-    input: &mut impl io::Read,
-    output: &mut impl io::Write,
-    abandoned: impl Fn() -> bool,
-) -> io::Result<()> {
-    // Not `XzReader`: see the module doc.
-    let mut stream =
-        XzStream::new_mem_limit(/* allow_multiple_streams = */ true, xz_mem_limit_kb());
-    // Input is read in `PIPE_CAPACITY` chunks: one read per 64 KiB, not one
-    // per header field.
-    let mut in_buf = vec![0u8; PIPE_CAPACITY];
-    let mut out_buf = vec![0u8; PIPE_CAPACITY];
-    let mut in_len = 0;
-    let mut in_pos = 0;
-    let mut eof = false;
+/// The decode's input: fails every read with `BrokenPipe` once `abandoned`
+/// reports that the consumer is gone (see the module doc for why the check
+/// sits here).
+struct HangUpCheck<R, F> {
+    inner: R,
+    abandoned: F,
+}
 
-    loop {
-        if abandoned() {
+impl<R: io::Read, F: Fn() -> bool> io::Read for HangUpCheck<R, F> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if (self.abandoned)() {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "xz consumer went away; abandoning the decode",
             ));
         }
-        if in_pos == in_len && !eof {
-            in_len = input.read(&mut in_buf)?;
-            in_pos = 0;
-            eof = in_len == 0;
+        self.inner.read(buf)
+    }
+}
+
+/// Pump `input` through a memory-limited [`XzReader`] into `output` until the
+/// stream ends.  A truncated stream surfaces as `UnexpectedEof`.
+///
+/// Gives up with `BrokenPipe` at the first input refill after `abandoned`
+/// reports that the consumer is gone.
+fn decode_stream(
+    input: impl io::Read,
+    output: &mut impl io::Write,
+    abandoned: impl Fn() -> bool,
+) -> io::Result<()> {
+    // Buffered: `XzReader` parses headers, padding and the index a byte at a
+    // time. Each refill reads up to 64 KiB and passes the hang-up check.
+    let input = io::BufReader::with_capacity(
+        PIPE_CAPACITY,
+        HangUpCheck {
+            inner: input,
+            abandoned,
+        },
+    );
+    let mut reader = XzReader::new_mem_limit(
+        input,
+        /* allow_multiple_streams = */ true,
+        xz_mem_limit_kb(),
+    );
+    let mut out_buf = vec![0u8; PIPE_CAPACITY];
+    loop {
+        let len = reader.read(&mut out_buf).map_err(name_mem_limit)?;
+        if len == 0 {
+            return Ok(());
         }
-        let action = if eof { Action::Finish } else { Action::Run };
-        // Since lzma-rust2 0.25 a memory-limit refusal is not terminal for
-        // the stream, and a call that produced output before reaching the
-        // refused block header returns that output as `Ok`: the refusal then
-        // comes from the next call, which re-reads the same header.
-        let step = stream
-            .process(&in_buf[in_pos..in_len], &mut out_buf, action)
-            .map_err(|err| explain_mem_limit(err, &stream))?;
-        in_pos += step.bytes_consumed;
-        output.write_all(&out_buf[..step.bytes_produced])?;
-        match step.status {
-            Status::StreamEnd => return Ok(()),
-            Status::Ok => {}
-        }
-        if eof && step.bytes_consumed == 0 && step.bytes_produced == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "xz stream ended without a stream footer",
-            ));
-        }
+        output.write_all(&out_buf[..len])?;
     }
 }
 
@@ -297,24 +295,23 @@ mod tests {
             .expect_err("a dictionary above the cap must be refused");
         assert_eq!(err.kind(), io::ErrorKind::OutOfMemory, "{err}");
         assert!(
-            err.to_string()
-                .contains("needing 128MiB of decoder memory, above the 65.0MiB limit"),
-            "the refusal must name both figures: {err}"
+            err.to_string().contains("under the 65.0MiB decoder limit"),
+            "the refusal must name the limit: {err}"
         );
         assert!(out.is_empty(), "nothing must be decoded");
     }
 
     #[tokio::test]
     async fn oversized_dictionary_after_output_is_still_refused() {
-        // lzma-rust2 0.25 hands back the output decoded before a refused
-        // block header as `Ok` and defers the refusal to the next call; the
-        // decode must still end in the refusal, not hang or report EOF.
+        // The output decoded before the refused block header reaches the
+        // consumer, and the decode still ends in the refusal, not in a hang
+        // or a clean EOF.
         let input = [HELLO_XZ, BIG_DICT_XZ].concat();
         let mut decoder = xz_decoder(Cursor::new(input));
         let mut out = Vec::new();
         let err = tokio::time::timeout(Duration::from_secs(10), decoder.read_to_end(&mut out))
             .await
-            .expect("the deferred refusal must end the decode")
+            .expect("the refusal must end the decode")
             .expect_err("a dictionary above the cap must be refused after earlier output");
         assert_eq!(err.kind(), io::ErrorKind::OutOfMemory, "{err}");
         assert_eq!(&out, b"hello world\n");
@@ -324,25 +321,24 @@ mod tests {
     /// zero blocks) whose record count claims 2^31 records, then nothing.
     /// `XzReader`'s index parser before lzma-rust2 0.22 reserved
     /// `count * 16` bytes (32 GiB) for it before comparing the count with the
-    /// blocks it saw; the decoder must reject the mismatch from the count
-    /// alone.
+    /// blocks it saw; it must now read records off the input without
+    /// reserving anything.
     const HOSTILE_INDEX_XZ: &[u8] = &[
         0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x01, 0x69, 0x22, 0xde, 0x36, 0x00, 0x80, 0x80,
         0x80, 0x80, 0x08,
     ];
 
     #[tokio::test]
-    async fn hostile_index_record_count_is_refused_before_allocation() {
+    async fn hostile_index_record_count_allocates_nothing() {
         let mut decoder = xz_decoder(Cursor::new(HOSTILE_INDEX_XZ));
         let mut out = Vec::new();
         let err = decoder
             .read_to_end(&mut out)
             .await
             .expect_err("an index claiming records for absent blocks must be refused");
-        // `InvalidData` from the count check, not `OutOfMemory` (a failed
-        // reservation) or `UnexpectedEof` (a granted one, then reading the
-        // records off the end of the input).
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        // `UnexpectedEof` from reading the records off the end of the input,
+        // not `OutOfMemory` from a reservation sized by the count.
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
         assert!(out.is_empty(), "nothing must be decoded");
     }
 
