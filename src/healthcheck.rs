@@ -246,8 +246,10 @@ pub(crate) struct HealthReport {
 }
 
 impl HealthReport {
-    #[must_use]
-    pub(crate) fn healthy(&self) -> bool {
+    /// Every check with its JSON key, in output order. Destructures `Self`,
+    /// so a new check is a compile error here rather than a field silently
+    /// missing from the verdict or the endpoint's output.
+    const fn checks(&self) -> [(&'static str, &CheckResult); 5] {
         let Self {
             database,
             cache_write,
@@ -255,20 +257,22 @@ impl HealthReport {
             disk_free,
             inodes_free,
         } = self;
-        database.ok() && cache_write.ok() && quota.ok() && disk_free.ok() && inodes_free.ok()
+        [
+            ("database", database),
+            ("cache_write", cache_write),
+            ("quota", quota),
+            ("disk_free", disk_free),
+            ("inodes_free", inodes_free),
+        ]
     }
 
-    /// Destructures `Self`, so a new check is a compile error here rather
-    /// than a field silently missing from the endpoint's output.
+    #[must_use]
+    pub(crate) fn healthy(&self) -> bool {
+        self.checks().iter().all(|(_name, check)| check.ok())
+    }
+
     #[must_use]
     pub(crate) fn to_json(&self) -> String {
-        let Self {
-            database,
-            cache_write,
-            quota,
-            disk_free,
-            inodes_free,
-        } = self;
         let mut out = String::with_capacity(128);
         out.push_str("{\"status\":\"");
         out.push_str(if self.healthy() {
@@ -276,16 +280,16 @@ impl HealthReport {
         } else {
             "unhealthy"
         });
-        out.push_str("\",\"checks\":{\"database\":");
-        database.write_json(&mut out);
-        out.push_str(",\"cache_write\":");
-        cache_write.write_json(&mut out);
-        out.push_str(",\"quota\":");
-        quota.write_json(&mut out);
-        out.push_str(",\"disk_free\":");
-        disk_free.write_json(&mut out);
-        out.push_str(",\"inodes_free\":");
-        inodes_free.write_json(&mut out);
+        out.push_str("\",\"checks\":{");
+        for (i, (name, check)) in self.checks().into_iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push('"');
+            out.push_str(name);
+            out.push_str("\":");
+            check.write_json(&mut out);
+        }
         out.push_str("}}");
         out
     }
@@ -422,20 +426,12 @@ pub(crate) async fn probe_filesystem_space(
     }
 }
 
-/// One statvfs feeding both filesystem checks, bounded by [`CHECK_TIMEOUT`]
-/// like the other probes. Returns `(disk_free, inodes_free)`. The probe runs
-/// even without a configured `min_disk_free`, because inode exhaustion is
-/// invisible to that setting.
+/// One statvfs feeding both filesystem checks, through `slot` (the daemon's
+/// is [`STATVFS_PROBE`]; a test owns its own) with deadline `limit`
+/// ([`CHECK_TIMEOUT`] like the other probes). Returns
+/// `(disk_free, inodes_free)`. The probe runs even without a configured
+/// `min_disk_free`, because inode exhaustion is invisible to that setting.
 async fn probe_filesystem(
-    cache_dir: &Path,
-    min_free: Option<NonZero<u64>>,
-) -> (CheckResult, CheckResult) {
-    probe_filesystem_in(&STATVFS_PROBE, CHECK_TIMEOUT, cache_dir, min_free).await
-}
-
-/// [`probe_filesystem`] through `slot` with deadline `limit`, so a test can
-/// own both.
-async fn probe_filesystem_in(
     slot: &'static ProbeSlot,
     limit: Duration,
     cache_dir: &Path,
@@ -464,14 +460,9 @@ async fn probe_filesystem_in(
 }
 
 /// Cache-directory writability: create, write, and unlink a small probe
-/// file at the cache root, as one blocking job through [`WRITE_PROBE`].
-async fn check_cache_write(cache_dir: &Path) -> CheckResult {
-    check_cache_write_in(&WRITE_PROBE, CHECK_TIMEOUT, cache_dir).await
-}
-
-/// [`check_cache_write`] through `slot` with deadline `limit`, so a test can
-/// own both.
-async fn check_cache_write_in(
+/// file at the cache root, as one blocking job through `slot` (the daemon's
+/// is [`WRITE_PROBE`]; a test owns its own) with deadline `limit`.
+async fn check_cache_write(
     slot: &'static ProbeSlot,
     limit: Duration,
     cache_dir: &Path,
@@ -560,8 +551,8 @@ async fn run_healthcheck(
 ) -> HealthReport {
     let (database, cache_write, (disk_free, inodes_free)) = tokio::join!(
         check_database(),
-        check_cache_write(cache_dir),
-        probe_filesystem(cache_dir, min_disk_free)
+        check_cache_write(&WRITE_PROBE, CHECK_TIMEOUT, cache_dir),
+        probe_filesystem(&STATVFS_PROBE, CHECK_TIMEOUT, cache_dir, min_disk_free)
     );
     let quota = check_quota(quota.current_size(), quota.quota_limit());
     HealthReport {
@@ -737,7 +728,7 @@ mod tests {
         dir: &Path,
         min_free: Option<NonZero<u64>>,
     ) -> (CheckResult, CheckResult) {
-        probe_filesystem_in(slot, CHECK_TIMEOUT, dir, min_free).await
+        probe_filesystem(slot, CHECK_TIMEOUT, dir, min_free).await
     }
 
     #[tokio::test]
@@ -799,7 +790,7 @@ mod tests {
     /// [`check_cache_write`] through a slot of the test's own (see
     /// [`probe_fs`]).
     async fn write_probe(slot: &'static ProbeSlot, dir: &Path) -> CheckResult {
-        check_cache_write_in(slot, CHECK_TIMEOUT, dir).await
+        check_cache_write(slot, CHECK_TIMEOUT, dir).await
     }
 
     #[tokio::test]
