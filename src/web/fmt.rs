@@ -54,16 +54,20 @@ impl Utc {
         f: &mut Formatter<'_>,
         write: impl FnOnce(&mut Formatter<'_>, &str, &str) -> fmt::Result,
     ) -> fmt::Result {
-        let mut buf = Vec::<u8>::with_capacity(48);
-        if self.0.format_into(&mut buf, WEBUI_ISO_FORMAT).is_err() {
+        // Both formats are fixed-width, 40 bytes together (42 with the sign
+        // of a negative year): a stack buffer spares every rendered time a
+        // heap allocation. One that did not fit would fail the format,
+        // rendered as an invalid time.
+        let mut buf = [0_u8; 64];
+        let mut out = buf.as_mut_slice();
+        let Ok(iso_len) = self.0.format_into(&mut out, WEBUI_ISO_FORMAT) else {
             return f.write_str("<time>invalid time</time>");
-        }
-        let iso_len = buf.len();
-        if self.0.format_into(&mut buf, WEBUI_DATE_FORMAT).is_err() {
+        };
+        let Ok(display_len) = self.0.format_into(&mut out, WEBUI_DATE_FORMAT) else {
             return f.write_str("<time>invalid time</time>");
-        }
+        };
         // Both formatters emit ASCII only, so the buffer is valid UTF-8.
-        let Ok(s) = std::str::from_utf8(&buf) else {
+        let Some(Ok(s)) = buf.get(..iso_len + display_len).map(std::str::from_utf8) else {
             return f.write_str("<time>invalid time</time>");
         };
         let (iso, display) = s.split_at(iso_len);
@@ -1418,6 +1422,9 @@ mod tests {
     #[test]
     fn a_plain_utc_time_is_markup_free() {
         assert_eq!(render(UtcText(NOW)), "14 Nov 2023 22:13:20 UTC");
+        // The widest rendering fits the stack buffer.
+        let earliest = time::Date::MIN.midnight().assume_utc().unix_timestamp();
+        assert_eq!(render(UtcText(earliest)), "01 Jan -9999 00:00:00 UTC");
     }
 
     #[test]
