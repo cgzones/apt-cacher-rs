@@ -1218,8 +1218,6 @@ async fn try_sendfile_request(
             }
         };
 
-    let aliased = conn_details.alias_suffix();
-
     // sendfile from the growing partial file.  `attach()` atomically records
     // the late joiner under the same write lock as the lookup; should the
     // response turn out unframeable here (no Content-Length), the attached
@@ -1237,7 +1235,6 @@ async fn try_sendfile_request(
         return serve_unfinished_sendfile(
             stream,
             conn_details,
-            &aliased,
             dl_status,
             *conn_version,
             conn_action,
@@ -1313,7 +1310,6 @@ async fn try_sendfile_request(
             return serve_file_via_sendfile(
                 stream,
                 &conn_details,
-                &aliased,
                 (file, mdata, &cache_path),
                 (*conn_version, conn_action),
                 RangeRequestHeaders::extract(req.headers),
@@ -1365,7 +1361,6 @@ async fn try_sendfile_request(
                 serve_unfinished_sendfile(
                     stream,
                     conn_details,
-                    &aliased,
                     dl_status,
                     *conn_version,
                     conn_action,
@@ -1389,7 +1384,9 @@ async fn try_sendfile_request(
                 "splice proxy",
                 format_args!(
                     "{} from mirror {}{}",
-                    conn_details.debname, conn_details.mirror, aliased
+                    conn_details.debname,
+                    conn_details.mirror,
+                    conn_details.alias_suffix()
                 ),
             ),
         }
@@ -1480,7 +1477,6 @@ pub(crate) enum SendfileResult {
 pub(crate) async fn serve_file_via_sendfile(
     stream: &TcpStream,
     conn_details: &ConnectionDetails,
-    aliased: &str,
     source: (tokio::fs::File, Option<std::fs::Metadata>, &Path),
     conn_settings: (ConnectionVersion, ConnectionAction),
     headers: RangeRequestHeaders<'_>,
@@ -1515,7 +1511,6 @@ pub(crate) async fn serve_file_via_sendfile(
     serve_planned(
         stream,
         conn_details,
-        aliased,
         conn_settings,
         headers,
         &cache_info,
@@ -1553,7 +1548,6 @@ struct ServeSource<'a> {
 async fn serve_planned(
     stream: &TcpStream,
     conn_details: &ConnectionDetails,
-    aliased: &str,
     (conn_version, conn_action): (ConnectionVersion, ConnectionAction),
     headers: RangeRequestHeaders<'_>,
     cache_info: &CacheInfo,
@@ -1566,6 +1560,7 @@ async fn serve_planned(
         progress,
     } = source;
     let client = conn_details.client;
+    let aliased = conn_details.alias_suffix();
     let role = if progress.is_some() {
         Role::LateJoiner
     } else {
@@ -2492,7 +2487,6 @@ async fn sendfile_unfinished_transfer(
 async fn serve_unfinished_sendfile(
     stream: &TcpStream,
     conn_details: ConnectionDetails,
-    aliased: &str,
     dl_status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     conn_version: ConnectionVersion,
     conn_action: ConnectionAction,
@@ -2514,7 +2508,6 @@ async fn serve_unfinished_sendfile(
                 return serve_file_via_sendfile(
                     stream,
                     &conn_details,
-                    aliased,
                     (file, None, &path),
                     (conn_version, conn_action),
                     headers,
@@ -2563,9 +2556,10 @@ async fn serve_unfinished_sendfile(
     // We need an exact content length to write a Content-Length header.
     let ContentLength::Exact(exact_size) = total_size else {
         warn_once_or_debug!(
-            "Unknown content length for in-progress download of {} from mirror {}{aliased}; not serving the joining client via sendfile",
+            "Unknown content length for in-progress download of {} from mirror {}{}; not serving the joining client via sendfile",
             conn_details.debname,
             conn_details.mirror,
+            conn_details.alias_suffix(),
         );
         return ZeroCopyResult::NotApplicable {
             reason: "unknown content length for in-progress download",
@@ -2599,7 +2593,6 @@ async fn serve_unfinished_sendfile(
     serve_planned(
         stream,
         &conn_details,
-        aliased,
         (conn_version, conn_action),
         headers,
         &cache_info,

@@ -226,7 +226,6 @@ async fn serve_volatile_304_via_sendfile(
     match serve_file_via_sendfile(
         client.stream,
         conn_details,
-        "",
         (file, Some(metadata), &path),
         (client.version, client.action),
         client_range,

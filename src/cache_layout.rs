@@ -634,15 +634,12 @@ impl ConnectionDetails {
         }
     }
 
-    /// Log suffix naming the alias the client used, empty when the request
-    /// named the canonical host itself.
+    /// Log suffix naming the alias the client used (` via alias host X`),
+    /// empty when the request named the canonical host itself. Rendered
+    /// only when the line is formatted, so it costs nothing to pass along.
     #[must_use]
-    pub(crate) fn alias_suffix(&self) -> String {
-        if &self.upstream_host == self.mirror.host() {
-            String::new()
-        } else {
-            format!(" via alias host {}", self.upstream_host)
-        }
+    pub(crate) const fn alias_suffix(&self) -> AliasSuffix<'_> {
+        AliasSuffix(self)
     }
 
     /// The absolute cached file path for this request, in one pre-sized
@@ -650,6 +647,21 @@ impl ConnectionDetails {
     #[must_use]
     pub(crate) fn cache_file_path(&self) -> PathBuf {
         CachePaths::global().entry_file(self.layout(), self.site(), Path::new(&self.debname))
+    }
+}
+
+/// [`ConnectionDetails::alias_suffix`]'s renderer.
+#[derive(Clone, Copy)]
+pub(crate) struct AliasSuffix<'a>(&'a ConnectionDetails);
+
+impl std::fmt::Display for AliasSuffix<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self(conn_details) = self;
+        if &conn_details.upstream_host == conn_details.mirror.host() {
+            Ok(())
+        } else {
+            write!(f, " via alias host {}", conn_details.upstream_host)
+        }
     }
 }
 
@@ -1980,5 +1992,18 @@ mod tests {
         assert!(ValidateKind::Distribution.accepts("bookworm-security"));
         assert!(ValidateKind::Architecture.accepts("binary-amd64"));
         assert!(ValidateKind::Component.accepts("non-free-firmware"));
+    }
+
+    /// The alias suffix names the host the client used only when it is not
+    /// the canonical mirror host.
+    #[test]
+    fn alias_suffix_names_only_an_alias_host() {
+        let mut details = crate::test_support::connection_details("foo_1.0_amd64.deb");
+        assert_eq!(details.alias_suffix().to_string(), "");
+        details.upstream_host = ClientHost::new("alias.test").unwrap();
+        assert_eq!(
+            details.alias_suffix().to_string(),
+            " via alias host alias.test"
+        );
     }
 }
