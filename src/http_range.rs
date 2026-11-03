@@ -1,9 +1,8 @@
+use std::cell::Cell;
 use std::cmp::min;
 use std::num::NonZero;
-use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, SystemTimeError};
 
-use parking_lot::RwLock;
 use time::format_description::FormatItem;
 use time::format_description::well_known::Rfc2822;
 use time::macros::format_description;
@@ -15,6 +14,41 @@ use crate::{swrite, warn_once_or_info};
 const HTTP_DATE_FORMAT: &[FormatItem<'_>] = format_description!(
     "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
 );
+
+/// Length of every IMF-fixdate [`HttpDate`] renders: each field is
+/// zero-padded and the clamp to [`HttpDate::MAX_SECS`] keeps the year at four
+/// digits (`Sun, 06 Nov 1994 08:49:37 GMT`).
+const IMF_FIXDATE_LEN: usize = 29;
+
+/// An IMF-fixdate held inline, as [`format_http_date`] returns it.
+///
+/// `Copy` and heap-free, so each response takes its own copy of the `Date`
+/// text rather than sharing one allocation (and its refcount) across
+/// threads.  Dereferences to `str`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HttpDateText([u8; IMF_FIXDATE_LEN]);
+
+impl HttpDateText {
+    #[must_use]
+    pub(crate) fn as_str(&self) -> &str {
+        let Self(bytes) = self;
+        std::str::from_utf8(bytes).expect("an IMF-fixdate is ASCII")
+    }
+}
+
+impl std::ops::Deref for HttpDateText {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for HttpDateText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// A wall-clock point in time at HTTP-date (1-second) granularity.
 ///
@@ -66,11 +100,26 @@ impl HttpDate {
     /// Format as an IMF-fixdate string (e.g. `Sun, 06 Nov 1994 08:49:37 GMT`).
     #[must_use]
     pub(crate) fn format(self) -> String {
+        self.format_inline().as_str().to_owned()
+    }
+
+    /// [`Self::format`] into an inline buffer, without allocating.
+    #[must_use]
+    fn format_inline(self) -> HttpDateText {
         let secs_i64 = i64::try_from(self.0).expect("HttpDate is clamped to MAX_SECS");
         let odt = OffsetDateTime::from_unix_timestamp(secs_i64)
             .expect("MAX_SECS is the last instant OffsetDateTime represents");
         debug_assert_eq!(odt.offset(), offset!(UTC), "offset should be UTC");
-        odt.format(HTTP_DATE_FORMAT).expect("date should be valid")
+        let mut buf = [0u8; IMF_FIXDATE_LEN];
+        let written = odt
+            .format_into(&mut buf.as_mut_slice(), HTTP_DATE_FORMAT)
+            .expect("an IMF-fixdate fits its fixed length");
+        // A shorter rendering would leave NUL bytes in the header.
+        assert_eq!(
+            written, IMF_FIXDATE_LEN,
+            "an IMF-fixdate fills its fixed length"
+        );
+        HttpDateText(buf)
     }
 
     /// Parse an RFC 2822 / IMF-fixdate string. Returns `None` for malformed input
@@ -117,36 +166,26 @@ impl From<SystemTime> for HttpDate {
 
 /// Format the current date and time as an HTTP date string.
 ///
-/// Cached at 1-second granularity.  Every response writer calls this once
-/// per response for the `Date` header, so the steady state is a shared
-/// read lock plus an `Arc` refcount bump — no allocation and no exclusive
-/// lock; only the once-per-second rollover takes the write lock and
-/// formats.
+/// Every response writer calls this once per response for the `Date`
+/// header, so the rendering is cached per thread at 1-second granularity:
+/// the steady state touches no shared memory, no lock and no refcount, and
+/// returns the text by value.  Each thread formats once per second it
+/// serves in.
 #[must_use]
-pub(crate) fn format_http_date() -> Arc<str> {
-    static CACHE: LazyLock<RwLock<(HttpDate, Arc<str>)>> = LazyLock::new(|| {
-        let now = HttpDate::now();
-        RwLock::new((now, now.format().into()))
-    });
+pub(crate) fn format_http_date() -> HttpDateText {
+    thread_local! {
+        static CACHE: Cell<Option<(HttpDate, HttpDateText)>> = const { Cell::new(None) };
+    }
 
     let now = HttpDate::now();
-
-    {
-        let cached = CACHE.read();
-        if cached.0 == now {
-            return Arc::clone(&cached.1);
+    CACHE.with(|cache| match cache.get() {
+        Some((at, text)) if at == now => text,
+        Some(_) | None => {
+            let text = now.format_inline();
+            cache.set(Some((now, text)));
+            text
         }
-    }
-
-    let formatted: Arc<str> = now.format().into();
-
-    let mut cached = CACHE.write();
-    if cached.0 != now {
-        cached.0 = now;
-        cached.1 = Arc::clone(&formatted);
-    }
-
-    formatted
+    })
 }
 
 /// Maximum value for the HTTP `Age` header, per RFC 9111 §5.1: a cache
@@ -429,8 +468,8 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::http_range::{
-        ContentRange, HttpDate, ParsedRange, http_parse_range, if_range_matches,
-        parse_content_range,
+        ContentRange, HttpDate, IMF_FIXDATE_LEN, ParsedRange, format_http_date, http_parse_range,
+        if_range_matches, parse_content_range,
     };
 
     /// Helper to unwrap a `ParsedRange::Satisfiable` for concise test assertions.
@@ -476,6 +515,24 @@ mod tests {
             HttpDate::from(UNIX_EPOCH + Duration::from_nanos(999_999_999)).format(),
             "Thu, 01 Jan 1970 00:00:01 GMT"
         );
+    }
+
+    #[test]
+    fn format_http_date_renders_the_current_second() {
+        let before = HttpDate::now();
+        let first = format_http_date();
+        let second = format_http_date();
+        let after = HttpDate::now();
+        assert_eq!(first.len(), IMF_FIXDATE_LEN);
+        let parsed = HttpDate::parse(&first).expect("an IMF-fixdate parses");
+        assert!(
+            before <= parsed && parsed <= after,
+            "the Date text names the current second"
+        );
+        // A second call within the same second is served from the cache; one
+        // across a rollover must name a later second, never an earlier one.
+        let reparsed = HttpDate::parse(&second).expect("an IMF-fixdate parses");
+        assert!(parsed <= reparsed && reparsed <= after);
     }
 
     #[test]
