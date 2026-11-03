@@ -378,12 +378,6 @@ mod tests {
         use super::{SpanTable, sweep_candidates};
         use crate::cleanup::engine::SpanClass;
 
-        // `invalidate_metadata_for` reaches `cache_metadata::store()`, which
-        // panics unless initialised. Idempotent across the test binary.
-        if crate::cache_metadata::init().is_err() {
-            // Already installed by an earlier test in this process.
-        }
-
         let dir = tempfile::tempdir().expect("tempdir");
         let deb = dir.path().join("pkg_1.0_amd64.deb");
         let covered = dir.path().join("covered");
@@ -477,12 +471,6 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_aged_metadata_removes_old_keeps_young_and_skips_subdirs() {
-        // `invalidate_metadata_for` reaches `cache_metadata::store()`, which
-        // panics unless initialised. Idempotent across the test binary.
-        if crate::cache_metadata::init().is_err() {
-            // Already installed by an earlier test in this process.
-        }
-
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("sid_Release"), b"r").expect("write release");
         std::fs::write(dir.path().join("sid_main_binary-amd64_Packages.xz"), b"p")
@@ -542,10 +530,6 @@ mod tests {
         // volatile indexes with `.deb` files. With `skip_debs`, an aged `.deb`
         // must be left to the reference-based flat-deb cleanup while the aged
         // index metadata is still reclaimed.
-        if crate::cache_metadata::init().is_err() {
-            // Already installed by an earlier test in this process.
-        }
-
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("Release"), b"r").expect("write release");
         std::fs::write(dir.path().join("Packages"), b"p").expect("write packages");

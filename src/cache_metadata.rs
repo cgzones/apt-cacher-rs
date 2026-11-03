@@ -75,7 +75,10 @@
 //! `(None, Some(...))`, and vice versa) but does not insert; the next
 //! reader retries both syscalls.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{Arc, LazyLock},
+};
 
 use hashbrown::{Equivalent, HashMap, HashSet};
 
@@ -621,35 +624,15 @@ impl CacheMetadataStore {
     }
 }
 
-mod store {
-    //! Global handle to the singleton [`CacheMetadataStore`].  The pattern
-    //! mirrors `database_task::DB_TASK_QUEUE_SENDER`: initialised once at
-    //! startup, accessed via a typed getter that panics if uninitialised
-    //! (which would be a logic bug — startup is required to call `init`).
+/// The singleton store, built empty on first use: it takes no runtime
+/// configuration, so there is no startup step to order or forget.
+static STORE: LazyLock<CacheMetadataStore> = LazyLock::new(CacheMetadataStore::new);
 
-    use std::sync::OnceLock;
-
-    use super::CacheMetadataStore;
-
-    static STORE: OnceLock<CacheMetadataStore> = OnceLock::new();
-
-    /// Install the singleton store.  Returns `Err` (with the rejected
-    /// new instance) if `init` was already called; mirrors
-    /// `OnceLock::set` so callers can `.expect("...")` at startup like
-    /// `database_task::DB_TASK_QUEUE_SENDER` does.
-    pub(crate) fn init() -> Result<(), CacheMetadataStore> {
-        STORE.set(CacheMetadataStore::new())
-    }
-
-    #[must_use]
-    pub(crate) fn store() -> &'static CacheMetadataStore {
-        STORE.get().expect(
-            "cache_metadata::store called before init; main() must invoke cache_metadata::init",
-        )
-    }
+/// Global handle to the singleton [`CacheMetadataStore`].
+#[must_use]
+pub(crate) fn store() -> &'static CacheMetadataStore {
+    &STORE
 }
-
-pub(crate) use store::{init, store};
 
 #[cfg(test)]
 mod tests {

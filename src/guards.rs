@@ -1285,9 +1285,6 @@ mod tests {
             std::fs::write(&source, b"verified body").unwrap();
             let active = ActiveDownloads::new();
             let key = key("queued-rename.deb");
-            match cache_metadata::init() {
-                Ok(()) | Err(_) => {}
-            }
             let old_metadata = Arc::new(UpstreamMetadata::from_upstream(
                 Some("\"previous-version\""),
                 None,
@@ -1603,11 +1600,6 @@ mod tests {
     /// `If-None-Match` on that file would miss and re-send the whole body.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn dropping_a_rename_barrier_keeps_the_cached_validators() {
-        // The store is a process-global installed by `main`; install it here
-        // and tolerate another test in the same process having won the race.
-        match cache_metadata::init() {
-            Ok(()) | Err(_) => {}
-        }
         let store = cache_metadata::store();
         let key = key("kept-validators.deb");
         let metadata = Arc::new(UpstreamMetadata::from_upstream(

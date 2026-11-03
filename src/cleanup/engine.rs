@@ -1423,17 +1423,8 @@ mod tests {
         structured_mirror("deb.example.org", "debian")
     }
 
-    /// `cache_metadata::store()` (reached via `invalidate_metadata_for` on
-    /// deletion) panics unless initialised. Idempotent across the test binary.
-    fn ensure_metadata_store() {
-        if crate::cache_metadata::init().is_err() {
-            // Already installed by an earlier test in this process.
-        }
-    }
-
     #[tokio::test]
     async fn cleanup_reference_mode_removes_unreferenced_after_grace() {
-        ensure_metadata_store();
         let dir = tempfile::tempdir().expect("tempdir");
         let referenced = [0x01u8; 32];
         let unref_a = [0x02u8; 32];
@@ -1472,7 +1463,6 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_release_section_uses_age_retention_for_omitted_digests() {
-        ensure_metadata_store();
         let releases = tempfile::tempdir().expect("Release directory");
         let files = tempfile::tempdir().expect("by-hash directory");
         let first = hex_encode(&[0x11; 32]);
@@ -1533,7 +1523,6 @@ mod tests {
     /// file: it counts in neither `removed` nor `retained`.
     #[tokio::test]
     async fn byhash_sweep_does_not_count_a_removed_symlink_as_eviction() {
-        ensure_metadata_store();
         let dir = tempfile::tempdir().expect("tempdir");
         let link = dir.path().join(hex_encode(&[0x0au8; 32]));
         std::os::unix::fs::symlink("/nonexistent", &link).expect("symlink");
@@ -1558,7 +1547,6 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_reference_mode_grace_keeps_recent() {
-        ensure_metadata_store();
         let dir = tempfile::tempdir().expect("tempdir");
         let unref = [0x07u8; 32];
         std::fs::write(dir.path().join(hex_encode(&unref)), b"x").expect("write");
@@ -1595,7 +1583,6 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_fallback_age_mode() {
-        ensure_metadata_store();
         let dir = tempfile::tempdir().expect("tempdir");
         for d in [[0x21u8; 32], [0x22u8; 32]] {
             std::fs::write(dir.path().join(hex_encode(&d)), b"x").expect("write");

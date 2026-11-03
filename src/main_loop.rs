@@ -42,7 +42,6 @@ use crate::sendfile_conn;
 use crate::{
     AppState, DB_DRAIN_TIMEOUT, OUTPUT_LOG_FILE, RUNTIMEDETAILS,
     active_downloads::ActiveDownloads,
-    cache_metadata,
     cache_paths::CachePaths,
     cleanup::{
         CLEANUP_INTERVAL_SECS, FIRST_CLEANUP_DELAY_SECS, set_next_cleanup_epoch, task_cleanup,
@@ -241,9 +240,6 @@ pub(crate) async fn main_loop(
     database_task::DB_TASK_QUEUE_SENDER
         .set(db_task_tx)
         .expect("DB task queue sender initialized once");
-
-    // Process-local cache for cached-file ETag / Last-Modified xattrs.
-    cache_metadata::init().expect("cache metadata store initialized once");
 
     // Migration warning: scan the existing `mirrors_v2` rows for paths
     // containing a segment reserved for their kind
