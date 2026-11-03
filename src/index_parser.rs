@@ -724,7 +724,7 @@ pub(crate) fn parse_release_byhash_digests(
     Ok(parsed)
 }
 
-/// What a `StreamHasher` (splice-only, below) computed, as handed to
+/// What a download's [`StreamHasher`] (splice-only) computed, as handed to
 /// `integrity::verify_temp_file`.
 ///
 /// The algorithm and the byte count travel with the digest because the
@@ -756,27 +756,26 @@ pub(crate) struct StreamedDigest {
 /// expects, over exactly the file it is about to commit, and fall back to a
 /// re-read when it was not.
 ///
-/// Splice-only: the other backends have no single site every cache byte passes
-/// through, so they re-read and hash the finished file at commit time.
+/// Only the splice backend hashes a download as it writes it: the other
+/// backends have no single site every cache byte passes through, so they
+/// re-read and hash the finished file at commit time ([`hash_open_file`],
+/// which dispatches through this type too).
 ///
 /// Both digests are boxed: a `Sha512` carries a 128-byte block buffer plus its
 /// chaining state inline, and this type is held in `splice::CacheTarget` across
 /// every await of a download, where that much dead weight pushed
 /// `try_sendfile_request`'s future over `clippy::large_futures`.
-#[cfg(feature = "splice")]
 pub(crate) struct StreamHasher {
     state: StreamHasherState,
     /// Bytes seen by [`Self::update`], carried into [`StreamedDigest::bytes`].
     bytes: u64,
 }
 
-#[cfg(feature = "splice")]
 enum StreamHasherState {
     Sha256(Box<sha2::Sha256>),
     Sha512(Box<sha2::Sha512>),
 }
 
-#[cfg(feature = "splice")]
 impl StreamHasher {
     #[must_use]
     pub(crate) fn new(algo: HashAlgo) -> Self {
@@ -813,18 +812,31 @@ impl StreamHasher {
     }
 }
 
-/// Hash the contents of an open file from its current position to its end.
-/// Synchronous; blocks the current thread. Generic over the reader so the
-/// commit can hash through a shared `&std::fs::File`.
-pub(crate) fn hash_open_file<D: sha2::Digest>(file: &mut impl io::Read) -> io::Result<Vec<u8>> {
-    /// Read granularity for whole-file hashing. 1 MiB rather than the
-    /// kernel's default readahead window: cleanup hashes the whole cache and
-    /// commit hashes every download, so this is the read-syscall count for
-    /// both. Heap, not stack — a 1 MiB array would blow the frame.
-    const HASH_READ_BUFFER: usize = 1024 * 1024;
+/// Hash the contents of an open file with `algo`, from its current position
+/// to its end. Synchronous; blocks the current thread. Generic over the
+/// reader so the commit can hash through a shared `&std::fs::File`.
+///
+/// `size_hint` is the file's length (what its `fstat` said); it only sizes
+/// the read buffer, and the read runs to EOF whatever it says.
+pub(crate) fn hash_open_file(
+    algo: HashAlgo,
+    file: &mut impl io::Read,
+    size_hint: u64,
+) -> io::Result<Vec<u8>> {
+    /// Largest read for whole-file hashing. 1 MiB rather than the kernel's
+    /// default readahead window: cleanup hashes the whole cache and commit
+    /// hashes every download, so this is the read-syscall count for both.
+    /// Heap, not stack — a 1 MiB array would blow the frame.
+    const MAX_READ_BUFFER: usize = 1024 * 1024;
+    /// Smallest read buffer: a small index is still read in one call, and
+    /// no 1 MiB buffer is zeroed for it.
+    const MIN_READ_BUFFER: usize = 64 * 1024;
 
-    let mut hasher = D::new();
-    let mut buf = vec![0u8; HASH_READ_BUFFER];
+    let len = usize::try_from(size_hint).map_or(MAX_READ_BUFFER, |size| {
+        size.clamp(MIN_READ_BUFFER, MAX_READ_BUFFER)
+    });
+    let mut hasher = StreamHasher::new(algo);
+    let mut buf = vec![0u8; len];
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
@@ -832,7 +844,7 @@ pub(crate) fn hash_open_file<D: sha2::Digest>(file: &mut impl io::Read) -> io::R
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hasher.finalize().to_vec())
+    Ok(hasher.finalize().digest)
 }
 
 #[cfg(test)]
@@ -848,10 +860,21 @@ mod tests {
             .map(|i: u32| u8::try_from(i % 251).expect("i % 251 is in 0..251, fits in u8"))
             .collect();
 
-        let mut file = io::Cursor::new(&payload);
-        let streamed = hash_open_file::<sha2::Sha256>(&mut file).expect("hash");
+        // The real size (1 MiB reads), and an understated one (64 KiB reads):
+        // the hint sizes the buffer, never the read.
+        for size_hint in [payload.len() as u64, 0] {
+            let mut file = io::Cursor::new(&payload);
+            let streamed = hash_open_file(HashAlgo::Sha256, &mut file, size_hint).expect("hash");
+            assert_eq!(
+                streamed,
+                sha2::Sha256::digest(&payload).to_vec(),
+                "{size_hint}"
+            );
+        }
 
-        assert_eq!(streamed, sha2::Sha256::digest(&payload).to_vec());
+        let mut file = io::Cursor::new(&payload);
+        let streamed = hash_open_file(HashAlgo::Sha512, &mut file, 0).expect("hash");
+        assert_eq!(streamed, sha2::Sha512::digest(&payload).to_vec());
     }
 
     #[test]

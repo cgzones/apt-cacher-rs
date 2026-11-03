@@ -73,11 +73,7 @@ fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> Verdict {
     // the whole file is read, so the readahead hint is worth its syscall.
     hint_sequential_read(&file, pre_size, path);
 
-    let computed = match algo {
-        HashAlgo::Sha256 => hash_open_file::<sha2::Sha256>(&mut file),
-        HashAlgo::Sha512 => hash_open_file::<sha2::Sha512>(&mut file),
-    };
-    let computed = match computed {
+    let computed = match hash_open_file(algo, &mut file, pre_size) {
         Ok(hash) => hash,
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();

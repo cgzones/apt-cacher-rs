@@ -303,7 +303,7 @@ fn reuse_streamed_digest<'a>(
 /// the download's own descriptor, so no reopen of `path` (which is for log
 /// context only). The writer's cursor sits wherever its last write left it;
 /// the rewind is what makes the read start at byte 0. `size` is the file's
-/// length, for the read-ahead hint.
+/// length, for the read-ahead hint and the read buffer.
 fn hash_file(
     file: &std::fs::File,
     size: u64,
@@ -315,10 +315,7 @@ fn hash_file(
     let mut reader = file;
     reader.rewind()?;
     hint_sequential_read(file, size, path);
-    match algo {
-        HashAlgo::Sha256 => index_parser::hash_open_file::<sha2::Sha256>(&mut reader),
-        HashAlgo::Sha512 => index_parser::hash_open_file::<sha2::Sha512>(&mut reader),
-    }
+    index_parser::hash_open_file(algo, &mut reader, size)
 }
 
 /// Stamp the cleanup-verification marker on a temp file whose digest just
