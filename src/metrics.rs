@@ -548,8 +548,7 @@ pub(crate) static BYTES_SERVED_SENDFILE: Accumulator = Accumulator::new();
 /// these traverse Linux `splice(2)` zero-copy (`tee_and_splice`), but the
 /// counter also covers the small userspace-write tail that the splice path
 /// cannot avoid: the body prefix consumed by the header parser,
-/// range-boundary chunks carved from a userspace
-/// drain buffer, and the volatile buffered re-fetch path that buffers the
+/// the TLS upstream loop's userspace batches, and the volatile buffered re-fetch path that buffers the
 /// entire body in RAM before writing.  All of these sit within a request
 /// counted under `REQUESTS_SPLICE`.
 pub(crate) static BYTES_SERVED_SPLICE: Accumulator = Accumulator::new();

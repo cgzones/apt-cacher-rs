@@ -68,6 +68,23 @@ pub(super) struct SpliceRangeFilter {
     pub(super) send: u64,
 }
 
+impl SpliceRangeFilter {
+    /// The next client-range edge past body offset `at`, and whether the
+    /// bytes from `at` up to it are the client's. One decision yields both,
+    /// so a batch capped at the edge is classified by the very value that
+    /// bounds it: it lies wholly inside the range or wholly outside.
+    const fn next_edge(self, at: u64) -> (u64, bool) {
+        let range_end = self.skip + self.send;
+        if at < self.skip {
+            (self.skip, false)
+        } else if at < range_end {
+            (range_end, true)
+        } else {
+            (u64::MAX, false)
+        }
+    }
+}
+
 /// Default pipe buffer size on Linux is 16 pages (64 KiB on most systems).
 /// We increase it to 1 MiB to reduce the number of splice syscall pairs needed.
 const PIPE_BUFFER_SIZE: i32 = 1024 * 1024;
@@ -309,9 +326,9 @@ pub(super) struct CacheWriter {
     /// Where batched bytes wait for the file: the body loop installs its
     /// own sink before its first read.
     sink: CacheSink,
-    /// Some byte of this transfer reached the file (a body prefix, a
-    /// boundary chunk or a batch): the barrier's unbatched first ping went
-    /// out with it, so the batch no longer needs its eager first flush.
+    /// Some byte of this transfer reached the file (a body prefix or a
+    /// batch): the barrier's unbatched first ping went out with it, so the
+    /// batch no longer needs its eager first flush.
     landed_once: sticky::Bool,
 }
 
@@ -758,8 +775,8 @@ pub(super) struct BodyTransfer<'a> {
     /// Body bytes pulled from upstream so far (the next chunk starts here).
     bytes_done: u64,
     /// Absolute cache-file offset of the next byte the client expects.
-    /// Maintained together with `client_remaining` across the tee, boundary
-    /// and userspace delivery paths so that on demotion the file-serve task
+    /// Maintained together with `client_remaining` across the tee and
+    /// userspace delivery paths so that on demotion the file-serve task
     /// gets the exact resume point and length regardless of resume offset,
     /// body-prefix advance, or 206 range filtering.
     client_file_pos: u64,
@@ -973,6 +990,29 @@ impl<'a> BodyTransfer<'a> {
         self.client_status = ClientStatus::Aborted(self.conclude_delivery(failure));
     }
 
+    /// Whether a zero-copy batch ending at body offset `chunk_end` is teed
+    /// to the client: an attached client's batch inside its range
+    /// (`in_range`, decided with `edge`) is, every other batch is cache-only.
+    ///
+    /// The batch cap stops every batch at `edge`, so a batch reaching past it
+    /// is an invariant breach, caught by `drive_batches`'s `debug_assert!`.
+    /// In a release build it aborts the client and the batch goes cache-only:
+    /// teeing it would send out-of-range bytes, or skip in-range ones, and
+    /// corrupt a 206. The client gets a short body instead, and the download
+    /// continues.
+    fn batch_to_client(&mut self, chunk_end: u64, edge: u64, in_range: bool) -> bool {
+        if chunk_end > edge && self.client_status.client_to_write().is_some() {
+            self.abort_client(
+                InternalError::invalid(
+                    "splice body loop",
+                    format!("a batch ending at body offset {chunk_end} straddled the client-range edge at {edge}"),
+                )
+                .into(),
+            );
+        }
+        in_range && self.client_status.client_to_write().is_some()
+    }
+
     fn conclude_delivery(&self, failure: DeliveryFailure) -> ReportedDelivery {
         let client_total = self.range_filter.send;
         let client_sent = client_total - self.client_remaining;
@@ -1121,27 +1161,20 @@ async fn drive_batches(
     let config = global_config();
 
     let range_filter = xfer.range_filter;
-    let client_skip = range_filter.skip;
-    let client_range_end = range_filter.skip + range_filter.send;
 
     while xfer.remaining > 0 {
         xfer.check_upstream_rate()?;
 
         // Cap the batch at the next client-range edge so a batch is either
-        // wholly inside or wholly outside the range: accumulating across an
-        // edge would push up to a whole pipe through the userspace boundary
-        // path below. `bytes_done` does not move during the accumulation --
-        // `note_chunk` runs once, after it -- so the cap is computed here.
-        // For a non-Range transfer (`skip == 0`, `send` spanning the whole
-        // splice region) the edge is the end of the body and the cap is
-        // `min(remaining, PIPE_BUFFER_SIZE)`.
-        let edge = if xfer.bytes_done < client_skip {
-            client_skip
-        } else if xfer.bytes_done < client_range_end {
-            client_range_end
-        } else {
-            u64::MAX
-        };
+        // wholly inside or wholly outside the range: a tee moves a whole
+        // batch, so one reaching across an edge could not be split between
+        // the client and the cache. The edge and the batch's side of it come
+        // from one decision. `bytes_done` does not move during the
+        // accumulation -- `note_chunk` runs once, after it -- so the cap is
+        // computed here. For a non-Range transfer (`skip == 0`, `send`
+        // spanning the whole splice region) the edge is the end of the body
+        // and the cap is `min(remaining, PIPE_BUFFER_SIZE)`.
+        let (edge, in_range) = range_filter.next_edge(xfer.bytes_done);
         static_assert!(PIPE_BUFFER_SIZE > 0 && (PIPE_BUFFER_SIZE as u64) < usize::MAX as u64);
         #[expect(
             clippy::cast_possible_truncation,
@@ -1250,54 +1283,16 @@ async fn drive_batches(
             "a batch only ends with bytes; every failure returns"
         );
 
-        // Determine how this chunk overlaps with the client range.
         let chunk = xfer.note_chunk(got);
         debug_assert!(
-            chunk.end <= client_skip
-                || chunk.start >= client_range_end
-                || (chunk.start >= client_skip && chunk.end <= client_range_end),
+            chunk.end <= edge,
             "the batch cap keeps every chunk on one side of both client-range edges"
         );
 
-        if let Some(client) = xfer.client_status.client_to_write()
-            && chunk.end > client_skip
-            && chunk.start < client_range_end
-        {
-            if chunk.start >= client_skip && chunk.end <= client_range_end {
-                // Chunk is entirely inside client range — normal tee
-                tee_and_splice(xfer, got).await?;
-                xfer.maybe_demote()?;
-                continue;
-            }
-
-            // Boundary chunk -- read into userspace, slice for client, pwrite
-            // for cache. The batch cap above stops a batch at a range edge, so
-            // this is unreachable in practice; it stays as the release-mode
-            // fail-safe, because a wrong cap would otherwise tee out-of-range
-            // bytes straight to the client and corrupt a 206. Once the read
-            // starts, whatever is left in `pipe_A` is a tail whose head lives
-            // in `buf`, so the salvage must not land it.
-            let mut buf = xfer
-                .cache
-                .pipes_mut()
-                .read_boundary(got)
-                .await
-                .map_err(internal_io)?;
-
-            debug_assert_eq!(buf.len(), got, "read_pipe_to_buf reads exactly `got` bytes");
-
-            // Write full chunk to cache via pwrite first, so concurrent clients
-            // see progress without being gated on the first client's send speed.
-            // The pwrite lands at `file_offset`, so the batched `pipe_B` bytes
-            // (which come earlier in the body) have to be there already.
-            xfer.tracked(async |cache| cache.write_cache_chunk(&mut buf).await)
-                .await?;
-
-            let client_slice = range_slice(&buf, chunk.start, range_filter.skip, range_filter.send);
-            if !client_slice.is_empty() {
-                write_client_or_demote(xfer, client, ClientBytes::Slice(client_slice)).await?;
-                xfer.maybe_demote()?;
-            }
+        if xfer.batch_to_client(chunk.end, edge, in_range) {
+            // Chunk is entirely inside client range — normal tee
+            tee_and_splice(xfer, got).await?;
+            xfer.maybe_demote()?;
         } else {
             // Chunk is entirely outside the client range, or the client is
             // absent/gone/demoted — cache only. `pipe_A` holds exactly the
@@ -1602,7 +1597,7 @@ async fn drive_reads(
             && !client_range.is_empty()
         {
             let batched = start + client_range.start..start + client_range.end;
-            write_client_or_demote(xfer, client, ClientBytes::Batched(batched)).await?;
+            write_client_or_demote(xfer, client, batched).await?;
             xfer.maybe_demote()?;
         }
     }
@@ -1615,20 +1610,10 @@ fn tls_premature_eof() -> DownloadFailure {
     UpstreamError::protocol("TLS upstream closed prematurely").into()
 }
 
-/// The bytes a [`write_client_or_demote`] delivers.
-enum ClientBytes<'b> {
-    /// A buffer of the caller's own (the zero-copy loop's boundary chunk).
-    Slice(&'b [u8]),
-    /// A range of the userspace loop's batch buffer. Read in place on every
-    /// write attempt: the delivery flushes the batch, which borrows the
-    /// buffer, so it cannot hold a slice of it across one.
-    Batched(Range<usize>),
-}
-
-/// Write `bytes` to the client with rate checking, translating client
-/// failures into [`ClientStatus`] transitions instead of hard errors:
-/// a slow or gone client must not abort the download (late joiners depend
-/// on it).
+/// Write `batched`, a range of the userspace loop's batch buffer, to the
+/// client with rate checking, translating client failures into
+/// [`ClientStatus`] transitions instead of hard errors: a slow or gone client
+/// must not abort the download (late joiners depend on it).
 ///
 /// Mirrors the `tee_and_splice` client-splice semantics: a client
 /// rate-check trip after progress leaves `DemoteRequested` (the caller
@@ -1640,25 +1625,18 @@ enum ClientBytes<'b> {
 /// two [`CacheBatch`] flush points in here: before parking on a
 /// back-pressuring client, and before a demotion hand-off, whose file-serve
 /// task reads the partial from `client_file_pos`.
-/// The userspace delivery of both loops: every TLS chunk, and the zero-copy
-/// loop's range-boundary chunk.
+///
+/// The range is read in place on every write attempt: the delivery flushes
+/// the batch, which borrows the buffer, so it cannot hold a slice of it
+/// across one.
 async fn write_client_or_demote<'a>(
     xfer: &mut BodyTransfer<'a>,
     client: &'a TcpStream,
-    bytes: ClientBytes<'_>,
+    batched: Range<usize>,
 ) -> Result<(), DownloadFailure> {
-    let len = match &bytes {
-        ClientBytes::Slice(slice) => slice.len(),
-        ClientBytes::Batched(range) => range.len(),
-    };
     let mut written = 0;
-    while written < len {
-        let unsent = match &bytes {
-            ClientBytes::Slice(slice) => &slice[written..],
-            ClientBytes::Batched(range) => {
-                &xfer.cache.buffer().sink.buf[range.start + written..range.end]
-            }
-        };
+    while written < batched.len() {
+        let unsent = &xfer.cache.buffer().sink.buf[batched.start + written..batched.end];
         match client.try_write(unsent) {
             Ok(0) => {
                 xfer.abort_client(
@@ -1838,9 +1816,6 @@ async fn serve_remaining_from_file(
 enum PipeHead {
     Unique,
     Duplicated(NonZero<usize>),
-    /// A boundary read moved the head into a userspace buffer. Until the
-    /// next accumulation, a leftover tail cannot be salvaged on its own.
-    Extracted,
 }
 
 /// Owns both pipes and their fan-out state. Received bytes are unique until
@@ -1974,24 +1949,12 @@ impl SplicePipes {
         Ok(())
     }
 
-    async fn read_boundary(&mut self, count: usize) -> std::io::Result<Vec<u8>> {
-        debug_assert!(
-            matches!(self.head, PipeHead::Unique),
-            "boundary extraction starts with unique bytes"
-        );
-        self.head = PipeHead::Extracted;
-        read_pipe_to_buf(&mut self.upstream_rx, count).await
-    }
-
     async fn salvage_into(
         mut self,
         cache_file: &Arc<CacheFile>,
         file_offset: &mut i64,
     ) -> std::io::Result<()> {
         drain_pipe_to_file(&self.cache.sink.rx, cache_file, file_offset).await?;
-        if matches!(self.head, PipeHead::Extracted) {
-            return Ok(());
-        }
         self.discard_duplicate().await?;
         drain_pipe_to_file(&self.upstream_fd, cache_file, file_offset).await?;
         Ok(())
@@ -2025,12 +1988,11 @@ impl SplicePipes {
 ///   every other reader;
 /// - before the demotion hand-off: the file-serve task reads the partial
 ///   from `client_file_pos`;
-/// - before anything else writes the cache file (the boundary chunk's
-///   `pwrite`, a direct `pipe_A` drain): `CacheWriter::file_offset` is one
-///   cursor and the pending bytes come earlier in the body
-///   ([`CacheWriter::write_through`] pairs the two drains). The zero-copy
-///   loop's cache-only batches do not write directly: they join `pipe_B`
-///   ([`BodyTransfer::write_cache_only`]);
+/// - before anything else writes the cache file (a direct `pipe_A` drain):
+///   `CacheWriter::file_offset` is one cursor and the pending bytes come
+///   earlier in the body ([`CacheWriter::write_through`] pairs the two
+///   drains). The zero-copy loop's cache-only batches do not write directly:
+///   they join `pipe_B` ([`BodyTransfer::write_cache_only`]);
 /// - a batch older than [`Self::MAX_BATCH_AGE`] while parked for upstream.
 ///   That park is deliberately not an unconditional flush point: every batch
 ///   ends on an EAGAIN probe (a `Pending` read on the TLS stream), so
@@ -2402,33 +2364,6 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), D
     }
 
     Ok(())
-}
-
-/// Read exactly `count` bytes from a pipe into a Vec (for boundary chunks
-/// that straddle a client range boundary and need userspace slicing).
-async fn read_pipe_to_buf(rx: &mut pipe::Receiver, count: usize) -> std::io::Result<Vec<u8>> {
-    // Reserve uninitialized capacity; `read_buf` fills bytes via `BufMut`
-    // so no zero-init pass is performed before the data is overwritten.
-    let mut read_buf: Vec<u8> = Vec::with_capacity(count);
-
-    while read_buf.len() < count {
-        let want = (count - read_buf.len()) as u64;
-        let n = (&mut *rx).take(want).read_buf(&mut read_buf).await?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                ErrorKind::UnexpectedEof,
-                "read_pipe_to_buf: pipe closed with bytes remaining",
-            ));
-        }
-    }
-
-    debug_assert_eq!(
-        read_buf.len(),
-        count,
-        "the result buffer should have the requested length"
-    );
-
-    Ok(read_buf)
 }
 
 /// Return the sub-slice of `buf` (which represents file bytes at
@@ -3281,29 +3216,29 @@ mod tests {
         xfer.cache.sink = CacheSink::Pipes(SplicePipes::new().unwrap());
         // Model an earlier teed batch whose client bytes have been delivered.
         queue_cache(xfer.cache.pipes_mut(), b"queued-").await;
-        let mut boundary = b"boundary-".to_vec();
-        xfer.tracked(async |cache| cache.write_cache_chunk(&mut boundary).await)
+        let mut direct = b"direct-".to_vec();
+        xfer.tracked(async |cache| cache.write_cache_chunk(&mut direct).await)
             .await
             .unwrap();
-        assert_eq!(xfer.cache.file_offset, 23);
+        assert_eq!(xfer.cache.file_offset, 21);
         assert!(receiver.has_changed().unwrap());
         receiver.borrow_and_update();
         assert_eq!(
             std::fs::read(&scratch.path).unwrap(),
-            b"resume-queued-boundary-"
+            b"resume-queued-direct-"
         );
 
         // Switching to cache-only must also land the next queued bytes first.
         queue_cache(xfer.cache.pipes_mut(), b"queued2-").await;
         accumulate(xfer.cache.pipes_mut(), b"tail");
         xfer.tracked(CacheWriter::write_through).await.unwrap();
-        assert_eq!(xfer.cache.file_offset, 35);
+        assert_eq!(xfer.cache.file_offset, 33);
         assert!(xfer.cache.batch().is_empty());
         drop(xfer);
         drop(writer);
         assert_eq!(
             std::fs::read(&scratch.path).unwrap(),
-            b"resume-queued-boundary-queued2-tail"
+            b"resume-queued-direct-queued2-tail"
         );
     }
 
@@ -3603,6 +3538,99 @@ mod tests {
         pipes.discard_duplicate().await.unwrap();
     }
 
+    /// Read the next `count` unique bytes out of `pipe_A`, to inspect what
+    /// it holds.
+    async fn read_unique(pipes: &mut SplicePipes, count: usize) -> Vec<u8> {
+        assert!(
+            matches!(pipes.head, PipeHead::Unique),
+            "only unique bytes are read back"
+        );
+        let mut buf = vec![0; count];
+        pipes.upstream_rx.read_exact(&mut buf).await.unwrap();
+        buf
+    }
+
+    /// Each edge comes with the side of it the bytes before it are on.
+    #[test]
+    fn next_edge_classifies_the_bytes_it_bounds() {
+        let filter = SpliceRangeFilter { skip: 2, send: 10 };
+        assert_eq!(filter.next_edge(0), (2, false));
+        assert_eq!(filter.next_edge(1), (2, false));
+        assert_eq!(filter.next_edge(2), (12, true));
+        assert_eq!(filter.next_edge(11), (12, true));
+        assert_eq!(filter.next_edge(12), (u64::MAX, false));
+        let whole = SpliceRangeFilter { skip: 0, send: 20 };
+        assert_eq!(whole.next_edge(0), (20, true));
+        assert_eq!(whole.next_edge(20), (u64::MAX, false));
+    }
+
+    /// A batch reaching past its client-range edge cannot be teed without
+    /// corrupting the 206: it aborts the client with an internal failure and
+    /// goes cache-only, while an in-range batch is teed and a client-less
+    /// transfer concludes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_batch_straddling_a_client_range_edge_aborts_the_client() {
+        let scratch = ScratchFile::new();
+        let mut barrier = cache_barrier(&scratch.path).await;
+        let mut writer = CacheWriter::new(
+            scratch.file,
+            0,
+            CacheWriteMode::Kernel,
+            &barrier,
+            &scratch.path,
+        )
+        .await
+        .unwrap();
+        let (mut peer, client) = crate::test_support::connected_tcp_pair().await;
+        let config = crate::config::Config::default();
+        let filter = SpliceRangeFilter { skip: 2, send: 10 };
+        let mut xfer = BodyTransfer::new(
+            BodyClient::Attached(&client, local_client()),
+            &mut writer,
+            &mut barrier,
+            filter,
+            0, // No loop runs here; `finish` checks nothing is left to pull.
+            None,
+            &config,
+        );
+        assert!(!xfer.batch_to_client(2, 2, false), "before the range");
+        assert!(xfer.batch_to_client(12, 12, true), "inside the range");
+        assert!(xfer.client_status.client_to_write().is_some());
+
+        assert!(
+            !xfer.batch_to_client(13, 12, true),
+            "straddles the range end"
+        );
+        assert!(xfer.client_status.client_to_write().is_none());
+        let outcome = xfer.finish();
+        assert!(
+            matches!(
+                outcome.client,
+                ClientEnd::Aborted(ref reported)
+                    if matches!(reported.get(), DeliveryFailure::Internal(_))
+            ),
+            "a straddling batch is a short response"
+        );
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), peer.read_to_end(&mut rest))
+            .await
+            .expect("the aborted client's socket is half-closed")
+            .unwrap();
+        assert_eq!(rest, b"", "nothing more reaches the aborted client");
+
+        let mut xfer = BodyTransfer::new(
+            BodyClient::Absent,
+            &mut writer,
+            &mut barrier,
+            filter,
+            0,
+            None,
+            &config,
+        );
+        assert!(!xfer.batch_to_client(3, 2, false));
+        assert!(matches!(xfer.finish().client, ClientEnd::Absent));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn salvage_does_not_land_a_batch_that_was_already_teed() {
         let scratch = ScratchFile::new();
@@ -3651,21 +3679,6 @@ mod tests {
             .unwrap();
         assert_eq!(scratch.contents(), b"abcdefgh");
         assert_eq!(offset, 8);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn salvage_leaves_a_tail_without_its_extracted_head_alone() {
-        let scratch = ScratchFile::new();
-        let mut pipes = SplicePipes::new().unwrap();
-        accumulate(&mut pipes, b"abcdefgh");
-        assert_eq!(pipes.read_boundary(3).await.unwrap(), b"abc");
-        let mut offset = 0;
-        pipes
-            .salvage_into(&owned_cache_file(&scratch).await, &mut offset)
-            .await
-            .unwrap();
-        assert!(scratch.contents().is_empty(), "the tail must not land");
-        assert_eq!(offset, 0);
     }
 
     #[test]
@@ -3789,7 +3802,7 @@ mod tests {
         assert_eq!(pipes.duplicate(3).unwrap(), 3);
         pipes.discard_duplicate().await.unwrap();
         assert!(!pipes.has_duplicate());
-        assert_eq!(pipes.read_boundary(5).await.unwrap(), b"defgh");
+        assert_eq!(read_unique(&mut pipes, 5).await, b"defgh");
     }
 
     #[tokio::test]
@@ -3797,6 +3810,6 @@ mod tests {
         let mut pipes = SplicePipes::new().unwrap();
         accumulate(&mut pipes, b"body");
         pipes.discard_duplicate().await.unwrap();
-        assert_eq!(pipes.read_boundary(4).await.unwrap(), b"body");
+        assert_eq!(read_unique(&mut pipes, 4).await, b"body");
     }
 }
