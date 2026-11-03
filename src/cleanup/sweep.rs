@@ -13,7 +13,7 @@ use crate::error::ErrorReport;
 use crate::humanfmt::HumanFmt;
 use crate::{cache_metadata, info_once, metrics, warn_once_or_info};
 
-use super::engine::SpanClass;
+use super::engine::{SpanClass, UnitStats};
 use super::scan::remove_non_regular;
 
 /// Drop the in-memory `cache_metadata` entry keyed by `(mirror, basename, layout)`.
@@ -38,22 +38,6 @@ pub(super) fn invalidate_metadata_for(path: &Path, mirror: &Mirror, layout: Cach
     if let Some(debname) = path.file_name().and_then(|n| n.to_str()) {
         cache_metadata::store().invalidate(&CacheEntryKeyRef::new(mirror, debname, layout));
     }
-}
-
-/// Return value of [`sweep_candidates`].
-#[derive(Copy, Clone)]
-pub(super) struct SweepResult {
-    pub(super) files_removed: u64,
-    pub(super) bytes_removed: u64,
-    /// Subset of `files_removed` deleted because they were unreferenced but
-    /// their algorithm was covered (by-hash reference reclaim), threaded up to
-    /// `CLEANUP_BYHASH_UNREFERENCED` by the by-hash unit.
-    pub(super) removed_unreferenced: u64,
-    /// Entries left in place, or a directory left unread, on a cache I/O
-    /// failure, each logged where it failed (see [`UnitStats::io_failures`]).
-    ///
-    /// [`UnitStats::io_failures`]: super::engine::UnitStats::io_failures
-    pub(super) io_failures: u64,
 }
 
 /// Per-[`SpanClass`] retention spans consulted by [`sweep_candidates`]: each
@@ -114,6 +98,10 @@ fn age_reference_time(meta: &std::fs::Metadata, path: &Path) -> Option<SystemTim
 /// Remove cached files older than their per-class span, dropping any matching
 /// `cache_metadata` entries on success.
 ///
+/// Returns the removals (`removed`, `bytes_removed`, and `removed_unreferenced`
+/// for a removed [`SpanClass::ByHashCovered`] candidate) and `io_failures`;
+/// `scanned` is left to the caller, which knows what its unit considered.
+///
 /// Each candidate is `(name, class)` where `name` is the entry's path *relative
 /// to `root`* — a bare basename for the depth-1 trees, a `/`-joined relpath for
 /// the recursive flat walk. The full path is rebuilt here rather than carried on
@@ -139,11 +127,8 @@ pub(super) async fn sweep_candidates(
     now: SystemTime,
     mirror: &Mirror,
     layout: CacheLayout,
-) -> SweepResult {
-    let mut bytes_removed = 0u64;
-    let mut files_removed = 0u64;
-    let mut removed_unreferenced = 0u64;
-    let mut io_failures = 0u64;
+) -> UnitStats {
+    let mut stats = UnitStats::default();
 
     for (name, &class) in candidates {
         let path = root.join(name);
@@ -174,7 +159,7 @@ pub(super) async fn sweep_candidates(
                 None
             }
             Err(err) => {
-                io_failures += 1;
+                stats.io_failures += 1;
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
                     "Failed to inspect cached file `{}`; retaining it:  {}",
@@ -190,7 +175,7 @@ pub(super) async fn sweep_candidates(
         };
 
         let Some(created) = age_reference_time(&data, &path) else {
-            io_failures += 1;
+            stats.io_failures += 1;
             continue;
         };
 
@@ -218,7 +203,7 @@ pub(super) async fn sweep_candidates(
         let size = data.len();
 
         if let Err(err) = tokio::fs::remove_file(&path).await {
-            io_failures += 1;
+            stats.io_failures += 1;
             metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "Failed to remove cached file `{}`; retaining it:  {}",
@@ -232,19 +217,14 @@ pub(super) async fn sweep_candidates(
 
         debug!("Removed cached file `{}`", path.display());
 
-        bytes_removed += accounted_size(size);
-        files_removed += 1;
+        stats.bytes_removed += accounted_size(size);
+        stats.removed += 1;
         if matches!(class, SpanClass::ByHashCovered) {
-            removed_unreferenced += 1;
+            stats.removed_unreferenced += 1;
         }
     }
 
-    SweepResult {
-        files_removed,
-        bytes_removed,
-        removed_unreferenced,
-        io_failures,
-    }
+    stats
 }
 
 static METADATA_WALK: WalkContext = WalkContext {
@@ -277,6 +257,7 @@ static METADATA_WALK: WalkContext = WalkContext {
 ///
 /// `now` is injected for testability, matching [`sweep_candidates`]: birthtime is
 /// not backdatable on Linux, so removal cannot be exercised via mtime alone.
+/// Like [`sweep_candidates`], the result leaves `scanned` to the caller.
 pub(super) async fn sweep_aged_metadata(
     cache_root: &Path,
     dir: &Path,
@@ -284,15 +265,10 @@ pub(super) async fn sweep_aged_metadata(
     now: SystemTime,
     mirror: &Mirror,
     layout: CacheLayout,
-) -> SweepResult {
+) -> UnitStats {
     let skip_debs = layout.is_flat();
 
-    let mut result = SweepResult {
-        files_removed: 0,
-        bytes_removed: 0,
-        removed_unreferenced: 0,
-        io_failures: 0,
-    };
+    let mut result = UnitStats::default();
 
     let mut walker =
         Walker::new(dir, &METADATA_WALK, OnMissing::Tolerate, ()).confined_to(cache_root);
@@ -361,7 +337,7 @@ pub(super) async fn sweep_aged_metadata(
         debug!("Removed stale metadata file `{}`", path.display());
 
         result.bytes_removed += accounted_size(size);
-        result.files_removed += 1;
+        result.removed += 1;
     }
 
     result.io_failures += walker.io_failures();
@@ -445,7 +421,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            res.files_removed, 1,
+            res.removed, 1,
             "only the covered by-hash file is past its span"
         );
         assert_eq!(
@@ -495,7 +471,7 @@ mod tests {
             CacheLayout::StructuredPool,
         )
         .await;
-        assert_eq!(res.files_removed, 0);
+        assert_eq!(res.removed, 0);
         assert_eq!(metrics::CACHE_IO_FAILURE.get(), io_failure);
     }
 
@@ -531,7 +507,7 @@ mod tests {
             CacheLayout::Dists,
         )
         .await;
-        assert_eq!(res.files_removed, 2);
+        assert_eq!(res.removed, 2);
         assert!(res.bytes_removed >= 2);
         assert!(!dir.path().join("sid_Release").exists());
         assert!(
@@ -556,7 +532,7 @@ mod tests {
             CacheLayout::Dists,
         )
         .await;
-        assert_eq!(res.files_removed, 0);
+        assert_eq!(res.removed, 0);
         assert!(dir.path().join("trixie_Release").exists());
     }
 
@@ -593,7 +569,7 @@ mod tests {
             CacheLayout::Flat,
         )
         .await;
-        assert_eq!(res.files_removed, 2, "only the two index files are swept");
+        assert_eq!(res.removed, 2, "only the two index files are swept");
         assert!(!dir.path().join("Release").exists());
         assert!(!dir.path().join("Packages").exists());
         assert!(
@@ -614,7 +590,7 @@ mod tests {
             CacheLayout::Dists,
         )
         .await;
-        assert_eq!(res.files_removed, 0);
+        assert_eq!(res.removed, 0);
         assert_eq!(res.bytes_removed, 0);
     }
 }

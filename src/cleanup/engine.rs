@@ -37,7 +37,7 @@ use crate::cleanup::refs::{
     ByHashReferenceSet, active_origin_distributions, build_byhash_reference_set, byhash_dir_present,
 };
 use crate::cleanup::scan::{ScannedTree, remove_non_regular, scan_candidates};
-use crate::cleanup::sweep::{SpanTable, SweepResult, sweep_aged_metadata, sweep_candidates};
+use crate::cleanup::sweep::{SpanTable, sweep_aged_metadata, sweep_candidates};
 
 /// Retention class of a scanned cache-tree entry, selecting its sweep span from
 /// the `SpanTable`.
@@ -74,16 +74,11 @@ pub(super) enum SpanClass {
 #[derive(Debug)]
 pub(super) struct CleanupUnitError(pub(super) Logged);
 
+/// One mirror's cleanup result: the sum of its units' [`UnitStats`], summed
+/// again across mirrors by the orchestrator.
 pub(super) struct CleanupDone {
     pub(super) mirror: Mirror,
-    pub(super) files_retained: u64,
-    pub(super) files_removed: u64,
-    pub(super) bytes_removed: u64,
-    /// Subset of `files_removed` reclaimed as unreferenced-but-covered by-hash
-    /// files; surfaced by the orchestrator as `CLEANUP_BYHASH_UNREFERENCED`.
-    pub(super) removed_unreferenced: u64,
-    /// See [`UnitStats::tmp_bytes_removed`].
-    pub(super) tmp_bytes_removed: u64,
+    pub(super) stats: UnitStats,
     /// Units of this mirror that did not do their whole job, each logged
     /// where it stopped: abandoned on a directory they could not read, or
     /// [`UnitStats::failed`].  A unit counts once however many of its entries
@@ -91,35 +86,10 @@ pub(super) struct CleanupDone {
     pub(super) failed_units: u64,
 }
 
-impl CleanupDone {
-    /// Close out a mirror from the sum of its units' [`UnitStats`] and the
-    /// count of its failed units: `files_retained` is derived (scanned minus
-    /// removed) rather than tallied, so the two can never disagree.
-    fn tally(mirror: Mirror, stats: UnitStats, failed_units: u64) -> Self {
-        let UnitStats {
-            scanned,
-            removed,
-            bytes_removed,
-            removed_unreferenced,
-            tmp_bytes_removed,
-            // Per unit, folded into `failed_units` by `run_mirror_units`.
-            bailed: _,
-            io_failures: _,
-        } = stats;
-        Self {
-            mirror,
-            files_retained: scanned.saturating_sub(removed),
-            files_removed: removed,
-            bytes_removed,
-            removed_unreferenced,
-            tmp_bytes_removed,
-            failed_units,
-        }
-    }
-}
-
-/// Per-unit cleanup counters returned by [`run_unit`], folded into the
-/// per-mirror [`CleanupDone`] by [`run_mirror_units`].
+/// Cleanup counters: returned per sweep by [`sweep_candidates`] /
+/// [`sweep_aged_metadata`] and per unit by [`run_unit`], summed per mirror
+/// into [`CleanupDone`] by [`run_mirror_units`] and across mirrors by the
+/// orchestrator.
 ///
 /// Also the running tally threaded through a reconcile unit's resolvers, so
 /// deletions performed before a mid-cascade group failure stay accounted (an
@@ -127,47 +97,36 @@ impl CleanupDone {
 /// discrepancy` warn).
 #[derive(Clone, Copy, Default)]
 pub(super) struct UnitStats {
-    scanned: u64,
-    removed: u64,
-    bytes_removed: u64,
+    /// Entries considered; the retained count is derived from it
+    /// ([`Self::retained`]) rather than tallied, so the two never disagree.
+    pub(super) scanned: u64,
+    pub(super) removed: u64,
+    pub(super) bytes_removed: u64,
     /// Subset of `removed` deleted as unreferenced-but-covered by-hash files,
-    /// summed by [`run_mirror_units`] into `CleanupDone::removed_unreferenced`
-    /// and surfaced as `CLEANUP_BYHASH_UNREFERENCED` by the orchestrator.
-    removed_unreferenced: u64,
+    /// surfaced as `CLEANUP_BYHASH_UNREFERENCED` by the orchestrator.
+    pub(super) removed_unreferenced: u64,
     /// Bytes of the regular files a `tmp/` reap unlinked (kept partials and
     /// foreign files). The quota counts them like cached files, so the
     /// reconcile subtracts them, but they are not cache evictions: kept out
     /// of `removed`/`bytes_removed` and the metrics fed from those.
-    tmp_bytes_removed: u64,
+    pub(super) tmp_bytes_removed: u64,
     /// Reconcile sweeps bailed for an incomplete reference set (an index that
     /// could not be fetched, parsed or looked up): nothing of that tree is
     /// reclaimed this cycle, which the dashboard labels as a failed step.
-    bailed: u64,
+    pub(super) bailed: u64,
     /// Entries the unit left in place, or directories it left unread, on a
     /// cache I/O failure (an unreadable file type, metadata or timestamp, a
     /// failed unlink or verification), each logged and counted
     /// (`CACHE_IO_FAILURE`) where it failed. The rest of the unit ran, but
     /// what it could not reach is unreclaimed, so the dashboard labels it as
     /// a failed step. A vanished entry is no failure.
-    pub io_failures: u64,
+    pub(super) io_failures: u64,
 }
 
 impl UnitStats {
-    /// Fold one sweep's counters in. The reconcile facets
-    /// (`StructuredPool`/`FlatTree`) only sweep `Deb`-class candidates, so
-    /// `removed_unreferenced` stays zero there; the by-hash facets thread it
-    /// through their own path.
-    fn fold(&mut self, swept: SweepResult) {
-        let SweepResult {
-            files_removed,
-            bytes_removed,
-            removed_unreferenced,
-            io_failures,
-        } = swept;
-        self.removed += files_removed;
-        self.bytes_removed += bytes_removed;
-        self.removed_unreferenced += removed_unreferenced;
-        self.io_failures += io_failures;
+    /// Entries considered but kept: `scanned` minus `removed`.
+    pub(super) const fn retained(&self) -> u64 {
+        self.scanned.saturating_sub(self.removed)
     }
 
     /// Whether this unit left part of its job undone: a bailed sweep or an
@@ -176,10 +135,10 @@ impl UnitStats {
         self.bailed > 0 || self.io_failures > 0
     }
 
-    /// Accumulate one finished unit into the per-mirror running total. The
-    /// destructure makes a new counter a compile error here rather than a
+    /// Accumulate one finished sweep, unit or mirror into a running total.
+    /// The destructure makes a new counter a compile error here rather than a
     /// silently unsummed field.
-    fn accumulate(&mut self, unit: Self) {
+    pub(super) fn accumulate(&mut self, unit: Self) {
         let Self {
             scanned,
             removed,
@@ -373,7 +332,11 @@ pub(super) async fn run_mirror_units(
         }
     }
 
-    CleanupDone::tally(mirror, totals, failed_units)
+    CleanupDone {
+        mirror,
+        stats: totals,
+        failed_units,
+    }
 }
 
 /// Everything a unit needs that is fixed for the whole mirror: its identity, the
@@ -518,41 +481,19 @@ async fn run_metadata_unit(unit: &MetadataUnit, ctx: &MirrorCtx<'_>) -> UnitStat
     )
     .await;
 
-    if swept.files_removed > 0 {
+    if swept.removed > 0 {
         info!(
             "Removed {} stale index metadata files for mirror {mirror} ({})",
-            swept.files_removed,
+            swept.removed,
             HumanFmt::Size(swept.bytes_removed),
         );
     }
 
+    // Only the removed files count as scanned: the unit retains nothing.
     UnitStats {
-        scanned: swept.files_removed,
-        removed: swept.files_removed,
-        bytes_removed: swept.bytes_removed,
-        removed_unreferenced: 0,
-        tmp_bytes_removed: 0,
-        bailed: 0,
-        io_failures: swept.io_failures,
+        scanned: swept.removed,
+        ..swept
     }
-}
-
-/// Counters from a single [`sweep_byhash_dir`] pass; [`run_byhash_unit`] turns
-/// them into both its summary line and the unit's [`UnitStats`].
-struct ByHashOutcome {
-    /// By-hash files kept: referenced digests (dropped from the candidate map
-    /// before the sweep) plus candidates too young for their span.
-    retained: u64,
-    /// By-hash files removed. An anomalous entry (symlink / FIFO / ... in
-    /// the by-hash dir) is unlinked too but not counted here: it was never
-    /// cached content, so it is no eviction -- the walker's
-    /// `CACHE_NON_REGULAR` is its count, as in every other cleanup walk.
-    removed: u64,
-    /// Subset of `removed` that were unreferenced but algorithm-covered.
-    removed_unreferenced: u64,
-    bytes_removed: u64,
-    /// See [`UnitStats::io_failures`].
-    io_failures: u64,
 }
 
 /// Execute a [`ByHashUnit`]: probe the by-hash tree, build its `Release`
@@ -601,7 +542,7 @@ async fn run_byhash_unit(
         }
     };
 
-    let outcome = sweep_byhash_dir(
+    let stats = sweep_byhash_dir(
         cache_root,
         &unit.root,
         reference.as_ref(),
@@ -615,24 +556,13 @@ async fn run_byhash_unit(
 
     info!(
         "Removed {} files acquired by-hash for mirror {mirror} ({}; {} unreferenced, {} retained)",
-        outcome.removed,
-        HumanFmt::Size(outcome.bytes_removed),
-        outcome.removed_unreferenced,
-        outcome.retained,
+        stats.removed,
+        HumanFmt::Size(stats.bytes_removed),
+        stats.removed_unreferenced,
+        stats.retained(),
     );
 
-    // `scanned = retained + removed` so the derived `files_retained`
-    // (`scanned - removed`) equals the kept count, exactly as the old by-hash
-    // task reported it; anomaly removals are in neither.
-    Ok(UnitStats {
-        scanned: outcome.retained + outcome.removed,
-        removed: outcome.removed,
-        bytes_removed: outcome.bytes_removed,
-        removed_unreferenced: outcome.removed_unreferenced,
-        tmp_bytes_removed: 0,
-        bailed: 0,
-        io_failures: outcome.io_failures,
-    })
+    Ok(stats)
 }
 
 static BYHASH_WALK: WalkContext = WalkContext {
@@ -651,9 +581,15 @@ static BYHASH_WALK: WalkContext = WalkContext {
 /// `grace`, counted as `removed_unreferenced`); anything uncovered,
 /// unclassifiable, or in age mode (`reference` is `None`) stays `ByHashUncovered`
 /// (swept past `backstop`). A symlink / FIFO / socket / device is unlinked
-/// inline without counting toward `removed` (no eviction, see
-/// [`ByHashOutcome::removed`]); a stray directory is reported and retained. Removal, metadata invalidation, future-timestamp and I/O-error
+/// inline without counting toward `removed` or the retained count: it was never
+/// cached content, so it is no eviction -- the walker's `CACHE_NON_REGULAR` is
+/// its count, as in every other cleanup walk. A stray directory is reported
+/// and retained. Removal, metadata invalidation, future-timestamp and I/O-error
 /// handling all flow through [`sweep_candidates`].
+///
+/// The returned `scanned` is the kept count (referenced digests plus
+/// candidates the sweep left in place) plus `removed`, so
+/// [`UnitStats::retained`] is the kept count.
 ///
 /// `NotFound` is treated as "nothing to do" (TOCTOU: the caller pre-probes with
 /// `byhash_dir_present`, but the tree may vanish in between). The walk is
@@ -671,7 +607,7 @@ async fn sweep_byhash_dir(
     now: SystemTime,
     mirror: &Mirror,
     layout: CacheLayout,
-) -> Result<ByHashOutcome, CleanupUnitError> {
+) -> Result<UnitStats, CleanupUnitError> {
     let mut candidates: HashMap<OsString, SpanClass> = HashMap::new();
     let mut referenced_kept = 0u64;
     let mut io_failures = 0u64;
@@ -725,7 +661,7 @@ async fn sweep_byhash_dir(
     }
 
     let survivors = candidates.len() as u64;
-    let swept = sweep_candidates(
+    let mut swept = sweep_candidates(
         byhash_path,
         &candidates,
         SpanTable {
@@ -741,15 +677,12 @@ async fn sweep_byhash_dir(
     )
     .await;
 
-    Ok(ByHashOutcome {
-        // Referenced keeps + candidates the sweep left in place (too young / I/O
-        // skipped); anomaly removals never count as retained.
-        retained: referenced_kept + survivors.saturating_sub(swept.files_removed),
-        removed: swept.files_removed,
-        removed_unreferenced: swept.removed_unreferenced,
-        bytes_removed: swept.bytes_removed,
-        io_failures: io_failures + swept.io_failures,
-    })
+    // Referenced keeps + candidates the sweep left in place (too young / I/O
+    // skipped); anomaly removals never count as retained.
+    let retained = referenced_kept + survivors.saturating_sub(swept.removed);
+    swept.scanned = retained + swept.removed;
+    swept.io_failures += io_failures;
+    Ok(swept)
 }
 
 /// Generic candidate-reconcile engine tail, shared by every candidate facet:
@@ -905,7 +838,7 @@ async fn run_reconcile_unit(
             root_failed: _,
         } => info!(
             "Removed {} aged flat deb files for mirror {mirror} ({})",
-            swept.files_removed,
+            swept.removed,
             HumanFmt::Size(swept.bytes_removed)
         ),
         // Strict-hybrid finish: the owning archive-root group reconciled this
@@ -916,13 +849,13 @@ async fn run_reconcile_unit(
         SweepReason::Grace => match owning_root {
             Some(archive_root) => info!(
                 "Strict-reconciled flat-pool mirror {mirror} against archive root `{archive_root}`: removed {} unreferenced deb files ({})",
-                swept.files_removed,
+                swept.removed,
                 HumanFmt::Size(swept.bytes_removed)
             ),
             None => log_reconcile_removed(unit.facet, mirror, &swept),
         },
     }
-    tally.fold(swept);
+    tally.accumulate(swept);
 
     Ok(tally)
 }
@@ -1390,16 +1323,16 @@ async fn resolve_origin_packages_self(
 /// only the structured-pool and flat facets reach it (the by-hash units emit
 /// their own summary in `run_byhash_unit`). The flat `AgeFallback` path emits
 /// its own "aged flat deb files" line rather than routing through here.
-fn log_reconcile_removed(facet: ReconcileFacet, mirror: &Mirror, swept: &SweepResult) {
+fn log_reconcile_removed(facet: ReconcileFacet, mirror: &Mirror, swept: &UnitStats) {
     match facet {
         ReconcileFacet::StructuredPool => info!(
             "Removed {} unreferenced deb files for mirror {mirror} ({})",
-            swept.files_removed,
+            swept.removed,
             HumanFmt::Size(swept.bytes_removed)
         ),
         ReconcileFacet::FlatTree => info!(
             "Removed {} unreferenced flat deb files for mirror {mirror} ({})",
-            swept.files_removed,
+            swept.removed,
             HumanFmt::Size(swept.bytes_removed)
         ),
     }
@@ -1530,7 +1463,7 @@ mod tests {
         .await
         .expect("sweep ok");
 
-        assert_eq!(outcome.retained, 1);
+        assert_eq!(outcome.retained(), 1);
         assert_eq!(outcome.removed, 2);
         assert_eq!(outcome.removed_unreferenced, 2);
         assert!(dir.path().join(hex_encode(&referenced)).exists());
@@ -1620,7 +1553,7 @@ mod tests {
 
         assert!(link.symlink_metadata().is_err(), "the symlink is unlinked");
         assert_eq!(outcome.removed, 0);
-        assert_eq!(outcome.retained, 0);
+        assert_eq!(outcome.retained(), 0);
     }
 
     #[tokio::test]
@@ -1655,7 +1588,7 @@ mod tests {
         .await
         .expect("sweep ok");
 
-        assert_eq!(outcome.retained, 1);
+        assert_eq!(outcome.retained(), 1);
         assert_eq!(outcome.removed, 0);
         assert!(dir.path().join(hex_encode(&unref)).exists());
     }
@@ -1687,7 +1620,7 @@ mod tests {
         .await
         .expect("sweep ok");
         assert_eq!(outcome.removed, 0);
-        assert_eq!(outcome.retained, 2);
+        assert_eq!(outcome.retained(), 2);
 
         // Past the backstop with no reference set -> aged out, not "unreferenced".
         let old = now + Duration::from_secs(91 * DAY);

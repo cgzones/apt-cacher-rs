@@ -8,7 +8,7 @@ mod scan;
 mod sweep;
 mod verify;
 
-use engine::run_mirror_units;
+use engine::{UnitStats, run_mirror_units};
 // The hyper-less bridge (`splice/cleanup_bridge.rs`) answers in these.
 #[cfg(not(feature = "hyper"))]
 pub(crate) use fetch::{FetchFailure, IndexAnswer};
@@ -329,11 +329,9 @@ async fn task_cleanup_impl(appstate: &AppState) {
         .collect::<Vec<_>>()
         .await;
 
+    let mut totals = UnitStats::default();
+    // Derived per mirror (`UnitStats::retained`) before the mirrors are summed.
     let mut files_retained = 0;
-    let mut files_removed = 0;
-    let mut bytes_removed = 0;
-    let mut removed_unreferenced = 0;
-    let mut tmp_bytes_removed = 0;
     // Steps that failed (`LAST_CLEANUP_FAILURES`), each logged where it failed.
     let mut failures = 0;
 
@@ -365,13 +363,21 @@ async fn task_cleanup_impl(appstate: &AppState) {
             );
         }
 
-        files_retained += cleanup_result.files_retained;
-        files_removed += cleanup_result.files_removed;
-        bytes_removed += cleanup_result.bytes_removed;
-        removed_unreferenced += cleanup_result.removed_unreferenced;
-        tmp_bytes_removed += cleanup_result.tmp_bytes_removed;
+        files_retained += cleanup_result.stats.retained();
+        totals.accumulate(cleanup_result.stats);
         failures += cleanup_result.failed_units;
     }
+
+    let UnitStats {
+        scanned: _,
+        removed: files_removed,
+        bytes_removed,
+        removed_unreferenced,
+        tmp_bytes_removed,
+        // Per unit, already folded into `failures` by `run_mirror_units`.
+        bailed: _,
+        io_failures: _,
+    } = totals;
 
     // The window snapshot must precede the scan: commits landing while the
     // scan walks are ambiguous to it, and the reconcile tolerates exactly
