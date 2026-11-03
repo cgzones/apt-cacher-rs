@@ -779,22 +779,27 @@ async fn forward_upstream_body(
     if length.is_none() {
         reader = reader.capped(max_bytes);
     }
+    // No larger than the body when its length is known: most relayed bodies
+    // are small error pages, which need no full read buffer.
+    let buf_size = length.map_or(TLS_READ_BUF_SIZE, |length| {
+        usize::try_from(length).map_or(TLS_READ_BUF_SIZE, |length| length.min(TLS_READ_BUF_SIZE))
+    });
     // `Vec::with_capacity` reserves uninitialized backing storage; `read_buf`
     // fills bytes into the spare capacity via `BufMut`, so the buffer is
     // never zero-initialized before being overwritten by upstream data.
-    let mut buf: Vec<u8> = Vec::with_capacity(TLS_READ_BUF_SIZE);
+    let mut buf: Vec<u8> = Vec::with_capacity(buf_size);
     let mut total: u64 = 0;
     let mut client_rate_checker = RateChecker::from_config(config);
 
     loop {
         let to_read = match length {
             Some(length) if total == length => break,
-            Some(length) => (length - total).min(TLS_READ_BUF_SIZE as u64),
-            None => TLS_READ_BUF_SIZE as u64,
+            Some(length) => (length - total).min(buf_size as u64),
+            None => buf_size as u64,
         };
         debug_assert_eq!(
             buf.capacity(),
-            TLS_READ_BUF_SIZE,
+            buf_size,
             "buffer capacity should remain constant"
         );
         buf.clear();
@@ -1338,7 +1343,10 @@ async fn read_dechunk_body_to_vec(
     let mut body = Vec::with_capacity(4096);
     let mut reader = UpstreamReader::new(global_config(), "chunked body buffering");
     let mut decoder = ChunkDecoder::new(max_bytes);
-    let mut read_buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE);
+    // Allocated by the first upstream read: a small body (a drained redirect
+    // or error page) often arrives whole with the head. Sized down to a small
+    // payload cap: a drain capped at 64 KiB needs no full read buffer.
+    let mut read_buf = BytesMut::new();
 
     // The bytes that arrived with the headers are decoded first; every later
     // iteration reads from upstream (`take` leaves an empty slice behind).
@@ -1347,6 +1355,7 @@ async fn read_dechunk_body_to_vec(
     loop {
         let data = if pending.is_empty() {
             read_buf.clear();
+            read_buf.reserve(TLS_READ_BUF_SIZE.min(max_bytes));
             let n = reader.read(upstream.read_buf(&mut read_buf)).await?;
             if n == 0 {
                 return Err(UpstreamError::protocol(
