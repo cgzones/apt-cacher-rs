@@ -1817,7 +1817,9 @@ fn rate_check_tick(rc: &RateChecker) -> std::time::Duration {
 /// fresh inner 1 s timer per loop iteration), allocating even on the
 /// fast path where `wait_once` returns instantly.  This version pins
 /// one outer `Sleep` and one re-armable inner `Sleep`, then drives them
-/// with `tokio::select!` — no per-iteration allocation.
+/// with `tokio::select!` — no per-iteration allocation.  Without a
+/// `RateChecker` the tick branch is disabled and never polled, so its
+/// timer is never registered.
 async fn wait_socket_rated(
     socket: &TcpStream,
     op: SocketReadiness,
@@ -1838,48 +1840,33 @@ async fn wait_socket_rated(
     let outer = tokio::time::sleep(http_timeout);
     tokio::pin!(outer);
 
-    if let Some(rc) = rate_checker {
-        let tick_period = rate_check_tick(rc);
-        let tick = tokio::time::sleep(tick_period);
-        tokio::pin!(tick);
+    let tick_period = rate_checker.as_ref().map_or(http_timeout, rate_check_tick);
+    let tick = tokio::time::sleep(tick_period);
+    tokio::pin!(tick);
 
-        loop {
-            tokio::select! {
-                biased;
-                result = async {
-                    match op {
-                        #[cfg(feature = "splice")]
-                        SocketReadiness::Readable => socket.readable().await,
-                        SocketReadiness::Writable => socket.writable().await,
-                    }
-                } => return result.map_err(SocketWaitError::Io),
-                () = &mut tick => {
+    loop {
+        tokio::select! {
+            biased;
+            result = async {
+                match op {
+                    #[cfg(feature = "splice")]
+                    SocketReadiness::Readable => socket.readable().await,
+                    SocketReadiness::Writable => socket.writable().await,
+                }
+            } => return result.map_err(SocketWaitError::Io),
+            () = &mut tick, if rate_checker.is_some() => {
+                if let Some(rc) = rate_checker {
                     rc.add(0);
                     if let Some(rate) = rc.check_fail() {
                         return Err(SocketWaitError::Rate(rate));
                     }
-                    tick.as_mut().reset(tokio::time::Instant::now() + tick_period);
                 }
-                () = &mut outer => {
-                    bump_timeout();
-                    return Err(SocketWaitError::Timeout { operation: timeout_msg, duration: http_timeout });
-                }
+                tick.as_mut().reset(tokio::time::Instant::now() + tick_period);
             }
-        }
-    }
-
-    tokio::select! {
-        biased;
-        result = async {
-            match op {
-                #[cfg(feature = "splice")]
-                SocketReadiness::Readable => socket.readable().await,
-                SocketReadiness::Writable => socket.writable().await,
+            () = &mut outer => {
+                bump_timeout();
+                return Err(SocketWaitError::Timeout { operation: timeout_msg, duration: http_timeout });
             }
-        } => result.map_err(SocketWaitError::Io),
-        () = &mut outer => {
-            bump_timeout();
-            Err(SocketWaitError::Timeout { operation: timeout_msg, duration: http_timeout })
         }
     }
 }
