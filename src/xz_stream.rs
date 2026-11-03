@@ -43,7 +43,7 @@ use std::io::{self, Read as _};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use lzma_rust2::XzReader;
+use lzma_rust2::{XzReader, lzma2_get_memory_usage};
 use tokio::io::{AsyncRead, DuplexStream, ReadBuf};
 use tokio::sync::oneshot;
 use tokio_util::io::SyncIoBridge;
@@ -105,14 +105,13 @@ where
     }
 }
 
-/// The decoder's memory limit in KiB: the dictionary cap plus the fixed
-/// per-block overhead `lzma_rust2` counts on top for `XzReader` (its 64 KiB
-/// input buffer and 40 KiB of decoder state as of 0.25; one MiB of slack
-/// keeps a `-9` index decodable without tracking the crate's exact
-/// formula).
+/// The decoder's memory limit in KiB: exactly what `lzma_rust2` counts for a
+/// block with a [`MAX_XZ_DICT_SIZE`] dictionary (the dictionary plus, as of
+/// 0.25, a 64 KiB input buffer and 40 KiB of decoder state), so a `-9` index
+/// decodes and every larger dictionary is refused.
 fn xz_mem_limit_kb() -> u32 {
-    let dict_kib = MAX_XZ_DICT_SIZE.get() / 1024 + 1024;
-    u32::try_from(dict_kib).expect("64 MiB in KiB fits u32")
+    let dict_size = u32::try_from(MAX_XZ_DICT_SIZE.get()).expect("64 MiB fits u32");
+    lzma2_get_memory_usage(dict_size)
 }
 
 /// Adds the limit to an out-of-memory error, which the crate words as
@@ -300,7 +299,7 @@ pub(crate) mod tests {
             .expect_err("a dictionary above the cap must be refused");
         assert_eq!(err.kind(), io::ErrorKind::OutOfMemory, "{err}");
         assert!(
-            err.to_string().contains("under the 65.0MiB decoder limit"),
+            err.to_string().contains("under the 64.1MiB decoder limit"),
             "the refusal must name the limit: {err}"
         );
         assert!(out.is_empty(), "nothing must be decoded");
@@ -594,6 +593,25 @@ pub(crate) mod tests {
             }
             Ok(buf.len())
         }
+    }
+
+    #[test]
+    fn the_memory_limit_admits_exactly_the_dictionary_cap() {
+        // Property byte 0x1c is a 64 MiB dictionary, the cap; 0x1d is the
+        // next size LZMA2 can declare, 96 MiB.
+        decode_stream(
+            Cursor::new(empty_blocks_xz(1, 0x1c)),
+            &mut Vec::new(),
+            || false,
+        )
+        .expect("a dictionary at the cap must decode");
+        let err = decode_stream(
+            Cursor::new(empty_blocks_xz(1, 0x1d)),
+            &mut Vec::new(),
+            || false,
+        )
+        .expect_err("the next dictionary size must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory, "{err}");
     }
 
     #[test]
