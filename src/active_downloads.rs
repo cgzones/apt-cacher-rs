@@ -45,7 +45,7 @@ use crate::guards::CANCELLED_DOWNLOAD;
 use crate::humanfmt::HumanFmt;
 use crate::mem_usage::{ARC_HEADER, Footprint};
 use crate::passthrough_limiter;
-use crate::transfer_error::DownloadFailure;
+use crate::transfer_error::{DeliveryFailure, DownloadFailure, InternalError};
 use crate::upstream_head::{ContentLength, RejectReason};
 use crate::{global_config, global_verify_throttle, metrics, warn_once_or_info};
 
@@ -226,6 +226,44 @@ impl ActiveDownloadStatus {
             // a reader that somehow did has no bytes coming either.
             Self::Aborted(AbortReason::Declined(_)) => {
                 AttachedReaderState::Failed(Arc::clone(&CANCELLED_DOWNLOAD))
+            }
+        }
+    }
+}
+
+/// What a reader of a growing download file learned from [`await_progress`].
+pub(crate) enum Progress {
+    /// A progress ping: more bytes may be on disk.
+    More,
+    /// The writer is gone and every byte is on disk: read to the end and stop.
+    Drained,
+}
+
+/// Wait for the next progress ping of the download a growing-file reader
+/// follows, and on the writer's end map its terminal state: a complete file
+/// drains, a failed download fails the delivery, and a sender closed in a
+/// nonterminal state is a logic error, reported as `op`/`detail`.
+///
+/// Needs no timeout: the wait ends at the latest when the writer drops the
+/// sender, which `DownloadBarrier::begin_rename` and every barrier `Drop`
+/// do, and no holder of that barrier ever awaits the reader first.
+pub(crate) async fn await_progress(
+    receiver: &mut tokio::sync::watch::Receiver<()>,
+    status: &tokio::sync::RwLock<ActiveDownloadStatus>,
+    op: &'static str,
+    detail: &'static str,
+) -> Result<Progress, DeliveryFailure> {
+    match receiver.changed().await {
+        Ok(()) => Ok(Progress::More),
+        Err(_err @ tokio::sync::watch::error::RecvError { .. }) => {
+            // Verifying means all bytes are on disk and the writer is hashing
+            // on a blocking thread; the open file handle stays valid across
+            // the upcoming rename, so drain like Finished.
+            let state = status.read().await.attached_reader();
+            match state {
+                AttachedReaderState::Drainable => Ok(Progress::Drained),
+                AttachedReaderState::Failed(failure) => Err(DeliveryFailure::Download(failure)),
+                AttachedReaderState::Incomplete => Err(InternalError::invalid(op, detail).into()),
             }
         }
     }

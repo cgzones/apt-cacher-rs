@@ -39,8 +39,8 @@ use crate::{
     AppState, Never, Scheme,
     accounted_body::{AccountedBody, Subject},
     active_downloads::{
-        ActiveDownloadStatus, Admission, AttachedReaderState, Declined, JoinFailure, Origination,
-        Serveable, at_capacity_refusal, await_serveable,
+        ActiveDownloadStatus, Admission, Declined, JoinFailure, Origination, Progress, Serveable,
+        at_capacity_refusal, await_progress, await_serveable,
     },
     build_info::{APP_USER_AGENT, APP_VIA},
     cache_conditional::{
@@ -1009,21 +1009,16 @@ async fn serve_unfinished_file(
                 if draining {
                     return Ok(());
                 }
-                if receiver.changed().await.is_err() {
-                    let state = status.read().await.attached_reader();
-                    match state {
-                        AttachedReaderState::Drainable => draining = true,
-                        AttachedReaderState::Failed(failure) => {
-                            return Err(DeliveryFailure::Download(failure));
-                        }
-                        AttachedReaderState::Incomplete => {
-                            return Err(InternalError::invalid(
-                                "follow growing cache file",
-                                "download progress closed in nonterminal state",
-                            )
-                            .into());
-                        }
-                    }
+                match await_progress(
+                    &mut receiver,
+                    &status,
+                    "follow growing cache file",
+                    "download progress closed in nonterminal state",
+                )
+                .await?
+                {
+                    Progress::More => {}
+                    Progress::Drained => draining = true,
                 }
             }
         }

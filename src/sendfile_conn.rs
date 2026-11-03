@@ -55,8 +55,8 @@ use crate::transfer_error::UpstreamError;
 use crate::{
     AppState, Never,
     active_downloads::{
-        ActiveDownloadStatus, AttachedReaderState, Declined, JoinFailure, Serveable,
-        await_serveable,
+        ActiveDownloadStatus, AttachedReaderState, Declined, JoinFailure, Progress, Serveable,
+        await_progress, await_serveable,
     },
     build_info::APP_NAME,
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServePlan, check_volatile_hit},
@@ -2352,47 +2352,27 @@ async fn sendfile_unfinished_transfer(
                 )
                 .into());
             }
-            // Wait for the sender to notify us of new data on disk.
-            // The sender handles timeouts, so we *should* never stall here.
-            // The wait has no timeout of its own and needs none: it ends at
-            // the latest when the writer drops the sender, which
-            // `DownloadBarrier::begin_rename` and every barrier `Drop` do,
-            // and no holder of that barrier ever awaits this task first --
-            // the splice backend awaits its demoted file-serve only through
+            // Wait for the sender to notify us of new data on disk. The
+            // splice backend awaits its demoted file-serve only through
             // `splice::commit::ClientSettlement::settle`, which exists only
-            // past that drop.
+            // past the barrier drop that ends this wait (see
+            // `await_progress`).
+            let progress = await_progress(
+                &mut receiver,
+                &status,
+                "sendfile attached reader",
+                "unexpected download state after progress sender closed",
+            )
+            .await?;
             // Time waiting for the download is not client backpressure.
             // Reset the delivery-rate window after that wait, including for
             // a tail-range reader that has not received its first byte yet.
-            let changed = receiver.changed().await;
             rate_checker = RateChecker::from_config(config);
-            let _: Never = match changed {
-                Ok(()) => continue,
-                Err(_err @ tokio::sync::watch::error::RecvError { .. }) => {
-                    // Sender dropped — download finished, verifying, or
-                    // aborted. Verifying means all bytes are on disk and the
-                    // writer is hashing on a blocking thread; the open file
-                    // handle stays valid across the upcoming rename, so drain
-                    // like Finished.
-                    let state = status.read().await.attached_reader();
-                    match state {
-                        AttachedReaderState::Drainable => {
-                            finished = true;
-                            continue;
-                        }
-                        AttachedReaderState::Failed(failure) => {
-                            return Err(DeliveryFailure::Download(failure));
-                        }
-                        AttachedReaderState::Incomplete => {
-                            return Err(InternalError::invalid(
-                                "sendfile attached reader",
-                                "unexpected download state after progress sender closed",
-                            )
-                            .into());
-                        }
-                    }
-                }
-            };
+            match progress {
+                Progress::More => {}
+                Progress::Drained => finished = true,
+            }
+            continue;
         }
 
         // Transfer what is currently available via the shared sendfile loop.
