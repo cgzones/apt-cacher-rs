@@ -525,9 +525,9 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
         .set(logstore::LogStore::new(config.logstore_capacity))
         .expect("Initial set in main() should succeed");
 
-    let logstore_handle = LOGSTORE.get().expect("initialized in main()").clone();
+    let logstore = LOGSTORE.get().expect("initialized in main()");
     let internal_layer = tracing_subscriber::fmt::layer()
-        .with_writer(move || logstore_handle.clone())
+        .with_writer(move || logstore)
         .with_ansi(false)
         .with_target(true)
         .with_thread_names(true)

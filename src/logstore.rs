@@ -19,7 +19,7 @@
 //! bounded raw prefix while waiting for its newline; leading whitespace in
 //! an oversized fragmented line counts toward that prefix too.
 
-use std::{num::NonZero, sync::Arc};
+use std::num::NonZero;
 
 use crate::{
     mem_usage::{Footprint, buffer_bytes},
@@ -128,16 +128,19 @@ impl std::io::Write for LogStoreImpl {
     }
 }
 
-#[derive(Clone, Debug)]
+/// Lives in a `static` (`main.rs`'s `LOGSTORE`), so the log layer writes
+/// through a shared `&'static LogStore`: `io::Write` is implemented for the
+/// reference, as std does for `&File`.
+#[derive(Debug)]
 pub(crate) struct LogStore {
-    inner: Arc<parking_lot::RwLock<LogStoreImpl>>,
+    inner: parking_lot::RwLock<LogStoreImpl>,
 }
 
 impl LogStore {
     #[must_use]
     pub(crate) fn new(capacity: NonZero<usize>) -> Self {
         Self {
-            inner: Arc::new(parking_lot::RwLock::new(LogStoreImpl::new(capacity))),
+            inner: parking_lot::RwLock::new(LogStoreImpl::new(capacity)),
         }
     }
 
@@ -163,13 +166,14 @@ impl LogStore {
     }
 }
 
-impl std::io::Write for LogStore {
+impl std::io::Write for &LogStore {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.inner.write().write(buf)
     }
 
+    /// Nothing is buffered past a newline, so there is nothing to lock for.
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.write().flush()
+        Ok(())
     }
 }
 
@@ -187,21 +191,21 @@ mod tests {
     /// in pieces and must not surface until its newline does.
     #[test]
     fn a_line_split_across_writes_surfaces_only_once_terminated() {
-        let mut store = new_store(4);
+        let store = new_store(4);
 
-        store.write_all(b"hello ").expect("write");
+        (&store).write_all(b"hello ").expect("write");
         assert!(store.snapshot().is_empty(), "no newline seen yet");
 
-        store.write_all(b"world\n").expect("write");
+        (&store).write_all(b"world\n").expect("write");
         assert_eq!(store.snapshot(), ["hello world"]);
     }
 
     /// One `write` can carry several records plus the head of the next one.
     #[test]
     fn one_write_is_split_on_every_newline_and_trimmed() {
-        let mut store = new_store(4);
+        let store = new_store(4);
 
-        store
+        (&store)
             .write_all(b"first\r\n  second  \nthird-so-far")
             .expect("write");
 
@@ -216,17 +220,17 @@ mod tests {
     /// has to be counted.
     #[test]
     fn overflowing_the_ring_drops_the_oldest_entry_and_counts_it() {
-        let mut store = new_store(2);
+        let store = new_store(2);
         let before = metrics::LOGSTORE_EVICTIONS.get();
 
-        store.write_all(b"one\ntwo\n").expect("write");
+        (&store).write_all(b"one\ntwo\n").expect("write");
         assert_eq!(
             metrics::LOGSTORE_EVICTIONS.get(),
             before,
             "filling the ring is not an eviction"
         );
 
-        store.write_all(b"three\n").expect("write");
+        (&store).write_all(b"three\n").expect("write");
         assert_eq!(store.snapshot(), ["two", "three"]);
         assert_eq!(metrics::LOGSTORE_EVICTIONS.get(), before + 1);
     }
@@ -235,18 +239,18 @@ mod tests {
     /// quoting a huge upstream value cannot pin that much memory per entry.
     #[test]
     fn an_overlong_line_is_truncated_at_a_char_boundary() {
-        let mut store = new_store(4);
+        let store = new_store(4);
 
         // A two-byte char straddles the cap, so the cut must back off by one.
         let mut line = "a".repeat(MAX_ENTRY_LEN - 1);
         line.push_str(&"\u{e9}".repeat(1000));
         line.push('\n');
-        store.write_all(line.as_bytes()).expect("write");
+        (&store).write_all(line.as_bytes()).expect("write");
         assert!(
             store.inner.read().buffer.capacity() <= MAX_ENTRY_LEN,
             "a complete oversized line must not enlarge the scratch buffer"
         );
-        store.write_all(b"next\n").expect("write");
+        (&store).write_all(b"next\n").expect("write");
 
         let entries = store.snapshot();
         assert_eq!(entries.len(), 2);
@@ -255,9 +259,9 @@ mod tests {
         assert_eq!(entries[1], "next");
 
         // A line exactly at the cap is kept whole.
-        let mut store = new_store(4);
+        let store = new_store(4);
         let at_cap = "b".repeat(MAX_ENTRY_LEN);
-        store
+        (&store)
             .write_all(format!("{at_cap}\n").as_bytes())
             .expect("write");
         assert_eq!(store.snapshot(), [at_cap]);
@@ -265,61 +269,61 @@ mod tests {
 
     #[test]
     fn fragmented_records_are_bounded_and_reset_at_the_next_newline() {
-        let mut store = new_store(4);
+        let store = new_store(4);
         let prefix = "a".repeat(MAX_ENTRY_LEN - 1);
-        store.write_all(prefix.as_bytes()).unwrap();
+        (&store).write_all(prefix.as_bytes()).unwrap();
         // Split the scalar at the entry boundary across writes.
-        store.write_all(&[0xc3]).unwrap();
-        store.write_all(&[0xa9]).unwrap();
+        (&store).write_all(&[0xc3]).unwrap();
+        (&store).write_all(&[0xa9]).unwrap();
         let chunk = vec![b'x'; 1024];
         for _ in 0..1024 {
-            store.write_all(&chunk).unwrap();
+            (&store).write_all(&chunk).unwrap();
         }
         assert!(
             store.snapshot().is_empty(),
             "the record still needs its newline"
         );
         assert!(store.inner.read().buffer.len() <= MAX_FRAGMENT_BYTES);
-        store.write_all(b"discarded tail\nnext\n").unwrap();
+        (&store).write_all(b"discarded tail\nnext\n").unwrap();
         assert_eq!(
             store.snapshot(),
             [format!("{prefix}{TRUNCATION_MARK}"), "next".to_owned()]
         );
 
         // An ordinary fragmented scalar and an exactly-at-cap record stay whole.
-        store.write_all(&[0xc3]).unwrap();
-        store.write_all(&[0xa9, b'\n']).unwrap();
+        (&store).write_all(&[0xc3]).unwrap();
+        (&store).write_all(&[0xa9, b'\n']).unwrap();
         let at_cap = "b".repeat(MAX_ENTRY_LEN);
         for part in at_cap.as_bytes().chunks(1024) {
-            store.write_all(part).unwrap();
+            (&store).write_all(part).unwrap();
         }
-        store.write_all(b"\n").unwrap();
+        (&store).write_all(b"\n").unwrap();
         let entries = store.snapshot();
         assert_eq!(entries[2], "\u{e9}");
         assert_eq!(entries[3], at_cap);
 
         // Whitespace past the cap is trimmed, not truncated content.
-        store.write_all(at_cap.as_bytes()).unwrap();
-        store.write_all(b" \t\x0b ").unwrap();
-        store.write_all(b"\n").unwrap();
+        (&store).write_all(at_cap.as_bytes()).unwrap();
+        (&store).write_all(b" \t\x0b ").unwrap();
+        (&store).write_all(b"\n").unwrap();
         assert_eq!(store.snapshot()[3], at_cap);
 
         // Leading whitespace shifts the cap into a scalar: the partial scalar
         // is dropped, not decoded to U+FFFD.
         let shifted = "a".repeat(MAX_ENTRY_LEN - 8);
-        store.write_all(b"          ").unwrap();
-        store.write_all(shifted.as_bytes()).unwrap();
-        store.write_all("\u{e9} tail".as_bytes()).unwrap();
-        store.write_all(b"\n").unwrap();
+        (&store).write_all(b"          ").unwrap();
+        (&store).write_all(shifted.as_bytes()).unwrap();
+        (&store).write_all("\u{e9} tail".as_bytes()).unwrap();
+        (&store).write_all(b"\n").unwrap();
         assert_eq!(store.snapshot()[3], format!("{shifted}{TRUNCATION_MARK}"));
     }
 
     /// Invalid UTF-8 must not lose the record or panic the logging path.
     #[test]
     fn invalid_utf8_is_replaced_rather_than_dropped() {
-        let mut store = new_store(4);
+        let store = new_store(4);
 
-        store.write_all(b"bad \xff byte\n").expect("write");
+        (&store).write_all(b"bad \xff byte\n").expect("write");
 
         assert_eq!(store.snapshot(), ["bad \u{fffd} byte"]);
     }
