@@ -30,7 +30,7 @@
 //!   query.  Logs one `warn!` per colliding mirror so operators see the
 //!   collision in the daemon's startup log.
 //! - **Maintenance**: [`record_mirror`] is called from
-//!   `upsert_mirror_get_id` whenever the post-upsert row's `kind`
+//!   `Database::upsert_mirror_id` whenever the post-upsert row's `kind`
 //!   column is `Structured` (0).  That covers both fresh inserts and
 //!   the ON-CONFLICT path that latches a previously-`Flat` row to
 //!   `Structured`, so a collision that only surfaces after a flat

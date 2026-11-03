@@ -320,7 +320,7 @@ async fn scan_mirror_dir(
     if matches!(outcome, WalkOutcome::RootMissing) {
         // For a `Flat`-kind row the structured-pool path is expected
         // not to exist — `kind` latches to `Structured` on the very
-        // first structured request (see `upsert_mirror_get_id`), so a
+        // first structured request (see `Database::upsert_mirror_id`), so a
         // `Flat` row has by construction never written to
         // `<host>/<mirror_path>/`. Logging above debug here would just
         // add noise on every startup / SIGUSR2 cleanup. For

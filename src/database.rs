@@ -410,67 +410,6 @@ async fn delete_mirror_rows(tx: &mut SqliteConnection, id: i64) -> Result<(), Er
     Ok(())
 }
 
-/// Upsert a mirror row and return `(id, was_inserted)` in a single round
-/// trip via `RETURNING`. `was_inserted` is `first_seen = last_seen`: equal
-/// on a fresh INSERT, since ON CONFLICT rewrites `last_seen` (and
-/// conditionally `kind`) but never `first_seen`. An ON-CONFLICT update
-/// landing in the same unixepoch second as the original INSERT also
-/// compares equal - a harmless false positive (a repeated "Encountered
-/// new mirror" debug line at worst).
-///
-/// The `kind` column on ON-CONFLICT latches to `Structured` (0) whenever
-/// any structured request arrives for an existing row, so the blocklist
-/// seed at next startup cannot lose a collision that surfaced only after
-/// a flat row already existed for the same `(host, port, path)`.
-async fn upsert_mirror_get_id(
-    tx: &mut SqliteConnection,
-    mirror: &Mirror,
-) -> Result<(i64, bool), Error> {
-    let host = mirror.host();
-    let port = mirror.port().map_or(0, NonZero::get);
-    let path = mirror.path();
-    let kind = mirror.kind().as_db_int();
-    let row = query!(
-        r#"
-            INSERT INTO mirrors_v2
-            (host, port, path, kind)
-            VALUES
-            (?, ?, ?, ?)
-            ON CONFLICT
-            DO UPDATE SET
-              last_seen = unixepoch(CURRENT_TIMESTAMP),
-              kind = CASE
-                WHEN excluded.kind = 0 THEN 0
-                ELSE mirrors_v2.kind
-              END
-            RETURNING id, kind AS "kind!: i64", (first_seen = last_seen) AS "was_inserted!: bool";
-        "#,
-        host,
-        port,
-        path,
-        kind,
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-    // Newly-registered structured mirrors at `path = "flat"` (or
-    // `flat/<anything>`) would have their files written into the same
-    // `<host>/flat/` tree the host-level flat layout reserves.  Record
-    // the host in the blocklist so subsequent flat URLs for it fall
-    // through to passthrough uncached.
-    //
-    // Gate on the post-upsert `kind` column rather than `was_inserted`:
-    // a structured request can latch a previously-flat row to structured
-    // (was_inserted=false), and that transition must still be observed
-    // by the blocklist.  `record_mirror`'s `path_collides_with_flat_layout`
-    // check is the cheap pre-filter; the HashSet insert is idempotent.
-    if MirrorKind::from_db_int(row.kind) == Some(MirrorKind::Structured) {
-        // `mirror` is canonical (alias-resolved at dispatch), so its host is
-        // the on-disk host directory the blocklist keys on.
-        flat_blocklist::record_mirror(mirror.host().as_cache_host(), mirror.port(), mirror.path());
-    }
-    Ok((row.id, row.was_inserted))
-}
-
 /// On-disk footprint of the `SQLite` database: the main file plus its `-wal`
 /// sidecar, which in WAL mode can hold a sizeable share of the rows (an
 /// unclean shutdown leaves it uncheckpointed). `None` when the main file
@@ -1056,16 +995,78 @@ impl Database {
             .collect())
     }
 
-    /// Pool-based variant of the private `upsert_mirror_get_id`. Issued on a
-    /// mirror-id cache miss in the batched `db_loop`. Returns the row `id`
-    /// and `was_inserted = true` when the mirror was inserted for the first
-    /// time (no prior row in `mirrors_v2`; same-second caveat on
-    /// `upsert_mirror_get_id` applies).
+    /// Upsert a mirror row and return `(id, was_inserted)` in a single round
+    /// trip via `RETURNING`. `was_inserted` is `first_seen = last_seen`: equal
+    /// on a fresh INSERT, since ON CONFLICT rewrites `last_seen` (and
+    /// conditionally `kind`) but never `first_seen`. An ON-CONFLICT update
+    /// landing in the same unixepoch second as the original INSERT also
+    /// compares equal - a harmless false positive (a repeated "Encountered
+    /// new mirror" debug line at worst).
+    ///
+    /// The `kind` column on ON-CONFLICT latches to `Structured` (0) whenever
+    /// any structured request arrives for an existing row, so the blocklist
+    /// seed at next startup cannot lose a collision that surfaced only after
+    /// a flat row already existed for the same `(host, port, path)`.
+    ///
+    /// Issued on a mirror-id cache miss in the batched `db_loop`.
+    ///
+    /// The explicit transaction is load-bearing although the upsert is one
+    /// statement: `fetch_one` stops at the `RETURNING` row and sqlx resets
+    /// the statement without reporting the reset's result, so under
+    /// autocommit a failed commit (full disk, WAL I/O error) would still hand
+    /// back the id. The caller caches that id for good, and once the
+    /// rolled-back `AUTOINCREMENT` value is reused another mirror's rows
+    /// would land under it. `commit` surfaces the failure instead.
     pub(crate) async fn upsert_mirror_id(&self, mirror: &Mirror) -> Result<(i64, bool), Error> {
+        let host = mirror.host();
+        let port = mirror.port().map_or(0, NonZero::get);
+        let path = mirror.path();
+        let kind = mirror.kind().as_db_int();
         let mut tx = self.conn.begin().await?;
-        let result = upsert_mirror_get_id(&mut tx, mirror).await?;
+        let row = query!(
+            r#"
+            INSERT INTO mirrors_v2
+            (host, port, path, kind)
+            VALUES
+            (?, ?, ?, ?)
+            ON CONFLICT
+            DO UPDATE SET
+              last_seen = unixepoch(CURRENT_TIMESTAMP),
+              kind = CASE
+                WHEN excluded.kind = 0 THEN 0
+                ELSE mirrors_v2.kind
+              END
+            RETURNING id, kind AS "kind!: i64", (first_seen = last_seen) AS "was_inserted!: bool";
+        "#,
+            host,
+            port,
+            path,
+            kind,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
         tx.commit().await?;
-        Ok(result)
+        // Newly-registered structured mirrors at `path = "flat"` (or
+        // `flat/<anything>`) would have their files written into the same
+        // `<host>/flat/` tree the host-level flat layout reserves.  Record
+        // the host in the blocklist so subsequent flat URLs for it fall
+        // through to passthrough uncached.
+        //
+        // Gate on the post-upsert `kind` column rather than `was_inserted`:
+        // a structured request can latch a previously-flat row to structured
+        // (was_inserted=false), and that transition must still be observed
+        // by the blocklist.  `record_mirror`'s `path_collides_with_flat_layout`
+        // check is the cheap pre-filter; the HashSet insert is idempotent.
+        if MirrorKind::from_db_int(row.kind) == Some(MirrorKind::Structured) {
+            // `mirror` is canonical (alias-resolved at dispatch), so its host is
+            // the on-disk host directory the blocklist keys on.
+            flat_blocklist::record_mirror(
+                mirror.host().as_cache_host(),
+                mirror.port(),
+                mirror.path(),
+            );
+        }
+        Ok((row.id, row.was_inserted))
     }
 
     /// Bulk-update `mirrors_v2.last_seen` for a set of (id, `last_seen`) pairs.

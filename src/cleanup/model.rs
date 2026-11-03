@@ -447,7 +447,7 @@ fn flat_root_split(mirror_path: &str) -> Option<(&str, String)> {
 /// Reconcile(StructuredPool)?, Reconcile(FlatTree), Metadata(Dists)?,
 /// Metadata(Flat), ByHash(DistsByHash)?, ByHash(FlatByHash)]`. The three `?`
 /// units are omitted for a `MirrorKind::Flat` row: `kind` latches one-way to
-/// `Structured` (see `upsert_mirror_get_id`), so a `Flat` row is guaranteed to
+/// `Structured` (see `Database::upsert_mirror_id`), so a `Flat` row is guaranteed to
 /// have no structured pool tree, dists tree, or dists by-hash tree on disk.
 ///
 /// `nested` is the caller's pre-computed list of sibling mirror paths nested
