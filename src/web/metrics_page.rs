@@ -170,11 +170,12 @@ impl Groups {
     }
 
     fn group(&mut self, title: &'static str, build: impl FnOnce(&mut DetailsList)) {
-        let mut list = DetailsList::new().scoped(title);
+        swrite!(self.out, "<h3 class=\"group\">{title}</h3>");
+        let mut list = DetailsList::appending_to(std::mem::take(&mut self.out)).scoped(title);
         build(&mut list);
-        let (html, highlights) = list.finish_counted();
+        let (out, highlights) = list.finish_counted();
+        self.out = out;
         self.highlights.add(highlights);
-        swrite!(self.out, "<h3 class=\"group\">{title}</h3>{html}");
     }
 
     fn finish(self) -> (String, Highlights) {

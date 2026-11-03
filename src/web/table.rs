@@ -354,13 +354,22 @@ impl DetailsList {
         Self::with_now(now_epoch())
     }
 
+    /// A list appended to `out`, which [`Self::finish_counted`] hands back:
+    /// a run of lists renders into one buffer instead of each into its own.
+    pub(super) fn appending_to(out: String) -> Self {
+        Self::open_in(out, "details", now_epoch())
+    }
+
     /// A list whose relative times are measured against `now`: tests pin it.
     fn with_now(now: i64) -> Self {
         Self::open("details", now)
     }
 
     fn open(class: &'static str, now: i64) -> Self {
-        let mut out = String::with_capacity(1024);
+        Self::open_in(String::with_capacity(1024), class, now)
+    }
+
+    fn open_in(mut out: String, class: &'static str, now: i64) -> Self {
         swrite!(out, "<dl class=\"{class}\">");
         Self {
             out,
