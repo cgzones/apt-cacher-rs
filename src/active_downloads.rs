@@ -5,8 +5,9 @@
 //! splice, and sendfile delivery backends. It is also the single enforcement
 //! site for `max_upstream_downloads`: a new origination at the cap returns
 //! `AtCapacity` from [`ActiveDownloads::register`] (late joiners are exempt:
-//! they open no new upstream connection), which every backend maps to the canonical 503. It
-//! also drives the related metric accounting so callers don't have to:
+//! they open no new upstream connection), which every backend answers from
+//! [`at_capacity_refusal`]. It also drives the related metric accounting so
+//! callers don't have to:
 //!
 //! - Late-joiner counts ([`metrics::LATE_JOINERS_TOTAL`] /
 //!   [`metrics::LATE_JOINER_PEAK_PER_DOWNLOAD`]) — bumped atomically when
@@ -51,7 +52,9 @@ use crate::{global_config, global_verify_throttle, metrics, warn_once_or_info};
 /// Why an originator ended its registry entry without downloading anything:
 /// it answered its client from the upstream's head or from its own policy.
 /// A joiner answers what the originator answered ([`Self::response_parts`]),
-/// where a `Cancelled` abort would claim a failure of unknown cause.
+/// where a `Cancelled` abort would claim a failure of unknown cause.  An
+/// originator declining on its own policy answers from the same table, so
+/// the two agree by construction.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Declined {
     /// The upstream answered with a status that is relayed, not cached.
@@ -76,9 +79,12 @@ pub(crate) enum Declined {
 
 impl Declined {
     /// The status + body a joiner answers with: the originator's own answer,
-    /// except that a relayed upstream body cannot be replayed.
+    /// except that a relayed upstream body cannot be replayed.  Every
+    /// originator declining on a proxy-side condition (quota, verify
+    /// throttle, relay cap, planner refusal, empty volatile body) answers
+    /// from here, with [`Self::retry_after`].
     #[must_use]
-    fn response_parts(self) -> (StatusCode, &'static str) {
+    pub(crate) fn response_parts(self) -> (StatusCode, &'static str) {
         match self {
             Self::Passthrough(status) => (status, status.canonical_reason().unwrap_or("")),
             Self::Rejected(reason) => (StatusCode::BAD_GATEWAY, reason.body()),
@@ -95,6 +101,19 @@ impl Declined {
             ),
             #[cfg(feature = "splice")]
             Self::RangeNotSatisfiable => (StatusCode::INTERNAL_SERVER_ERROR, "Download Aborted"),
+        }
+    }
+
+    /// `Retry-After` value for the response, when the decline carries one.
+    #[must_use]
+    pub(crate) fn retry_after(self) -> Option<std::time::Duration> {
+        match self {
+            Self::VerifyThrottled { remaining } => Some(remaining),
+            Self::Passthrough(_) | Self::Rejected(_) | Self::RelayRefused | Self::QuotaExceeded => {
+                None
+            }
+            #[cfg(feature = "splice")]
+            Self::EmptyVolatileBody | Self::RangeNotSatisfiable => None,
         }
     }
 }
@@ -246,12 +265,12 @@ pub(crate) enum JoinFailure {
     /// Every byte was written but the commit discarded them (a verify I/O or
     /// rename failure; a checksum mismatch with an expired throttle).
     Discarded,
-    /// The originator answered without downloading.
+    /// The originator answered without downloading -- or the writer
+    /// discarded the download on a checksum mismatch and the verify
+    /// throttle is armed for the resource, which is answered as the
+    /// pre-upstream gate's `Declined::VerifyThrottled` (503 with
+    /// `Retry-After`).
     Declined(Declined),
-    /// The writer discarded the download on a checksum mismatch and the
-    /// verify throttle is armed for the resource: the same 503 the
-    /// pre-upstream gate answers, with `Retry-After`.
-    VerifyThrottled { remaining: std::time::Duration },
     /// Still `Init` after the writer signalled - a logic error.
     StateCorrupted,
     /// Opening the file failed (`CACHE_IO_FAILURE` or `CACHE_NON_REGULAR`
@@ -271,10 +290,6 @@ impl JoinFailure {
             Self::Aborted(failure) => failure.response_parts(),
             Self::Discarded => (StatusCode::INTERNAL_SERVER_ERROR, "Download Aborted"),
             Self::Declined(why) => why.response_parts(),
-            Self::VerifyThrottled { remaining: _ } => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Recently failed checksum verification",
-            ),
             Self::StateCorrupted => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Download State Corrupted",
@@ -288,7 +303,9 @@ impl JoinFailure {
     /// of answering this failure: cleanup's synthetic client skips the
     /// pre-upstream verify-throttle gate (a 503 would bail the mirror's
     /// cleanup), so a throttled originator's decline is no answer for it.
-    /// Only hyper's `serve_cache_miss` can see such a joiner.
+    /// Only hyper's `serve_cache_miss` can see such a joiner.  (The same
+    /// variant from a discarded download never reaches cleanup's client:
+    /// `discarded_join` exempts it before arming the answer.)
     #[must_use]
     pub(crate) fn exempts(&self, client: &ClientInfo) -> bool {
         matches!(
@@ -301,13 +318,8 @@ impl JoinFailure {
     #[must_use]
     pub(crate) fn retry_after(&self) -> Option<std::time::Duration> {
         match self {
-            Self::VerifyThrottled { remaining }
-            | Self::Declined(Declined::VerifyThrottled { remaining }) => Some(*remaining),
-            Self::Aborted(_)
-            | Self::Discarded
-            | Self::Declined(_)
-            | Self::StateCorrupted
-            | Self::CacheAccess => None,
+            Self::Declined(why) => why.retry_after(),
+            Self::Aborted(_) | Self::Discarded | Self::StateCorrupted | Self::CacheAccess => None,
         }
     }
 }
@@ -488,7 +500,6 @@ pub(crate) async fn await_serveable(
                         conn_details.client,
                     ),
                     JoinFailure::Discarded
-                    | JoinFailure::VerifyThrottled { remaining: _ }
                     | JoinFailure::StateCorrupted
                     | JoinFailure::CacheAccess => {}
                 }
@@ -515,9 +526,9 @@ fn discarded_join(checksum_mismatch: bool, conn_details: &ConnectionDetails) -> 
             HumanFmt::Time(throttled.remaining)
         );
         metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.increment();
-        return JoinFailure::VerifyThrottled {
+        return JoinFailure::Declined(Declined::VerifyThrottled {
             remaining: throttled.remaining,
-        };
+        });
     }
     let failure = JoinFailure::Discarded;
     info!(
@@ -684,9 +695,28 @@ pub(crate) enum Admission {
     /// A new origination was refused because `max` downloads were already in
     /// flight; nothing was inserted. Carries the enforced cap so callers can
     /// log the actual value the decision was made against. The caller answers
-    /// with the canonical 503 (`"Too many concurrent upstream downloads"`);
-    /// the `UPSTREAM_DOWNLOAD_REJECTED_CAP` bump already happened here.
+    /// from [`at_capacity_refusal`]; the `UPSTREAM_DOWNLOAD_REJECTED_CAP` bump
+    /// already happened here.
     AtCapacity { max: NonZero<usize> },
+}
+
+/// Log the refusal of an origination at the `max_upstream_downloads` cap
+/// ([`Admission::AtCapacity`]) and return the canonical 503 every backend
+/// answers it with. Not an error: the connection stays usable.
+#[must_use]
+pub(crate) fn at_capacity_refusal(
+    max: NonZero<usize>,
+    conn_details: &ConnectionDetails,
+) -> (StatusCode, &'static str) {
+    warn_once_or_info!(
+        "Max upstream downloads ({max}) exceeded for {} from client {}; returning 503",
+        conn_details.debname,
+        conn_details.client
+    );
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Too many concurrent upstream downloads",
+    )
 }
 
 /// Mint-side cap tracking, under the registry's write lock: count the

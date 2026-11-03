@@ -40,7 +40,7 @@ use crate::{
     accounted_body::{AccountedBody, Subject},
     active_downloads::{
         ActiveDownloadStatus, Admission, AttachedReaderState, Declined, JoinFailure, Origination,
-        Serveable, await_serveable,
+        Serveable, at_capacity_refusal, await_serveable,
     },
     build_info::{APP_USER_AGENT, APP_VIA},
     cache_conditional::{
@@ -1437,7 +1437,8 @@ async fn serve_cache_miss(
             }
             Admission::AtCapacity { max } => {
                 conn_details.count_fetch_role(FetchRole::Refused);
-                upstream_cap_rejection(&conn_details, max)
+                let (status, msg) = at_capacity_refusal(max, &conn_details);
+                quick_response(status, msg)
             }
         };
     }
@@ -1751,25 +1752,19 @@ fn redirect_permitted(moved_uri: &Uri) -> bool {
     true
 }
 
-/// Log and build the canonical 503 for a download origination refused by the
-/// `max_upstream_downloads` cap (`Admission::AtCapacity`). The
-/// `UPSTREAM_DOWNLOAD_REJECTED_CAP` bump already happened inside
-/// `ActiveDownloads::lookup_or_insert`, the enforcement site shared with the
-/// splice backend.
-#[must_use]
-fn upstream_cap_rejection(
-    conn_details: &ConnectionDetails,
-    max: NonZero<usize>,
-) -> Response<ProxyCacheBody> {
-    warn_once_or_info!(
-        "Max upstream downloads ({max}) exceeded for {} from client {}; returning 503",
-        conn_details.debname,
-        conn_details.client
-    );
-    quick_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Too many concurrent upstream downloads",
-    )
+/// Decline `ibarrier`'s download as `why` and build the response its joiners
+/// answer too ([`Declined::response_parts`], with its `Retry-After`).
+async fn decline_with_response(
+    ibarrier: &mut InitBarrier,
+    why: Declined,
+) -> (Settled, Response<ProxyCacheBody>) {
+    let settled = ibarrier.decline(why).await;
+    let (status, msg) = why.response_parts();
+    let head = ResponseHead {
+        retry_after: why.retry_after().map(retry_after_secs),
+        ..ResponseHead::error(status)
+    };
+    (settled, head.into_hyper(full_body(msg)))
 }
 
 /// A client request header's value for a log line, withheld for the headers
@@ -2016,19 +2011,10 @@ async fn serve_new_file_worker(
             HumanFmt::Time(throttled.remaining)
         );
         metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.increment();
-        let settled = ibarrier
-            .decline(Declined::VerifyThrottled {
-                remaining: throttled.remaining,
-            })
-            .await;
-        let head = ResponseHead {
-            retry_after: Some(retry_after_secs(throttled.remaining)),
-            ..ResponseHead::error(StatusCode::SERVICE_UNAVAILABLE)
+        let why = Declined::VerifyThrottled {
+            remaining: throttled.remaining,
         };
-        return Ok((
-            settled,
-            head.into_hyper(full_body("Recently failed checksum verification")),
-        ));
+        return Ok(decline_with_response(ibarrier, why).await);
     }
 
     let prefetched_upstream_metadata = match &cfstate {
@@ -2341,13 +2327,7 @@ async fn serve_new_file_worker(
                     &req_uri,
                     &conn_details.client,
                 ) else {
-                    return Ok((
-                        ibarrier.decline(Declined::RelayRefused).await,
-                        quick_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            passthrough_limiter::REFUSAL_BODY,
-                        ),
-                    ));
+                    return Ok(decline_with_response(ibarrier, Declined::RelayRefused).await);
                 };
                 Some(slot)
             };
@@ -2414,11 +2394,7 @@ async fn serve_new_file_worker(
                     reason.detail()
                 ),
             );
-            let settled = ibarrier.decline(Declined::Rejected(reason)).await;
-            return Ok((
-                settled,
-                quick_response(StatusCode::BAD_GATEWAY, reason.body()),
-            ));
+            return Ok(decline_with_response(ibarrier, Declined::Rejected(reason)).await);
         }
         DownloadPlan::Download {
             total,
@@ -2475,10 +2451,7 @@ async fn serve_new_file_worker(
         ) {
             Ok(r) => r,
             Err(QuotaExceeded) => {
-                return Ok((
-                    ibarrier.decline(Declined::QuotaExceeded).await,
-                    quick_response(StatusCode::SERVICE_UNAVAILABLE, "Disk quota reached"),
-                ));
+                return Ok(decline_with_response(ibarrier, Declined::QuotaExceeded).await);
             }
         }
     };

@@ -41,11 +41,12 @@ use tokio::io::{AsyncWriteExt as _, Interest};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, trace};
 
+#[cfg(feature = "splice")]
+use crate::active_downloads::at_capacity_refusal;
 #[cfg(not(feature = "splice"))]
 use crate::hyper_conn::PassthroughRequest;
 #[cfg(feature = "hyper")]
 use crate::hyper_conn::{HandoffPlan, handle_hyper_connection, serve_handoff_request};
-#[cfg(feature = "splice")]
 #[cfg(feature = "splice")]
 use crate::splice::SpliceProxyError;
 #[cfg(feature = "splice")]
@@ -1373,17 +1374,13 @@ async fn try_sendfile_request(
                 .await
             }
             Ok(SpliceProxyOutcome::AtCapacity { max }) => {
-                // Same log line and canonical 503 as the hyper backend's
-                // `upstream_cap_rejection`; the metric bump happened inside
+                // The metric bump happened inside
                 // `ActiveDownloads::lookup_or_insert`.
-                warn_once_or_info!(
-                    "Max upstream downloads ({max}) exceeded for {} from client {client}; returning 503",
-                    conn_details.debname,
-                );
+                let (status, msg) = at_capacity_refusal(max, &conn_details);
                 ZeroCopyResult::Rejection {
-                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    status,
                     conn_action,
-                    msg: "Too many concurrent upstream downloads",
+                    msg,
                 }
             }
             Err(err) => splice_error_outcome(
@@ -2526,10 +2523,7 @@ async fn serve_unfinished_sendfile(
                 .await
                 .into();
             }
-            Err(
-                failure @ (JoinFailure::VerifyThrottled { remaining: _ }
-                | JoinFailure::Declined(Declined::VerifyThrottled { remaining: _ })),
-            ) => {
+            Err(failure @ JoinFailure::Declined(Declined::VerifyThrottled { remaining: _ })) => {
                 // Same answer and keep-alive handling as the pre-upstream
                 // throttle gate (`splice_proxy`).
                 let (status, msg) = failure.response_parts();

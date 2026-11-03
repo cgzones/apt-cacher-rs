@@ -171,6 +171,21 @@ impl ClientConn<'_> {
         .await
         .map_err(SpliceProxyError::client(phase))
     }
+
+    /// Decline `ibarrier`'s download as `why` and answer the client what
+    /// its joiners answer ([`Declined::response_parts`]); `phase` tags a
+    /// failed write.
+    async fn decline(
+        self,
+        ibarrier: &mut InitBarrier,
+        why: Declined,
+        phase: &'static str,
+    ) -> Result<(), SpliceProxyError> {
+        let _settled = ibarrier.decline(why).await;
+        let (status, msg) = why.response_parts();
+        self.write_invalid(status, msg, why.retry_after(), phase)
+            .await
+    }
 }
 
 /// Maximum bytes to forward for volatile responses (no Content-Length / chunked non-cacheable).
@@ -518,14 +533,8 @@ async fn prepare_cache_target(
         ) {
             Ok(r) => r,
             Err(_err @ QuotaExceeded) => {
-                let _settled = ibarrier.decline(Declined::QuotaExceeded).await;
                 client
-                    .write_invalid(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Disk quota reached",
-                        None,
-                        quota_phase,
-                    )
+                    .decline(&mut ibarrier, Declined::QuotaExceeded, quota_phase)
                     .await?;
                 return Ok(None);
             }
@@ -719,19 +728,10 @@ async fn reject_if_verify_throttled(
         HumanFmt::Time(throttled.remaining)
     );
     metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.increment();
-    let _settled = ibarrier
-        .decline(Declined::VerifyThrottled {
-            remaining: throttled.remaining,
-        })
-        .await;
-    client
-        .write_invalid(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Recently failed checksum verification",
-            Some(throttled.remaining),
-            "verify-throttle 503",
-        )
-        .await?;
+    let why = Declined::VerifyThrottled {
+        remaining: throttled.remaining,
+    };
+    client.decline(ibarrier, why, "verify-throttle 503").await?;
     Ok(true)
 }
 
@@ -1621,12 +1621,10 @@ pub(crate) async fn splice_proxy(
                 upstream_path,
                 &conn_details.client,
             ) else {
-                let _settled = ibarrier.decline(Declined::RelayRefused).await;
                 client
-                    .write_invalid(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        passthrough_limiter::REFUSAL_BODY,
-                        None,
+                    .decline(
+                        &mut ibarrier,
+                        Declined::RelayRefused,
                         "passthrough relay 503",
                     )
                     .await?;
@@ -1942,9 +1940,8 @@ pub(crate) enum SpliceProxyOutcome {
     },
     /// Origination refused by the `max_upstream_downloads` cap
     /// (`Admission::AtCapacity`); nothing was written to the client.
-    /// The sendfile caller answers with the canonical 503
-    /// (`"Too many concurrent upstream downloads"`) — not an error, the
-    /// connection stays usable.
+    /// The sendfile caller answers from
+    /// [`crate::active_downloads::at_capacity_refusal`].
     AtCapacity {
         max: NonZero<usize>,
     },

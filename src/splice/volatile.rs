@@ -24,7 +24,6 @@
 
 use std::num::NonZero;
 
-use http::StatusCode;
 use tracing::debug;
 
 use crate::active_downloads::Declined;
@@ -113,12 +112,10 @@ pub(super) async fn handle_volatile_buffered_download(
             "splice proxy: zero-length volatile body for {} from mirror {}",
             conn_details.debname, conn_details.mirror
         );
-        let _settled = ibarrier.decline(Declined::EmptyVolatileBody).await;
         client
-            .write_invalid(
-                StatusCode::BAD_GATEWAY,
-                "zero-length body",
-                None,
+            .decline(
+                &mut ibarrier,
+                Declined::EmptyVolatileBody,
                 "volatile zero-body 502",
             )
             .await?;
