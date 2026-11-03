@@ -724,6 +724,15 @@ async fn run_reconcile_unit(
         io_failures,
     };
 
+    // Nothing to reconcile: no index source runs (no DB gate, no fetch; a
+    // reduce of an empty map would trip `reduce_file_list`'s debug-assert)
+    // and nothing is swept. From here on the map only empties through a
+    // reduce, which returns `Exhausted` and ends the unit, so every resolver
+    // below and the sweep see candidates.
+    if cached_files.is_empty() {
+        return Ok(tally);
+    }
+
     let ctx = ReconcileCtx { mirror_ctx, unit };
 
     // Resolve every source group in order and collect the full ordered result
@@ -768,13 +777,6 @@ async fn run_reconcile_unit(
                 }
             }
         }
-    }
-
-    // Nothing to sweep (the tree scanned empty; a reduce that emptied the map
-    // already short-circuited as `Exhausted`). Skip the no-op sweep + its
-    // summary, matching the previous empty-cache early return.
-    if cached_files.is_empty() {
-        return Ok(tally);
     }
 
     // The shared decision core: policy + group results -> spans + reason.
@@ -1026,14 +1028,6 @@ async fn resolve_origin_packages_archive_root(
 ) -> GroupResolution {
     let (mirror, appstate) = (ctx.mirror_ctx.mirror, ctx.mirror_ctx.appstate);
 
-    // No candidates to reconcile: skip the DB gate + fetch entirely (a fetch
-    // against an empty map would also trip `reduce_file_list`'s non-empty
-    // debug-assert). Mirrors the structured resolver's empty-cache guard; the
-    // unit's post-group empty check then returns without a sweep.
-    if cached_files.is_empty() {
-        return GroupResolution::Skipped;
-    }
-
     if let Err(resolution) = gate_on_row(ctx, root, "archive root").await {
         return resolution;
     }
@@ -1116,12 +1110,6 @@ async fn resolve_flat_root_segment(
 ) -> GroupResolution {
     let mirror = ctx.mirror_ctx.mirror;
 
-    // Skip the DB gate + fetch when there is nothing to reconcile (see the
-    // hybrid resolver's guard for the debug-assert rationale).
-    if cached_files.is_empty() {
-        return GroupResolution::Skipped;
-    }
-
     if let Err(resolution) = gate_on_row(ctx, seg, "flat-repo root").await {
         return resolution;
     }
@@ -1152,12 +1140,6 @@ async fn resolve_flat_colocated(
     tally: &mut UnitStats,
 ) -> GroupResolution {
     let mirror = ctx.mirror_ctx.mirror;
-
-    // Skip the co-located fetch when there is nothing to reconcile (see the
-    // hybrid resolver's guard for the debug-assert rationale).
-    if cached_files.is_empty() {
-        return GroupResolution::Skipped;
-    }
 
     let plan = FetchPlan {
         mirror: mirror.clone(),
@@ -1237,7 +1219,7 @@ async fn resolve_origin_packages_self(
     // "no recent .deb traffic" (origins present but stale) from "origins
     // never recorded" (origins_count == 0).  Cheap: one extra info line
     // per cleanup cycle, only when the smelly state actually fires.
-    if !cached_files.is_empty() && active_origins.is_empty() {
+    if active_origins.is_empty() {
         if origins_count == 0 {
             info!(
                 "Mirror {mirror}: no origin records, so cached debs cannot be reconciled against any Packages index; aging them out via the {} grace window",
@@ -1257,15 +1239,10 @@ async fn resolve_origin_packages_self(
                 HumanFmt::Time(grace),
             );
         }
-    }
-
-    // No candidates, or no active origin index to reduce against: the group
-    // does not run. `decide_sweep` on the resulting empty result set returns
-    // `Grace`, matching the previous grace sweep (empty active origins swept
-    // the leftovers). Returning early also avoids fetching a `Packages` index
-    // when there are no debs to reconcile (which would otherwise stall on an
-    // absent upstream).
-    if cached_files.is_empty() || active_origins.is_empty() {
+        // No active origin index to reduce against: the group does not run.
+        // `decide_sweep` on the resulting empty result set returns `Grace`,
+        // matching the previous grace sweep (empty active origins swept the
+        // leftovers).
         return GroupResolution::Skipped;
     }
 
