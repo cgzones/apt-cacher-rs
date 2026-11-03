@@ -23,11 +23,13 @@
 //! the index (~0.9x the compressed size for a stream of empty blocks) to
 //! check each index record against its block, where `XzReader` keeps a block
 //! count and compares only the record count. A corrupt payload fails either
-//! way, on its block's own check.
+//! way on its block's integrity check, when the stream carries one (`xz`
+//! writes CRC64 unless told `--check=none`).
 //!
-//! The callers' size caps alone bound what a stream can cost: an
-//! output-free one by the compressed cap, any other by the decompressed
-//! one. Up to lzma-rust2 0.21 every block allocated and zero-filled its
+//! The callers' size caps alone bound what a stream can cost: the decode
+//! works per input byte (empty blocks yield no output) and per output byte,
+//! and `limits::packages_reader` holds the input to the compressed cap and
+//! the output to the decompressed one as they are read. Up to lzma-rust2 0.21 every block allocated and zero-filled its
 //! declared dictionary up front, ~35 ms of CPU per empty block at the
 //! 64 MiB cap, which the decode loop answered with a CPU budget. Since 0.22
 //! the window grows with the output: an empty block costs ~1 us of CPU
@@ -118,7 +120,9 @@ fn xz_mem_limit_kb() -> u32 {
 /// without figures: `XzReader` does not say what the block needed. Any
 /// other error passes through.
 fn name_mem_limit(err: io::Error) -> io::Error {
-    if err.kind() != io::ErrorKind::OutOfMemory {
+    // An `ENOMEM` from the input read is the system's, not the decoder's,
+    // and must keep its errno: ingest retries an error that carries one.
+    if err.kind() != io::ErrorKind::OutOfMemory || err.raw_os_error().is_some() {
         return err;
     }
     io::Error::new(
@@ -301,6 +305,12 @@ mod tests {
         assert!(out.is_empty(), "nothing must be decoded");
     }
 
+    #[test]
+    fn an_os_out_of_memory_keeps_its_errno() {
+        let err = name_mem_limit(io::Error::from_raw_os_error(nix::libc::ENOMEM));
+        assert_eq!(err.raw_os_error(), Some(nix::libc::ENOMEM), "{err}");
+    }
+
     #[tokio::test]
     async fn oversized_dictionary_after_output_is_still_refused() {
         // The output decoded before the refused block header reaches the
@@ -321,23 +331,23 @@ mod tests {
     /// zero blocks) whose record count claims 2^31 records, then nothing.
     /// `XzReader`'s index parser before lzma-rust2 0.22 reserved
     /// `count * 16` bytes (32 GiB) for it before comparing the count with the
-    /// blocks it saw; it must now read records off the input without
-    /// reserving anything.
+    /// blocks it saw. The test pins the refusal only: on a host that
+    /// overcommits, a reservation succeeds unseen and the decode ends the
+    /// same way.
     const HOSTILE_INDEX_XZ: &[u8] = &[
         0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x01, 0x69, 0x22, 0xde, 0x36, 0x00, 0x80, 0x80,
         0x80, 0x80, 0x08,
     ];
 
     #[tokio::test]
-    async fn hostile_index_record_count_allocates_nothing() {
+    async fn hostile_index_record_count_is_refused() {
         let mut decoder = xz_decoder(Cursor::new(HOSTILE_INDEX_XZ));
         let mut out = Vec::new();
         let err = decoder
             .read_to_end(&mut out)
             .await
             .expect_err("an index claiming records for absent blocks must be refused");
-        // `UnexpectedEof` from reading the records off the end of the input,
-        // not `OutOfMemory` from a reservation sized by the count.
+        // `UnexpectedEof` from reading the records off the end of the input.
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
         assert!(out.is_empty(), "nothing must be decoded");
     }

@@ -121,22 +121,54 @@ pub(crate) fn content_length_within_cap(
     }
 }
 
-/// An [`AsyncRead`] adapter that fails with [`io::ErrorKind::InvalidData`] once
-/// more than `limit` total bytes have been read from the inner reader. Used to
-/// bound the decompressed output of upstream `Packages` files.
+/// A reader adapter ([`AsyncRead`] and [`io::Read`]) that fails with
+/// [`io::ErrorKind::InvalidData`] once more than `limit` total bytes have been
+/// read from the inner reader. Bounds both ends of a `Packages` decode: the
+/// decompressed output and the compressed input.
 struct LimitedReader<R> {
     inner: R,
     limit: NonZero<u64>,
     count: u64,
+    /// The error message once the limit is crossed.
+    exceeded: &'static str,
 }
 
 impl<R> LimitedReader<R> {
-    fn new(inner: R, limit: NonZero<u64>) -> Self {
+    /// Bounds the decompressed output of a `Packages` index.
+    fn decompressed(inner: R, limit: NonZero<u64>) -> Self {
         Self {
             inner,
             limit,
             count: 0,
+            exceeded: "decompressed size exceeds limit",
         }
+    }
+
+    /// Bounds the compressed input of a `.gz`/`.xz` `Packages` index.
+    fn compressed(inner: R, limit: NonZero<u64>) -> Self {
+        Self {
+            inner,
+            limit,
+            count: 0,
+            exceeded: "compressed Packages index exceeds the size cap",
+        }
+    }
+
+    /// Adds `read` bytes to the count; an error once it passes the limit.
+    fn account(&mut self, read: usize) -> io::Result<()> {
+        self.count = self.count.saturating_add(read as u64);
+        if self.count > self.limit.get() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, self.exceeded));
+        }
+        Ok(())
+    }
+}
+
+impl<R: io::Read> io::Read for LimitedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.account(read)?;
+        Ok(read)
     }
 }
 
@@ -150,16 +182,12 @@ impl<R: AsyncRead + Unpin> AsyncRead for LimitedReader<R> {
         let before = buf.filled().len();
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Ready(Ok(())) => {
-                let read = (buf.filled().len() - before) as u64;
-                this.count = this.count.saturating_add(read);
-                if this.count > this.limit.get() {
+                let read = buf.filled().len() - before;
+                if let Err(err) = this.account(read) {
                     // Undo the fill so the caller sees zero bytes read alongside
                     // the error — tokio's `read_to_end` asserts n == 0 on Err.
                     buf.set_filled(before);
-                    Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "decompressed size exceeds limit",
-                    )))
+                    Poll::Ready(Err(err))
                 } else {
                     Poll::Ready(Ok(()))
                 }
@@ -398,7 +426,11 @@ impl AsyncRead for InputReader {
 /// decompression-bomb guard applied, ready for [`read_line_capped`].
 ///
 /// `limit` bounds the *decompressed* byte count (see [`decompressed_limit`]), so
-/// the [`LimitedReader`] sits above the decoder, not below it. The gzip layer
+/// that [`LimitedReader`] sits above the decoder. A second one below the
+/// decoder holds a `.gz`/`.xz` input to [`packages_file_cap`] as it is read:
+/// the callers check the size they stat first, but integrity ingest decodes
+/// on when the stat fails, and a decoder does work per input byte that
+/// yields no output (xz's empty blocks), which no output cap sees. The gzip layer
 /// is fed from its own [`BufReader`](tokio::io::BufReader) because it benefits
 /// from amortising reads of its compressed input; raw bytes need no such inner
 /// buffer, and the xz decoder reads the input on its own blocking thread, in
@@ -421,25 +453,32 @@ pub(crate) async fn packages_reader(
     match compression {
         PackagesCompression::Raw => Box::new(tokio::io::BufReader::with_capacity(
             buffer_size,
-            LimitedReader::new(InputReader::from(input), limit),
+            LimitedReader::decompressed(InputReader::from(input), limit),
         )),
         PackagesCompression::Gz => {
-            let input_reader =
-                tokio::io::BufReader::with_capacity(buffer_size, InputReader::from(input));
+            let input_reader = tokio::io::BufReader::with_capacity(
+                buffer_size,
+                LimitedReader::compressed(InputReader::from(input), packages_file_cap(compression)),
+            );
             let decoder = async_compression::tokio::bufread::GzipDecoder::new(input_reader);
             Box::new(tokio::io::BufReader::with_capacity(
                 buffer_size,
-                LimitedReader::new(decoder, limit),
+                LimitedReader::decompressed(decoder, limit),
             ))
         }
         PackagesCompression::Xz => {
+            let cap = packages_file_cap(compression);
             let decoder = match input {
-                PackagesInput::File(file) => xz_decoder(file.into_std().await),
-                PackagesInput::Bytes(bytes) => xz_decoder(io::Cursor::new(bytes)),
+                PackagesInput::File(file) => {
+                    xz_decoder(LimitedReader::compressed(file.into_std().await, cap))
+                }
+                PackagesInput::Bytes(bytes) => {
+                    xz_decoder(LimitedReader::compressed(io::Cursor::new(bytes), cap))
+                }
             };
             Box::new(tokio::io::BufReader::with_capacity(
                 buffer_size,
-                LimitedReader::new(decoder, limit),
+                LimitedReader::decompressed(decoder, limit),
             ))
         }
     }
@@ -575,7 +614,7 @@ mod tests {
     async fn limited_reader_allows_within_limit() {
         use tokio::io::AsyncReadExt as _;
         let data = b"hello world";
-        let mut reader = LimitedReader::new(&data[..], nonzero!(100));
+        let mut reader = LimitedReader::decompressed(&data[..], nonzero!(100));
         let mut out = Vec::new();
         reader
             .read_to_end(&mut out)
@@ -588,7 +627,7 @@ mod tests {
     async fn limited_reader_rejects_over_limit() {
         use tokio::io::AsyncReadExt as _;
         let data = vec![0u8; 1000];
-        let mut reader = LimitedReader::new(&data[..], nonzero!(100));
+        let mut reader = LimitedReader::decompressed(&data[..], nonzero!(100));
         let mut out = Vec::new();
         let err = reader
             .read_to_end(&mut out)
@@ -601,7 +640,7 @@ mod tests {
     async fn limited_reader_allows_exact_limit() {
         use tokio::io::AsyncReadExt as _;
         let data = [0u8; 100];
-        let mut reader = LimitedReader::new(&data[..], nonzero!(100));
+        let mut reader = LimitedReader::decompressed(&data[..], nonzero!(100));
         let mut out = Vec::new();
         reader
             .read_to_end(&mut out)
@@ -610,12 +649,30 @@ mod tests {
         assert_eq!(out.len(), 100);
     }
 
+    #[test]
+    fn limited_reader_bounds_a_blocking_reader() {
+        use std::io::Read as _;
+        let within = [1u8; 100];
+        let mut out = Vec::new();
+        LimitedReader::compressed(&within[..], nonzero!(100))
+            .read_to_end(&mut out)
+            .expect("reading exactly `limit` bytes must succeed");
+        assert_eq!(out.len(), 100);
+
+        let over = [1u8; 101];
+        let err = LimitedReader::compressed(&over[..], nonzero!(100))
+            .read_to_end(&mut Vec::new())
+            .expect_err("101 bytes exceed the 100-byte limit");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("compressed"), "{err}");
+    }
+
     #[tokio::test]
     async fn limited_reader_undoes_the_fill_on_overrun() {
         // tokio's `read_to_end` asserts that an `Err` reports zero bytes
         // read, so the overrun must roll the fill back.
         let data = [7u8; 150];
-        let mut reader = LimitedReader::new(&data[..], nonzero!(100));
+        let mut reader = LimitedReader::decompressed(&data[..], nonzero!(100));
         let mut storage = [0u8; 150];
         let mut buf = ReadBuf::new(&mut storage);
         let polled = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read(cx, &mut buf)).await;

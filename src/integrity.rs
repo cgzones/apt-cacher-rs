@@ -1511,7 +1511,7 @@ static INGEST_SLOTS: Semaphore = Semaphore::const_new(PACKAGES_INGEST_CONCURRENC
 
 /// How many `Release`/`InRelease` ingests may be admitted at once, in a pool
 /// separate from [`INGEST_SLOTS`]: a hostile permitted mirror committing
-/// budget-burning `.xz` `Packages` indexes can hold every slot of that
+/// cap-sized `.xz` `Packages` indexes can hold every slot of that
 /// shared line, and without a pool of its own every other mirror's
 /// `Release` ingest would then be refused too. `Release` jobs take no
 /// decode permit (a capped, uncompressed read), so this pool only bounds
