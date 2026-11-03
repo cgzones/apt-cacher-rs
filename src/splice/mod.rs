@@ -2,8 +2,8 @@
 //! mirror (HTTP or HTTPS), moves the response body to the client socket via
 //! tee+splice fan-out while caching it to disk, and commits the download
 //! through `RenameBarrier` -- the `Download -> Verifying` flip on the
-//! connection task ([`commit::Committable`]), everything with I/O in it on a
-//! task of its own ([`commit::CommitTail`]), so the connection returns to its
+//! connection task (`CacheTarget::begin_rename`), everything with I/O in it
+//! on a task of its own ([`commit::CommitTail`]), so the connection returns to its
 //! request loop with the client's last body byte rather than behind an
 //! `fsync`, a hash and three DB writes.
 //!
@@ -116,7 +116,7 @@ use body::{
     SpliceRangeFilter, range_slice, shutdown_client_write, splice_proxy_body,
     splice_proxy_body_tls,
 };
-use commit::{CommitTail, CompletionBytes, Served};
+use commit::{CompletionBytes, Served};
 use detached::DetachedDownload;
 use http::UpstreamResponse;
 use simple_proxy::rewrite_simple_proxy_headers;
@@ -437,7 +437,7 @@ async fn write_splice_response_headers(
 /// path guard, the final cache path, and the barrier the download reports
 /// progress on. Built by [`prepare_cache_target`], consumed by
 /// `CacheTarget::begin_rename` (in [`commit`]), which turns it into the
-/// [`commit::Committable`] the [`commit::CommitTail`] is built from.
+/// [`commit::CommitTail`].
 struct CacheTarget {
     writer: CacheWriter,
     dbarrier: DownloadBarrier,
@@ -1771,6 +1771,11 @@ async fn splice_proxy_drive(
     // The gate, the head and the wording are shared with the hyper backend
     // (`parallel_hack.rs`). Range and resumed requests are nudged too, for
     // that parity: the retry's Range is honoured by the late-joiner path.
+    let bytes = CompletionBytes {
+        total: total_content_length,
+        upstream: body_content_length.get(),
+        resume_offset,
+    };
     let config = global_config();
     if should_nudge(
         config,
@@ -1789,9 +1794,7 @@ async fn splice_proxy_drive(
             target,
             conn_details: conn_details.clone(),
             conn_label,
-            total_content_length,
-            body_content_length,
-            resume_offset,
+            bytes,
             splice_count,
             request_sent_at: upstream_resp.request_sent_at,
             head_at: upstream_resp.head_at,
@@ -1899,17 +1902,9 @@ async fn splice_proxy_drive(
     // own back), flips the entry to `Verifying` so a request arriving
     // meanwhile still late-joins it, and drops the watch sender -- the
     // wake-up a demoted file-serve task may be parked on. No I/O yet.
-    let tail = CommitTail::new(
-        target.begin_rename().await,
-        conn_details.clone(),
-        conn_label,
-        CompletionBytes {
-            total: total_content_length,
-            upstream: body_content_length.get(),
-            resume_offset,
-        },
-        start,
-    );
+    let tail = target
+        .begin_rename(conn_details.clone(), conn_label, bytes, start)
+        .await;
 
     // Start the commit immediately, independently of the demoted writer.
     // The returned settlement proves the watch sender is gone and the commit

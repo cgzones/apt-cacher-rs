@@ -25,8 +25,6 @@
 //! `UpstreamConn` variant the exchange produced, so hyper-less builds are
 //! covered without a second code path.
 
-use std::num::NonZero;
-
 use bytes::BytesMut;
 
 use crate::cache_layout::ConnectionDetails;
@@ -34,7 +32,7 @@ use crate::guards::Consequence;
 use crate::precise_instant::PreciseInstant;
 
 use super::body::{BodyClient, ClientEnd};
-use super::commit::{CommitTail, CompletionBytes, CompletionClient};
+use super::commit::{CompletionBytes, CompletionClient};
 use super::upstream::{ConnLabel, ResponseBody};
 use super::{
     BodyTransferred, CacheTarget, RateTimestamps, log_download_start, transfer_body,
@@ -56,9 +54,8 @@ pub(super) struct DetachedDownload {
     pub(super) target: CacheTarget,
     pub(super) conn_details: ConnectionDetails,
     pub(super) conn_label: ConnLabel,
-    pub(super) total_content_length: NonZero<u64>,
-    pub(super) body_content_length: NonZero<u64>,
-    pub(super) resume_offset: u64,
+    /// The body geometry the completion line and the `Download` row report.
+    pub(super) bytes: CompletionBytes,
     pub(super) splice_count: u64,
     /// Start of the upstream-rate window: when the upstream request went out.
     pub(super) request_sent_at: PreciseInstant,
@@ -87,9 +84,7 @@ impl DetachedDownload {
             target,
             conn_details,
             conn_label,
-            total_content_length,
-            body_content_length,
-            resume_offset,
+            bytes,
             splice_count,
             request_sent_at,
             head_at,
@@ -101,8 +96,8 @@ impl DetachedDownload {
         log_download_start(
             &conn_details,
             conn_label,
-            resume_offset,
-            total_content_length,
+            bytes.resume_offset,
+            bytes.total,
             true,
         );
 
@@ -153,18 +148,10 @@ impl DetachedDownload {
         // cached, so no DB rows and no completion line. Upstream side only:
         // no client was ever served, so there is no `SERVED_*` /
         // `BYTES_SERVED_SPLICE` bump and no `Delivery` row.
-        CommitTail::new(
-            target.begin_rename().await,
-            conn_details,
-            conn_label,
-            CompletionBytes {
-                total: total_content_length,
-                upstream: body_content_length.get(),
-                resume_offset,
-            },
-            start,
-        )
-        .finish(rates, CompletionClient::Absent)
-        .await;
+        target
+            .begin_rename(conn_details, conn_label, bytes, start)
+            .await
+            .finish(rates, CompletionClient::Absent)
+            .await;
     }
 }

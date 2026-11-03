@@ -43,7 +43,7 @@ use crate::{
     warn_once,
 };
 
-use super::commit::{CommitTail, CompletionBytes, CompletionClient, Served};
+use super::commit::{CompletionBytes, CompletionClient, Served};
 use super::http::UpstreamResponse;
 use super::upstream::{ConnLabel, ResponseBody};
 use super::{
@@ -178,18 +178,19 @@ pub(super) async fn handle_volatile_buffered_download(
     // slot back with the entry, so the client write below holds neither.
     let verdict = match cache_write {
         Ok(target) => Some(
-            CommitTail::new(
-                target.begin_rename().await,
-                conn_details.clone(),
-                conn_label,
-                CompletionBytes {
-                    total: total_content_length,
-                    upstream: total_content_length.get(),
-                    resume_offset: 0,
-                },
-                start,
-            )
-            .spawn_before_serving(rates),
+            target
+                .begin_rename(
+                    conn_details.clone(),
+                    conn_label,
+                    CompletionBytes {
+                        total: total_content_length,
+                        upstream: total_content_length.get(),
+                        resume_offset: 0,
+                    },
+                    start,
+                )
+                .await
+                .spawn_before_serving(rates),
         ),
         Err(_reported) => None,
     };

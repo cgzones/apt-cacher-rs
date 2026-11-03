@@ -5,9 +5,8 @@
 //! the final ping, the `max_upstream_downloads` slot drop, the `Download ->
 //! Verifying` flip and the watch sender's drop, none of which touch the disk
 //! -- and everything after that (`fsync`, verify + rename, the `Download`
-//! and `Delivery` rows, the completion line) is a [`CommitTail`]
-//! built from the [`Committable`] that step returns. Its three callers are the
-//! three ways a download finishes:
+//! and `Delivery` rows, the completion line) is the [`CommitTail`] that step
+//! returns. Its three callers are the three ways a download finishes:
 //!
 //! - [`CommitTail::spawn`]: the streaming drive, which hands the tail to its
 //!   own task as soon as upstream finishes. The returned [`ClientSettlement`]
@@ -101,22 +100,6 @@ pub(super) enum CompletionClient {
     Absent,
 }
 
-/// A download past [`CacheTarget::begin_rename`]: every body byte is in the
-/// temp file, the registry entry says `Verifying`, the watch sender and the
-/// `max_upstream_downloads` slot are gone, and the [`RenameBarrier`] is what
-/// is left to commit. Built only by that method and consumed only by
-/// [`CommitTail::new`], so nothing can commit a download that has not been
-/// through the flip.
-#[must_use = "a download past begin_rename must be committed or dropped as aborted"]
-pub(super) struct Committable {
-    tempfile: tokio::fs::File,
-    temppath: TempPath,
-    dest_path: PathBuf,
-    rbarrier: RenameBarrier,
-    /// The incremental digest, if one was kept.
-    streamed_digest: Option<StreamedDigest>,
-}
-
 impl CacheTarget {
     /// End the download on the calling task: the `Download -> Verifying`
     /// flip that drops the `max_upstream_downloads` slot and the watch sender
@@ -125,7 +108,17 @@ impl CacheTarget {
     /// rather than in the spawned tail: the slot goes back at the same point
     /// as in the hyper backend, and a demoted file-serve task parked on the
     /// sender is awake before anyone can await it.
-    pub(super) async fn begin_rename(self) -> Committable {
+    ///
+    /// The only constructor of [`CommitTail`], so nothing can commit a
+    /// download that has not been through the flip. `start` opens the
+    /// download window the `Download` and `Delivery` rows share.
+    pub(super) async fn begin_rename(
+        self,
+        conn_details: ConnectionDetails,
+        conn_label: ConnLabel,
+        bytes: CompletionBytes,
+        start: PreciseInstant,
+    ) -> CommitTail {
         let Self {
             writer,
             dbarrier,
@@ -135,12 +128,16 @@ impl CacheTarget {
         } = self;
         let (tempfile, streamed_digest) = writer.finish();
         let rbarrier = dbarrier.begin_rename().await;
-        Committable {
+        CommitTail {
             tempfile,
             temppath,
             dest_path,
             rbarrier,
             streamed_digest,
+            conn_details,
+            conn_label,
+            bytes,
+            start,
         }
     }
 }
@@ -149,9 +146,19 @@ impl CacheTarget {
 /// outlive the connection task: the sync, the verify + rename, the
 /// `Download` row, and -- through [`Committed`] -- the completion line and
 /// the `Delivery` row.
+///
+/// Built only by [`CacheTarget::begin_rename`]: every body byte is in the
+/// temp file, the registry entry says `Verifying`, the watch sender and the
+/// `max_upstream_downloads` slot are gone, and the [`RenameBarrier`] is what
+/// is left to commit.
 #[must_use = "the download is only committed once the tail is spawned, finished or committed"]
 pub(super) struct CommitTail {
-    target: Committable,
+    tempfile: tokio::fs::File,
+    temppath: TempPath,
+    dest_path: PathBuf,
+    rbarrier: RenameBarrier,
+    /// The incremental digest, if one was kept.
+    streamed_digest: Option<StreamedDigest>,
     conn_details: ConnectionDetails,
     conn_label: ConnLabel,
     bytes: CompletionBytes,
@@ -248,22 +255,6 @@ async fn receive_client_report(
 }
 
 impl CommitTail {
-    pub(super) fn new(
-        target: Committable,
-        conn_details: ConnectionDetails,
-        conn_label: ConnLabel,
-        bytes: CompletionBytes,
-        start: PreciseInstant,
-    ) -> Self {
-        Self {
-            target,
-            conn_details,
-            conn_label,
-            bytes,
-            start,
-        }
-    }
-
     /// Fire-and-forget, like `DetachedDownload::spawn` and the hyper
     /// backend's `download_file`: the connection task returns to its next
     /// request while this one commits. A request arriving meanwhile still
@@ -320,8 +311,10 @@ impl CommitTail {
         }
     }
 
-    /// Sync and commit the fully written download into the cache, then
-    /// record the `Download` transfer.
+    /// Sync and commit the fully written download into the cache --
+    /// `RenameBarrier::commit`, whose single blocking job runs
+    /// [`sync_cache_file`], then the verify + rename -- then record the
+    /// `Download` transfer.
     ///
     /// `Some` when the file landed in the cache. `None` means the commit
     /// failed: it logged the cause and dropped the barrier, the temp-file
@@ -329,13 +322,29 @@ impl CommitTail {
     /// re-download), so no DB row is written.
     async fn commit(self) -> Option<Committed> {
         let Self {
-            target,
+            tempfile,
+            temppath,
+            dest_path,
+            rbarrier,
+            streamed_digest,
             conn_details,
             conn_label,
             bytes,
             start,
         } = self;
-        let elapsed = commit_target(target, start).await?;
+        let committed = rbarrier
+            .commit(
+                tempfile,
+                temppath,
+                dest_path,
+                streamed_digest,
+                Some(sync_cache_file),
+            )
+            .await;
+        let elapsed = start.elapsed();
+        if committed.is_err() {
+            return None;
+        }
 
         // Record download in database (mirrors download_file() in hyper_conn.rs).
         let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
@@ -404,34 +413,6 @@ async fn await_demoted_client(
     };
     rates.t_client_done = PreciseInstant::now();
     end
-}
-
-/// The on-disk half of the commit: `RenameBarrier::commit`, whose single
-/// blocking job runs [`sync_cache_file`], then the verify + rename. Returns
-/// the download duration when the file landed in the cache.
-async fn commit_target(target: Committable, start: PreciseInstant) -> Option<Duration> {
-    let Committable {
-        tempfile,
-        temppath,
-        dest_path,
-        rbarrier,
-        streamed_digest,
-    } = target;
-
-    let cache_committed = rbarrier
-        .commit(
-            tempfile,
-            temppath,
-            dest_path,
-            streamed_digest,
-            Some(sync_cache_file),
-        )
-        .await
-        .is_ok();
-
-    let elapsed = start.elapsed();
-
-    cache_committed.then_some(elapsed)
 }
 
 /// Sync the cache file to ensure durability: the commit job's prepare step,
