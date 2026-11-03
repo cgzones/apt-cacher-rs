@@ -487,8 +487,18 @@ pub(crate) struct ChecksumRegistry {
 type Fingerprint = [u8; 16];
 
 fn fingerprint(key: &str) -> Fingerprint {
+    fingerprint_joined([key])
+}
+
+/// The [`fingerprint`] of `parts` concatenated, without building the
+/// concatenation: a `Release` entry's key is `<release_dir>/<rel>`.
+fn fingerprint_joined<'a>(parts: impl IntoIterator<Item = &'a str>) -> Fingerprint {
     use sha2::Digest as _;
-    let digest: [u8; 32] = sha2::Sha256::digest(key.as_bytes()).into();
+    let mut hasher = sha2::Sha256::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
     *digest
         .first_chunk::<16>()
         .expect("a SHA-256 holds 16 bytes")
@@ -504,12 +514,28 @@ fn fingerprint_hash(hasher: &DefaultHashBuilder, key: &Fingerprint) -> u64 {
 
 /// One registered digest: its key's fingerprint, the digest and the key's
 /// family (so an eviction knows which count it lowers without the key
-/// text). 49 bytes, nothing on the heap.
+/// text). 49 bytes, nothing on the heap. Built by the ingest that read the
+/// digest, outside the registry lock: the family is fixed per writer
+/// (`Packages` registers [`KeyKind::Package`], `Release`
+/// [`KeyKind::Index`]), and the fingerprint is the SHA-256 the lock would
+/// otherwise run once per entry.
 #[derive(Clone, Copy, Debug)]
 struct Slot {
     key: Fingerprint,
     digest: [u8; 32],
     kind: KeyKind,
+}
+
+#[cfg(test)]
+impl Slot {
+    /// The slot of `key`, its family read off the text as a lookup does.
+    fn for_key(key: &str, digest: [u8; 32]) -> Self {
+        Self {
+            key: fingerprint(key),
+            digest,
+            kind: KeyKind::of(key),
+        }
+    }
 }
 
 /// One `(authority, mirror_path)` scope: its slots in insertion order and
@@ -551,10 +577,11 @@ fn slot_in(slots: &VecDeque<Slot>, base: u64, seq: u64) -> Option<&Slot> {
 }
 
 /// Which of the two digest families a registry key belongs to. One scope
-/// holds both, and the key alone tells them apart: a package's key is its
-/// bare basename (`index_parser::structured_lookup_key`), an index's the
-/// host-relative path `ingest_release_file` builds (`<release_dir>/<rel>`,
-/// so it always holds a `/`).
+/// holds both, and the key alone tells them apart ([`Self::of`], for the
+/// lookup side, which has the text): a package's key is its bare basename
+/// (`index_parser::structured_lookup_key`), an index's the host-relative
+/// path `ingest_release_file` fingerprints (`<release_dir>/<rel>`, so it
+/// always holds a `/`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KeyKind {
     /// A `.deb`, registered by a `Packages` index.
@@ -726,19 +753,14 @@ impl ChecksumRegistry {
     /// eviction-order position to most-recent.
     #[cfg(test)]
     fn insert(&self, authority: &str, mirror_path: &str, relpath: &str, digest: [u8; 32]) {
-        self.insert_many(authority, mirror_path, [(relpath, digest)]);
+        self.insert_many(authority, mirror_path, &[Slot::for_key(relpath, digest)]);
     }
 
     /// Insert several entries of one scope under one lock.
-    fn insert_many<'k>(
-        &self,
-        authority: &str,
-        mirror_path: &str,
-        entries: impl IntoIterator<Item = (&'k str, [u8; 32])>,
-    ) {
+    fn insert_many(&self, authority: &str, mirror_path: &str, slots: &[Slot]) {
         let mut inner = self.inner.lock();
-        for (relpath, digest) in entries {
-            self.insert_locked(&mut inner, authority, mirror_path, relpath, digest);
+        for &slot in slots {
+            self.insert_locked(&mut inner, authority, mirror_path, slot);
         }
     }
 
@@ -760,7 +782,7 @@ impl ChecksumRegistry {
         mirror_path: &str,
         release_dir: &str,
         date: Option<i64>,
-        entries: &[(String, [u8; 32])],
+        slots: &[Slot],
     ) -> bool {
         let mut inner = self.inner.lock();
         let recorded = inner
@@ -778,8 +800,8 @@ impl ChecksumRegistry {
         if !supersedes {
             return false;
         }
-        for (key, digest) in entries {
-            self.insert_locked(&mut inner, authority, mirror_path, key, *digest);
+        for &slot in slots {
+            self.insert_locked(&mut inner, authority, mirror_path, slot);
         }
         // Eviction may have drained this scope; record the date only if it
         // still exists (a drained scope rebuilds its dates on re-ingest).
@@ -921,7 +943,7 @@ impl ChecksumRegistry {
 
     /// Insert (or refresh) one expected digest under an already-locked
     /// `RegistryInner`, evicting when the insert pushes the registry over its
-    /// cap. Shared by `ChecksumRegistry::insert` (one entry) and
+    /// cap. Shared by `ChecksumRegistry::insert_many` (a `Packages` batch) and
     /// `ChecksumRegistry::insert_release` (a whole `Release`/`InRelease` batch
     /// under one lock).
     fn insert_locked(
@@ -929,8 +951,7 @@ impl ChecksumRegistry {
         inner: &mut RegistryInner,
         authority: &str,
         mirror_path: &str,
-        relpath: &str,
-        digest: [u8; 32],
+        slot: Slot,
     ) {
         let cap = self.cap;
 
@@ -948,8 +969,11 @@ impl ChecksumRegistry {
                 ScopeState::default(),
             ),
         };
-        let key = fingerprint(relpath);
-        let kind = KeyKind::of(relpath);
+        let Slot {
+            key,
+            digest: _,
+            kind,
+        } = slot;
         let seq = state.next_seq();
         if state.slots.len() == state.slots.capacity() {
             // Grow in eighths, not by doubling: at 49 bytes a slot, a log
@@ -958,7 +982,7 @@ impl ChecksumRegistry {
             // log; an insert is a hash and a probe anyway.
             state.slots.reserve_exact(state.slots.len() / 8 + 16);
         }
-        state.slots.push_back(Slot { key, digest, kind });
+        state.slots.push_back(slot);
         let ScopeState {
             slots,
             base,
@@ -2252,22 +2276,20 @@ async fn ingest_release_file(
     let header = index_parser::parse_release_header(&content);
     let date = clamp_future_release_date(header.date);
     let dir = release_dir.trim_end_matches('/');
-    let entries: Vec<(String, [u8; 32])> = index_parser::parse_release_checksums(&content, |rel| {
+    let slots: Vec<Slot> = index_parser::parse_release_checksums(&content, |rel| {
         // Only Packages files are verified at layer C.
         let leaf = rel.rsplit_once('/').map_or(rel, |(_, leaf)| leaf);
         PackagesCompression::from_filename(leaf).is_some()
     })
-    .map(|(rel, digest)| {
-        // Resolve to the host-relative key (matches the Packages lookup
-        // key): <release_dir>/<rel>.
-        let mut key = String::with_capacity(dir.len() + 1 + rel.len());
-        key.push_str(dir);
-        key.push('/');
-        key.push_str(rel);
-        (key, digest)
+    .map(|(rel, digest)| Slot {
+        // The host-relative key (matches the Packages lookup key):
+        // <release_dir>/<rel>.
+        key: fingerprint_joined([dir, "/", rel]),
+        digest,
+        kind: KeyKind::Index,
     })
     .collect();
-    if !registry.insert_release(authority, mirror_path, release_dir, date, &entries) {
+    if !registry.insert_release(authority, mirror_path, release_dir, date, &slots) {
         debug!(
             "Not registering index `{}` for host {authority} mirror {mirror_path}; a newer Release/InRelease of `{release_dir}` is already registered",
             path.display(),
@@ -2282,20 +2304,14 @@ async fn ingest_release_file(
     })
 }
 
-/// Register one stanza's `(Filename, SHA256)` pair. A stanza without a
-/// usable SHA256 (a SHA512-only mirror leaves every stanza that way, so deb
-/// verification stays off for the whole archive) was already warned about
-/// by [`StanzaStream`] and registers nothing.
-/// The `(key, digest)` pairs of one `Packages` ingest not yet registered.
-/// A `Debian` `Packages` holds ~65k stanzas, and taking the registry lock
-/// (which every cache miss's digest lookup also takes) once per stanza
-/// cost as many lock round trips; a batch takes it once per
-/// [`Self::BATCH`]. The keys share one reused buffer, since each stanza's
-/// fields are overwritten by the next.
+/// The digests of one `Packages` ingest not yet registered, as ready
+/// [`Slot`]s. A `Debian` `Packages` holds ~65k stanzas, and taking the
+/// registry lock (which every cache miss's digest lookup also takes) once
+/// per stanza cost as many lock round trips; a batch takes it once per
+/// [`Self::BATCH`], and the fingerprints are computed here, outside it.
 #[derive(Default)]
 struct PendingDigests {
-    keys: String,
-    entries: Vec<(std::ops::Range<usize>, [u8; 32])>,
+    slots: Vec<Slot>,
 }
 
 impl PendingDigests {
@@ -2303,7 +2319,11 @@ impl PendingDigests {
     /// microseconds, not the ingest.
     const BATCH: usize = 256;
 
-    /// Queue `stanza`'s digest; whether the batch is full.
+    /// Queue `stanza`'s `(Filename, SHA256)` pair; whether the batch is
+    /// full. A stanza without a usable SHA256 (a SHA512-only mirror leaves
+    /// every stanza that way, so deb verification stays off for the whole
+    /// archive) was already warned about by [`StanzaStream`] and registers
+    /// nothing.
     fn push_stanza(
         &mut self,
         stanza: &index_parser::Stanza,
@@ -2322,29 +2342,20 @@ impl PendingDigests {
             );
             return false;
         };
-        let start = self.keys.len();
-        self.keys.push_str(key);
-        self.entries.push((start..self.keys.len(), sha256));
-        self.entries.len() >= Self::BATCH
+        self.slots.push(Slot {
+            key: fingerprint(key),
+            digest: sha256,
+            kind: KeyKind::Package,
+        });
+        self.slots.len() >= Self::BATCH
     }
 
     fn flush(&mut self, registry: &ChecksumRegistry, authority: &str, mirror_path: &str) {
-        if self.entries.is_empty() {
+        if self.slots.is_empty() {
             return;
         }
-        let Self { keys, entries } = self;
-        registry.insert_many(
-            authority,
-            mirror_path,
-            entries.iter().map(|(range, digest)| {
-                let key = keys
-                    .get(range.clone())
-                    .expect("each range spans one pushed key");
-                (key, *digest)
-            }),
-        );
-        keys.clear();
-        entries.clear();
+        registry.insert_many(authority, mirror_path, &self.slots);
+        self.slots.clear();
     }
 }
 
@@ -2797,7 +2808,7 @@ mod tests {
             "debian",
             "dists/sid",
             None,
-            &[(INDEX.to_owned(), [0; 32])]
+            &[Slot::for_key(INDEX, [0; 32])]
         ));
         assert_eq!(
             reg.explain_miss("h", "debian", "a_1_arm64.deb"),
@@ -2832,8 +2843,8 @@ mod tests {
             "m",
             "dists/sid",
             None,
-            &[(
-                "dists/sid/main/binary-arm64/Packages.xz".to_owned(),
+            &[Slot::for_key(
+                "dists/sid/main/binary-arm64/Packages.xz",
                 [0; 32]
             )]
         ));
