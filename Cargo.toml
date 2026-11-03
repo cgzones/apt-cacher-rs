@@ -62,7 +62,7 @@ ipnet = { version = "2.9.0", features = ["serde"] }
 # The version sqlx-sqlite pins; only its memory statistics are called directly.
 libsqlite3-sys = { version = "0.37.0", default-features = false }
 log = "0.4.20"
-lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "xz"] }
+lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "xz"] }
 memchr = "2.8"
 nix = { version = "0.31", features = ["fs", "hostname", "resource", "user"] }
 openssl = { version = "0.10", optional = true }
