@@ -278,18 +278,6 @@ impl ServeParams {
             StatusCode::OK
         }
     }
-
-    /// The status line of a hand-rendered response head. Only the splice
-    /// backend renders one; the others go through `ResponseHead`.
-    #[cfg(feature = "splice")]
-    #[must_use]
-    pub(crate) fn status_line(&self) -> &'static str {
-        if self.is_partial() {
-            "206 Partial Content"
-        } else {
-            "200 OK"
-        }
-    }
 }
 
 /// Outcome of [`CacheInfo::plan`].  The caller emits the response: a 304 or
@@ -879,10 +867,9 @@ mod tests {
 
     #[cfg(feature = "splice")]
     #[test]
-    fn content_end_and_status_line_follow_the_range() {
+    fn content_end_follows_the_range() {
         let whole = ServeParams::full(SIZE);
         assert_eq!(whole.content_end(), SIZE);
-        assert_eq!(whole.status_line(), "200 OK");
 
         let partial = ServeParams {
             content_start: 100,
@@ -890,6 +877,5 @@ mod tests {
             content_range: Some(String::from("bytes 100-199/1000")),
         };
         assert_eq!(partial.content_end(), 200);
-        assert_eq!(partial.status_line(), "206 Partial Content");
     }
 }

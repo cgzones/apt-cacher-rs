@@ -32,8 +32,10 @@
 //! derives it from the body's size hint.
 //!
 //! The heads whose shape must not drift between the backends have one
-//! constructor each: [`ResponseHead::cached`] (the hyper and sendfile
-//! cache-hit and joiner `200`/`206`), [`ResponseHead::not_modified`] and
+//! constructor each: [`ResponseHead::representation`] (every `200`/`206`
+//! carrying a cacheable file: splice's streamed download directly, the
+//! hyper and sendfile cache-hit and joiner serves through
+//! [`ResponseHead::cached`]), [`ResponseHead::not_modified`] and
 //! [`ResponseHead::range_not_satisfiable`].
 //!
 //! A new proxy-generated response must be built from a [`ResponseHead`] —
@@ -79,6 +81,7 @@ const TEXT_PLAIN_UTF8: &str = "text/plain; charset=utf-8";
 /// fields with struct-update syntax; every field is `pub(crate)` so a call
 /// site states exactly which optional headers it emits.
 #[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct ResponseHead<'a> {
     pub(crate) status: StatusCode,
     pub(crate) kind: ResponseKind,
@@ -148,13 +151,39 @@ impl<'a> ResponseHead<'a> {
         }
     }
 
-    /// The `200`/`206` head of a cached representation whose body follows:
-    /// its type, framing and validators, and `Accept-Ranges`.
+    /// The `200`/`206` head of a cacheable file whose body follows: its
+    /// type, framing and validators, and `Accept-Ranges`.
     ///
     /// `content_length` is `None` only for a joiner of a download of unknown
     /// length (hyper frames that body itself); `content_range` is set for a
-    /// `206`. Every cache-hit and joiner serve of the hyper and sendfile
-    /// backends answers with this head.
+    /// `206`. Every backend answers with this head, so its shape cannot drift
+    /// between them: splice's streamed download directly, every cache hit
+    /// and joiner through [`Self::cached`].
+    #[must_use]
+    pub(crate) fn representation(
+        status: StatusCode,
+        content_length: Option<u64>,
+        content_range: Option<&'a str>,
+        content_type: &'static str,
+        last_modified: &'a str,
+        etag: Option<&'a str>,
+        age: u32,
+    ) -> Self {
+        Self {
+            content_length,
+            content_type: Some(content_type),
+            accept_ranges: true,
+            last_modified: Some(last_modified),
+            etag,
+            age: Some(age),
+            content_range: content_range.map(Cow::Borrowed),
+            ..Self::bare(status, ResponseKind::Success)
+        }
+    }
+
+    /// [`Self::representation`] with the validators and age of a cached
+    /// file: the head of every cache-hit and joiner serve of the hyper and
+    /// sendfile backends.
     #[must_use]
     pub(crate) fn cached(
         status: StatusCode,
@@ -163,16 +192,15 @@ impl<'a> ResponseHead<'a> {
         content_type: &'static str,
         cache_info: &'a CacheInfo,
     ) -> Self {
-        Self {
+        Self::representation(
+            status,
             content_length,
-            content_type: Some(content_type),
-            accept_ranges: true,
-            last_modified: Some(&cache_info.last_modified_str),
-            etag: cache_info.file_etag.as_deref(),
-            age: Some(cache_info.age),
-            content_range: content_range.map(Cow::Borrowed),
-            ..Self::bare(status, ResponseKind::Success)
-        }
+            content_range,
+            content_type,
+            &cache_info.last_modified_str,
+            cache_info.file_etag.as_deref(),
+            cache_info.age,
+        )
     }
 
     /// The `416 Range Not Satisfiable` head for a request no byte of the
@@ -336,7 +364,10 @@ impl ResponseHead<'_> {
 #[cfg(feature = "sendfile")]
 #[derive(Copy, Clone)]
 pub(crate) enum WireBody<'a> {
-    /// No body bytes follow (`304`, `416`, tunnel establishment).
+    /// No body bytes follow (`304`, `416`, tunnel establishment), or they
+    /// follow on a socket the caller corked: splice's `CorkGuard` coalesces
+    /// the head with the body, and its final `SPLICE_F_MORE` chunk needs the
+    /// uncork, so the head is written plainly.
     None,
     /// A small body written together with the head in one buffer.
     Inline(&'a str),

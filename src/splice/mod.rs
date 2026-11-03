@@ -56,7 +56,7 @@ use std::{
 
 use ::http::StatusCode;
 use tokio::net::TcpStream;
-use tracing::{debug, info, trace};
+use tracing::{debug, info};
 
 use crate::cache_conditional::{RangeRequestHeaders, ServeParams};
 use crate::cache_layout::{CachedFlavor, ConnectionDetails, FetchRole};
@@ -67,12 +67,10 @@ use crate::fs_open::{
 };
 use crate::guards::{Consequence, DownloadBarrier, InitBarrier};
 use crate::http_helpers::{
-    ConnectionAction, ConnectionVersion, OptHeader, WritePhase, write_416_response,
-    write_all_to_stream, write_invalid_response,
+    ConnectionAction, ConnectionVersion, WritePhase, write_416_response, write_all_to_stream,
+    write_invalid_response,
 };
-use crate::http_range::{
-    HttpDate, ParsedRange, cache_file_http_date, format_http_date, http_parse_range,
-};
+use crate::http_range::{HttpDate, ParsedRange, cache_file_http_date, http_parse_range};
 use crate::humanfmt::HumanFmt;
 use crate::integrity::{self, note_cached_index_touch, note_release_revalidated};
 use crate::parallel_hack::{NUDGE_BODY, log_nudge, nudge_head, should_nudge};
@@ -80,7 +78,7 @@ use crate::partial_file::{self, TempPath};
 use crate::passthrough_limiter;
 use crate::precise_instant::PreciseInstant;
 use crate::rate_checker::RateChecker;
-use crate::response_head::WireBody;
+use crate::response_head::{ResponseHead, WireBody};
 use crate::sendfile_conn::{
     SendfileResult, async_sendfile, serve_file_via_sendfile, write_all_to_stream_rated_counted,
 };
@@ -96,7 +94,6 @@ use crate::upstream_head::{
 use crate::{
     AppState,
     active_downloads::{ActiveDownloadStatus, Admission, Declined},
-    build_info::APP_VIA,
     cache_metadata::{self, write_upstream_metadata},
     client_counter,
     content_type::{content_type_for_cached_file, warn_on_content_type_mismatch},
@@ -288,61 +285,50 @@ async fn resolve_client_range(
     Ok(None)
 }
 
-/// Render the `200 OK` / `206 Partial Content` head of a splice-served body:
-/// the same bytes for the streaming drive and the buffered volatile path.
-/// Deliberately not built on `ResponseHead::render`, which orders the
-/// headers differently; the wire bytes are pinned by the
-/// `splice_response_head_renders_the_pinned_bytes` test.
+/// The `200 OK` / `206 Partial Content` head of a splice-served body, for the
+/// streaming drive and the buffered volatile path alike: the
+/// [`ResponseHead::representation`] every backend's cache hit answers with,
+/// so a client sees the same header set, in the same order, whichever
+/// backend served it and whether or not the file was cached yet.
 ///
 /// The validators are the download's settled ones ([`HeadValidators`]), not
 /// the upstream head's: `Last-Modified` is always sent -- the same value
 /// every later cache hit of this file carries, so the first client gets the
 /// same `If-Modified-Since` validator as the next (hyper's
 /// `serve_unfinished_file`, reached through `serve_downloading_file`, does
-/// the same through `CacheInfo::with_meta`).
-fn render_splice_response_head(
-    conn_version: ConnectionVersion,
-    conn_action: ConnectionAction,
-    range: &ServeParams,
-    content_type: &str,
-    date: &str,
-    validators: &HeadValidators,
-) -> String {
+/// the same through `CacheInfo::with_meta`). `Age: 0` is a constant: a fresh
+/// response streamed straight from the origin has spent no time in a cache
+/// (RFC 9111 section 4.2.3).
+fn splice_response_head<'a>(
+    range: &'a ServeParams,
+    content_type: &'static str,
+    validators: &'a HeadValidators,
+) -> ResponseHead<'a> {
     let HeadValidators {
         etag,
         last_modified,
     } = validators;
-    let status_line = range.status_line();
-    let response_content_length = range.content_length;
-    // `Age: 0` is a constant here: a fresh response streamed straight from
-    // the origin has spent no time in a cache (RFC 9111 section 4.2.3).
-    format!(
-        "{conn_version} {status_line}\r\n\
-         Date: {date}\r\n\
-         Via: {APP_VIA}\r\n\
-         Connection: {conn_action}\r\n\
-         Content-Length: {response_content_length}\r\n\
-         Content-Type: {content_type}\r\n\
-         Last-Modified: {last_modified}\r\n\
-         {etag_header}\
-         Accept-Ranges: bytes\r\n\
-         Age: 0\r\n\
-         {content_range_header}\
-         \r\n",
-        etag_header = OptHeader("ETag", etag.as_deref()),
-        content_range_header = OptHeader("Content-Range", range.content_range.as_deref()),
+    ResponseHead::representation(
+        range.http_status(),
+        Some(range.content_length),
+        range.content_range.as_deref(),
+        content_type,
+        last_modified,
+        etag.as_deref(),
+        0,
     )
 }
 
 /// Write the response head of a splice-served body to the client. The
-/// caller has corked the socket, so the head coalesces with the body bytes
-/// written right after. Records the client status and the per-response
-/// `REQUESTS_SPLICE` bump, and returns the instant the first byte headed to
-/// the client (start of the client-rate window). `phase` tags a failed
-/// write, which can only ever be a client failure -- the caller decides what
-/// that ends. `splice_proxy` does not end the download with it: it
-/// hands the failure to [`lost_prefix_client`], which reports it, half-closes
-/// the socket and keeps the download running cache-only.
+/// caller has corked the socket, so the head, written plainly
+/// ([`WireBody::None`]), coalesces with the body bytes written right after.
+/// Records the client status and the per-response `REQUESTS_SPLICE` bump,
+/// and returns the instant the first byte headed to the client (start of the
+/// client-rate window). `phase` tags a failed write, which can only ever be a
+/// client failure -- the caller decides what that ends. `splice_proxy` does
+/// not end the download with it: it hands the failure to
+/// [`lost_prefix_client`], which reports it, half-closes the socket and keeps
+/// the download running cache-only.
 async fn write_splice_response_headers(
     client: ClientConn<'_>,
     conn_details: &ConnectionDetails,
@@ -357,35 +343,16 @@ async fn write_splice_response_headers(
         &conn_details.mirror,
         &conn_details.debname,
     );
-    let date = format_http_date();
-    let response_headers = render_splice_response_head(
-        client.version,
-        client.action,
-        range,
-        content_type,
-        &date,
-        validators,
-    );
-
-    trace!(
-        "Outgoing {} response:\n{response_headers}",
-        range.status_line()
-    );
-
-    metrics::record_client_status(range.http_status());
     // Bump once per splice-served response, regardless of whether the body
     // ends up flowing through `splice_proxy_body{,_tls}`, the body-prefix
     // direct write, or the buffered volatile write.
     metrics::REQUESTS_SPLICE.increment();
     // Start of the client-rate window: the first byte heading to the client.
     let t_client_first = PreciseInstant::now();
-    write_all_to_stream(
-        client.stream,
-        response_headers.as_bytes(),
-        WritePhase::Header,
-    )
-    .await
-    .map_err(|err| HeaderWriteFailure::io(phase, err))?;
+    splice_response_head(range, content_type, validators)
+        .write_to(client.stream, client.version, client.action, WireBody::None)
+        .await
+        .map_err(|err| HeaderWriteFailure::io(phase, err))?;
     Ok(t_client_first)
 }
 
@@ -1992,72 +1959,29 @@ impl SpliceProxyError {
 
 #[cfg(test)]
 mod tests {
-    use super::http::parse_upstream_response;
-
     use super::*;
 
+    /// The head splice streams a download under is the one sendfile's (and
+    /// hyper's) cache hit of the finished file answers with: same headers,
+    /// same values, same order, with `Age: 0` for the fresh response.
     #[test]
-    fn client_range_plan_exposes_wire_bounds_and_status_lines() {
-        let whole = ServeParams::full(1000);
-        assert_eq!(whole.content_end(), 1000);
-        assert_eq!(whole.status_line(), "200 OK");
+    fn splice_response_head_is_the_cache_hit_head() {
+        use crate::cache_conditional::CacheInfo;
+        use crate::http_helpers::cached_file_head;
 
-        let partial = ServeParams {
-            content_range: Some("bytes 200-499/1000".to_owned()),
-            content_start: 200,
-            content_length: 300,
+        const LAST_MODIFIED: &str = "Thu, 01 Jan 2025 00:00:00 GMT";
+        let cache_info = |etag: Option<&str>| CacheInfo {
+            file_etag: etag.map(Arc::from),
+            last_modified_for_ims: HttpDate::parse(LAST_MODIFIED).unwrap(),
+            last_modified_str: Arc::from(LAST_MODIFIED),
+            age: 0,
         };
-        assert_eq!(partial.content_end(), 500);
-        assert_eq!(partial.status_line(), "206 Partial Content");
-    }
+        let validators = |etag: Option<&str>| HeadValidators {
+            etag: etag.map(Arc::from),
+            last_modified: Arc::from(LAST_MODIFIED),
+        };
 
-    /// Pins the wire bytes of the splice response head shared by the
-    /// streaming drive and the buffered volatile path (header order included).
-    #[test]
-    fn splice_response_head_renders_the_pinned_bytes() {
-        let date = "Fri, 02 Jan 2026 00:00:00 GMT";
-
-        let headers = b"HTTP/1.1 200 OK\r\n\
-                        Content-Length: 1000\r\n\
-                        Last-Modified: Thu, 01 Jan 2025 00:00:00 GMT\r\n\
-                        ETag: \"abc\"\r\n\
-                        \r\n";
-        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
-            .expect("should parse");
         let whole = ServeParams::from_parsed(None, 1000).expect("no range");
-        let validators = HeadValidators {
-            etag: resp.etag.as_deref().map(Arc::from),
-            last_modified: resp
-                .last_modified
-                .as_deref()
-                .expect("upstream sent one")
-                .into(),
-        };
-        let head = render_splice_response_head(
-            ConnectionVersion::Http11,
-            ConnectionAction::KeepAlive,
-            &whole,
-            "application/vnd.debian.binary-package",
-            date,
-            &validators,
-        );
-        assert_eq!(
-            head,
-            format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Date: {date}\r\n\
-                 Via: {APP_VIA}\r\n\
-                 Connection: keep-alive\r\n\
-                 Content-Length: 1000\r\n\
-                 Content-Type: application/vnd.debian.binary-package\r\n\
-                 Last-Modified: Thu, 01 Jan 2025 00:00:00 GMT\r\n\
-                 ETag: \"abc\"\r\n\
-                 Accept-Ranges: bytes\r\n\
-                 Age: 0\r\n\
-                 \r\n"
-            )
-        );
-
         let partial = ServeParams::from_parsed(
             Some(ParsedRange::Satisfiable {
                 content_range: "bytes 200-499/1000".to_owned(),
@@ -2067,35 +1991,13 @@ mod tests {
             1000,
         )
         .expect("satisfiable");
-        // No `ETag`, and a synthesized `Last-Modified`, which is rendered
-        // like any other.
-        let validators = HeadValidators {
-            etag: None,
-            last_modified: "Sat, 03 Jan 2026 00:00:00 GMT".into(),
-        };
-        let head = render_splice_response_head(
-            ConnectionVersion::Http10,
-            ConnectionAction::Close,
-            &partial,
-            "text/plain",
-            date,
-            &validators,
-        );
-        assert_eq!(
-            head,
-            format!(
-                "HTTP/1.0 206 Partial Content\r\n\
-                 Date: {date}\r\n\
-                 Via: {APP_VIA}\r\n\
-                 Connection: close\r\n\
-                 Content-Length: 300\r\n\
-                 Content-Type: text/plain\r\n\
-                 Last-Modified: Sat, 03 Jan 2026 00:00:00 GMT\r\n\
-                 Accept-Ranges: bytes\r\n\
-                 Age: 0\r\n\
-                 Content-Range: bytes 200-499/1000\r\n\
-                 \r\n"
-            )
-        );
+        for (range, etag) in [(&whole, Some("\"abc\"")), (&partial, None)] {
+            let (validators, cache_info) = (validators(etag), cache_info(etag));
+            let content_type = "application/vnd.debian.binary-package";
+            assert_eq!(
+                splice_response_head(range, content_type, &validators),
+                cached_file_head(range, content_type, &cache_info),
+            );
+        }
     }
 }

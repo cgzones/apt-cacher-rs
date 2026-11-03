@@ -243,6 +243,17 @@ pub(crate) async fn write_response_headers(
     content_type: &'static str,
     cache_info: &CacheInfo,
 ) -> std::io::Result<()> {
+    cached_file_head(params, content_type, cache_info)
+        .write_to(stream, conn_version, conn_action, WireBody::Follows)
+        .await
+}
+
+/// The head [`write_response_headers`] writes.
+pub(crate) fn cached_file_head<'a>(
+    params: &'a ServeParams,
+    content_type: &'static str,
+    cache_info: &'a CacheInfo,
+) -> ResponseHead<'a> {
     ResponseHead::cached(
         params.http_status(),
         Some(params.content_length),
@@ -250,8 +261,6 @@ pub(crate) async fn write_response_headers(
         content_type,
         cache_info,
     )
-    .write_to(stream, conn_version, conn_action, WireBody::Follows)
-    .await
 }
 
 /// Which syscall the shared write loop issues, and which timeout counter its
