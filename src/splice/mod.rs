@@ -1496,23 +1496,21 @@ async fn splice_proxy_drive(
     // The dial target: the host the client named (an alias is a real
     // mirror), never the canonical mirror the caches key on.
     let host_authority = conn_details.upstream_authority();
-    // Capture the original (pre-redirect) client request path. A 301 redirect
-    // in `plan_upstream_response` shadows `upstream_path` to the redirected
-    // URL; the registry key (`InitBarrier::new`) must carry the original
-    // path so it matches across all backends (the hyper backend in
-    // hyper_conn.rs always uses the client-request URI).
-    // Strip the query so cache identity (registry keys, Origin rows) stays
-    // path-only; the query still rides on the upstream GET line via
-    // `upstream_path`. Matches the hyper backend.
-    let original_uri_path = upstream_path
-        .split_once('?')
-        .map_or(upstream_path, |(path, _)| path);
+    // A cacheable request carrying a query is an uncached passthrough
+    // (`PassthroughReason::QueryString`), so the path is the cache identity
+    // as is: the registry key (`InitBarrier::new`), the index-touch hooks and
+    // the relay limiter all take it. A redirect never rewrites it --
+    // `plan_upstream_response` dials the `RedirectTarget` it returns.
+    debug_assert!(
+        !upstream_path.contains('?'),
+        "a query-carrying request reached the cached splice drive"
+    );
 
     let mut ibarrier = InitBarrier::new(
         origination,
         appstate.active_downloads.clone(),
         conn_details,
-        original_uri_path,
+        upstream_path,
     );
 
     if reject_if_verify_throttled(&mut ibarrier, client, conn_details).await? {
@@ -1588,8 +1586,8 @@ async fn splice_proxy_drive(
 
     let (total_content_length, body_content_length, resume_offset) = match plan {
         DownloadPlan::NotModified(stale) => {
-            note_cached_index_touch(conn_details, original_uri_path, &stale.path);
-            note_release_revalidated(conn_details, original_uri_path);
+            note_cached_index_touch(conn_details, upstream_path, &stale.path);
+            note_release_revalidated(conn_details, upstream_path);
             // Upstream confirms the cached copy is still current: refresh the
             // freshness window and serve the cached file via sendfile.
             debug!(
@@ -1641,7 +1639,7 @@ async fn splice_proxy_drive(
             // answers rather than the upstream status.
             let Some(_relay_slot) = passthrough_limiter::admit(
                 global_config().max_passthrough_relays,
-                original_uri_path,
+                upstream_path,
                 &conn_details.client,
             ) else {
                 let _settled = ibarrier.decline(Declined::RelayRefused).await;
