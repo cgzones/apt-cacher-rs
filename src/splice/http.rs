@@ -34,6 +34,7 @@ use tokio::{
 };
 
 use crate::cache_layout::ConnectionDetails;
+use crate::config::Config;
 use crate::http_helpers::{
     ConnectionAction, ConnectionVersion, HeadEnd, OptHeader, capped_header_end, find_header,
 };
@@ -362,11 +363,9 @@ impl BodyFraming {
             Self::ContentLength(cl) => {
                 write_prefix(client_stream, body_prefix).await?;
                 let remaining = cl.saturating_sub(prefix_len);
-                let forwarded = if remaining > 0 {
-                    forward_upstream_body(&mut upstream, client_stream, remaining).await?
-                } else {
-                    0
-                };
+                let forwarded =
+                    forward_upstream_body(&mut upstream, client_stream, Some(remaining), max_bytes)
+                        .await?;
                 upstream.complete();
                 Ok(prefix_len + forwarded)
             }
@@ -394,8 +393,7 @@ impl BodyFraming {
                 // cap bounds how long a relay runs, not what it holds.
                 write_prefix(client_stream, body_prefix).await?;
                 let forwarded =
-                    forward_upstream_body_until_eof(&mut upstream, client_stream, max_bytes)
-                        .await?;
+                    forward_upstream_body(&mut upstream, client_stream, None, max_bytes).await?;
                 Ok(prefix_len + forwarded)
             }
         }
@@ -678,27 +676,6 @@ pub(super) async fn send_and_read_headers(
     Ok((resp, hdr_buf, hdr_end))
 }
 
-/// Feed `n` freshly read upstream bytes to the mirror-rate checker and fail
-/// with the shared `TimedOut` error once the mirror has fallen below
-/// `min_download_rate`. A `None` checker means the limit is disabled.
-///
-/// The one gate for every body reader below; the `BYTES_DOWNLOADED_UPSTREAM`
-/// bump stays at the call sites, which differ in what they check between the
-/// read and this gate.
-fn check_upstream_read_rate(
-    rate_checker: &mut Option<RateChecker>,
-    n: usize,
-) -> Result<(), UpstreamError> {
-    let Some(rate_checker) = rate_checker.as_mut() else {
-        return Ok(());
-    };
-    rate_checker.add(n);
-    match rate_checker.check_fail() {
-        Some(rate) => Err(UpstreamError::rate(rate)),
-        None => Ok(()),
-    }
-}
-
 /// The `TimedOut` error every upstream body read in this module returns:
 /// bumps `HTTP_TIMEOUT_UPSTREAM_READ` and names the phase alongside the
 /// budget that ran out.
@@ -707,120 +684,136 @@ fn upstream_read_timeout(timeout: Duration) -> UpstreamError {
     UpstreamError::timeout("upstream read timed out", timeout)
 }
 
-/// One upstream body read under the `http_timeout` deadline, for the body
-/// readers below: a deadline hit surfaces as [`upstream_read_timeout`]
-/// tagged with `phase`. A `0` (EOF) is the caller's to interpret.
-async fn read_upstream_timed(
-    read: impl Future<Output = std::io::Result<usize>>,
-    phase: &'static str,
+/// The upstream half of every body reader below: one read under the
+/// `http_timeout` deadline (a deadline hit surfaces as
+/// [`upstream_read_timeout`], an I/O error is tagged with `phase`), its
+/// `BYTES_DOWNLOADED_UPSTREAM` bump, the optional relay cap
+/// ([`Self::capped`]) and the mirror-rate gate, which fails with the shared
+/// `TimedOut` error once the mirror has fallen below `min_download_rate`. A
+/// `0` (EOF) passes no check and is the caller's to interpret.
+struct UpstreamReader {
+    /// `None` when `min_download_rate` is disabled.
+    rate_checker: Option<RateChecker>,
     http_timeout: Duration,
-) -> Result<usize, UpstreamError> {
-    match tokio::time::timeout(http_timeout, read).await {
-        Ok(result) => result.map_err(|error| UpstreamError::io(phase, error)),
-        Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-            Err(upstream_read_timeout(http_timeout))
+    phase: &'static str,
+    cap: Option<RelayCap>,
+}
+
+/// The bytes a capped [`UpstreamReader`] has read, and its limit.
+struct RelayCap {
+    max_bytes: usize,
+    total: u64,
+}
+
+impl UpstreamReader {
+    fn new(config: &Config, phase: &'static str) -> Self {
+        Self {
+            rate_checker: RateChecker::from_config(config),
+            http_timeout: config.http_timeout,
+            phase,
+            cap: None,
         }
+    }
+
+    /// Fail the read that takes the body past `max_bytes`. Checked before
+    /// the rate gate, so a read crossing both reports the cap.
+    fn capped(self, max_bytes: usize) -> Self {
+        Self {
+            cap: Some(RelayCap {
+                max_bytes,
+                total: 0,
+            }),
+            ..self
+        }
+    }
+
+    async fn read(
+        &mut self,
+        read: impl Future<Output = std::io::Result<usize>>,
+    ) -> Result<usize, UpstreamError> {
+        let n = match tokio::time::timeout(self.http_timeout, read).await {
+            Ok(result) => result.map_err(|error| UpstreamError::io(self.phase, error))?,
+            Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
+                return Err(upstream_read_timeout(self.http_timeout));
+            }
+        };
+        if n == 0 {
+            return Ok(0);
+        }
+
+        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
+
+        if let Some(RelayCap { max_bytes, total }) = &mut self.cap {
+            *total += n as u64;
+            if *total > *max_bytes as u64 {
+                return Err(UpstreamError::body_limit(format!(
+                    "upstream error response body exceeded {max_bytes} byte cap (size={total} bytes)"
+                )));
+            }
+        }
+
+        if let Some(rate_checker) = self.rate_checker.as_mut() {
+            rate_checker.add(n);
+            if let Some(rate) = rate_checker.check_fail() {
+                return Err(UpstreamError::rate(rate));
+            }
+        }
+        Ok(n)
     }
 }
 
-/// Forward remaining body bytes from upstream to client (no caching).
-/// Used for relaying bodies verbatim: non-200 responses on the cache path
-/// and any status via `splice_simple_proxy`.
+/// Forward the rest of a relayed body from upstream to client (no
+/// caching): `length` more bytes of a length-delimited body, else
+/// everything up to EOF, capped at `max_bytes`. Used for relaying bodies
+/// verbatim: non-200 responses on the cache path and any status via
+/// `splice_simple_proxy`. Returns the bytes forwarded.
 /// On error the connection state is indeterminate -- callers must mark the upstream non-poolable.
 async fn forward_upstream_body(
     upstream: &mut UpstreamConn,
     client: &TcpStream,
-    count: u64,
+    length: Option<u64>,
+    max_bytes: usize,
 ) -> Result<u64, DeliveryFailure> {
     let config = global_config();
+    let mut reader = UpstreamReader::new(config, "body forward");
+    if length.is_none() {
+        reader = reader.capped(max_bytes);
+    }
     // `Vec::with_capacity` reserves uninitialized backing storage; `read_buf`
     // fills bytes into the spare capacity via `BufMut`, so the buffer is
     // never zero-initialized before being overwritten by upstream data.
     let mut buf: Vec<u8> = Vec::with_capacity(TLS_READ_BUF_SIZE);
-    let mut remaining = count;
-    let mut rate_checker = RateChecker::from_config(config);
+    let mut total: u64 = 0;
     let mut client_rate_checker = RateChecker::from_config(config);
 
-    while remaining > 0 {
+    loop {
+        let to_read = match length {
+            Some(length) if total == length => break,
+            Some(length) => (length - total).min(TLS_READ_BUF_SIZE as u64),
+            None => TLS_READ_BUF_SIZE as u64,
+        };
         debug_assert_eq!(
             buf.capacity(),
             TLS_READ_BUF_SIZE,
             "buffer capacity should remain constant"
         );
         buf.clear();
-        let to_read = std::cmp::min(remaining, TLS_READ_BUF_SIZE as u64);
-        let n = read_upstream_timed(
-            (&mut *upstream).take(to_read).read_buf(&mut buf),
-            "body forward",
-            config.http_timeout,
-        )
-        .await?;
+        let n = reader
+            .read((&mut *upstream).take(to_read).read_buf(&mut buf))
+            .await?;
         if n == 0 {
+            if length.is_none() {
+                break;
+            }
             return Err(DeliveryFailure::from(UpstreamError::protocol(
                 "upstream closed before sending complete body",
             )));
         }
 
-        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
-
-        check_upstream_read_rate(&mut rate_checker, n)?;
-
         write_all_to_stream_rated(client, &buf, &mut client_rate_checker, config.http_timeout)
             .await?;
         metrics::BYTES_SERVED_PASSTHROUGH.increment_by(n as u64);
-        remaining = remaining
-            .checked_sub(n as u64)
-            .expect("read should not return more than requested");
-    }
-
-    Ok(count)
-}
-
-/// Forward body bytes from upstream to client until EOF, with a size cap.
-/// Used for relayed responses that lack a Content-Length header (non-200 on
-/// the cache path, any status via `splice_simple_proxy`).
-async fn forward_upstream_body_until_eof(
-    upstream: &mut UpstreamConn,
-    client: &TcpStream,
-    max_bytes: usize,
-) -> Result<u64, DeliveryFailure> {
-    let config = global_config();
-    let mut buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE);
-    let mut total = 0;
-    let mut rate_checker = RateChecker::from_config(config);
-    let mut client_rate_checker = RateChecker::from_config(config);
-
-    loop {
-        buf.clear();
-        let n = read_upstream_timed(
-            upstream.read_buf(&mut buf),
-            "body forward",
-            config.http_timeout,
-        )
-        .await?;
-        if n == 0 {
-            break;
-        }
-
-        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
-
         total += n as u64;
-        if total > max_bytes as u64 {
-            return Err(DeliveryFailure::from(UpstreamError::body_limit(format!(
-                "upstream error response body exceeded {max_bytes} byte cap (size={total} bytes)"
-            ))));
-        }
-
-        check_upstream_read_rate(&mut rate_checker, n)?;
-
-        write_all_to_stream_rated(
-            client,
-            &buf[..n],
-            &mut client_rate_checker,
-            config.http_timeout,
-        )
-        .await?;
-        metrics::BYTES_SERVED_PASSTHROUGH.increment_by(n as u64);
     }
 
     Ok(total)
@@ -855,6 +848,22 @@ enum ChunkDecodeError {
     /// A framing violation, as the reason phrase its I/O wrapper hands to
     /// `UpstreamError::protocol` (which owns the counter bump).
     Framing(&'static str),
+}
+
+impl ChunkDecodeError {
+    /// The upstream failure this stop is, a cap naming the capped body as
+    /// `what`.
+    fn into_upstream(self, what: &str) -> UpstreamError {
+        match self {
+            Self::SizeCap {
+                max_bytes,
+                declared_bytes,
+            } => UpstreamError::body_limit(format!(
+                "{what} exceeded {max_bytes} byte cap (declared payload={declared_bytes} bytes)"
+            )),
+            Self::Framing(reason) => UpstreamError::protocol(reason),
+        }
+    }
 }
 
 /// What one [`ChunkDecoder::feed`] call took from its input.
@@ -1139,20 +1148,7 @@ async fn forward_chunked_buf(
             decoder.feed(data, |range| payload.extend_from_slice(&data[range]))
         }
     };
-    let consumed = match fed {
-        Ok(consumed) => consumed,
-        Err(ChunkDecodeError::SizeCap {
-            max_bytes,
-            declared_bytes,
-        }) => {
-            return Err(DeliveryFailure::from(UpstreamError::body_limit(format!(
-                "chunked response body exceeded {max_bytes} byte cap (declared payload={declared_bytes} bytes)"
-            ))));
-        }
-        Err(ChunkDecodeError::Framing(reason)) => {
-            return Err(DeliveryFailure::from(UpstreamError::protocol(reason)));
-        }
-    };
+    let consumed = fed.map_err(|err| err.into_upstream("chunked response body"))?;
     let forward_slice = match relay {
         ChunkedRelay::Raw => &data[..consumed.framed],
         ChunkedRelay::Decoded => payload.as_slice(),
@@ -1192,7 +1188,7 @@ async fn forward_upstream_chunked_body(
     max_bytes: usize,
 ) -> Result<u64, DeliveryFailure> {
     let config = global_config();
-    let mut rate_checker = RateChecker::from_config(config);
+    let mut reader = UpstreamReader::new(config, "chunked body forward");
     let mut client_rate_checker = RateChecker::from_config(config);
 
     let mut decoder = ChunkDecoder::new(max_bytes);
@@ -1221,21 +1217,12 @@ async fn forward_upstream_chunked_body(
     let mut buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE);
     loop {
         buf.clear();
-        let n = read_upstream_timed(
-            upstream.read_buf(&mut buf),
-            "chunked body forward",
-            config.http_timeout,
-        )
-        .await?;
+        let n = reader.read(upstream.read_buf(&mut buf)).await?;
         if n == 0 {
             return Err(DeliveryFailure::from(UpstreamError::protocol(
                 "upstream closed during chunked body transfer",
             )));
         }
-
-        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
-
-        check_upstream_read_rate(&mut rate_checker, n)?;
 
         if forward_chunked_buf(
             &mut decoder,
@@ -1261,11 +1248,10 @@ async fn read_body_to_vec_until_eof(
     prefix: &[u8],
     max_bytes: usize,
 ) -> Result<Vec<u8>, UpstreamError> {
-    let config = global_config();
     let size = (prefix.len() + 4096).min(max_bytes.saturating_add(1));
     let mut body = Vec::with_capacity(size);
     body.extend_from_slice(prefix);
-    let mut rate_checker = RateChecker::from_config(config);
+    let mut reader = UpstreamReader::new(global_config(), "volatile body buffering");
 
     loop {
         if body.len() > max_bytes {
@@ -1285,19 +1271,12 @@ async fn read_body_to_vec_until_eof(
         // already covers this.
         body.reserve(TLS_READ_BUF_SIZE.min(remaining));
 
-        let n = read_upstream_timed(
-            (&mut *upstream).take(remaining as u64).read_buf(&mut body),
-            "volatile body buffering",
-            config.http_timeout,
-        )
-        .await?;
+        let n = reader
+            .read((&mut *upstream).take(remaining as u64).read_buf(&mut body))
+            .await?;
         if n == 0 {
             break;
         }
-
-        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
-
-        check_upstream_read_rate(&mut rate_checker, n)?;
     }
 
     Ok(body)
@@ -1324,32 +1303,24 @@ async fn read_body_to_vec_with_content_length(
         ));
     }
 
-    let config = global_config();
     // Allocate incrementally (the per-iteration `reserve` below), like
     // `read_body_to_vec_until_eof`: `content_length` is an untrusted upstream
     // header and must not size an up-front allocation.
     let mut body = Vec::with_capacity((prefix.len() + 32 * 1024).min(content_length));
     body.extend_from_slice(prefix);
-    let mut rate_checker = RateChecker::from_config(config);
+    let mut reader = UpstreamReader::new(global_config(), "length-delimited body buffering");
 
     while body.len() < content_length {
         let remaining = content_length - body.len();
         body.reserve(TLS_READ_BUF_SIZE.min(remaining));
-        let n = read_upstream_timed(
-            (&mut *upstream).take(remaining as u64).read_buf(&mut body),
-            "length-delimited body buffering",
-            config.http_timeout,
-        )
-        .await?;
+        let n = reader
+            .read((&mut *upstream).take(remaining as u64).read_buf(&mut body))
+            .await?;
         if n == 0 {
             return Err(UpstreamError::protocol(
                 "upstream closed before content-length body completed",
             ));
         }
-
-        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
-
-        check_upstream_read_rate(&mut rate_checker, n)?;
     }
 
     Ok(body)
@@ -1364,9 +1335,8 @@ async fn read_dechunk_body_to_vec(
     prefix: &[u8],
     max_bytes: usize,
 ) -> Result<Vec<u8>, UpstreamError> {
-    let config = global_config();
     let mut body = Vec::with_capacity(4096);
-    let mut rate_checker = RateChecker::from_config(config);
+    let mut reader = UpstreamReader::new(global_config(), "chunked body buffering");
     let mut decoder = ChunkDecoder::new(max_bytes);
     let mut read_buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE);
 
@@ -1377,36 +1347,20 @@ async fn read_dechunk_body_to_vec(
     loop {
         let data = if pending.is_empty() {
             read_buf.clear();
-            let n = read_upstream_timed(
-                upstream.read_buf(&mut read_buf),
-                "chunked body buffering",
-                config.http_timeout,
-            )
-            .await?;
+            let n = reader.read(upstream.read_buf(&mut read_buf)).await?;
             if n == 0 {
                 return Err(UpstreamError::protocol(
                     "upstream closed during chunked body buffering",
                 ));
             }
-            metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
-            check_upstream_read_rate(&mut rate_checker, n)?;
             &read_buf[..n]
         } else {
             std::mem::take(&mut pending)
         };
 
-        let consumed = match decoder.feed(data, |payload| body.extend_from_slice(&data[payload])) {
-            Ok(consumed) => consumed,
-            Err(ChunkDecodeError::SizeCap {
-                max_bytes,
-                declared_bytes,
-            }) => {
-                return Err(UpstreamError::body_limit(format!(
-                    "chunked volatile body exceeded {max_bytes} byte cap (declared payload={declared_bytes} bytes)"
-                )));
-            }
-            Err(ChunkDecodeError::Framing(reason)) => return Err(UpstreamError::protocol(reason)),
-        };
+        let consumed = decoder
+            .feed(data, |payload| body.extend_from_slice(&data[payload]))
+            .map_err(|err| err.into_upstream("chunked volatile body"))?;
 
         if consumed.done {
             consumed
