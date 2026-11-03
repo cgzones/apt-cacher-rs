@@ -140,7 +140,7 @@ mod tests {
         let mirror = Mirror::new(
             ClientHost::new("health-key.example").expect("valid host"),
             std::num::NonZero::new(8080),
-            String::from("debian"),
+            "debian".into(),
             MirrorKind::Structured,
         );
         record(&mirror, MirrorFault::Slow);

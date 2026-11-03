@@ -64,6 +64,7 @@ use std::{
     borrow::Cow,
     path::{Path, PathBuf},
     str::Utf8Error,
+    sync::Arc,
 };
 
 use hashbrown::Equivalent;
@@ -770,7 +771,10 @@ pub(crate) fn dists_debname(
 /// deferred origin record to be sent post-hoc.
 #[derive(Debug)]
 pub(crate) struct RequestClass {
-    pub(crate) mirror_path: String,
+    /// Shared, because it becomes [`Mirror`]'s path, which every clone of
+    /// the request's mirror (active-downloads key, DB commands, rename plan)
+    /// carries.
+    pub(crate) mirror_path: Arc<str>,
     pub(crate) debname: String,
     pub(crate) resource_kind: ResourceKind,
     pub(crate) origin_fields: Option<OriginFields>,
@@ -876,7 +880,7 @@ pub(crate) fn classify_request<'a>(
             );
 
             Ok(RequestClass {
-                mirror_path: mirror_path.into_owned(),
+                mirror_path: Arc::from(mirror_path),
                 debname: filename.into_owned(),
                 resource_kind: ResourceKind::Pool,
                 origin_fields: None,
@@ -896,7 +900,7 @@ pub(crate) fn classify_request<'a>(
             );
 
             Ok(RequestClass {
-                mirror_path: mirror_path.into_owned(),
+                mirror_path: Arc::from(mirror_path),
                 debname: format!("{distribution}_{filename}"),
                 resource_kind: ResourceKind::Release,
                 origin_fields: None,
@@ -952,7 +956,7 @@ pub(crate) fn classify_request<'a>(
             };
 
             Ok(RequestClass {
-                mirror_path: mirror_path.into_owned(),
+                mirror_path: Arc::from(mirror_path),
                 debname: filename.into_owned(),
                 resource_kind: ResourceKind::ByHash(*algorithm, content),
                 origin_fields,
@@ -1018,7 +1022,7 @@ pub(crate) fn classify_request<'a>(
             // recorded as a per-binary origin (those come from the .deb
             // fetch path), so `origin_fields` is unconditionally `None`.
             Ok(RequestClass {
-                mirror_path: mirror_path.into_owned(),
+                mirror_path: Arc::from(mirror_path),
                 debname: dists_debname(&distribution, &component, &architecture, &filename),
                 resource_kind: ResourceKind::ComponentRelease,
                 origin_fields: None,
@@ -1062,7 +1066,7 @@ pub(crate) fn classify_request<'a>(
             };
 
             Ok(RequestClass {
-                mirror_path: mirror_path.into_owned(),
+                mirror_path: Arc::from(mirror_path),
                 debname,
                 resource_kind: ResourceKind::Packages,
                 origin_fields,
@@ -1103,7 +1107,7 @@ pub(crate) fn classify_request<'a>(
             };
 
             Ok(RequestClass {
-                mirror_path: mirror_path.into_owned(),
+                mirror_path: Arc::from(mirror_path),
                 debname: filename.into_owned(),
                 resource_kind,
                 origin_fields: None,
@@ -1133,7 +1137,7 @@ fn classify_component_scoped<'a>(
     );
 
     Ok(RequestClass {
-        mirror_path: mirror_path.into_owned(),
+        mirror_path: Arc::from(mirror_path),
         debname: format!("{distribution}_{component}_{filename}"),
         resource_kind,
         origin_fields: None,
@@ -1161,8 +1165,8 @@ fn validate_directories(dirs: &str) -> Result<Option<Cow<'_, str>>, ClassifyErro
 /// of one ([`ClassifyError::JoinedFieldUnderscore`]).  Returns a `Cow` borrowing the input when no percent-escape was
 /// present (the common case for ASCII Debian paths), so callers that feed
 /// the result into `format!` or a `&str`-taking validator pay no extra
-/// allocation; callers needing an owned `String` (e.g. `RequestClass.mirror_path`)
-/// call `.into_owned()` at the move site.
+/// allocation; callers needing an owned value convert at the move site
+/// (`RequestClass.mirror_path` takes `Arc::from`).
 fn decode_validate(raw: &str, kind: ValidateKind) -> Result<Cow<'_, str>, ClassifyError<'_>> {
     let decoded = match percent_encoding::percent_decode_str(raw).decode_utf8() {
         Ok(s) => s,
@@ -1254,7 +1258,7 @@ mod tests {
             filename: "firefox-esr_115.9.1esr-1_amd64.deb",
         };
         let class = classify_request(&res, &local_client()).unwrap();
-        assert_eq!(class.mirror_path, "debian");
+        assert_eq!(&*class.mirror_path, "debian");
         assert_eq!(class.debname, "firefox-esr_115.9.1esr-1_amd64.deb");
         assert_eq!(class.resource_kind, ResourceKind::Pool);
         assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
@@ -1510,7 +1514,7 @@ mod tests {
         };
         let class = classify_request(&res, &local_client()).unwrap();
         assert_eq!(
-            class.mirror_path,
+            &*class.mirror_path,
             "api/packages/85/debian/pool/php-zts/main"
         );
         assert_eq!(class.debname, "php-zts-cli_8.5.7-1_amd64.deb");
@@ -1531,7 +1535,7 @@ mod tests {
         .expect("parses");
         let class = classify_request(&res, &local_client()).expect("classifies");
         assert_eq!(
-            class.mirror_path,
+            &*class.mirror_path,
             "linux/debian/dists/bookworm/pool/stable/amd64"
         );
         assert_eq!(class.resource_kind, ResourceKind::FlatPool);
@@ -1636,7 +1640,7 @@ mod tests {
             filename: "foo_1.0_amd64.deb",
         };
         let class = classify_request(&res, &local_client()).expect("classifies");
-        assert_eq!(class.mirror_path, "public-ubuntu/x");
+        assert_eq!(&*class.mirror_path, "public-ubuntu/x");
     }
 
     #[test]
@@ -1723,7 +1727,7 @@ mod tests {
             filename: "InRelease",
         };
         let class = classify_request(&res, &local_client()).unwrap();
-        assert_eq!(class.mirror_path, "debian");
+        assert_eq!(&*class.mirror_path, "debian");
         assert_eq!(class.debname, "sid_InRelease");
     }
 

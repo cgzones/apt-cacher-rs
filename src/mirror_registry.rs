@@ -127,7 +127,7 @@ mod tests {
         Mirror::new(
             ClientHost::new(host).expect("valid host"),
             None,
-            path.to_owned(),
+            path.into(),
             kind,
         )
     }

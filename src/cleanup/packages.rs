@@ -489,7 +489,7 @@ mod tests {
         let mirror = Mirror::new(
             ClientHost::new("example.com").expect("valid host"),
             None::<NonZero<u16>>,
-            "apt/amd64".to_owned(),
+            "apt/amd64".into(),
             MirrorKind::Flat,
         );
         let mut tally = UnitStats::default();
@@ -557,7 +557,7 @@ mod tests {
         let mirror = Mirror::new(
             ClientHost::new("example.com").expect("valid host"),
             None::<NonZero<u16>>,
-            "apt/amd64".to_owned(),
+            "apt/amd64".into(),
             MirrorKind::Flat,
         );
         // A non-matching entry keeps `file_list` non-empty so the reducer
@@ -605,7 +605,7 @@ mod tests {
         let mirror = Mirror::new(
             ClientHost::new("example.com").expect("valid host"),
             None::<NonZero<u16>>,
-            "apt/amd64".to_owned(),
+            "apt/amd64".into(),
             MirrorKind::Flat,
         );
         let mut file_list = cands(&["never-matched.deb"]);

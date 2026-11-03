@@ -1276,7 +1276,7 @@ mod tests {
                 let mirror = Mirror::new(
                     ClientHost::new("redirect-port-policy.invalid").expect("host"),
                     uri_authority::normalize_http_port(port, uri.scheme()),
-                    String::new(),
+                    "".into(),
                     MirrorKind::Structured,
                 );
                 let scheme = if uri.scheme() == Some(&http::uri::Scheme::HTTPS) {
@@ -1315,7 +1315,7 @@ mod tests {
         let mirror = Mirror::new(
             ClientHost::new("example.com").unwrap(),
             None,
-            String::new(),
+            "".into(),
             MirrorKind::Structured,
         );
         assert_eq!(endpoint_port((&mirror).into(), false), 80);
@@ -1327,7 +1327,7 @@ mod tests {
         let mirror = Mirror::new(
             ClientHost::new("example.com").unwrap(),
             Some(NonZero::new(8080).unwrap()),
-            String::new(),
+            "".into(),
             MirrorKind::Structured,
         );
         assert_eq!(endpoint_port((&mirror).into(), false), 8080);

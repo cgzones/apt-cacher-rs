@@ -15,7 +15,7 @@ pub(crate) fn structured_mirror(host: &str, path: &str) -> Mirror {
     Mirror::new(
         ClientHost::new(host).expect("valid host"),
         None,
-        path.to_owned(),
+        path.into(),
         MirrorKind::Structured,
     )
 }

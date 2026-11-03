@@ -3538,7 +3538,7 @@ mod tests {
         let mirror = Mirror::new(
             ClientHost::new("deb.debian.org").expect("valid host"),
             NonZero::new(8080),
-            "debian".to_owned(),
+            "debian".into(),
             MirrorKind::Structured,
         );
         let kind = IngestKind::Packages {

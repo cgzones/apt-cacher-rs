@@ -578,7 +578,7 @@ mod tests {
         let mirror = Mirror::new(
             ClientHost::new("deb.example.org").expect("valid host"),
             None,
-            "apt".to_owned(),
+            "apt".into(),
             MirrorKind::Flat,
         );
         let keep_span = Duration::from_hours(90 * 24);

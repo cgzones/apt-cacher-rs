@@ -499,7 +499,7 @@ mod tests {
         let other_mirror = Mirror::new(
             ClientHost::new("archive.ubuntu.com").expect("valid host"),
             None,
-            String::new(),
+            "".into(),
             MirrorKind::Structured,
         );
         let now = Instant::now();

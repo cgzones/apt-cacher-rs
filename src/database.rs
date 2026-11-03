@@ -156,7 +156,7 @@ impl From<MirrorEntry> for Mirror {
             kind,
         } = entry;
         let kind = decode_mirror_kind(kind, &path);
-        Self::new(host, NonZero::new(port), path, kind)
+        Self::new(host, NonZero::new(port), path.into(), kind)
     }
 }
 
@@ -1045,7 +1045,12 @@ impl Database {
                 };
                 Some((
                     row_id,
-                    Mirror::new(ClientHost::from(host), NonZero::new(r.port), r.path, kind),
+                    Mirror::new(
+                        ClientHost::from(host),
+                        NonZero::new(r.port),
+                        r.path.into(),
+                        kind,
+                    ),
                 ))
             })
             .collect())

@@ -308,7 +308,7 @@ fn flat_root_fetch_plan<'a>(mirror: &'a Mirror, seg: &str, prefix: &'a str) -> F
     let root_mirror = Mirror::new(
         mirror.host().clone(),
         mirror.port(),
-        seg.to_owned(),
+        seg.into(),
         MirrorKind::Flat,
     );
     FetchPlan {
@@ -1141,7 +1141,7 @@ async fn resolve_origin_packages_archive_root(
     let archive_mirror = Mirror::new(
         mirror.host().clone(),
         mirror.port(),
-        root.to_owned(),
+        root.into(),
         MirrorKind::Structured,
     );
 
@@ -1422,7 +1422,7 @@ mod tests {
         let owner = Mirror::new(
             ClientHost::new("deb.example.com").expect("valid host"),
             None,
-            "apt/amd64".to_owned(),
+            "apt/amd64".into(),
             MirrorKind::Flat,
         );
         let plan = flat_root_fetch_plan(&owner, "apt", "amd64/");

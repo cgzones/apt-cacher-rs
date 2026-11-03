@@ -1,4 +1,8 @@
-use std::{borrow::Cow, num::NonZero, sync::OnceLock};
+use std::{
+    borrow::Cow,
+    num::NonZero,
+    sync::{Arc, OnceLock},
+};
 
 use tracing::debug;
 
@@ -54,7 +58,9 @@ impl MirrorKind {
 pub(crate) struct Mirror {
     host: ClientHost,
     port: Option<NonZero<u16>>,
-    path: String,
+    /// Shared like the host's text, so a clone (an active-downloads key, a
+    /// DB command, a registry entry) bumps a refcount instead of copying it.
+    path: Arc<str>,
     kind: MirrorKind,
     /// Lazily-populated cache of `host.format_authority(port)` when the result
     /// is owned (i.e. requires allocation: an IPv6 host or a non-empty port).
@@ -68,7 +74,7 @@ impl Mirror {
     pub(crate) const fn new(
         host: ClientHost,
         port: Option<NonZero<u16>>,
-        path: String,
+        path: Arc<str>,
         kind: MirrorKind,
     ) -> Self {
         Self {
@@ -110,8 +116,8 @@ impl Mirror {
     }
 
     #[must_use]
-    pub(crate) const fn path(&self) -> &str {
-        self.path.as_str()
+    pub(crate) fn path(&self) -> &str {
+        &self.path
     }
 
     /// The on-disk identity of this mirror: a plain projection, so callers
@@ -126,8 +132,9 @@ impl Mirror {
     }
 
     /// The heap this value owns beyond its inline size: the host text, the
-    /// path and the rendered authority once cached. The host text is a
-    /// shared allocation when the value is a clone, and is counted anyway.
+    /// path and the rendered authority once cached. The host and path texts
+    /// are shared allocations when the value is a clone, and are counted
+    /// anyway.
     #[must_use]
     pub(crate) fn heap_bytes(&self) -> usize {
         let Self {
@@ -138,7 +145,7 @@ impl Mirror {
             cached_authority,
         } = self;
         host.as_str().len()
-            + path.capacity()
+            + path.len()
             + cached_authority
                 .get()
                 .map_or(0, |authority| authority.len())
@@ -181,7 +188,7 @@ impl Clone for Mirror {
         Self {
             host: host.clone(),
             port: *port,
-            path: path.clone(),
+            path: Arc::clone(path),
             kind: *kind,
             cached_authority: OnceLock::new(),
         }
@@ -1491,7 +1498,7 @@ mod tests {
                 mirror: Mirror::new(
                     ClientHost::new("site.example.com").unwrap(),
                     Some(nonzero!(80)),
-                    "private/debian".to_string(),
+                    "private/debian".into(),
                     MirrorKind::Structured,
                 ),
                 fields: OriginFields {
@@ -1522,7 +1529,7 @@ mod tests {
                 mirror: Mirror::new(
                     ClientHost::new("apt.llvm.org").unwrap(),
                     Some(nonzero!(443)),
-                    "unstable".to_string(),
+                    "unstable".into(),
                     MirrorKind::Structured,
                 ),
                 fields: OriginFields {

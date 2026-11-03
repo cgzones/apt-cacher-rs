@@ -574,7 +574,7 @@ mod tests {
         let mirror = Mirror::new(
             ClientHost::new("2001:db8::1").expect("valid host"),
             NonZero::new(8080),
-            "debian".to_owned(),
+            "debian".into(),
             MirrorKind::Structured,
         );
         let from_mirror = SchemeKeyRef::from(&mirror);
