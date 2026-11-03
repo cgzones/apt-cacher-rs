@@ -28,8 +28,8 @@ use crate::{
 use crate::cleanup::fetch::{DebnameKind, FetchFailure, fetch_packages};
 use crate::cleanup::model::{
     ByHashUnit, CleanupUnit, DistGate, FlatFetch, GroupOutcome, GroupResult, IndexSource,
-    MetadataUnit, PartialsUnit, ReconcileFacet, ReconcilePolicy, ReconcileUnit, SkipReason,
-    SweepAction, SweepReason, decide_sweep,
+    MetadataUnit, PartialsUnit, ReconcileFacet, ReconcileUnit, SkipReason, SweepAction,
+    SweepReason, decide_sweep,
 };
 use crate::cleanup::packages::{KeyMapper, ReduceContext, ReduceError, reduce_file_list};
 use crate::cleanup::partials::cleanup_tmp_dir;
@@ -209,14 +209,14 @@ async fn reduce_against(
     candidates: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
 ) -> Result<ReduceOutcome, ReduceError> {
-    let &ReconcileCtx {
-        policy: _,
-        self_origins: _,
-        tree_root,
+    let tree_root = ctx.tree_root();
+    let &MirrorCtx {
         mirror: _,
         appstate,
         config,
-    } = ctx;
+        self_origins: _,
+        now: _,
+    } = ctx.mirror_ctx;
 
     let index = match fetch_packages(
         &plan.mirror,
@@ -380,17 +380,17 @@ async fn read_self_origins(appstate: &AppState, mirror: &Mirror) -> Option<Vec<O
 /// Immutable context threaded through the reconcile-unit resolvers (the
 /// candidate map and tally are the only mutable state, kept separate).
 struct ReconcileCtx<'a> {
-    policy: ReconcilePolicy,
-    /// This mirror's own `origins` rows, read once per cycle by
-    /// [`run_mirror_units`]; `None` = unread (see [`read_self_origins`]).
-    self_origins: Option<&'a [OriginEntry]>,
+    mirror_ctx: &'a MirrorCtx<'a>,
+    unit: &'a ReconcileUnit,
+}
+
+impl ReconcileCtx<'_> {
     /// The unit's tree root: candidate keys are relative to it, so a resolver
     /// needs it to turn a matched key back into an on-disk path. Named apart
     /// from the archive-root / flat-root *segments* the resolvers call `root`.
-    tree_root: &'a Path,
-    mirror: &'a Mirror,
-    appstate: &'a AppState,
-    config: &'a Config,
+    fn tree_root(&self) -> &Path {
+        &self.unit.tree.root
+    }
 }
 
 /// Signal from a source-group resolver back to the generic tail.
@@ -700,9 +700,9 @@ async fn run_reconcile_unit(
     let policy = unit.policy;
     let &MirrorCtx {
         mirror,
-        appstate,
+        appstate: _,
         config,
-        self_origins,
+        self_origins: _,
         now,
     } = mirror_ctx;
 
@@ -724,14 +724,7 @@ async fn run_reconcile_unit(
         io_failures,
     };
 
-    let ctx = ReconcileCtx {
-        policy,
-        self_origins,
-        tree_root: &unit.tree.root,
-        mirror,
-        appstate,
-        config,
-    };
+    let ctx = ReconcileCtx { mirror_ctx, unit };
 
     // Resolve every source group in order and collect the full ordered result
     // set. The tail's ONLY short-circuit is `Exhausted` (the candidate map
@@ -919,10 +912,10 @@ async fn gate_on_row(
     seg: &str,
     noun: &'static str,
 ) -> Result<(), GroupResolution> {
-    match ctx
-        .appstate
+    let (mirror, appstate) = (ctx.mirror_ctx.mirror, ctx.mirror_ctx.appstate);
+    match appstate
         .database
-        .mirror_exists(ctx.mirror.host(), ctx.mirror.port(), seg)
+        .mirror_exists(mirror.host(), mirror.port(), seg)
         .await
     {
         Ok(true) => Ok(()),
@@ -1031,7 +1024,7 @@ async fn resolve_origin_packages_archive_root(
     cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
 ) -> GroupResolution {
-    let (mirror, appstate) = (ctx.mirror, ctx.appstate);
+    let (mirror, appstate) = (ctx.mirror_ctx.mirror, ctx.mirror_ctx.appstate);
 
     // No candidates to reconcile: skip the DB gate + fetch entirely (a fetch
     // against an empty map would also trip `reduce_file_list`'s non-empty
@@ -1121,7 +1114,7 @@ async fn resolve_flat_root_segment(
     cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
 ) -> GroupResolution {
-    let mirror = ctx.mirror;
+    let mirror = ctx.mirror_ctx.mirror;
 
     // Skip the DB gate + fetch when there is nothing to reconcile (see the
     // hybrid resolver's guard for the debug-assert rationale).
@@ -1158,7 +1151,7 @@ async fn resolve_flat_colocated(
     cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
 ) -> GroupResolution {
-    let mirror = ctx.mirror;
+    let mirror = ctx.mirror_ctx.mirror;
 
     // Skip the co-located fetch when there is nothing to reconcile (see the
     // hybrid resolver's guard for the debug-assert rationale).
@@ -1200,14 +1193,14 @@ async fn resolve_origin_packages_self(
     cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
 ) -> GroupResolution {
-    let &ReconcileCtx {
-        policy,
-        self_origins,
-        tree_root: _,
+    let policy = ctx.unit.policy;
+    let &MirrorCtx {
         mirror,
         appstate: _,
         config: _,
-    } = ctx;
+        self_origins,
+        now: _,
+    } = ctx.mirror_ctx;
 
     // The grace window is used only for the diagnostics below; the tail derives
     // the sweep spans from the same policy.
