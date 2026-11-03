@@ -1088,7 +1088,8 @@ pub(crate) static DB_MIRROR_CACHE_MISSES: Counter = Counter::new();
 /// Total `mirrors_v2.last_seen` rows updated by the periodic flush task.
 pub(crate) static DB_MIRROR_LAST_SEEN_FLUSHED: Accumulator = Accumulator::new();
 /// Current size of the in-memory mirror-id cache (entries hydrated at startup
-/// plus newly observed mirrors). Entries are never evicted, so this only grows.
+/// plus newly observed mirrors). It shrinks only when cleanup deletes mirror
+/// rows (`DatabaseCommand::DeleteMirrors`), which evicts their entries.
 pub(crate) static DB_MIRROR_CACHE_ENTRIES: StateU64 = StateU64::new();
 
 /// Total cache files evicted across all cleanup runs.
