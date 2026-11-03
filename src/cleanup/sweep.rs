@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use hashbrown::HashMap;
@@ -95,6 +95,110 @@ fn age_reference_time(meta: &std::fs::Metadata, path: &Path) -> Option<SystemTim
     }
 }
 
+/// Which age-based sweep a file is aged out by: each keeps its own log
+/// wording and its own once-gate for the future-timestamp warn.
+#[derive(Clone, Copy)]
+enum AgeSweep {
+    /// [`sweep_candidates`]: cached debs and by-hash files.
+    Candidates,
+    /// [`sweep_aged_metadata`]: top-level index files.
+    Metadata,
+}
+
+impl AgeSweep {
+    /// Whether the regular file at `path` (lstat `meta`) is at least
+    /// `keep_span` old at `now`, by [`age_reference_time`]. A file without a
+    /// usable timestamp is counted in `stats.io_failures` (logged there); a
+    /// file too young (logged by the candidate sweep only) or with a future
+    /// timestamp (warned once per sweep) is kept.
+    fn is_due(
+        self,
+        path: &Path,
+        meta: &std::fs::Metadata,
+        keep_span: Duration,
+        now: SystemTime,
+        stats: &mut UnitStats,
+    ) -> bool {
+        let Some(created) = age_reference_time(meta, path) else {
+            stats.io_failures += 1;
+            return false;
+        };
+
+        match now.duration_since(created) {
+            Ok(existing_for) if existing_for < keep_span => {
+                match self {
+                    Self::Candidates => debug!(
+                        "Keeping cached file `{}` since it is too new ({}, threshold={})",
+                        path.display(),
+                        HumanFmt::Time(existing_for),
+                        HumanFmt::Time(keep_span)
+                    ),
+                    Self::Metadata => {}
+                }
+                false
+            }
+            Ok(_) => true,
+            Err(err) => {
+                match self {
+                    Self::Candidates => warn_once_or_info!(
+                        "Cache file `{}` has a future timestamp; skipping its removal:  {}",
+                        path.display(),
+                        ErrorReport(&err)
+                    ),
+                    Self::Metadata => warn_once_or_info!(
+                        "Metadata file `{}` has a future timestamp; skipping its removal:  {}",
+                        path.display(),
+                        ErrorReport(&err)
+                    ),
+                }
+                false
+            }
+        }
+    }
+
+    /// Settle the unlink of an aged-out file that was `size` bytes long:
+    /// on success drop its `cache_metadata` entry and tally the removal, on
+    /// failure log and count it. Returns whether the file was removed.
+    fn settle_unlink(
+        self,
+        path: &Path,
+        unlinked: std::io::Result<()>,
+        size: u64,
+        mirror: &Mirror,
+        layout: CacheLayout,
+        stats: &mut UnitStats,
+    ) -> bool {
+        let noun = match self {
+            Self::Candidates => "cached file",
+            Self::Metadata => "stale metadata file",
+        };
+
+        if let Err(err) = unlinked {
+            stats.io_failures += 1;
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "Failed to remove {noun} `{}`; retaining it:  {}",
+                path.display(),
+                ErrorReport(&err)
+            );
+            return false;
+        }
+
+        invalidate_metadata_for(path, mirror, layout);
+
+        debug!("Removed {noun} `{}`", path.display());
+
+        stats.bytes_removed += accounted_size(size);
+        stats.removed += 1;
+        true
+    }
+}
+
+/// Candidates [`sweep_candidates`] hands to one blocking job, like
+/// `cache_walk`'s listing batch: one blocking-pool hop per batch instead of
+/// two per removed candidate.
+const SWEEP_BATCH: usize = 256;
+
 /// Remove cached files older than their per-class span, dropping any matching
 /// `cache_metadata` entries on success.
 ///
@@ -109,7 +213,8 @@ fn age_reference_time(meta: &std::fs::Metadata, path: &Path) -> Option<SystemTim
 /// entries, ten mirrors at once) and only *then* reduced against the Packages
 /// index, so a `PathBuf` per *scanned* entry would be megabytes held for the
 /// whole unit — to spare the surviving candidates one join apiece. The sweep
-/// itself does allocate one joined path per candidate it inspects.
+/// itself does allocate one joined path per candidate it inspects, a batch
+/// ([`SWEEP_BATCH`]) at a time.
 ///
 /// A candidate's [`SpanClass`] selects its span from `spans`: `.deb` files use
 /// `spans.deb`; by-hash files use `spans.byhash_covered`/`byhash_uncovered`.
@@ -129,102 +234,98 @@ pub(super) async fn sweep_candidates(
     layout: CacheLayout,
 ) -> UnitStats {
     let mut stats = UnitStats::default();
+    let mut candidates = candidates.iter();
 
-    for (name, &class) in candidates {
-        let path = root.join(name);
-        let keep_span = match class {
-            SpanClass::Deb => spans.deb,
-            SpanClass::ByHashCovered => spans.byhash_covered,
-            SpanClass::ByHashUncovered => spans.byhash_uncovered,
-        };
-
-        let data = match tokio::fs::symlink_metadata(&path).await {
-            Ok(d) if d.file_type().is_file() => Some(d),
-            Ok(_) => {
-                metrics::CACHE_NON_REGULAR.increment();
-                warn!(
-                    "Cache file `{}` is not a regular file; retaining",
-                    path.display(),
-                );
-                None
-            }
-            // Listed by the scan, removed since (a download replacing it,
-            // another cleanup unit): not an I/O failure (`cache_walk`'s
-            // vanished-entry rule).
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                debug!(
-                    "Cache entry `{}` vanished before it could be inspected; skipping it",
-                    path.display()
-                );
-                None
-            }
-            Err(err) => {
-                stats.io_failures += 1;
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to inspect cached file `{}`; retaining it:  {}",
-                    path.display(),
-                    ErrorReport(&err)
-                );
-                None
-            }
-        };
-
-        let Some(data) = data else {
-            continue;
-        };
-
-        let Some(created) = age_reference_time(&data, &path) else {
-            stats.io_failures += 1;
-            continue;
-        };
-
-        match now.duration_since(created) {
-            Ok(existing_for) if existing_for < keep_span => {
-                debug!(
-                    "Keeping cached file `{}` since it is too new ({}, threshold={})",
-                    path.display(),
-                    HumanFmt::Time(existing_for),
-                    HumanFmt::Time(keep_span)
-                );
-                continue;
-            }
-            Ok(_) => {}
-            Err(err) => {
-                warn_once_or_info!(
-                    "Cache file `{}` has a future timestamp; skipping its removal:  {}",
-                    path.display(),
-                    ErrorReport(&err)
-                );
-                continue;
-            }
+    loop {
+        let batch: Vec<(PathBuf, SpanClass)> = candidates
+            .by_ref()
+            .take(SWEEP_BATCH)
+            .map(|(name, &class)| (root.join(name), class))
+            .collect();
+        if batch.is_empty() {
+            break;
         }
 
-        let size = data.len();
-
-        if let Err(err) = tokio::fs::remove_file(&path).await {
-            stats.io_failures += 1;
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "Failed to remove cached file `{}`; retaining it:  {}",
-                path.display(),
-                ErrorReport(&err)
-            );
-            continue;
-        }
-
-        invalidate_metadata_for(&path, mirror, layout);
-
-        debug!("Removed cached file `{}`", path.display());
-
-        stats.bytes_removed += accounted_size(size);
-        stats.removed += 1;
-        if matches!(class, SpanClass::ByHashCovered) {
-            stats.removed_unreferenced += 1;
+        let mirror = mirror.clone();
+        let job = move || {
+            let mut stats = UnitStats::default();
+            for (path, class) in batch {
+                sweep_candidate(&path, class, spans, now, &mirror, layout, &mut stats);
+            }
+            stats
+        };
+        match tokio::task::spawn_blocking(job).await {
+            Ok(batch_stats) => stats.accumulate(batch_stats),
+            // A panic in the job stays the mirror task's, as when the sweep
+            // ran on it.
+            Err(join_err) => std::panic::resume_unwind(join_err.into_panic()),
         }
     }
 
     stats
+}
+
+/// Inspect and age out one [`sweep_candidates`] candidate. Blocking: the
+/// lstat runs right before the unlink, never earlier (`cache_walk`'s
+/// reap rule: a stale stat would turn a concurrent removal into a reported
+/// unlink failure).
+fn sweep_candidate(
+    path: &Path,
+    class: SpanClass,
+    spans: SpanTable,
+    now: SystemTime,
+    mirror: &Mirror,
+    layout: CacheLayout,
+    stats: &mut UnitStats,
+) {
+    let keep_span = match class {
+        SpanClass::Deb => spans.deb,
+        SpanClass::ByHashCovered => spans.byhash_covered,
+        SpanClass::ByHashUncovered => spans.byhash_uncovered,
+    };
+
+    let data = match std::fs::symlink_metadata(path) {
+        Ok(d) if d.file_type().is_file() => d,
+        Ok(_) => {
+            metrics::CACHE_NON_REGULAR.increment();
+            warn!(
+                "Cache file `{}` is not a regular file; retaining",
+                path.display(),
+            );
+            return;
+        }
+        // Listed by the scan, removed since (a download replacing it,
+        // another cleanup unit): not an I/O failure (`cache_walk`'s
+        // vanished-entry rule).
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            debug!(
+                "Cache entry `{}` vanished before it could be inspected; skipping it",
+                path.display()
+            );
+            return;
+        }
+        Err(err) => {
+            stats.io_failures += 1;
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "Failed to inspect cached file `{}`; retaining it:  {}",
+                path.display(),
+                ErrorReport(&err)
+            );
+            return;
+        }
+    };
+
+    if !AgeSweep::Candidates.is_due(path, &data, keep_span, now, stats) {
+        return;
+    }
+
+    let unlinked = std::fs::remove_file(path);
+    if AgeSweep::Candidates.settle_unlink(path, unlinked, data.len(), mirror, layout, stats)
+        && matches!(class, SpanClass::ByHashCovered)
+    {
+        stats.removed_unreferenced += 1;
+    }
 }
 
 static METADATA_WALK: WalkContext = WalkContext {
@@ -301,43 +402,12 @@ pub(super) async fn sweep_aged_metadata(
 
         let path = entry.path();
 
-        let Some(created) = age_reference_time(&data, &path) else {
-            result.io_failures += 1;
-            continue;
-        };
-
-        match now.duration_since(created) {
-            Ok(age) if age < keep_span => continue,
-            Ok(_) => {}
-            Err(err) => {
-                warn_once_or_info!(
-                    "Metadata file `{}` has a future timestamp; skipping its removal:  {}",
-                    path.display(),
-                    ErrorReport(&err)
-                );
-                continue;
-            }
-        }
-
-        let size = data.len();
-
-        if let Err(err) = tokio::fs::remove_file(&path).await {
-            result.io_failures += 1;
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "Failed to remove stale metadata file `{}`; retaining it:  {}",
-                path.display(),
-                ErrorReport(&err)
-            );
+        if !AgeSweep::Metadata.is_due(&path, &data, keep_span, now, &mut result) {
             continue;
         }
 
-        invalidate_metadata_for(&path, mirror, layout);
-
-        debug!("Removed stale metadata file `{}`", path.display());
-
-        result.bytes_removed += accounted_size(size);
-        result.removed += 1;
+        let unlinked = tokio::fs::remove_file(&path).await;
+        AgeSweep::Metadata.settle_unlink(&path, unlinked, data.len(), mirror, layout, &mut result);
     }
 
     result.io_failures += walker.io_failures();
