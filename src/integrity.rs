@@ -114,6 +114,13 @@ struct VerifyInput<'a> {
     /// client's `sendfile` -- uses explicit offsets
     /// (`splice/body.rs::prepare_file_serve`).
     file: &'a std::fs::File,
+    /// `file`'s `fstat`, taken by the commit job before verifying (it also
+    /// ties the rename to this file). Nothing moves the file's size or mtime
+    /// after it: the writer has finished, hashing only reads and the marker's
+    /// xattr write leaves the mtime alone. So it serves the streamed-digest
+    /// size check, the read-ahead hint and the marker's identity, with no
+    /// stat of their own.
+    meta: &'a Metadata,
     /// `file`'s path, for log context and the verified marker only; never
     /// reopened.
     temp_path: &'a Path,
@@ -209,11 +216,16 @@ fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
     };
     let algo = *algo;
 
-    let reused = reuse_streamed_digest(input.streamed.as_ref(), algo, input.file, input.temp_path);
+    let reused = reuse_streamed_digest(
+        input.streamed.as_ref(),
+        algo,
+        input.meta.len(),
+        input.temp_path,
+    );
     let fallback;
     let computed = match reused {
         Some(reused) => reused,
-        None => match hash_file(input.file, input.temp_path, algo) {
+        None => match hash_file(input.file, input.meta.len(), input.temp_path, algo) {
             Ok(c) => {
                 fallback = c;
                 fallback.as_slice()
@@ -233,7 +245,7 @@ fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
 
     if computed == expected.as_slice() {
         metrics::CHECKSUM_VERIFIED.increment();
-        stamp_verified(input.file, input.temp_path, algo, expected);
+        stamp_verified(input.file, input.meta, input.temp_path, algo, expected);
         VerifyOutcome::Proceed
     } else {
         metrics::CHECKSUM_MISMATCH.increment();
@@ -263,31 +275,17 @@ fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
 /// question correctly either way, and rejecting outright would discard a
 /// download that may well be intact.
 ///
-/// A failed `fstat` is logged here: the re-read that follows would not
-/// report it, as it never stats the file.
+/// `on_disk` is the size from the commit job's `fstat` ([`VerifyInput::meta`]).
 fn reuse_streamed_digest<'a>(
     streamed: Option<&'a StreamedDigest>,
     algo: HashAlgo,
-    file: &std::fs::File,
+    on_disk: u64,
     path: &Path,
 ) -> Option<&'a [u8]> {
     let streamed = streamed?;
     if streamed.algo != algo {
         return None;
     }
-    let on_disk = match file.metadata() {
-        Ok(meta) => meta.len(),
-        Err(err) => {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "Failed to stat `{}` while checking the streamed {} digest against it; re-reading the file instead of trusting the digest:  {}",
-                path.display(),
-                algo.as_str(),
-                ErrorReport(&err),
-            );
-            return None;
-        }
-    };
     if on_disk != streamed.bytes {
         error!(
             "Streamed {} digest of `{}` covered {} bytes but the file holds {}; re-reading the file instead of trusting the digest",
@@ -304,15 +302,19 @@ fn reuse_streamed_digest<'a>(
 /// Rewind the already-open temp file, hint sequential read, and hash it --
 /// the download's own descriptor, so no reopen of `path` (which is for log
 /// context only). The writer's cursor sits wherever its last write left it;
-/// the rewind is what makes the read start at byte 0.
-fn hash_file(file: &std::fs::File, path: &Path, algo: HashAlgo) -> std::io::Result<Vec<u8>> {
+/// the rewind is what makes the read start at byte 0. `size` is the file's
+/// length, for the read-ahead hint.
+fn hash_file(
+    file: &std::fs::File,
+    size: u64,
+    path: &Path,
+    algo: HashAlgo,
+) -> std::io::Result<Vec<u8>> {
     use std::io::Seek as _;
 
     let mut reader = file;
     reader.rewind()?;
-    // `u64::MAX`: hashing reads the whole file, and no cheap size is on hand
-    // without an extra fstat, so always advise.
-    hint_sequential_read(file, u64::MAX, path);
+    hint_sequential_read(file, size, path);
     match algo {
         HashAlgo::Sha256 => index_parser::hash_open_file::<sha2::Sha256>(&mut reader),
         HashAlgo::Sha512 => index_parser::hash_open_file::<sha2::Sha512>(&mut reader),
@@ -328,20 +330,17 @@ fn hash_file(file: &std::fs::File, path: &Path, algo: HashAlgo) -> std::io::Resu
 /// for the destination path cleanup will read it from. Unlike
 /// `cleanup/verify.rs`, no post-hash identity recheck is needed — the temp
 /// file is exclusively owned by this download and no other writer can reach
-/// it. Best-effort: a stat or xattr failure only means the next cleanup cycle
-/// hashes the file, so it is not worth failing a commit.
-fn stamp_verified(file: &std::fs::File, path: &Path, algo: HashAlgo, expected: &[u8]) {
-    match file.metadata() {
-        Ok(meta) => verified_marker::stamp(file, path, FileIdentity::of(&meta), algo, expected),
-        Err(err) => {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "Failed to stat `{}` after hashing; skipping the cleanup verification marker, so the next cleanup cycle re-hashes it:  {}",
-                path.display(),
-                ErrorReport(&err)
-            );
-        }
-    }
+/// it, so the identity is the commit job's `fstat` (`meta`). Best-effort: an
+/// xattr failure only means the next cleanup cycle hashes the file, so it is
+/// not worth failing a commit.
+fn stamp_verified(
+    file: &std::fs::File,
+    meta: &Metadata,
+    path: &Path,
+    algo: HashAlgo,
+    expected: &[u8],
+) {
+    verified_marker::stamp(file, path, FileIdentity::of(meta), algo, expected);
 }
 
 /// Everything `verify_and_rename` needs. Built in exactly one place,
@@ -1330,8 +1329,9 @@ pub(crate) struct CommitFailure {
 ///
 /// Everything that touches the disk runs as **one** blocking job owning the
 /// descriptor, the write lease and the reservation, in order: the
-/// [`PrepareStep`], an `fstat` for the size the reservation is finalised with,
-/// the verification (on the open descriptor, never a reopen of the path), a
+/// [`PrepareStep`], an `fstat` for the size the reservation is finalised with
+/// (which the verification reuses), the verification (on the open
+/// descriptor, never a reopen of the path), a
 /// check that the path still names that descriptor's file
 /// ([`check_path_names_file`]), then the `rename(2)`. One blocking-pool round
 /// trip per commit instead of one per step.
@@ -1409,6 +1409,7 @@ pub(crate) async fn verify_and_rename(
             if let VerifyOutcome::Reject(err) = verify_temp_file(&VerifyInput {
                 kind,
                 file: &file,
+                meta: &verified_meta,
                 temp_path: &guard,
                 streamed,
             }) {
@@ -2402,6 +2403,7 @@ mod tests {
         let plan = VerifyInput {
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             file: f.as_file(),
+            meta: &f.as_file().metadata().unwrap(),
             temp_path: f.path(),
             streamed: None,
         };
@@ -2485,6 +2487,7 @@ mod tests {
         let plan = VerifyInput {
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             file: f.as_file(),
+            meta: &f.as_file().metadata().unwrap(),
             temp_path: f.path(),
             streamed: Some(StreamedDigest {
                 algo: HashAlgo::Sha256,
@@ -2502,6 +2505,7 @@ mod tests {
         let plan = VerifyInput {
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             file: f.as_file(),
+            meta: &f.as_file().metadata().unwrap(),
             temp_path: f.path(),
             streamed: Some(StreamedDigest {
                 algo: HashAlgo::Sha256,
@@ -2524,6 +2528,7 @@ mod tests {
         let plan = VerifyInput {
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             file: f.as_file(),
+            meta: &f.as_file().metadata().unwrap(),
             temp_path: f.path(),
             // Right length for SHA-512, wrong algorithm for this resource.
             streamed: Some(StreamedDigest {
@@ -2545,6 +2550,7 @@ mod tests {
         let plan = VerifyInput {
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             file: f.as_file(),
+            meta: &f.as_file().metadata().unwrap(),
             temp_path: f.path(),
             // Right algorithm, but it saw more bytes than the file holds.
             streamed: Some(StreamedDigest {
@@ -2562,6 +2568,7 @@ mod tests {
         let plan = VerifyInput {
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             file: f.as_file(),
+            meta: &f.as_file().metadata().unwrap(),
             temp_path: f.path(),
             streamed: None,
         };
@@ -2592,6 +2599,7 @@ mod tests {
         let plan = VerifyInput {
             kind: VerifyKind::Unverifiable,
             file: f.as_file(),
+            meta: &f.as_file().metadata().unwrap(),
             temp_path: f.path(),
             streamed: None,
         };
@@ -2610,6 +2618,7 @@ mod tests {
         let plan = VerifyInput {
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             file: &write_only,
+            meta: &write_only.metadata().unwrap(),
             temp_path: f.path(),
             streamed: None,
         };
@@ -2625,6 +2634,7 @@ mod tests {
         let plan = VerifyInput {
             kind: expect_sha256(HELLO_SHA256),
             file: f.as_file(),
+            meta: &f.as_file().metadata().unwrap(),
             temp_path: f.path(),
             streamed: None,
         };
@@ -2637,6 +2647,7 @@ mod tests {
         let plan = VerifyInput {
             kind: expect_zero_sha256(),
             file: f.as_file(),
+            meta: &f.as_file().metadata().unwrap(),
             temp_path: f.path(),
             streamed: None,
         };
@@ -2652,6 +2663,7 @@ mod tests {
         let plan = VerifyInput {
             kind: VerifyKind::Unknown,
             file: f.as_file(),
+            meta: &f.as_file().metadata().unwrap(),
             temp_path: f.path(),
             streamed: None,
         };
@@ -3068,6 +3080,7 @@ mod tests {
             let plan = VerifyInput {
                 kind: byhash_verify_kind(algo, &class.debname),
                 file: f.as_file(),
+                meta: &f.as_file().metadata().unwrap(),
                 temp_path: f.path(),
                 streamed: None,
             };
@@ -3096,6 +3109,7 @@ mod tests {
         let plan = VerifyInput {
             kind,
             file: f.as_file(),
+            meta: &f.as_file().metadata().unwrap(),
             temp_path: f.path(),
             streamed: None,
         };
@@ -3644,6 +3658,7 @@ mod tests {
                 digest: digest.to_vec(),
             },
             file: &temp_file,
+            meta: &temp_file.metadata().unwrap(),
             temp_path: &temp_path,
             streamed: None,
         });
