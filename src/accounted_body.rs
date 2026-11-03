@@ -165,21 +165,11 @@ where
         result
     }
 
+    /// Forwarded: every cached body's source already advertises the exact
+    /// remainder of the promised length (`CachedFileBody`, `ChannelBody`).
     #[inline]
     fn size_hint(&self) -> SizeHint {
-        match &self.subject {
-            // The promised length is known exactly; the inner reader may
-            // not advertise one (a `StreamBody` over a file reader).
-            Some(Subject::Cached {
-                size: Some(size), ..
-            }) => match size.checked_sub(self.transferred) {
-                Some(remaining) => SizeHint::with_exact(remaining),
-                None => SizeHint::default(),
-            },
-            Some(Subject::Cached { size: None, .. } | Subject::Passthrough { .. }) | None => {
-                self.inner.size_hint()
-            }
-        }
+        self.inner.size_hint()
     }
 
     #[inline]
