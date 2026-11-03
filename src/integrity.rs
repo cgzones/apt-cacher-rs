@@ -1625,9 +1625,8 @@ fn schedule_ingest(file: &IndexFile<'_>, trigger: IngestTrigger) {
         metrics::INGEST_TOUCH_TRIGGERED.increment();
     }
     let mirror = file.mirror.clone();
-    let dest = file.path.to_path_buf();
     let buffer_size = global_config().buffer_size;
-    tokio::spawn(run_ingest_job(claim, slot, kind, mirror, dest, buffer_size));
+    tokio::spawn(run_ingest_job(claim, slot, kind, mirror, buffer_size));
 }
 
 /// Answer a request for a cached index without a commit (a cache hit, a
@@ -1675,22 +1674,21 @@ pub(crate) fn note_release_revalidated(conn_details: &ConnectionDetails, raw_uri
 }
 
 /// One claimed path's ingest, run again while commits keep replacing the
-/// file under it.
+/// file under it. The file is the claim's path.
 async fn run_ingest_job(
     mut claim: Claim<'static>,
     // Held for the whole job, reruns included; see `INGEST_SLOTS`.
     _slot: SemaphorePermit<'static>,
     kind: IngestKind,
     mirror: Mirror,
-    dest: PathBuf,
     buffer_size: usize,
 ) {
     let registry = global_checksum_registry();
     let (authority, mirror_path) = (mirror.format_authority(), mirror.path());
     loop {
-        let result = ingest_once(registry, &kind, &mirror, &dest, buffer_size).await;
+        let result = ingest_once(registry, &kind, &mirror, claim.path(), buffer_size).await;
         let outcome = ingest_outcome(&result);
-        log_ingest_result(&result, outcome, authority, mirror_path, &dest);
+        log_ingest_result(&result, outcome, authority, mirror_path, claim.path());
         if !claim.finish(outcome, registry.scope_epoch(authority, mirror_path)) {
             return;
         }

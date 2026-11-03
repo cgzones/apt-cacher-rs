@@ -3,8 +3,9 @@
 //! its digests are missing (restart, eviction, a skipped or failed ingest).
 //!
 //! Pure bookkeeping, no I/O and no globals: `integrity` owns the one
-//! instance and runs the ingests. Keyed by the index's cache path. A path is
-//! `Running` while one ingest task owns it, which is also the dedupe: a
+//! instance and runs the ingests. Keyed by the index's cache path; an
+//! unmarked path (never claimed, invalidated, retryable) has no entry. A
+//! path is `Running` while one ingest task owns it, which is also the dedupe: a
 //! second claim of a running path is refused. A commit that replaces the
 //! file while its ingest runs sets `rerun`, and the owner runs again instead
 //! of marking the old file's result on the new one.
@@ -43,7 +44,6 @@ pub(crate) enum Outcome {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
-    Unmarked,
     Ingested { epoch: u64 },
     Failed,
     Running { rerun: bool, epoch_at_start: u64 },
@@ -79,7 +79,6 @@ impl IngestLedger {
         let mut paths = self.paths.lock();
         if let Some(state) = paths.get_mut(path) {
             match *state {
-                State::Unmarked => {}
                 State::Ingested { epoch: marked } if marked != epoch => {}
                 State::Ingested { .. } | State::Failed | State::Running { .. } => return None,
             }
@@ -112,16 +111,16 @@ impl IngestLedger {
     /// A commit replaced the file at `path`: forget its mark, or tell its
     /// running ingest to run again on the new file.
     pub(crate) fn invalidate(&self, path: &Path) {
-        if let Some(state) = self.paths.lock().get_mut(path) {
-            match state {
-                State::Running {
-                    rerun,
-                    epoch_at_start: _,
-                } => *rerun = true,
-                State::Unmarked | State::Ingested { .. } | State::Failed => {
-                    *state = State::Unmarked;
-                }
+        let mut paths = self.paths.lock();
+        match paths.get_mut(path) {
+            Some(State::Running {
+                rerun,
+                epoch_at_start: _,
+            }) => *rerun = true,
+            Some(State::Ingested { .. } | State::Failed) => {
+                paths.remove(path);
             }
+            None => {}
         }
     }
 
@@ -145,11 +144,13 @@ impl IngestLedger {
             };
             return true;
         }
-        *state = match outcome {
-            Outcome::Ingested if epoch == epoch_at_start => State::Ingested { epoch },
-            Outcome::Ingested | Outcome::Retry => State::Unmarked,
-            Outcome::Failed => State::Failed,
-        };
+        match outcome {
+            Outcome::Ingested if epoch == epoch_at_start => *state = State::Ingested { epoch },
+            Outcome::Ingested | Outcome::Retry => {
+                paths.remove(path);
+            }
+            Outcome::Failed => *state = State::Failed,
+        }
         drop(paths);
         false
     }
@@ -162,8 +163,8 @@ impl IngestLedger {
 
 /// Ownership of one claimed path's run. Dropped without a final
 /// [`Self::finish`] (a panic, runtime shutdown), it leaves the path
-/// unmarked, so the next claim runs it instead of finding it `Running`
-/// forever.
+/// unmarked (removes its entry), so the next claim runs it instead of
+/// finding it `Running` forever.
 #[derive(Debug)]
 pub(crate) struct Claim<'a> {
     ledger: &'a IngestLedger,
@@ -172,6 +173,11 @@ pub(crate) struct Claim<'a> {
 }
 
 impl Claim<'_> {
+    /// The claimed path: the cache file the run ingests.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Record the run's outcome under the scope's current `epoch`. `true`
     /// when the file was replaced during the run: the caller runs again,
     /// still owning the path.
@@ -184,10 +190,8 @@ impl Claim<'_> {
 
 impl Drop for Claim<'_> {
     fn drop(&mut self) {
-        if self.open
-            && let Some(state) = self.ledger.paths.lock().get_mut(&self.path)
-        {
-            *state = State::Unmarked;
+        if self.open {
+            self.ledger.paths.lock().remove(&self.path);
         }
     }
 }
@@ -225,7 +229,7 @@ mod tests {
         let mut claim = ledger.claim(&p("a"), 0).expect("claim");
         assert!(!claim.finish(Outcome::Ingested, 1));
         drop(claim);
-        assert_eq!(ledger.state(&p("a")), Some(State::Unmarked));
+        assert_eq!(ledger.state(&p("a")), None);
     }
 
     #[test]
@@ -280,7 +284,7 @@ mod tests {
         assert!(!claim.finish(Outcome::Ingested, 0));
         drop(claim);
         ledger.invalidate(&p("a"));
-        assert_eq!(ledger.state(&p("a")), Some(State::Unmarked));
+        assert_eq!(ledger.state(&p("a")), None);
         ledger.invalidate(&p("never-seen"));
         assert_eq!(ledger.state(&p("never-seen")), None);
     }
@@ -289,7 +293,7 @@ mod tests {
     fn dropped_claim_leaves_the_path_unmarked() {
         let ledger = IngestLedger::new(16);
         drop(ledger.claim(&p("a"), 0).expect("claim"));
-        assert_eq!(ledger.state(&p("a")), Some(State::Unmarked));
+        assert_eq!(ledger.state(&p("a")), None);
         assert!(ledger.claim(&p("a"), 0).is_some());
     }
 
@@ -308,6 +312,6 @@ mod tests {
         ));
         ledger.invalidate(&p("run"));
         drop(running);
-        assert_eq!(ledger.state(&p("run")), Some(State::Unmarked));
+        assert_eq!(ledger.state(&p("run")), None);
     }
 }
