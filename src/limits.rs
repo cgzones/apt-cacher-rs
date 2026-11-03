@@ -203,8 +203,8 @@ pub(crate) enum CappedLine<'a> {
     /// End of stream reached with no data read.
     Eof,
     /// A line, including any trailing newline, borrowed from the caller's
-    /// `line_buf`.
-    Line(&'a str),
+    /// `line_buf`. Raw bytes: the caller decodes only what it reads as text.
+    Line(&'a [u8]),
     /// A line longer than `max_len` was drained (its trailing newline, if
     /// any, was consumed) without keeping any of it. The
     /// `Packages` parser uses this to skip fields it does not care about
@@ -218,8 +218,9 @@ pub(crate) enum CappedLine<'a> {
 /// again. A line longer than `max_len` bytes is drained from the reader and
 /// reported as [`CappedLine::Skipped`] — the absolute decompressed-size cap is
 /// enforced separately by [`LimitedReader`], so the per-line cap only exists
-/// to bound the in-memory line buffer. Fails with [`io::ErrorKind::InvalidData`]
-/// if the bytes read are not valid UTF-8.
+/// to bound the in-memory line buffer. The bytes are not validated as UTF-8:
+/// a `Packages` file may carry another encoding in fields nobody reads (a
+/// Latin-1 `Description:`), so the caller decodes only the fields it uses.
 ///
 /// `line_buf` is a caller-owned scratch buffer whose capacity is reused across
 /// calls; the body of a real `Packages` file is millions of short lines, so
@@ -273,13 +274,7 @@ where
     if line_buf.is_empty() {
         return Ok(CappedLine::Eof);
     }
-    let text = std::str::from_utf8(line_buf).map_err(|_err| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "metadata line is not valid UTF-8",
-        )
-    })?;
-    Ok(CappedLine::Line(text))
+    Ok(CappedLine::Line(line_buf))
 }
 
 /// Compression of a `Packages` file.
@@ -774,14 +769,14 @@ mod tests {
         let result = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect("ok");
-        assert!(matches!(result, CappedLine::Line("first\n")), "{result:?}");
+        assert!(matches!(result, CappedLine::Line(b"first\n")), "{result:?}");
 
         let result = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect("ok");
         // `StanzaStream` flushes its stanza on a blank line, so a blank line
         // must arrive as a `Line` carrying "\n" - never as `Eof`.
-        assert!(matches!(result, CappedLine::Line("\n")), "{result:?}");
+        assert!(matches!(result, CappedLine::Line(b"\n")), "{result:?}");
     }
 
     #[tokio::test]
@@ -793,7 +788,7 @@ mod tests {
             .await
             .expect("ok");
         assert!(
-            matches!(result, CappedLine::Line("short line\n")),
+            matches!(result, CappedLine::Line(b"short line\n")),
             "{result:?}"
         );
     }
@@ -808,13 +803,16 @@ mod tests {
             .await
             .expect("ok");
         assert!(
-            matches!(result, CappedLine::Line("a line longer than eight bytes\n")),
+            matches!(
+                result,
+                CappedLine::Line(b"a line longer than eight bytes\n")
+            ),
             "{result:?}"
         );
         let result = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect("ok");
-        assert!(matches!(result, CappedLine::Line("next\n")), "{result:?}");
+        assert!(matches!(result, CappedLine::Line(b"next\n")), "{result:?}");
     }
 
     #[tokio::test]
@@ -834,7 +832,7 @@ mod tests {
         let result = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect("follow-on read");
-        assert!(matches!(result, CappedLine::Line("next\n")), "{result:?}");
+        assert!(matches!(result, CappedLine::Line(b"next\n")), "{result:?}");
     }
 
     #[tokio::test]
@@ -874,7 +872,7 @@ mod tests {
         let result = read_line_capped(&mut reader, &mut line_buf, 5)
             .await
             .expect("exact limit must be accepted");
-        assert!(matches!(result, CappedLine::Line("abcd\n")), "{result:?}");
+        assert!(matches!(result, CappedLine::Line(b"abcd\n")), "{result:?}");
     }
 
     #[tokio::test]
@@ -896,15 +894,20 @@ mod tests {
         assert!(matches!(result, CappedLine::Eof));
     }
 
+    /// The line is handed out as bytes; whether they must be UTF-8 is the
+    /// caller's decision (`index_parser` decodes only the fields it reads).
     #[tokio::test]
-    async fn read_line_capped_rejects_non_utf8() {
+    async fn read_line_capped_hands_out_non_utf8_bytes() {
         let input = b"\xff\xfe\n";
         let mut reader = tokio::io::BufReader::new(&input[..]);
         let mut line_buf = Vec::new();
-        let err = read_line_capped(&mut reader, &mut line_buf, 64)
+        let result = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
-            .expect_err("non-UTF-8 must be rejected");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            .expect("bytes are not validated");
+        assert!(
+            matches!(result, CappedLine::Line(b"\xff\xfe\n")),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
@@ -916,7 +919,7 @@ mod tests {
             .await
             .expect("ok");
         assert!(
-            matches!(result, CappedLine::Line("no newline")),
+            matches!(result, CappedLine::Line(b"no newline")),
             "{result:?}"
         );
     }
@@ -938,7 +941,10 @@ mod tests {
         let result = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect("second line");
-        assert!(matches!(result, CappedLine::Line("second\n")), "{result:?}");
+        assert!(
+            matches!(result, CappedLine::Line(b"second\n")),
+            "{result:?}"
+        );
 
         assert!(line_buf.capacity() >= cap_before);
     }

@@ -467,9 +467,9 @@ mod tests {
     #[test]
     fn stanza_ingest_ignores_unrelated_lines() {
         let mut s = Stanza::new();
-        s.ingest("Package: stub\n");
-        s.ingest("Description: a stub\n");
-        s.ingest(" continued description text\n");
+        s.ingest_text("Package: stub\n");
+        s.ingest_text("Description: a stub\n");
+        s.ingest_text(" continued description text\n");
         assert_eq!(s.filename(), None);
         assert_eq!(s.chosen(), None);
     }
@@ -505,7 +505,7 @@ mod tests {
                 keymap: KeyMapper::RelpathUnderPrefix { prefix: "amd64/" },
             };
             let mut stanza = Stanza::new();
-            stanza.ingest("Filename: arm64/sibling.deb\n");
+            stanza.ingest_text("Filename: arm64/sibling.deb\n");
             process_stanza(&stanza, &mut file_list, &mut ctx).await;
         }
         assert_eq!(file_list.len(), 2);
@@ -523,7 +523,7 @@ mod tests {
                 keymap: KeyMapper::RelpathUnderPrefix { prefix: "amd64/" },
             };
             let mut stanza = Stanza::new();
-            stanza.ingest("Filename: amd64/pkg.deb\n");
+            stanza.ingest_text("Filename: amd64/pkg.deb\n");
             process_stanza(&stanza, &mut file_list, &mut ctx).await;
         }
         assert!(!file_list.contains_key(OsStr::new("pkg.deb")));
@@ -921,8 +921,8 @@ mod tests {
     }
 
     /// Once every candidate is referenced the reduce stops reading: a
-    /// malformed tail past that point is never decoded, while it still fails
-    /// a reduce that has candidates left.
+    /// malformed tail past that point (a `Filename:` that is not UTF-8) is
+    /// never decoded, while it still fails a reduce that has candidates left.
     #[tokio::test]
     async fn reduce_file_list_stops_reading_once_every_candidate_is_referenced() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -930,7 +930,7 @@ mod tests {
             .await
             .expect("write deb");
         let mut raw = INDEX_RAW.to_vec();
-        raw.extend_from_slice(b"Package: \xff\xfe not UTF-8\n\n");
+        raw.extend_from_slice(b"Package: tail\nFilename: pool/main/t/tail/\xff\xfe.deb\n\n");
 
         for via in [Via::File, Via::Bytes] {
             let index = index_via(via, PackagesCompression::Raw, raw.clone()).await;
@@ -943,6 +943,46 @@ mod tests {
                 reduce_keys(index, dir.path(), &["kept_1_amd64.deb", "unreferenced.deb"]).await;
             assert!(
                 matches!(result, Err(ReduceError::Read { .. })),
+                "via {via:?}: {result:?}"
+            );
+            assert!(left.contains_key(OsStr::new("unreferenced.deb")));
+        }
+    }
+
+    /// Only the fields the reduce reads must be UTF-8: a Latin-1
+    /// `Description:` in a third-party index reduces like any other, while
+    /// a `Filename:` that is not UTF-8 still bails the mirror rather than
+    /// reconcile against the references read before it.
+    #[tokio::test]
+    async fn reduce_file_list_reads_only_tracked_fields_as_utf8() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        tokio::fs::write(dir.path().join("kept_1_amd64.deb"), KEPT_DEB)
+            .await
+            .expect("write deb");
+        let mut latin1 = b"Package: other\nDescription: \xe9t\xe9 cr\xe8me\n na\xefve\n\n".to_vec();
+        latin1.extend_from_slice(INDEX_RAW);
+        let mut bad_filename = INDEX_RAW.to_vec();
+        bad_filename.extend_from_slice(b"Package: bad\nFilename: pool/main/b/bad/\xe9.deb\n\n");
+        let keys = ["kept_1_amd64.deb", "unreferenced.deb"];
+
+        for via in [Via::File, Via::Bytes] {
+            let index = index_via(via, PackagesCompression::Raw, latin1.clone()).await;
+            let (result, left) = reduce_keys(index, dir.path(), &keys).await;
+            assert!(result.is_ok(), "via {via:?}: {result:?}");
+            assert_eq!(
+                left.keys().collect::<Vec<_>>(),
+                [OsStr::new("unreferenced.deb")],
+                "via {via:?}"
+            );
+
+            let index = index_via(via, PackagesCompression::Raw, bad_filename.clone()).await;
+            let (result, left) = reduce_keys(index, dir.path(), &keys).await;
+            assert!(
+                matches!(
+                    &result,
+                    Err(ReduceError::Read { source, .. })
+                        if source.kind() == io::ErrorKind::InvalidData
+                ),
                 "via {via:?}: {result:?}"
             );
             assert!(left.contains_key(OsStr::new("unreferenced.deb")));

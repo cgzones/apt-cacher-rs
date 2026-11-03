@@ -6,7 +6,7 @@
 //! `cleanup` sweep (and its tests). Cold-path only; the helpers
 //! stay free of hot-path-specific coupling.
 
-use std::{borrow::Cow, io};
+use std::{borrow::Cow, io, str::Utf8Error};
 
 use tokio::io::AsyncBufRead;
 
@@ -21,8 +21,8 @@ use crate::{
 /// rejected value against its mirror.
 #[cfg(test)]
 pub(crate) fn parse_filename_field(line: &str) -> Option<&str> {
-    match split_field(line)? {
-        ("Filename", value) => filename_value(value).ok(),
+    match split_field(line.as_bytes())? {
+        (b"Filename", value) => filename_value(field_text(value).ok()?).ok(),
         _ => None,
     }
 }
@@ -36,12 +36,29 @@ pub(crate) fn parse_filename_field(line: &str) -> Option<&str> {
 /// override the digest the registry expects for any deb (a persistent
 /// checksum-mismatch denial of service), and a `Translation-*` blob would
 /// read as a `Packages` index. `None` too for a line without a colon.
-fn split_field(line: &str) -> Option<(&str, &str)> {
-    if line.starts_with([' ', '\t']) {
+///
+/// Splits bytes, matching ASCII only: a `Packages` line need be UTF-8 only
+/// where [`Stanza::ingest`] decodes a value ([`field_text`]).
+fn split_field(line: &[u8]) -> Option<(&[u8], &[u8])> {
+    if matches!(line.first(), Some(b' ' | b'\t')) {
         return None;
     }
-    let (name, value) = line.split_once(':')?;
-    Some((name, value.trim_ascii()))
+    let colon = memchr::memchr(b':', line)?;
+    Some((&line[..colon], line[colon + 1..].trim_ascii()))
+}
+
+/// Decode the value of a field [`Stanza`] reads. A tracked field that is not
+/// UTF-8 fails the whole index read, as any non-UTF-8 line once did: a
+/// consumer acting on part of an index (cleanup's reference set) must not
+/// mistake it for the whole. The bytes of every other field are never
+/// decoded, so a Latin-1 `Description:` is harmless.
+fn field_text(value: &[u8]) -> io::Result<&str> {
+    std::str::from_utf8(value).map_err(|_err @ Utf8Error { .. }| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metadata line is not valid UTF-8",
+        )
+    })
 }
 
 /// Gate a `Filename:` field value; `Err` carries the rejected value so
@@ -192,11 +209,11 @@ enum TrackedField {
 }
 
 impl TrackedField {
-    fn from_name(name: &str) -> Option<Self> {
+    fn from_name(name: &[u8]) -> Option<Self> {
         match name {
-            "Filename" => Some(Self::Filename),
-            "SHA256" => Some(Self::Sha256),
-            "SHA512" => Some(Self::Sha512),
+            b"Filename" => Some(Self::Filename),
+            b"SHA256" => Some(Self::Sha256),
+            b"SHA512" => Some(Self::Sha512),
             _ => None,
         }
     }
@@ -303,17 +320,20 @@ impl Stanza {
 
     /// Take one stanza line. Only a line starting in column 0 is a field
     /// ([`split_field`]); a tracked field seen a second time marks the
-    /// stanza [`Self::repeated`] and keeps nothing of the repeat.
-    pub(crate) fn ingest(&mut self, line: &str) {
+    /// stanza [`Self::repeated`] and keeps nothing of the repeat. `Err` for a
+    /// tracked field whose value is not UTF-8 ([`field_text`]), repeated or
+    /// not.
+    pub(crate) fn ingest(&mut self, line: &[u8]) -> io::Result<()> {
         let Some((name, value)) = split_field(line) else {
-            return;
+            return Ok(());
         };
         let Some(field) = TrackedField::from_name(name) else {
-            return;
+            return Ok(());
         };
+        let value = field_text(value)?;
         if self.seen & field.bit() != 0 {
             self.repeated.get_or_insert(field);
-            return;
+            return Ok(());
         }
         self.seen |= field.bit();
         match field {
@@ -342,6 +362,13 @@ impl Stanza {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// [`Self::ingest`] for a test line, which is text.
+    #[cfg(test)]
+    pub(crate) fn ingest_text(&mut self, line: &str) {
+        self.ingest(line.as_bytes()).expect("a `str` is UTF-8");
     }
 
     /// The digest fields this stanza's consumer can use, for the digest-less
@@ -394,7 +421,8 @@ impl Stanza {
 /// all (once-gated warn): which of two values a consumer would pick is
 /// exactly what a crafted index relies on, so neither is trusted. Fields
 /// start in column 0 only; see [`split_field`] for why an indented
-/// continuation line never counts.
+/// continuation line never counts. Only the values of those three fields
+/// must be UTF-8 ([`field_text`]); any other line may hold any bytes.
 /// A line over [`MAX_METADATA_LINE_LEN`] counts as non-blank (multi-kilobyte
 /// `Provides:`/`Depends:` fields are legitimate and never a field the
 /// stanza cares about) so the stanza is not flushed prematurely; a trailing
@@ -419,8 +447,8 @@ impl<R: AsyncBufRead + Unpin> StanzaStream<R> {
     }
 
     /// The next stanza carrying a `Filename:`, or `Ok(None)` at EOF. A read
-    /// error (size/line limit, invalid UTF-8, I/O) ends the stream; the
-    /// caller decides what an unreadable index means.
+    /// error (size/line limit, a tracked field that is not UTF-8, I/O) ends
+    /// the stream; the caller decides what an unreadable index means.
     pub(crate) async fn next(&mut self) -> io::Result<Option<&Stanza>> {
         if self.done.get() {
             return Ok(None);
@@ -438,7 +466,10 @@ impl<R: AsyncBufRead + Unpin> StanzaStream<R> {
                 Ok(CappedLine::Skipped) => {}
                 Ok(CappedLine::Line(line)) => {
                     if !line.trim_ascii().is_empty() {
-                        self.stanza.ingest(line);
+                        if let Err(err) = self.stanza.ingest(line) {
+                            self.done.set();
+                            return Err(err);
+                        }
                     } else if self.accept() {
                         return Ok(Some(&self.stanza));
                     } else {
@@ -545,10 +576,9 @@ fn release_hash_entries(
             let indented = line.starts_with(' ') || line.starts_with('\t');
             if !indented {
                 let malformed = section.is_some()
-                    && !split_field(line).is_some_and(|(name, _)| {
-                        !name.is_empty()
-                            && !name.starts_with(['#', '-'])
-                            && name.bytes().all(|byte| byte.is_ascii_graphic())
+                    && !split_field(line.as_bytes()).is_some_and(|(name, _)| {
+                        !matches!(name.first(), None | Some(b'#' | b'-'))
+                            && name.iter().all(u8::is_ascii_graphic)
                     });
                 section = match line.trim_end() {
                     "SHA256:" => Some(HashAlgo::Sha256),
@@ -881,29 +911,29 @@ mod tests {
     fn stanza_ingest_accepts_sha512_whitespace_and_crlf() {
         let mut stanza = Stanza::new();
         let hash = [0x22u8; 64];
-        stanza.ingest(&format!("SHA512:  {}\r\n", hex_encode(&hash)));
+        stanza.ingest_text(&format!("SHA512:  {}\r\n", hex_encode(&hash)));
         assert_eq!(stanza.sha512, Some(hash));
     }
 
     #[test]
     fn stanza_ingest_ignores_unrecognized_digest_fields() {
         let mut stanza = Stanza::new();
-        stanza.ingest(&format!("MD5sum: {}\n", hex_encode(&[0u8; 32])));
+        stanza.ingest_text(&format!("MD5sum: {}\n", hex_encode(&[0u8; 32])));
         assert_eq!(stanza.chosen(), None);
     }
 
     #[test]
     fn stanza_ingest_rejects_a_short_sha256() {
         let mut stanza = Stanza::new();
-        stanza.ingest(&format!("SHA256: {}\n", "0".repeat(63)));
+        stanza.ingest_text(&format!("SHA256: {}\n", "0".repeat(63)));
         assert_eq!(stanza.sha256, None);
     }
 
     #[test]
     fn stanza_ingest_collects_filename_and_sha256() {
         let mut s = Stanza::new();
-        s.ingest("Filename: pool/main/a/abc/abc_1.0_amd64.deb\n");
-        s.ingest(&format!("SHA256: {}\n", hex_encode(&[0xab; 32])));
+        s.ingest_text("Filename: pool/main/a/abc/abc_1.0_amd64.deb\n");
+        s.ingest_text(&format!("SHA256: {}\n", hex_encode(&[0xab; 32])));
         assert_eq!(s.filename(), Some("pool/main/a/abc/abc_1.0_amd64.deb"),);
         assert_eq!(s.chosen(), Some((HashAlgo::Sha256, [0xab; 32].as_slice())));
     }
@@ -915,7 +945,7 @@ mod tests {
         // `Filename:` as `./<deb>`. Rejecting those loses each package's
         // cleanup reference and cleanup-time digest.
         let mut s = Stanza::new();
-        s.ingest("Filename: ./collectx-bringup_1.22.1-1_amd64.deb\n");
+        s.ingest_text("Filename: ./collectx-bringup_1.22.1-1_amd64.deb\n");
         assert_eq!(s.filename(), Some("collectx-bringup_1.22.1-1_amd64.deb"),);
     }
 
@@ -943,15 +973,15 @@ mod tests {
     fn stanza_ingest_skips_sha512_once_sha256_is_known() {
         let sha512 = format!("SHA512: {}", hex_encode(&[0x22; 64]));
         let mut s = Stanza::new();
-        s.ingest(&format!("SHA256: {}", hex_encode(&[0x11; 32])));
-        s.ingest(&sha512);
+        s.ingest_text(&format!("SHA256: {}", hex_encode(&[0x11; 32])));
+        s.ingest_text(&sha512);
         assert_eq!(s.sha512, None, "never read: `chosen` prefers SHA256");
         assert_eq!(s.chosen(), Some((HashAlgo::Sha256, [0x11; 32].as_slice())));
 
         // A SHA512 listed first is kept, and SHA256 still wins.
         let mut s = Stanza::new();
-        s.ingest(&sha512);
-        s.ingest(&format!("SHA256: {}", hex_encode(&[0x11; 32])));
+        s.ingest_text(&sha512);
+        s.ingest_text(&format!("SHA256: {}", hex_encode(&[0x11; 32])));
         assert_eq!(s.sha512, Some([0x22; 64]));
         assert_eq!(s.chosen(), Some((HashAlgo::Sha256, [0x11; 32].as_slice())));
     }
@@ -959,11 +989,11 @@ mod tests {
     #[test]
     fn stanza_reset_reuses_the_filename_buffer() {
         let mut s = Stanza::new();
-        s.ingest("Filename: pool/main/a/abc/abc_1.0_amd64.deb");
+        s.ingest_text("Filename: pool/main/a/abc/abc_1.0_amd64.deb");
         let capacity = s.filename.capacity();
         s.reset();
         assert_eq!(s.filename(), None);
-        s.ingest("Filename: pool/b.deb");
+        s.ingest_text("Filename: pool/b.deb");
         assert_eq!(s.filename(), Some("pool/b.deb"));
         assert_eq!(s.filename.capacity(), capacity);
     }
@@ -1089,9 +1119,9 @@ mod tests {
     #[test]
     fn stanza_ingest_ignores_indented_continuation_lines() {
         let mut s = Stanza::new();
-        s.ingest(" Filename: pool/evil.deb\n");
-        s.ingest(&format!("\tSHA256: {}\n", hex_encode(&[0xee; 32])));
-        s.ingest(&format!("  SHA512: {}\n", hex_encode(&[0xee; 64])));
+        s.ingest_text(" Filename: pool/evil.deb\n");
+        s.ingest_text(&format!("\tSHA256: {}\n", hex_encode(&[0xee; 32])));
+        s.ingest_text(&format!("  SHA512: {}\n", hex_encode(&[0xee; 64])));
         assert_eq!(s.filename(), None);
         assert_eq!(s.chosen(), None);
     }
@@ -1218,12 +1248,52 @@ mod tests {
         drop(stream);
     }
 
+    /// A tracked field that is not UTF-8 fails the read, as any such line
+    /// once did, whether it comes first, as the value of a repeat, or as a
+    /// digest.
     #[tokio::test]
-    async fn stanza_stream_propagates_invalid_utf8_and_ends() {
-        let input = b"Filename: pool/a.deb\n\xff\xfe\n";
-        let mut stream = StanzaStream::new(&input[..], Stanza::new());
-        assert!(stream.next().await.is_err());
-        assert!(stream.next().await.expect("ended").is_none());
+    async fn stanza_stream_fails_on_a_non_utf8_tracked_field_and_ends() {
+        let digest = hex_encode(&[0x11; 32]);
+        for input in [
+            b"Filename: pool/\xff\xfe.deb\n".to_vec(),
+            b"Filename: pool/a.deb\nFilename: pool/\xff.deb\n".to_vec(),
+            [
+                format!("Filename: pool/a.deb\nSHA256: {digest}\nSHA512: ").as_bytes(),
+                b"\xff\n",
+            ]
+            .concat(),
+        ] {
+            let mut stream = StanzaStream::new(&input[..], Stanza::new());
+            let err = stream.next().await.expect_err("not UTF-8");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{input:?}");
+            assert_eq!(err.to_string(), "metadata line is not valid UTF-8");
+            assert!(stream.next().await.expect("ended").is_none());
+        }
+    }
+
+    /// Bytes outside the tracked fields are never decoded: a Latin-1
+    /// `Description:` (and its continuation lines), or a stray byte in a
+    /// field name nobody reads, leaves the stanza intact.
+    #[tokio::test]
+    async fn stanza_stream_ignores_non_utf8_bytes_outside_tracked_fields() {
+        let mut input =
+            b"Package: \xe9t\xe9\nDescription: \xe9t\xe9 cr\xe8me\n na\xefve\n".to_vec();
+        input.extend_from_slice(b"X-\xff: 1\n\xfe\n");
+        input.extend_from_slice(
+            format!(
+                "Filename: pool/a.deb\nSHA256: {}\n\nFilename: pool/b.deb\n",
+                hex_encode(&[0x11; 32])
+            )
+            .as_bytes(),
+        );
+        let got = collect_stanzas(&input, Stanza::new()).await;
+        assert_eq!(
+            got,
+            vec![
+                ("pool/a.deb".to_owned(), Some(HashAlgo::Sha256)),
+                ("pool/b.deb".to_owned(), None),
+            ]
+        );
     }
 
     #[test]
@@ -1422,7 +1492,7 @@ mod tests {
 
     fn stanza_with_filename(filename: &str) -> Stanza {
         let mut stanza = Stanza::new();
-        stanza.ingest(&format!("Filename: {filename}"));
+        stanza.ingest_text(&format!("Filename: {filename}"));
         stanza
     }
 

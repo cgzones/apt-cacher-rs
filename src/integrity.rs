@@ -3405,6 +3405,53 @@ mod tests {
         );
     }
 
+    /// Only the fields the ingest reads must be UTF-8: a Latin-1
+    /// `Description:` in a third-party index registers its digests, while a
+    /// `Filename:` that is not UTF-8 still fails the ingest of the index
+    /// (keeping only what was read before it).
+    #[tokio::test]
+    async fn ingest_packages_reads_only_tracked_fields_as_utf8() {
+        let sha = [0xaau8; 32];
+        let stanza = format!(
+            "Filename: pool/main/a/a/a_1_amd64.deb\nSHA256: {}\n\n",
+            index_parser::hex_encode(&sha),
+        );
+        let ingest = async |packages: &[u8]| {
+            let reg = ChecksumRegistry::new(NonZero::new(100).expect("non-zero"));
+            let f = temp_file_with(packages);
+            let result = ingest_packages_file(
+                &reg,
+                "deb.debian.org",
+                "debian",
+                f.path(),
+                Some(PackagesCompression::Raw),
+                64 * 1024,
+            )
+            .await;
+            let registered = reg.lookup("deb.debian.org", "debian", "a_1_amd64.deb");
+            (result, registered)
+        };
+
+        let latin1 = [
+            b"Package: a\nDescription: \xe9t\xe9 cr\xe8me\n na\xefve\n".as_slice(),
+            stanza.as_bytes(),
+        ]
+        .concat();
+        let (result, registered) = ingest(&latin1).await;
+        result.expect("a Latin-1 Description is never decoded");
+        assert_eq!(registered, Some(sha));
+
+        let bad_filename = [
+            stanza.as_bytes(),
+            b"Package: b\nFilename: pool/main/b/b/\xe9_1_amd64.deb\n".as_slice(),
+        ]
+        .concat();
+        let (result, registered) = ingest(&bad_filename).await;
+        let err = result.expect_err("a Filename that is not UTF-8 fails the ingest");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(registered, Some(sha), "what was read before it registers");
+    }
+
     /// An index of more stanzas than one registry batch registers all of
     /// them: the full batches as they fill, the rest at the end.
     #[tokio::test]
