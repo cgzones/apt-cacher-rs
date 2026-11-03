@@ -94,7 +94,7 @@ use crate::{
         ClientAcls, DispatchOutcome, PassthroughReason, RejectReason, RequestKind, RequestTarget,
         dispatch_request, preflight_method, preflight_target, preflight_via,
     },
-    response_head::{ResponseHead, ResponseKind, retry_after_secs},
+    response_head::{ResponseHead, retry_after_secs},
     scheme_cache::{self, SchemeDecision, canonical_upstream_authority},
     static_assert,
     transfer_error::{CacheError, DeliveryFailure, DownloadFailure, InternalError, UpstreamError},
@@ -983,12 +983,7 @@ async fn serve_unfinished_file(
         }
     };
 
-    let CacheInfo {
-        file_etag,
-        last_modified_str,
-        age,
-        last_modified_for_ims: _,
-    } = CacheInfo::with_meta(&md, upstream_metadata);
+    let cache_info = CacheInfo::with_meta(&md, upstream_metadata);
 
     let content_type = content_type_for_cached_file(&conn_details.debname);
     let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -1037,28 +1032,18 @@ async fn serve_unfinished_file(
         let _sent = tx.send(ChannelEvent::Finished(result)).await;
     });
 
-    let head = ResponseHead {
-        content_length: match content_length {
-            ContentLength::Exact(size) => Some(size.get()),
-            ContentLength::Unknown(_) => None,
-        },
-        content_type: Some(content_type),
-        accept_ranges: true,
-        last_modified: Some(&last_modified_str),
-        etag: file_etag.as_deref(),
-        age: Some(age),
-        ..ResponseHead::bare(StatusCode::OK, ResponseKind::Success)
+    let exact_size = match content_length {
+        ContentLength::Exact(size) => Some(size.get()),
+        ContentLength::Unknown(_) => None,
     };
+    let head = ResponseHead::cached(StatusCode::OK, exact_size, None, content_type, &cache_info);
 
     let body = rated_client_body(
         ChannelBody::new(rx, content_length),
         Subject::Cached {
             conn_details,
             mechanism: Mechanism::Channel,
-            size: match content_length {
-                ContentLength::Exact(size) => Some(size.get()),
-                ContentLength::Unknown(_) => None,
-            },
+            size: exact_size,
             role,
             partial: false,
         },
@@ -1222,59 +1207,13 @@ async fn serve_cached_file_buf(
         },
     );
 
-    // TODO: use become: https://github.com/rust-lang/rust/issues/112788
-    serve_cached_file_response(cache_info, params, content_type, body)
-}
-
-/// Response builder of `serve_cached_file_buf`; always called as a tail
-/// call.
-fn serve_cached_file_response(
-    cache_info: &CacheInfo,
-    params: ServeParams,
-    content_type: &'static str,
-    body: ProxyCacheBody,
-) -> Response<ProxyCacheBody> {
-    let http_status = params.http_status();
-    let ServeParams {
-        content_start: _,
-        content_length,
-        content_range,
-    } = params;
-    /*
-     * Original headers:
-     *
-     *  "connection":             "keep-alive",
-     *  "content-length":         "62092296",
-     *  "server":                 "Apache",
-     *  "x-content-type-options": "nosniff",
-     *  "x-frame-options":        "sameorigin",
-     *  "referrer-policy":        "no-referrer",
-     *  "x-xss-protection":       "1",
-     *  "permissions-policy":     "interest-cohort=()",
-     *  "last-modified":          "Wed, 20 Dec 2023 04:45:32 GMT",
-     *  "etag":                   "\"3b37408-60ce9a73589f2\"",
-     *  "x-clacks-overhead":      "GNU Terry Pratchett",
-     *  "cache-control":          "public, max-age=2592000",
-     *  "content-type":           "application/vnd.debian.binary-package",
-     *  "via":                    "1.1 varnish, 1.1 varnish",
-     *  "accept-ranges":          "bytes",
-     *  "age":                    "1544533",
-     *  "date":                   "Sat, 20 Jan 2024 20:28:06 GMT",
-     *  "x-served-by":            "cache-ams21052-AMS, cache-fra-eddf8230062-FRA",
-     *  "x-cache":                "HIT, HIT", "x-cache-hits": "1, 0",
-     *  "x-timer":                "S1705782486.334221,VS0,VE1"
-     */
-
-    let head = ResponseHead {
-        content_length: Some(content_length),
-        content_type: Some(content_type),
-        accept_ranges: true,
-        last_modified: Some(&cache_info.last_modified_str),
-        etag: cache_info.file_etag.as_deref(),
-        age: Some(cache_info.age),
-        content_range: content_range.map(Cow::Owned),
-        ..ResponseHead::bare(http_status, ResponseKind::Success)
-    };
+    let head = ResponseHead::cached(
+        params.http_status(),
+        Some(content_length),
+        params.content_range.as_deref(),
+        content_type,
+        cache_info,
+    );
 
     let response = head.into_hyper(body);
 

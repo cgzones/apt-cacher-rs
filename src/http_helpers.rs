@@ -1,4 +1,4 @@
-use std::{borrow::Cow, io::ErrorKind};
+use std::io::ErrorKind;
 
 use http::{HeaderName, StatusCode};
 use tokio::net::TcpStream;
@@ -9,7 +9,7 @@ use crate::{
     global_config,
     humanfmt::HumanFmt,
     metrics,
-    response_head::{ResponseHead, ResponseKind, WireBody, retry_after_secs},
+    response_head::{ResponseHead, WireBody, retry_after_secs},
 };
 
 /// Represents the action to take after sending a response.
@@ -243,18 +243,15 @@ pub(crate) async fn write_response_headers(
     content_type: &'static str,
     cache_info: &CacheInfo,
 ) -> std::io::Result<()> {
-    let head = ResponseHead {
-        content_length: Some(params.content_length),
-        content_type: Some(content_type),
-        accept_ranges: true,
-        last_modified: Some(&cache_info.last_modified_str),
-        etag: cache_info.file_etag.as_deref(),
-        age: Some(cache_info.age),
-        content_range: params.content_range.as_deref().map(Cow::Borrowed),
-        ..ResponseHead::bare(params.http_status(), ResponseKind::Success)
-    };
-    head.write_to(stream, conn_version, conn_action, WireBody::Follows)
-        .await
+    ResponseHead::cached(
+        params.http_status(),
+        Some(params.content_length),
+        params.content_range.as_deref(),
+        content_type,
+        cache_info,
+    )
+    .write_to(stream, conn_version, conn_action, WireBody::Follows)
+    .await
 }
 
 /// Which syscall the shared write loop issues, and which timeout counter its

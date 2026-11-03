@@ -31,6 +31,11 @@
 //! The hyper renderer leaves an unset `Content-Length` to hyper, which
 //! derives it from the body's size hint.
 //!
+//! The heads whose shape must not drift between the backends have one
+//! constructor each: [`ResponseHead::cached`] (the hyper and sendfile
+//! cache-hit and joiner `200`/`206`), [`ResponseHead::not_modified`] and
+//! [`ResponseHead::range_not_satisfiable`].
+//!
 //! A new proxy-generated response must be built from a [`ResponseHead`] —
 //! not from a hand-written `Response::builder()` chain or `format!`
 //! template — so the `Via`/`Server` invariant stays enforced by these two
@@ -43,6 +48,7 @@ use std::borrow::Cow;
 
 use http::StatusCode;
 
+use crate::cache_conditional::CacheInfo;
 #[cfg(feature = "sendfile")]
 use crate::http_helpers::{ConnectionAction, ConnectionVersion};
 
@@ -139,6 +145,33 @@ impl<'a> ResponseHead<'a> {
             etag,
             age: Some(age),
             ..Self::bare(StatusCode::NOT_MODIFIED, ResponseKind::Success)
+        }
+    }
+
+    /// The `200`/`206` head of a cached representation whose body follows:
+    /// its type, framing and validators, and `Accept-Ranges`.
+    ///
+    /// `content_length` is `None` only for a joiner of a download of unknown
+    /// length (hyper frames that body itself); `content_range` is set for a
+    /// `206`. Every cache-hit and joiner serve of the hyper and sendfile
+    /// backends answers with this head.
+    #[must_use]
+    pub(crate) fn cached(
+        status: StatusCode,
+        content_length: Option<u64>,
+        content_range: Option<&'a str>,
+        content_type: &'static str,
+        cache_info: &'a CacheInfo,
+    ) -> Self {
+        Self {
+            content_length,
+            content_type: Some(content_type),
+            accept_ranges: true,
+            last_modified: Some(&cache_info.last_modified_str),
+            etag: cache_info.file_etag.as_deref(),
+            age: Some(cache_info.age),
+            content_range: content_range.map(Cow::Borrowed),
+            ..Self::bare(status, ResponseKind::Success)
         }
     }
 
