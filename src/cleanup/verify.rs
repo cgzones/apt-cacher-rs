@@ -31,44 +31,90 @@ pub(super) enum Verdict {
     IoError(std::io::Error),
 }
 
+/// What [`open_and_check_marker`] found: a verdict reached without reading
+/// the file, or the open file still to be hashed.
+enum Opened {
+    Decided(Verdict),
+    NeedsHash {
+        file: std::fs::File,
+        pre_identity: FileIdentity,
+        pre_size: u64,
+    },
+}
+
 /// Blocking digest-and-compare with a [`FileIdentity`] race check after
-/// hashing. Runs on the blocking pool via [`verify_cache_file`].
+/// hashing: [`open_and_check_marker`] then [`hash_and_compare`], the two
+/// steps [`verify_cache_file`] runs as separate blocking jobs.
+#[cfg(test)]
 fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> Verdict {
-    let mut file = match nofollow_nonblock_options().read(true).open(path) {
+    match open_and_check_marker(path, algo, expected) {
+        Opened::Decided(verdict) => verdict,
+        Opened::NeedsHash {
+            file,
+            pre_identity,
+            pre_size,
+        } => hash_and_compare(file, path, pre_identity, pre_size, algo, expected),
+    }
+}
+
+/// Open the cache file and take the memoized fast path if its marker still
+/// vouches for it. Blocking, but reads nothing of the file's contents: one
+/// open, one fstat and one xattr read.
+fn open_and_check_marker(path: &Path, algo: HashAlgo, expected: &[u8]) -> Opened {
+    let file = match nofollow_nonblock_options().read(true).open(path) {
         Ok(f) => f,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Verdict::Vanished,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Opened::Decided(Verdict::Vanished);
+        }
         // A symlink swapped in since the scan: `O_NOFOLLOW` refuses it.
         Err(err) if is_non_regular_errno(&err) => {
             metrics::CACHE_NON_REGULAR.increment();
-            return Verdict::NonRegular;
+            return Opened::Decided(Verdict::NonRegular);
         }
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
-            return Verdict::IoError(err);
+            return Opened::Decided(Verdict::IoError(err));
         }
     };
     let pre_meta = match file.metadata() {
         Ok(m) if m.file_type().is_file() => m,
         Ok(_) => {
             metrics::CACHE_NON_REGULAR.increment();
-            return Verdict::NonRegular;
+            return Opened::Decided(Verdict::NonRegular);
         }
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
-            return Verdict::IoError(err);
+            return Opened::Decided(Verdict::IoError(err));
         }
     };
     let pre_identity = FileIdentity::of(&pre_meta);
-    let pre_size = pre_meta.len();
 
     // Memoized fast path: verified in an earlier cycle and unchanged since
     // (same inode/size/mtime, same expected digest) — skip the full
     // read+hash.
     if has_valid_marker(&file, path, pre_identity, algo, expected) {
         metrics::CLEANUP_CHECKSUM_SKIPS.increment();
-        return Verdict::Match;
+        return Opened::Decided(Verdict::Match);
     }
 
+    Opened::NeedsHash {
+        file,
+        pre_identity,
+        pre_size: pre_meta.len(),
+    }
+}
+
+/// Hash the file [`open_and_check_marker`] opened and compare the digest,
+/// checking afterwards that `path` still names the file hashed (by
+/// `pre_identity`). Blocking: reads the whole file.
+fn hash_and_compare(
+    mut file: std::fs::File,
+    path: &Path,
+    pre_identity: FileIdentity,
+    pre_size: u64,
+    algo: HashAlgo,
+    expected: &[u8],
+) -> Verdict {
     // Past the memo fast path, which reads nothing but one xattr: from here
     // the whole file is read, so the readahead hint is worth its syscall.
     hint_sequential_read(&file, pre_size, path);
@@ -133,7 +179,34 @@ const VERIFY_CONCURRENCY: usize = 3;
 
 static VERIFY_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(VERIFY_CONCURRENCY);
 
+/// Verify the cache file at `path` against `expected`.
+///
+/// Two blocking jobs: the open and the memoized-marker check
+/// ([`open_and_check_marker`]) run unthrottled -- in steady state they
+/// answer nearly every file -- and only a file that must really be hashed
+/// takes one of the [`VERIFY_SLOTS`], so a few cold multi-second hashes
+/// never stall other mirrors' microsecond marker checks behind them. The
+/// hash job keeps the descriptor the first job opened, so its type and
+/// identity checks still hold for the file it reads.
 pub(super) async fn verify_cache_file(path: PathBuf, algo: HashAlgo, expected: Vec<u8>) -> Verdict {
+    let (opened, path, expected) = match tokio::task::spawn_blocking(move || {
+        let opened = open_and_check_marker(&path, algo, &expected);
+        (opened, path, expected)
+    })
+    .await
+    {
+        Ok(checked) => checked,
+        Err(join_err) => return Verdict::IoError(std::io::Error::other(join_err)),
+    };
+    let (file, pre_identity, pre_size) = match opened {
+        Opened::Decided(verdict) => return verdict,
+        Opened::NeedsHash {
+            file,
+            pre_identity,
+            pre_size,
+        } => (file, pre_identity, pre_size),
+    };
+
     let permit = match VERIFY_SLOTS.acquire().await {
         Ok(permit) => permit,
         // `AcquireError` is a tuple struct with a private field, so the
@@ -150,7 +223,7 @@ pub(super) async fn verify_cache_file(path: PathBuf, algo: HashAlgo, expected: V
     // awaits its hashes inline); this keeps the bound from resting on that.
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        verify_file_sync(&path, algo, &expected)
+        hash_and_compare(file, &path, pre_identity, pre_size, algo, &expected)
     })
     .await
     {

@@ -97,7 +97,7 @@ async fn process_stanza(
     };
     let path = ctx.root.join(lookup_key);
 
-    // No pre-verify stat: `verify_file_sync` opens the file `O_NOFOLLOW |
+    // No pre-verify stat: `verify_cache_file` opens the file `O_NOFOLLOW |
     // O_NONBLOCK` and `fstat`s the descriptor it actually hashed, so it detects
     // a concurrent type swap without a second syscall (and without the
     // lstat-then-open race an extra stat would only narrow).
