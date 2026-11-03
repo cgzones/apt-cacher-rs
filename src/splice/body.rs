@@ -306,15 +306,25 @@ pub(super) struct CacheWriter {
     file: Arc<CacheFile>,
     file_offset: i64,
     hasher: Option<StreamHasher>,
-    /// The zero-copy loop's pipes, with `pipe_B` as its batch.
-    pipes: Option<SplicePipes>,
-    /// The userspace loop's read buffer, which is its batch. At most one of
-    /// the two sinks is installed: each loop installs its own.
-    buffer: Option<CacheBatch<BufferSink>>,
+    /// Where batched bytes wait for the file: the body loop installs its
+    /// own sink before its first read.
+    sink: CacheSink,
     /// Some byte of this transfer reached the file (a body prefix, a
     /// boundary chunk or a batch): the barrier's unbatched first ping went
     /// out with it, so the batch no longer needs its eager first flush.
     landed_once: sticky::Bool,
+}
+
+/// The batch a [`CacheWriter`] lands from, installed by the body loop that
+/// fills it.
+enum CacheSink {
+    /// No body loop yet: a prefix or a fully buffered body writes straight
+    /// through, with nothing batched.
+    Direct,
+    /// The zero-copy loop's pipes, with `pipe_B` as its batch.
+    Pipes(SplicePipes),
+    /// The userspace loop's read buffer, which is its batch.
+    Buffer(CacheBatch<BufferSink>),
 }
 
 /// Whether every new byte is available in userspace. Resumed downloads cannot
@@ -356,8 +366,7 @@ impl CacheWriter {
             }),
             file_offset,
             hasher,
-            pipes: None,
-            buffer: None,
+            sink: CacheSink::Direct,
             landed_once: sticky::Bool::new(),
         })
     }
@@ -385,13 +394,11 @@ impl CacheWriter {
     /// Only a drained writer can hand its file and whole-file digest to commit.
     pub(super) fn finish(self) -> (tokio::fs::File, Option<StreamedDigest>) {
         assert!(
-            self.pipes
-                .as_ref()
-                .is_none_or(|pipes| pipes.cache.is_empty())
-                && self
-                    .buffer
-                    .as_ref()
-                    .is_none_or(|batch| batch.sink.is_landed()),
+            match &self.sink {
+                CacheSink::Direct => true,
+                CacheSink::Pipes(pipes) => pipes.cache.is_empty(),
+                CacheSink::Buffer(batch) => batch.sink.is_landed(),
+            },
             "all queued cache bytes must land before commit"
         );
         (self.tempfile, self.hasher.map(StreamHasher::finalize))
@@ -404,35 +411,39 @@ impl CacheWriter {
     }
 
     fn pipes(&self) -> &SplicePipes {
-        self.pipes
-            .as_ref()
-            .expect("the splice loop installed its pipes")
+        match &self.sink {
+            CacheSink::Pipes(pipes) => Some(pipes),
+            CacheSink::Direct | CacheSink::Buffer(_) => None,
+        }
+        .expect("the splice loop installed its pipes")
     }
 
     fn pipes_mut(&mut self) -> &mut SplicePipes {
-        self.pipes
-            .as_mut()
-            .expect("the splice loop installed its pipes")
+        match &mut self.sink {
+            CacheSink::Pipes(pipes) => Some(pipes),
+            CacheSink::Direct | CacheSink::Buffer(_) => None,
+        }
+        .expect("the splice loop installed its pipes")
     }
 
     fn batch(&self) -> &CacheBatch<PipeSink> {
         &self.pipes().cache
     }
 
-    fn batch_mut(&mut self) -> &mut CacheBatch<PipeSink> {
-        &mut self.pipes_mut().cache
-    }
-
     fn buffer(&self) -> &CacheBatch<BufferSink> {
-        self.buffer
-            .as_ref()
-            .expect("the userspace loop installed its buffer")
+        match &self.sink {
+            CacheSink::Buffer(batch) => Some(batch),
+            CacheSink::Direct | CacheSink::Pipes(_) => None,
+        }
+        .expect("the userspace loop installed its buffer")
     }
 
     fn buffer_mut(&mut self) -> &mut CacheBatch<BufferSink> {
-        self.buffer
-            .as_mut()
-            .expect("the userspace loop installed its buffer")
+        match &mut self.sink {
+            CacheSink::Buffer(batch) => Some(batch),
+            CacheSink::Direct | CacheSink::Pipes(_) => None,
+        }
+        .expect("the userspace loop installed its buffer")
     }
 
     /// `pwrite` a userspace chunk to the cache file at the current offset,
@@ -454,7 +465,7 @@ impl CacheWriter {
     /// are not on disk yet. They stay in the buffer -- a delivery may still
     /// be reading them -- until [`BufferSink::recycle`] reclaims it.
     async fn land_buffer(&mut self) -> std::io::Result<()> {
-        let Some(batch) = self.buffer.as_mut() else {
+        let CacheSink::Buffer(batch) = &mut self.sink else {
             return Ok(());
         };
         let BufferSink { buf, landed } = &mut batch.sink;
@@ -504,47 +515,47 @@ impl CacheWriter {
     /// progress. A no-op while nothing is pending, so it is free to call
     /// wherever the file has to be current.
     async fn flush(&mut self) -> Result<(), DownloadFailure> {
-        if let Some(batch) = self.buffer.as_mut() {
-            if batch.is_empty() {
-                return Ok(());
+        match &mut self.sink {
+            CacheSink::Direct => Ok(()),
+            CacheSink::Buffer(batch) => {
+                if batch.is_empty() {
+                    return Ok(());
+                }
+                batch.mark_flushed();
+                self.landed_once.set();
+                self.land_buffer().await.map_err(|err| {
+                    CacheError::counted_io("splice cache write", &self.path, err).into()
+                })
             }
-            batch.mark_flushed();
-            self.landed_once.set();
-            return self.land_buffer().await.map_err(|err| {
-                CacheError::counted_io("splice cache write", &self.path, err).into()
-            });
+            CacheSink::Pipes(pipes) => {
+                if pipes.cache.is_empty() {
+                    return Ok(());
+                }
+                pipes.cache.mark_flushed();
+                self.landed_once.set();
+                debug_assert!(
+                    self.hasher.is_none(),
+                    "tee bytes cannot feed an incremental digest"
+                );
+                let _landed =
+                    drain_pipe_to_file(&pipes.cache.sink.rx, &self.file, &mut self.file_offset)
+                        .await
+                        .map_err(|err| {
+                            CacheError::counted_io("splice cache write", &self.path, err)
+                        })?;
+                Ok(())
+            }
         }
-        if self
-            .pipes
-            .as_ref()
-            .is_none_or(|pipes| pipes.cache.is_empty())
-        {
-            return Ok(());
-        }
-        self.batch_mut().mark_flushed();
-        self.landed_once.set();
-        debug_assert!(
-            self.hasher.is_none(),
-            "tee bytes cannot feed an incremental digest"
-        );
-        let _landed = drain_pipe_to_file(
-            &self.pipes.as_ref().expect("splice pipes").cache.sink.rx,
-            &self.file,
-            &mut self.file_offset,
-        )
-        .await
-        .map_err(|err| CacheError::counted_io("splice cache write", &self.path, err))?;
-        Ok(())
     }
 
     /// Flush once the installed batch is due: at the threshold, or while
     /// nothing of the transfer is on disk yet.
     async fn flush_if_due(&mut self) -> Result<(), DownloadFailure> {
         let landed_once = self.landed_once.get();
-        let due = match (&self.buffer, &self.pipes) {
-            (Some(batch), _) => batch.is_due(landed_once),
-            (None, Some(pipes)) => pipes.cache.is_due(landed_once),
-            (None, None) => false,
+        let due = match &self.sink {
+            CacheSink::Direct => false,
+            CacheSink::Pipes(pipes) => pipes.cache.is_due(landed_once),
+            CacheSink::Buffer(batch) => batch.is_due(landed_once),
         };
         if due {
             self.flush().await?;
@@ -574,10 +585,12 @@ impl CacheWriter {
     /// run. A failed salvage is reported here and does not replace the
     /// transfer's own error.
     pub(super) async fn salvage(&mut self) {
-        let landed = if let Some(pipes) = self.pipes.take() {
-            pipes.salvage_into(&self.file, &mut self.file_offset).await
-        } else {
-            self.land_buffer().await
+        let landed = match std::mem::replace(&mut self.sink, CacheSink::Direct) {
+            CacheSink::Pipes(pipes) => pipes.salvage_into(&self.file, &mut self.file_offset).await,
+            sink @ (CacheSink::Direct | CacheSink::Buffer(_)) => {
+                self.sink = sink;
+                self.land_buffer().await
+            }
         };
         if let Err(err) = landed {
             let _logged = Logged::cache_io_failure(format_args!(
@@ -1106,7 +1119,7 @@ pub(super) async fn splice_proxy_body(
     mut xfer: BodyTransfer<'_>,
     upstream: &TcpStream,
 ) -> Result<BodyOutcome, DownloadFailure> {
-    xfer.cache.pipes = Some(SplicePipes::new().map_err(internal_io)?);
+    xfer.cache.sink = CacheSink::Pipes(SplicePipes::new().map_err(internal_io)?);
     drive_batches(&mut xfer, upstream).await?;
     xfer.flush_cache().await?;
     Ok(xfer.finish())
@@ -1445,7 +1458,7 @@ pub(super) async fn splice_proxy_body_tls(
     mut xfer: BodyTransfer<'_>,
     upstream: &mut UpstreamConn,
 ) -> Result<BodyOutcome, DownloadFailure> {
-    xfer.cache.buffer = Some(CacheBatch::with_sink(BufferSink::new(xfer.remaining)));
+    xfer.cache.sink = CacheSink::Buffer(CacheBatch::with_sink(BufferSink::new(xfer.remaining)));
     drive_reads(&mut xfer, upstream).await?;
     xfer.flush_cache().await?;
     Ok(xfer.finish())
@@ -2932,7 +2945,7 @@ mod tests {
         let mut batch = CacheBatch::with_sink(BufferSink::new(12));
         batch.sink.buf.extend_from_slice(b"salvage-tail");
         batch.queue(batch.sink.buf.len());
-        writer.buffer = Some(batch);
+        writer.sink = CacheSink::Buffer(batch);
         writer.salvage().await;
         assert!(
             metrics::CACHE_IO_FAILURE.get() > before_cleanup,
@@ -3278,7 +3291,7 @@ mod tests {
             None,
             &crate::config::Config::default(),
         );
-        xfer.cache.pipes = Some(SplicePipes::new().unwrap());
+        xfer.cache.sink = CacheSink::Pipes(SplicePipes::new().unwrap());
         // Model an earlier teed batch whose client bytes have been delivered.
         queue_cache(xfer.cache.pipes_mut(), b"queued-").await;
         let mut boundary = b"boundary-".to_vec();
@@ -3331,7 +3344,7 @@ mod tests {
             None,
             &crate::config::Config::default(),
         );
-        xfer.cache.pipes = Some(SplicePipes::new().unwrap());
+        xfer.cache.sink = CacheSink::Pipes(SplicePipes::new().unwrap());
 
         // Nothing of the transfer is on disk yet, so the first batch lands.
         let mut expected = b"first-".to_vec();
@@ -3380,7 +3393,7 @@ mod tests {
         )
         .await
         .unwrap();
-        writer.pipes = Some(SplicePipes::new().unwrap());
+        writer.sink = CacheSink::Pipes(SplicePipes::new().unwrap());
         queue_cache(writer.pipes_mut(), b"first").await;
         writer.flush_if_due().await.unwrap();
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"first");
@@ -3448,7 +3461,7 @@ mod tests {
         .await
         .unwrap();
         writer.write_prefix(prefix).await.unwrap();
-        writer.buffer = Some(CacheBatch::with_sink(BufferSink::new(
+        writer.sink = CacheSink::Buffer(CacheBatch::with_sink(BufferSink::new(
             u64::try_from(body.len()).unwrap(),
         )));
 
@@ -3578,7 +3591,7 @@ mod tests {
         )
         .await
         .unwrap();
-        writer.pipes = Some(SplicePipes::new().unwrap());
+        writer.sink = CacheSink::Pipes(SplicePipes::new().unwrap());
         accumulate(writer.pipes_mut(), b"tail");
         writer.write_through().await.unwrap();
         drop(writer);
