@@ -138,23 +138,82 @@ local_error!(ClientError);
 local_error!(CacheError);
 local_error!(InternalError);
 
-/// The upstream exchange step a failure belongs to. A connect failure is the
-/// terminal end of the retry loop, so its attempt count and the reason the
-/// loop stopped belong to it and to no other phase.
+/// What kind of upstream failure this is: the exchange step it belongs to
+/// and, within a step, the class that picks its terminal counter and its
+/// per-mirror fault. Each constructor names one kind, and every property of a
+/// kind is an exhaustive match on it. A connect failure is the terminal end of
+/// the retry loop, so its attempt count and the reason the loop stopped belong
+/// to it and to no other kind.
 #[derive(Debug)]
-enum UpstreamPhase {
-    Connect { attempts: u32, stop: RetryStop },
+enum UpstreamKind {
+    Connect {
+        attempts: u32,
+        stop: RetryStop,
+    },
+    /// The transport failed before a head arrived (reset, EOF, read timeout).
     Head,
+    /// A head the transport delivered intact but HTTP could not accept.
+    HeadProtocol,
+    /// The transport failed mid-body.
     Body,
+    BodyProtocol,
+    /// A valid body exceeding this proxy's local limit.
+    BodyLimit,
+    /// A `min_download_rate` abort.
+    BodyRate,
+}
+
+impl UpstreamKind {
+    fn phase(&self) -> Phase {
+        match self {
+            Self::Connect {
+                attempts: _,
+                stop: _,
+            } => Phase::Connect,
+            Self::Head | Self::HeadProtocol => Phase::Head,
+            Self::Body | Self::BodyProtocol | Self::BodyLimit | Self::BodyRate => Phase::Body,
+        }
+    }
+
+    /// Bumped by [`UpstreamError::record_terminal`], never at construction:
+    /// an error built and then handled as non-terminal must not count. A
+    /// [`Self::HeadProtocol`] head counts nothing here: every such head is
+    /// counted in `UPSTREAM_PROTOCOL_VIOLATION` where it was parsed.
+    fn counter(&self) -> Option<&'static Signal> {
+        match self {
+            Self::Connect {
+                attempts: _,
+                stop: _,
+            } => Some(&metrics::UPSTREAM_CONNECT_FAILED),
+            Self::Head => Some(&metrics::UPSTREAM_HEAD_FAILED),
+            Self::BodyProtocol => Some(&metrics::UPSTREAM_PROTOCOL_VIOLATION),
+            Self::BodyLimit => Some(&metrics::UPSTREAM_BODY_LIMIT),
+            Self::BodyRate => Some(&metrics::RATE_LIMIT_UPSTREAM),
+            Self::HeadProtocol | Self::Body => None,
+        }
+    }
+
+    /// See [`UpstreamError::mirror_fault`]; `failure` decides only whether a
+    /// mid-body transport failure was a timeout.
+    fn mirror_fault(&self, failure: &OperationFailure) -> Option<MirrorFault> {
+        match self {
+            Self::Connect {
+                attempts: _,
+                stop: _,
+            }
+            | Self::Head => Some(MirrorFault::Unreachable),
+            Self::HeadProtocol | Self::BodyProtocol => Some(MirrorFault::Protocol),
+            Self::BodyRate => Some(MirrorFault::Slow),
+            Self::BodyLimit => None,
+            Self::Body => failure.is_timeout().then_some(MirrorFault::Slow),
+        }
+    }
 }
 
 #[derive(Debug)]
 struct UpstreamFailure {
     failure: OperationFailure,
-    phase: UpstreamPhase,
-    /// Bumped by [`UpstreamError::record_terminal`], never at construction:
-    /// an error built and then handled as non-terminal must not count.
-    counter: Option<&'static Signal>,
+    kind: UpstreamKind,
 }
 
 /// Request failures retain the target after redirects, aliases and scheme
@@ -168,18 +227,19 @@ pub(crate) struct UpstreamError {
 impl fmt::Display for UpstreamError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { failure, target } = self;
-        let UpstreamFailure {
-            failure,
-            phase,
-            counter: _,
-        } = failure.as_ref();
-        match phase {
-            UpstreamPhase::Connect { attempts, stop } => write!(
+        let UpstreamFailure { failure, kind } = failure.as_ref();
+        match kind {
+            UpstreamKind::Connect { attempts, stop } => write!(
                 f,
                 "{} after {attempts} connection attempts ({stop})",
                 failure.operation
             )?,
-            UpstreamPhase::Head | UpstreamPhase::Body => failure.fmt(f)?,
+            UpstreamKind::Head
+            | UpstreamKind::HeadProtocol
+            | UpstreamKind::Body
+            | UpstreamKind::BodyProtocol
+            | UpstreamKind::BodyLimit
+            | UpstreamKind::BodyRate => failure.fmt(f)?,
         }
         if let Some(target) = target {
             write!(f, " for `{target}`")?;
@@ -198,17 +258,11 @@ impl Error for UpstreamError {
 }
 
 impl UpstreamError {
-    fn new(
-        operation: &'static str,
-        phase: UpstreamPhase,
-        cause: Cause,
-        counter: Option<&'static Signal>,
-    ) -> Self {
+    fn new(operation: &'static str, kind: UpstreamKind, cause: Cause) -> Self {
         Self {
             failure: Arc::new(UpstreamFailure {
                 failure: OperationFailure { operation, cause },
-                phase,
-                counter,
+                kind,
             }),
             target: None,
         }
@@ -221,7 +275,7 @@ impl UpstreamError {
 
     #[cfg(feature = "splice")]
     pub(crate) fn io(operation: &'static str, error: io::Error) -> Self {
-        Self::new(operation, UpstreamPhase::Body, Cause::Io(error), None)
+        Self::new(operation, UpstreamKind::Body, Cause::Io(error))
     }
 
     #[cfg(any(feature = "hyper", test))]
@@ -231,29 +285,22 @@ impl UpstreamError {
     ) -> Self {
         Self::new(
             operation,
-            UpstreamPhase::Body,
+            UpstreamKind::Body,
             Cause::Transport(Box::new(error)),
-            None,
         )
     }
 
     #[cfg(feature = "splice")]
     pub(crate) fn timeout(operation: &'static str, duration: Duration) -> Self {
-        Self::new(
-            operation,
-            UpstreamPhase::Body,
-            Cause::Timeout(duration),
-            None,
-        )
+        Self::new(operation, UpstreamKind::Body, Cause::Timeout(duration))
     }
 
     /// Counts `UPSTREAM_PROTOCOL_VIOLATION` once concluded.
     pub(crate) fn protocol(reason: impl Into<String>) -> Self {
         Self::new(
             "upstream protocol failure",
-            UpstreamPhase::Body,
+            UpstreamKind::BodyProtocol,
             Cause::Invalid(reason.into()),
-            Some(&metrics::UPSTREAM_PROTOCOL_VIOLATION),
         )
     }
 
@@ -262,24 +309,18 @@ impl UpstreamError {
     pub(crate) fn body_limit(reason: impl Into<String>) -> Self {
         Self::new(
             "upstream body limit",
-            UpstreamPhase::Body,
+            UpstreamKind::BodyLimit,
             Cause::Invalid(reason.into()),
-            Some(&metrics::UPSTREAM_BODY_LIMIT),
         )
     }
 
     /// Counts `RATE_LIMIT_UPSTREAM` once concluded.
     pub(crate) fn rate(rate: InsufficientRate) -> Self {
-        Self::new(
-            "upstream",
-            UpstreamPhase::Body,
-            Cause::Rate(rate),
-            Some(&metrics::RATE_LIMIT_UPSTREAM),
-        )
+        Self::new("upstream", UpstreamKind::BodyRate, Cause::Rate(rate))
     }
 
     pub(crate) fn is_rate(&self) -> bool {
-        matches!(self.failure.failure.cause, Cause::Rate(_))
+        matches!(self.failure.kind, UpstreamKind::BodyRate)
     }
 
     /// The terminal end of the connect-retry loop: `attempts` and the reason
@@ -295,9 +336,8 @@ impl UpstreamError {
     ) -> Self {
         Self::new(
             operation,
-            UpstreamPhase::Connect { attempts, stop },
+            UpstreamKind::Connect { attempts, stop },
             Cause::Io(error),
-            Some(&metrics::UPSTREAM_CONNECT_FAILED),
         )
     }
 
@@ -312,12 +352,7 @@ impl UpstreamError {
         )
     )]
     pub(crate) fn head_io(operation: &'static str, error: io::Error) -> Self {
-        Self::new(
-            operation,
-            UpstreamPhase::Head,
-            Cause::Io(error),
-            Some(&metrics::UPSTREAM_HEAD_FAILED),
-        )
+        Self::new(operation, UpstreamKind::Head, Cause::Io(error))
     }
 
     /// Counts `UPSTREAM_HEAD_FAILED` once concluded, like [`Self::head_io`].
@@ -328,9 +363,8 @@ impl UpstreamError {
     ) -> Self {
         Self::new(
             operation,
-            UpstreamPhase::Head,
+            UpstreamKind::Head,
             Cause::Transport(Box::new(error)),
-            Some(&metrics::UPSTREAM_HEAD_FAILED),
         )
     }
 
@@ -341,27 +375,31 @@ impl UpstreamError {
     pub(crate) fn head_protocol(reason: impl Into<String>) -> Self {
         Self::new(
             "upstream response head",
-            UpstreamPhase::Head,
+            UpstreamKind::HeadProtocol,
             Cause::Invalid(reason.into()),
-            None,
         )
     }
 
     fn phase(&self) -> Phase {
-        match self.failure.phase {
-            UpstreamPhase::Connect {
-                attempts: _,
-                stop: _,
-            } => Phase::Connect,
-            UpstreamPhase::Head => Phase::Head,
-            UpstreamPhase::Body => Phase::Body,
-        }
+        self.failure.kind.phase()
     }
 
     /// The one counter bump for an upstream failure that ends a transfer.
     fn record_terminal(&self) {
-        if let Some(counter) = self.failure.counter {
+        if let Some(counter) = self.failure.kind.counter() {
             counter.increment();
+        }
+    }
+
+    /// Count a failure that ends a transfer: its terminal counter, and its
+    /// fault against `mirror`'s health where the transfer has a canonical
+    /// mirror. Both `conclude`s that can end an upstream exchange call this.
+    fn record(&self, mirror: Option<&Mirror>) {
+        self.record_terminal();
+        if let Some(mirror) = mirror
+            && let Some(fault) = self.mirror_fault()
+        {
+            mirror_health::record(mirror, fault);
         }
     }
 
@@ -376,27 +414,8 @@ impl UpstreamError {
     /// counted in `UPSTREAM_PROTOCOL_VIOLATION`; a body read that timed out
     /// and a `min_download_rate` abort are "slow".
     pub(crate) fn mirror_fault(&self) -> Option<MirrorFault> {
-        let UpstreamFailure {
-            failure,
-            phase,
-            counter,
-        } = self.failure.as_ref();
-        let counts = |signal: &'static Signal| counter.is_some_and(|c| std::ptr::eq(c, signal));
-        match phase {
-            // `head_protocol` is the one head constructor without a counter.
-            UpstreamPhase::Head if counter.is_none() => Some(MirrorFault::Protocol),
-            UpstreamPhase::Connect {
-                attempts: _,
-                stop: _,
-            }
-            | UpstreamPhase::Head => Some(MirrorFault::Unreachable),
-            UpstreamPhase::Body if counts(&metrics::UPSTREAM_PROTOCOL_VIOLATION) => {
-                Some(MirrorFault::Protocol)
-            }
-            UpstreamPhase::Body if counts(&metrics::RATE_LIMIT_UPSTREAM) => Some(MirrorFault::Slow),
-            UpstreamPhase::Body if counts(&metrics::UPSTREAM_BODY_LIMIT) => None,
-            UpstreamPhase::Body => failure.is_timeout().then_some(MirrorFault::Slow),
-        }
+        let UpstreamFailure { failure, kind } = self.failure.as_ref();
+        kind.mirror_fault(failure)
     }
 
     /// End the transfer this failure stops outside any download runner or
@@ -410,12 +429,7 @@ impl UpstreamError {
         mirror: Option<&Mirror>,
         log: impl FnOnce(&Self) -> Logged,
     ) -> Reported<Self> {
-        self.record_terminal();
-        if let Some(mirror) = mirror
-            && let Some(fault) = self.mirror_fault()
-        {
-            mirror_health::record(mirror, fault);
-        }
+        self.record(mirror);
         log(&self).with(self)
     }
 }
@@ -617,10 +631,11 @@ impl DownloadFailure {
         matches!(self, Self::Upstream(error) if error.is_rate())
     }
 
-    /// The one counter bump for a download that ends here; the cause decides.
-    fn record_terminal(&self) {
+    /// The one counter bump for a download from `mirror` that ends here, its
+    /// mirror's health included; the cause decides.
+    fn record_terminal(&self, mirror: Option<&Mirror>) {
         match self {
-            Self::Upstream(error) => error.record_terminal(),
+            Self::Upstream(error) => error.record(mirror),
             Self::Cache(_) | Self::Internal(_) | Self::Cancelled => {}
         }
     }
@@ -647,12 +662,7 @@ impl DownloadFailure {
         mirror: &Mirror,
         context: fmt::Arguments<'_>,
     ) -> ReportedDownloadFailure {
-        self.record_terminal();
-        if let Self::Upstream(error) = &self
-            && let Some(fault) = error.mirror_fault()
-        {
-            mirror_health::record(mirror, fault);
-        }
+        self.record_terminal(Some(mirror));
         let line = fmt::from_fn(|f| write!(f, "{context}:  {}", ErrorReport(&self)));
         let logged = if matches!(&self, Self::Upstream(error)
             if matches!(error.phase(), Phase::Connect | Phase::Head))
@@ -1089,7 +1099,7 @@ mod tests {
         DeliveryFailure::from(ClientError::io("w", io::ErrorKind::BrokenPipe.into()))
             .record_terminal();
         assert_eq!(metrics::CLIENT_DISCONNECTED_MID_BODY.get(), before_disc + 1);
-        DownloadFailure::Upstream(UpstreamError::rate(rate)).record_terminal();
+        DownloadFailure::Upstream(UpstreamError::rate(rate)).record_terminal(None);
         assert_eq!(metrics::RATE_LIMIT_UPSTREAM.get(), before_up + 1);
         // An uncached body reads its upstream directly, so the delivery side
         // owns the same bump for the same cause.
@@ -1128,7 +1138,7 @@ mod tests {
         assert_eq!(metrics::UPSTREAM_CONNECT_FAILED.get(), connect_before + 1);
         assert_eq!(metrics::UPSTREAM_HEAD_FAILED.get(), head_before);
 
-        DownloadFailure::Upstream(head).record_terminal();
+        DownloadFailure::Upstream(head).record_terminal(None);
         assert_eq!(metrics::UPSTREAM_HEAD_FAILED.get(), head_before + 1);
         assert_eq!(metrics::UPSTREAM_CONNECT_FAILED.get(), connect_before + 1);
 
