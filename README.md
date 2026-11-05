@@ -64,8 +64,15 @@ Install the Debian package via dpkg on a local network server and add the follow
 Acquire::http::Proxy "http://<proxy_ip>:3142/";
 ```
 
-If your sources contain HTTPS repositories you would like to cache as well, change their URL scheme to *http://* to cache their packages.
-Note that connections from the client to the proxy are unencrypted (but all packages are by default verified by `apt(8)` after download to have a valid GPG signature).
+To cache packages from a repository whose source URL uses *https://*, change that URL to *http://*.
+This leaves the connection from the client to the proxy unencrypted, but APT still rejects altered packages: it authenticates the signed repository metadata and checks each download against the hashes listed there (individual `.deb` packages normally carry no GPG signature).
+The proxy's default `https_upgrade_mode = 'Auto'` tries HTTPS to upstream mirrors but falls back to HTTP, which an attacker on the path can force.
+`https_upgrade_mode = 'Always'` requires upstream HTTPS, except for hosts listed in `http_only_mirrors`.
+Either mode protects only the proxy-to-mirror connection.
+
+APT sends *https://* sources through the same proxy as CONNECT tunnels, which the proxy refuses unless `https_tunnel_enabled` is set and the host is listed in `https_tunnel_allowed_mirrors`.
+Tunneled content is encrypted end to end and is not cached.
+To bypass the proxy for such a host instead, add `Acquire::https::Proxy::<host> "DIRECT";` on the client.
 
 ## Web interface
 
