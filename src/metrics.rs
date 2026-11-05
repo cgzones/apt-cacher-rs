@@ -792,6 +792,15 @@ pub(crate) static CACHE_DIRECTORY_UNEXPECTED: Signal = Signal::new();
 /// directory-shaped counterpart inside mirror subtrees).
 pub(crate) static CACHE_UNEXPECTED_REGULAR: Signal = Signal::new();
 
+/// `.partial` files a download found with a link count other than one --
+/// typically a hard link a backup (rsnapshot-style snapshots, `cp -al`) or
+/// a deduplication tool made into `tmp/`. Resuming would write the shared
+/// inode and so change every other name of it; the download unlinks its
+/// own name instead and starts afresh, leaving the other links untouched.
+/// Distinct from `CACHE_NON_REGULAR`: the entry is a regular file and the
+/// download goes on, so this is an operator artefact, not a failure.
+pub(crate) static PARTIAL_HARDLINKED: Signal = Signal::new();
+
 /// Bytes copied client → upstream through the CONNECT tunnel, including a
 /// payload pipelined behind the `CONNECT` head (a TLS `ClientHello`).
 ///

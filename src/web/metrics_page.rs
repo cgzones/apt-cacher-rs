@@ -1524,6 +1524,12 @@ fn build_errors_group(g: &mut Groups) {
             Level::Warn,
             &metrics::CACHE_UNEXPECTED_REGULAR,
         );
+        t.signal(
+            "Hard-Linked Partials",
+            "Partial downloads found sharing their file with another name (a link count other than one), typically from a hard-link backup or deduplication tool run over the cache. Resuming would change the other names too, so the download unlinks the partial and starts afresh; the other names stay untouched.",
+            Level::Warn,
+            &metrics::PARTIAL_HARDLINKED,
+        );
     });
 }
 

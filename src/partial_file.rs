@@ -377,6 +377,17 @@ async fn prepare_partial_resume_at(
         // a fresh download on the guard rather than making both backends
         // undo an `Err` identically.
         Err(PartialOpenError::NotFound(guard)) => Ok(PartialResume::fresh(guard)),
+        // Recoverable without touching the other names: unlinking ours
+        // removes one link, and the fresh download starts on a new inode.
+        Err(PartialOpenError::HardLinked { nlink, guard }) => {
+            metrics::PARTIAL_HARDLINKED.increment();
+            warn!(
+                "{} download `{}` for {debname} from mirror {mirror} has {nlink} hard links instead of one, discarding instead of resuming to leave the other links untouched",
+                speaker.lead("partial"),
+                guard.display()
+            );
+            Ok(PartialResume::fresh(guard.renew().await))
+        }
         Err(PartialOpenError::Failed { failure, guard }) => {
             Err(PartialOpenFailure { failure, guard })
         }
@@ -384,13 +395,17 @@ async fn prepare_partial_resume_at(
 }
 
 /// Why `open_partial_file` did not hand back a resumable file. Internal:
-/// `NotFound` never leaves this module, since [`prepare_partial_resume`]
-/// turns it into a fresh download.
+/// `NotFound` and `HardLinked` never leave this module, since
+/// [`prepare_partial_resume`] turns both into a fresh download.
 #[derive(Debug)]
 enum PartialOpenError {
     /// No partial file at the path: the normal fresh-download case, not
     /// logged and not counted.
     NotFound(TempPath),
+    /// A regular file whose link count is `nlink`, not one: resuming would
+    /// write an inode other names share. Unlinking the path drops only this
+    /// name, so the caller discards it and downloads afresh.
+    HardLinked { nlink: u64, guard: TempPath },
     /// Any other open/stat/seek failure. The operation counts cache failures;
     /// the guarded download owner retains and reports the cause.
     Failed {
@@ -690,15 +705,23 @@ fn partial_path_for_barrier(paths: CachePaths<'_>, ibarrier: &InitBarrier) -> Pa
 ///
 /// By opening the file and querying size from the same file handle, this avoids
 /// TOCTOU races between a separate `metadata()` check and a later `open()`.
+///
+/// A file whose link count is not one is not resumed
+/// ([`PartialOpenError::HardLinked`]): writing its inode would also change
+/// every other name of it, e.g. the copy a hard-link backup snapshot or a
+/// deduplication tool made. `O_NOFOLLOW` only rejects symlinks.
 async fn open_partial_file(
     claim: PartialClaim,
     quota: Option<CacheQuota>,
 ) -> Result<(tokio::fs::File, u64, TempPath), PartialOpenError> {
+    use std::os::unix::fs::MetadataExt as _;
+
     use tokio::io::AsyncSeekExt as _;
 
     /// [`PartialOpenError`] before the guard is attached.
     enum FileOpsError {
         NotFound,
+        HardLinked(u64),
         Failed(CacheError),
     }
 
@@ -733,6 +756,9 @@ async fn open_partial_file(
                 format!("{} is not a regular file", path.display()),
             )));
         }
+        if mdata.nlink() != 1 {
+            return Err(FileOpsError::HardLinked(mdata.nlink()));
+        }
 
         // Seek to the end so subsequent writes append correctly.
         let size = file.seek(std::io::SeekFrom::End(0)).await.map_err(|err| {
@@ -746,6 +772,7 @@ async fn open_partial_file(
     match file_ops(&guard).await {
         Ok((file, size)) => Ok((file, size, guard)),
         Err(FileOpsError::NotFound) => Err(PartialOpenError::NotFound(guard)),
+        Err(FileOpsError::HardLinked(nlink)) => Err(PartialOpenError::HardLinked { nlink, guard }),
         Err(FileOpsError::Failed(failure)) => Err(PartialOpenError::Failed { failure, guard }),
     }
 }
@@ -1038,7 +1065,9 @@ mod tests {
 
         let guard = match open_partial_file(claim(&path), None).await {
             Err(PartialOpenError::NotFound(guard)) => Some(guard),
-            Ok(_) | Err(PartialOpenError::Failed { .. }) => None,
+            Ok(_) | Err(PartialOpenError::HardLinked { .. } | PartialOpenError::Failed { .. }) => {
+                None
+            }
         }
         .expect("no partial exists yet");
         assert_eq!(&*guard, path.as_path());
@@ -1118,7 +1147,9 @@ mod tests {
         let before = metrics::CACHE_NON_REGULAR.get();
         let guard = match open_partial_file(claim(&path), None).await {
             Err(PartialOpenError::Failed { failure: _, guard }) => Some(guard),
-            Ok(_) | Err(PartialOpenError::NotFound(_)) => None,
+            Ok(_) | Err(PartialOpenError::NotFound(_) | PartialOpenError::HardLinked { .. }) => {
+                None
+            }
         }
         .expect("a FIFO is not a partial");
         assert!(
@@ -1128,6 +1159,48 @@ mod tests {
         drop(guard);
         tokio::task::yield_now().await;
         assert!(path.exists(), "the guard keeps the path untouched");
+    }
+
+    /// A partial sharing its inode with another name (a hard-link backup
+    /// snapshot, a deduplication tool) is not resumed: writing it would
+    /// change the other name too. Its own name is unlinked and the download
+    /// starts afresh, leaving the other name's bytes intact.
+    #[tokio::test]
+    async fn prepare_partial_resume_discards_a_hardlinked_partial() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = partial_path(&dir);
+        let other = dir.path().join("verified.deb");
+        let original = b"previously verified package bytes";
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&other, original).expect("seed the other name");
+        std::fs::hard_link(&other, &path).expect("link the partial to it");
+        let mirror = structured_mirror("deb.example.org", "debian");
+
+        let before = metrics::PARTIAL_HARDLINKED.get();
+        let resume = prepare_partial_resume_at(
+            path.clone(),
+            None,
+            "foo_1.0_amd64.deb",
+            &mirror,
+            ResumeLog::Unprefixed,
+        )
+        .await
+        .expect("a hardlinked partial is a fresh download");
+        assert_eq!(metrics::PARTIAL_HARDLINKED.get() - before, 1, "counted");
+        assert_eq!(resume.offset, 0);
+        assert_eq!(resume.partial.if_range(), None);
+        let guard = expect_fresh(resume.partial, "a shared inode is never resumed");
+        assert!(!path.exists(), "the partial's own name is unlinked");
+        assert_eq!(&*guard, path.as_path(), "the guard still reserves the path");
+
+        let other_meta = std::fs::metadata(&other).expect("the other name stays");
+        assert_eq!(other_meta.nlink(), 1, "only the partial's link is gone");
+        assert_eq!(
+            std::fs::read(&other).expect("read the other name"),
+            original
+        );
     }
 
     // The xattr read runs through `block_in_place`, which needs the
