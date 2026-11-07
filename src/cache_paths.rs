@@ -38,8 +38,8 @@
 //! which every join re-asserts.
 //!
 //! The directory *names* walkers compare against (`SUBDIR_FLAT_BYHASH`,
-//! `SUBDIR_TMP`, ...) live here too so a rename is one edit; the `dists`
-//! names are consumed by [`CachePaths`] alone.
+//! `SUBDIR_TMP`, ...) live here too, along with the names reserved by mirror
+//! path validation, so a rename is one edit.
 
 use std::{
     num::NonZero,
@@ -59,7 +59,7 @@ use crate::{cache_layout::CacheLayout, config::CacheHost, global_config};
 
 /// Subdirectory holding `dists/`-anchored metadata (`Release`, `Packages*`,
 /// etc.) under each `{host}/{mirror_path}/` cache root.
-const SUBDIR_DISTS: &str = "dists";
+pub(crate) const SUBDIR_DISTS: &str = "dists";
 
 /// Subdirectory holding by-hash content-addressed files belonging to the
 /// structured `dists/` layout.

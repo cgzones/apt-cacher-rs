@@ -9,7 +9,7 @@ use tracing::debug;
 
 use crate::{
     cache_layout::{MAX_DEBNAME_LEN, classify_request},
-    cache_paths::MirrorSite,
+    cache_paths::{MirrorSite, SUBDIR_DISTS, SUBDIR_FLAT_BYHASH, SUBDIR_TMP},
     client_info::ClientInfo,
     config::{CacheHost, ClientHost},
     database::{self, MirrorEntry},
@@ -1153,7 +1153,7 @@ const MAX_SEGMENT_LEN: usize = 128;
 ///
 /// Shared with the startup migration scan in `main.rs`, which warns about
 /// pre-existing `mirrors_v2` rows that would now fail validation.
-pub(crate) const RESERVED_MIRROR_PATH_SEGMENTS: &[&str] = &["tmp", "by-hash"];
+pub(crate) const RESERVED_MIRROR_PATH_SEGMENTS: &[&str] = &[SUBDIR_TMP, SUBDIR_FLAT_BYHASH];
 
 /// Path-segment names reserved in a *structured* mirror path on top of
 /// [`RESERVED_MIRROR_PATH_SEGMENTS`]: `dists/` holds each structured
@@ -1162,7 +1162,7 @@ pub(crate) const RESERVED_MIRROR_PATH_SEGMENTS: &[&str] = &["tmp", "by-hash"];
 /// cannot reach it, and real flat repositories keep their pool below a
 /// `dists/` directory (Docker CE's
 /// `linux/debian/dists/<codename>/pool/stable/<arch>/`).
-pub(crate) const RESERVED_STRUCTURED_MIRROR_PATH_SEGMENTS: &[&str] = &["dists"];
+pub(crate) const RESERVED_STRUCTURED_MIRROR_PATH_SEGMENTS: &[&str] = &[SUBDIR_DISTS];
 
 /// Whether `segment` is reserved in a mirror path of `kind`.
 #[must_use]
