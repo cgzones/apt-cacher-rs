@@ -10,7 +10,7 @@
 //! [`HumanFmt::BinarySize`] is the one IEC exception, for configuration
 //! values that are powers of two by nature (buffer sizes): a 32 KiB buffer
 //! reads `32.0KiB`, not `32.8kB`. Same precision ladder, promotion at
-//! `NEXT_BINARY_UNIT` (1023.5) for the same reason.
+//! 1023.5 for the same reason.
 //!
 //! [`HumanFmt::Rate`] divides by its window and renders `???B/s` for a
 //! zero-length one - see `precise_instant` for why the std clock makes that
@@ -47,28 +47,25 @@ impl std::fmt::Display for HumanFmt {
         }
 
         const NEXT_UNIT: f64 = 999.5;
-        const NEXT_BINARY_UNIT: f64 = 1023.5;
+        const RATE_UNITS: [&str; 5] = ["B/s", "kB/s", "MB/s", "GB/s", "TB/s"];
 
-        /// The `B/s` unit ladder, shared by the two rate variants so a
-        /// measured rate and a configured one cannot render differently.
-        fn write_rate(f: &mut std::fmt::Formatter<'_>, rate: f64) -> std::fmt::Result {
-            if rate < NEXT_UNIT {
-                return write!(f, "{rate:.0$}B/s", precision(rate));
+        /// Promote just before the rounded mantissa would reach the base,
+        /// using the same sequential divisions for bytes and rates.
+        fn write_scaled(
+            f: &mut std::fmt::Formatter<'_>,
+            mut value: f64,
+            base: f64,
+            units: [&str; 5],
+        ) -> std::fmt::Result {
+            let [mut unit, rest @ ..] = units;
+            for next in rest {
+                if value < base - 0.5 {
+                    break;
+                }
+                value /= base;
+                unit = next;
             }
-            let rate = rate / 1000.0;
-            if rate < NEXT_UNIT {
-                return write!(f, "{rate:.0$}kB/s", precision(rate));
-            }
-            let rate = rate / 1000.0;
-            if rate < NEXT_UNIT {
-                return write!(f, "{rate:.0$}MB/s", precision(rate));
-            }
-            let rate = rate / 1000.0;
-            if rate < NEXT_UNIT {
-                return write!(f, "{rate:.0$}GB/s", precision(rate));
-            }
-            let rate = rate / 1000.0;
-            write!(f, "{rate:.0$}TB/s", precision(rate))
+            write!(f, "{value:.0$}{unit}", precision(value))
         }
 
         #[expect(clippy::cast_precision_loss, reason = "only used for display purposes")]
@@ -77,48 +74,22 @@ impl std::fmt::Display for HumanFmt {
                 if bytes < 1000 {
                     return write!(f, "{bytes}B");
                 }
-                let size = bytes as f64 / 1000.0;
-                if size < NEXT_UNIT {
-                    return write!(f, "{size:.0$}kB", precision(size));
-                }
-                let size = size / 1000.0;
-                if size < NEXT_UNIT {
-                    return write!(f, "{size:.0$}MB", precision(size));
-                }
-                let size = size / 1000.0;
-                if size < NEXT_UNIT {
-                    return write!(f, "{size:.0$}GB", precision(size));
-                }
-                let size = size / 1000.0;
-                write!(f, "{size:.0$}TB", precision(size))
+                write_scaled(f, bytes as f64, 1000.0, ["B", "kB", "MB", "GB", "TB"])
             }
             Self::BinarySize(bytes) => {
                 if bytes < 1024 {
                     return write!(f, "{bytes}B");
                 }
-                let size = bytes as f64 / 1024.0;
-                if size < NEXT_BINARY_UNIT {
-                    return write!(f, "{size:.0$}KiB", precision(size));
-                }
-                let size = size / 1024.0;
-                if size < NEXT_BINARY_UNIT {
-                    return write!(f, "{size:.0$}MiB", precision(size));
-                }
-                let size = size / 1024.0;
-                if size < NEXT_BINARY_UNIT {
-                    return write!(f, "{size:.0$}GiB", precision(size));
-                }
-                let size = size / 1024.0;
-                write!(f, "{size:.0$}TiB", precision(size))
+                write_scaled(f, bytes as f64, 1024.0, ["B", "KiB", "MiB", "GiB", "TiB"])
             }
             Self::Rate(bytes, time) => {
                 let time = time.as_secs_f64();
                 if time == 0.0 {
                     return write!(f, "???B/s");
                 }
-                write_rate(f, bytes as f64 / time)
+                write_scaled(f, bytes as f64 / time, 1000.0, RATE_UNITS)
             }
-            Self::RatePerSec(per_sec) => write_rate(f, per_sec as f64),
+            Self::RatePerSec(per_sec) => write_scaled(f, per_sec as f64, 1000.0, RATE_UNITS),
             Self::Time(time) => {
                 let time = time.as_nanos();
                 if time < 1000 {
