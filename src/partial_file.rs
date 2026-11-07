@@ -609,7 +609,7 @@ impl Deref for TempPath {
 
 impl AsRef<Path> for TempPath {
     fn as_ref(&self) -> &Path {
-        self.path.as_deref().expect("path has not been taken yet")
+        self
     }
 }
 
