@@ -16,7 +16,7 @@
 use std::{
     future::Future,
     io::ErrorKind,
-    num::{NonZero, ParseIntError, Saturating},
+    num::{ParseIntError, Saturating},
     ops::Range,
     time::Duration,
 };
@@ -85,32 +85,9 @@ impl HeadError {
     }
 }
 
-/// The conditions an upstream `GET` carries beyond the plain request.
-/// `Default` is a plain, unconditional request.
-#[derive(Clone, Copy, Default)]
-pub(super) struct RequestConditions<'a> {
-    /// Resume a partial at this offset (`Range: bytes=N-`), with the
-    /// partial's `If-Range` validator if it has one. An `If-Range` only ever
-    /// goes with a `Range`.
-    resume: Option<(NonZero<u64>, Option<&'a str>)>,
-    /// Volatile revalidation of a stale cached copy.
-    volatile: Option<&'a VolatileCondHeaders>,
-}
-
-impl<'a> RequestConditions<'a> {
-    /// Resume from `resume_offset` (none at `0`, which drops `if_range`)
-    /// and revalidate against `volatile`, each when given.
-    pub(super) fn new(
-        resume_offset: u64,
-        if_range: Option<&'a str>,
-        volatile: Option<&'a VolatileCondHeaders>,
-    ) -> Self {
-        Self {
-            resume: NonZero::new(resume_offset).map(|offset| (offset, if_range)),
-            volatile,
-        }
-    }
-}
+/// Exactly one upstream request mode, shared with the response planner.
+pub(super) type RequestConditions<'a> =
+    crate::upstream_head::FetchMode<'a, &'a VolatileCondHeaders>;
 
 /// One upstream `GET`: the `Host` authority, the request target and its
 /// conditions.
@@ -127,7 +104,7 @@ impl<'a> UpstreamRequest<'a> {
         Self {
             authority,
             path,
-            conditions: RequestConditions::default(),
+            conditions: RequestConditions::Fresh(crate::cache_layout::CachedFlavor::Permanent),
         }
     }
 }
@@ -143,10 +120,12 @@ fn format_http_request(request: UpstreamRequest<'_>) -> String {
     let UpstreamRequest {
         authority: host_authority,
         path,
-        conditions: RequestConditions { resume, volatile },
+        conditions,
     } = request;
     let range_header = std::fmt::from_fn(|f| {
-        if let Some((resume_offset, resume_if_range)) = resume {
+        if let RequestConditions::Resume(resume) = conditions {
+            let resume_offset = resume.offset();
+            let resume_if_range = Some(resume.if_range());
             write!(
                 f,
                 "Range: bytes={resume_offset}-\r\n{}",
@@ -156,7 +135,7 @@ fn format_http_request(request: UpstreamRequest<'_>) -> String {
         Ok(())
     });
     let volatile_headers = std::fmt::from_fn(|f| {
-        if let Some(vc) = volatile {
+        if let RequestConditions::Revalidate(vc) = conditions {
             write!(
                 f,
                 "{}Cache-Control: max-age=300\r\n{}",
@@ -1378,6 +1357,7 @@ async fn read_dechunk_body_to_vec(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZero;
 
     #[test]
     fn request_wire_preserves_optional_header_conditions_and_order() {
@@ -1407,73 +1387,49 @@ mod tests {
              Accept-Encoding: identity\r\n\
              Connection: keep-alive\r\n"
         );
-        for (case, offset, if_range, volatile, headers) in [
-            ("fresh", 0, None, None, ""),
+        let validator =
+            <crate::http_etag::ETag as crate::xattr_helpers::XattrValue>::parse("\"resume-v1\"")
+                .unwrap()
+                .into_strong()
+                .unwrap();
+        let resume =
+            crate::upstream_head::ResumeState::new(NonZero::new(7).unwrap(), None, &validator);
+        for (case, conditions, headers) in [
             (
-                "resume without validator",
-                7,
-                None,
-                None,
-                "Range: bytes=7-\r\n",
-            ),
-            (
-                "resume with validator",
-                7,
-                Some("\"resume-v1\""),
-                None,
-                "Range: bytes=7-\r\nIf-Range: \"resume-v1\"\r\n",
-            ),
-            (
-                "zero offset ignores validator",
-                0,
-                Some("\"resume-v1\""),
-                None,
+                "unconditional",
+                RequestConditions::Fresh(crate::cache_layout::CachedFlavor::Permanent),
                 "",
             ),
             (
+                "resume with validator",
+                RequestConditions::Resume(resume),
+                "Range: bytes=7-\r\nIf-Range: \"resume-v1\"\r\n",
+            ),
+            (
                 "volatile without validators",
-                0,
-                None,
-                Some(&empty),
+                RequestConditions::Revalidate(&empty),
                 "Cache-Control: max-age=300\r\n",
             ),
             (
                 "volatile modified only",
-                0,
-                None,
-                Some(&modified),
-                "If-Modified-Since: Wed, 21 Oct 2015 07:28:00 GMT\r\n\
-                 Cache-Control: max-age=300\r\n",
+                RequestConditions::Revalidate(&modified),
+                "If-Modified-Since: Wed, 21 Oct 2015 07:28:00 GMT\r\nCache-Control: max-age=300\r\n",
             ),
             (
                 "volatile tag only",
-                0,
-                None,
-                Some(&tagged),
+                RequestConditions::Revalidate(&tagged),
                 "Cache-Control: max-age=300\r\nIf-None-Match: \"index-v2\"\r\n",
             ),
             (
                 "volatile both validators",
-                0,
-                None,
-                Some(&both),
-                "If-Modified-Since: Wed, 21 Oct 2015 07:28:00 GMT\r\n\
-                 Cache-Control: max-age=300\r\nIf-None-Match: \"index-v2\"\r\n",
-            ),
-            (
-                "resume before volatile headers",
-                7,
-                Some("\"resume-v1\""),
-                Some(&both),
-                "Range: bytes=7-\r\nIf-Range: \"resume-v1\"\r\n\
-                 If-Modified-Since: Wed, 21 Oct 2015 07:28:00 GMT\r\n\
-                 Cache-Control: max-age=300\r\nIf-None-Match: \"index-v2\"\r\n",
+                RequestConditions::Revalidate(&both),
+                "If-Modified-Since: Wed, 21 Oct 2015 07:28:00 GMT\r\nCache-Control: max-age=300\r\nIf-None-Match: \"index-v2\"\r\n",
             ),
         ] {
             let request = format_http_request(UpstreamRequest {
                 authority: "[2001:db8::1]:8080",
                 path: "/debian/dists/stable/InRelease?mirror=1",
-                conditions: RequestConditions::new(offset, if_range, volatile),
+                conditions,
             });
             let expected = format!("{preamble}{headers}\r\n");
             assert_eq!(request.as_bytes(), expected.as_bytes(), "{case}");

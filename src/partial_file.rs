@@ -33,7 +33,7 @@ use crate::{
     fs_open::{count_cache_failure, tokio_nofollow_options},
     global_cache_quota,
     guards::InitBarrier,
-    http_etag::ETag,
+    http_etag::{ETag, StrongETag},
     http_last_modified::LastModified,
     humanfmt::HumanFmt,
     metrics,
@@ -44,7 +44,7 @@ use crate::{
 
 /// Tri-state of an in-progress download's partial-file handling.
 ///
-/// - `Volatile`: non-permanent cache flavor — no partial-file semantics; caller creates a
+/// - `Scratch`: non-permanent cache flavor — no partial-file semantics; caller creates a
 ///   random temp file for the download.
 /// - `Fresh`: permanent cache flavor with no valid existing partial; the guard reserves
 ///   the deterministic partial path so a failed download can be resumed on the next attempt.
@@ -63,27 +63,29 @@ use crate::{
 /// a stale partial (a 200 answering an unsupported `Range`, a 416, an invalid
 /// `Content-Range`), `TempPath::remove_blocking` for known-bad bytes.
 pub(crate) enum PartialDownload {
-    Volatile,
+    Scratch,
     Fresh(TempPath),
-    Resumable {
-        file: tokio::fs::File,
-        guard: TempPath,
-        stored: UpstreamMetadata,
-    },
+    Resumable(ResumablePartial),
+}
+
+/// Evidence read from the open partial. Only this module can construct it.
+pub(crate) struct ResumablePartial {
+    file: tokio::fs::File,
+    guard: TempPath,
+    stored: UpstreamMetadata,
+    offset: std::num::NonZero<u64>,
+    expected_total: Option<u64>,
+    validator: StrongETag,
 }
 
 impl PartialDownload {
     /// Downgrade a `Resumable` state to `Fresh` by removing the stale partial file and
-    /// re-creating the guard for the same path.  No-op for `Fresh` and `Volatile`.
+    /// re-creating the guard for the same path.  No-op for `Fresh` and `Scratch`.
     pub(crate) async fn discard_resume(&mut self) {
-        *self = match std::mem::replace(self, Self::Volatile) {
-            Self::Volatile => Self::Volatile,
+        *self = match std::mem::replace(self, Self::Scratch) {
+            Self::Scratch => Self::Scratch,
             Self::Fresh(guard) => Self::Fresh(guard),
-            Self::Resumable {
-                file,
-                guard,
-                stored: _,
-            } => {
+            Self::Resumable(ResumablePartial { file, guard, .. }) => {
                 drop(file);
                 Self::Fresh(guard.renew().await)
             }
@@ -97,19 +99,58 @@ impl PartialDownload {
     /// [`UpstreamMetadata::inherit_resumed`].
     pub(crate) fn resumed_validators(&self) -> Option<&UpstreamMetadata> {
         match self {
-            Self::Resumable {
-                file: _,
-                guard: _,
-                stored,
-            } => Some(stored),
-            Self::Fresh(_) | Self::Volatile => None,
+            Self::Resumable(ResumablePartial { stored, .. }) => Some(stored),
+            Self::Fresh(_) | Self::Scratch => None,
         }
     }
 
-    /// Strong `ETag` authorizing a resume, absent once the partial is discarded.
-    pub(crate) fn if_range(&self) -> Option<&str> {
-        self.resumed_validators()
-            .and_then(|meta| meta.etag.as_deref())
+    pub(crate) fn offset(&self) -> u64 {
+        match self {
+            Self::Resumable(partial) => partial.offset.get(),
+            Self::Fresh(_) | Self::Scratch => 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn expected_total(&self) -> Option<u64> {
+        match self {
+            Self::Resumable(partial) => partial.expected_total,
+            Self::Fresh(_) | Self::Scratch => None,
+        }
+    }
+
+    pub(crate) fn resume_state(&self) -> Option<crate::upstream_head::ResumeState<'_>> {
+        match self {
+            Self::Resumable(partial) => Some(crate::upstream_head::ResumeState::new(
+                partial.offset,
+                partial.expected_total,
+                &partial.validator,
+            )),
+            Self::Fresh(_) | Self::Scratch => None,
+        }
+    }
+
+    /// Select exactly one kind of upstream request. Scratch targets are also
+    /// used for permanent files whose deterministic partial is still claimed.
+    pub(crate) fn fetch_mode<C>(
+        &self,
+        flavor: crate::cache_layout::CachedFlavor,
+        cached: Option<C>,
+    ) -> crate::upstream_head::FetchMode<'_, C> {
+        use crate::{cache_layout::CachedFlavor, upstream_head::FetchMode};
+        match flavor {
+            CachedFlavor::Permanent => self
+                .resume_state()
+                .map_or(FetchMode::Fresh(flavor), FetchMode::Resume),
+            CachedFlavor::Volatile => {
+                cached.map_or(FetchMode::Fresh(flavor), FetchMode::Revalidate)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn if_range(&self) -> Option<&str> {
+        self.resume_state().map(|state| state.if_range().as_ref())
     }
 
     /// The partial a quota reservation for this download accounts (see
@@ -117,17 +158,13 @@ impl PartialDownload {
     /// is never kept; a `Resumable` partial's `resume_offset` bytes are
     /// adopted from the kept partial. It shares the guard's claim on the
     /// path, which the reservation's drop still measures.
-    pub(crate) fn reserved_partial(&self, resume_offset: u64) -> Option<ReservedPartial> {
+    pub(crate) fn reserved_partial(&self) -> Option<ReservedPartial> {
         match self {
-            Self::Volatile => None,
+            Self::Scratch => None,
             Self::Fresh(guard) => guard.claim().map(|claim| ReservedPartial::new(claim, 0)),
-            Self::Resumable {
-                file: _,
-                guard,
-                stored: _,
-            } => guard
+            Self::Resumable(ResumablePartial { guard, offset, .. }) => guard
                 .claim()
-                .map(|claim| ReservedPartial::new(claim, resume_offset)),
+                .map(|claim| ReservedPartial::new(claim, offset.get())),
         }
     }
 
@@ -138,17 +175,13 @@ impl PartialDownload {
     /// likewise ([`tokio_tempfile`]).
     pub(crate) fn target_file(&self) -> TargetFile {
         match self {
-            Self::Resumable {
-                file: _,
-                guard: _,
-                stored: _,
-            } => TargetFile::Resumed,
-            Self::Fresh(_) | Self::Volatile => TargetFile::New,
+            Self::Resumable(_) => TargetFile::Resumed,
+            Self::Fresh(_) | Self::Scratch => TargetFile::New,
         }
     }
 
     /// Open or create the file the body is written into, taking over the path
-    /// guard. The one place the `Resumable`/`Fresh`/`Volatile` sequence lives,
+    /// guard. The one place the `Resumable`/`Fresh`/`Scratch` sequence lives,
     /// so both fetching backends agree on the resume check, the modes and the
     /// operation names; the caller's download runner reports the failure.
     ///
@@ -158,19 +191,20 @@ impl PartialDownload {
     pub(crate) async fn into_target(
         self,
         filename: &Path,
-        resume_offset: u64,
     ) -> Result<(tokio::fs::File, TempPath), CacheError> {
         use tokio::io::AsyncSeekExt as _;
 
         match self {
-            Self::Resumable {
+            Self::Resumable(ResumablePartial {
                 mut file,
                 guard,
-                stored: _,
-            } => {
+                offset,
+                ..
+            }) => {
                 let size = file.seek(std::io::SeekFrom::End(0)).await.map_err(|err| {
                     CacheError::counted_io("seek partial cache file", &guard, err)
                 })?;
+                let resume_offset = offset.get();
                 if size != resume_offset {
                     return Err(CacheError::invalid(
                         "validate resumed partial size",
@@ -180,41 +214,10 @@ impl PartialDownload {
                 Ok((file, guard))
             }
             Self::Fresh(guard) => create_partial_file(guard, 0o640).await,
-            Self::Volatile => {
+            Self::Scratch => {
                 let path = CachePaths::global().scratch_file(filename);
                 tokio_tempfile(&path, 0o640).await
             }
-        }
-    }
-}
-
-/// Outcome of [`prepare_partial_resume`]: byte offset, expected total size
-/// from xattr and the file-handle/path state (including validators) to thread
-/// into the download body.
-pub(crate) struct PartialResume {
-    pub(crate) offset: u64,
-    pub(crate) expected_total: Option<u64>,
-    pub(crate) partial: PartialDownload,
-}
-
-impl PartialResume {
-    /// A permanent file with no partial to resume: the download starts at
-    /// byte 0 on the deterministic partial path `guard` reserves.
-    fn fresh(guard: TempPath) -> Self {
-        Self {
-            offset: 0,
-            expected_total: None,
-            partial: PartialDownload::Fresh(guard),
-        }
-    }
-
-    /// A volatile file: no partial-file semantics, the download starts at
-    /// byte 0 into a random temp file.
-    pub(crate) fn volatile() -> Self {
-        Self {
-            offset: 0,
-            expected_total: None,
-            partial: PartialDownload::Volatile,
         }
     }
 }
@@ -248,7 +251,7 @@ impl PartialResume {
 pub(crate) async fn prepare_partial_resume(
     ibarrier: &InitBarrier,
     speaker: ResumeLog,
-) -> Result<PartialResume, PartialOpenFailure> {
+) -> Result<PartialDownload, PartialOpenFailure> {
     let path = partial_path_for_barrier(CachePaths::global(), ibarrier);
     let quota = Some(global_cache_quota().clone());
     prepare_partial_resume_at(path, quota, ibarrier.debname(), ibarrier.mirror(), speaker).await
@@ -300,7 +303,7 @@ async fn prepare_partial_resume_at(
     debname: &str,
     mirror: &deb_mirror::Mirror,
     speaker: ResumeLog,
-) -> Result<PartialResume, PartialOpenFailure> {
+) -> Result<PartialDownload, PartialOpenFailure> {
     let Some(claim) = PartialClaim::acquire(path.clone()) else {
         metrics::PARTIAL_CLAIM_CONTENDED.increment();
         warn_once_or_info!(
@@ -308,7 +311,7 @@ async fn prepare_partial_resume_at(
             speaker.lead("partial"),
             path.display()
         );
-        return Ok(PartialResume::volatile());
+        return Ok(PartialDownload::Scratch);
     };
     match open_partial_file(claim, quota).await {
         Ok((file, size, guard)) if size > 0 => {
@@ -319,7 +322,7 @@ async fn prepare_partial_resume_at(
             let read = || {
                 let xfile = &xattr_helpers::XattrFile(&file);
                 let if_range =
-                    xattr_helpers::read::<ETag>(xfile, &guard).filter(ETag::is_strong)?;
+                    xattr_helpers::read::<ETag>(xfile, &guard).and_then(ETag::into_strong)?;
                 let last_modified = xattr_helpers::read::<LastModified>(xfile, &guard);
                 let expected_total =
                     xattr_helpers::read::<xattr_helpers::ExpectedSize>(xfile, &guard);
@@ -332,7 +335,7 @@ async fn prepare_partial_resume_at(
             };
             if let Some((if_range, last_modified, expected_total)) = validators {
                 let stored = UpstreamMetadata {
-                    etag: Some(if_range),
+                    etag: Some(if_range.as_etag().clone()),
                     last_modified,
                 };
                 let expected_total = expected_total.map(|xattr_helpers::ExpectedSize(size)| size);
@@ -354,29 +357,28 @@ async fn prepare_partial_resume_at(
                     );
                 }
 
-                Ok(PartialResume {
-                    offset: size,
+                Ok(PartialDownload::Resumable(ResumablePartial {
+                    file,
+                    guard,
+                    stored,
+                    offset: std::num::NonZero::new(size).expect("nonempty partial"),
                     expected_total,
-                    partial: PartialDownload::Resumable {
-                        file,
-                        guard,
-                        stored,
-                    },
-                })
+                    validator: if_range,
+                }))
             } else {
                 warn!(
                     "{} download for {debname} from mirror {mirror} lacks a strong upstream ETag, discarding instead of resuming",
                     speaker.lead("partial"),
                 );
                 drop(file);
-                Ok(PartialResume::fresh(guard.renew().await))
+                Ok(PartialDownload::Fresh(guard.renew().await))
             }
         }
-        Ok((_file, _size, guard)) => Ok(PartialResume::fresh(guard)),
+        Ok((_file, _size, guard)) => Ok(PartialDownload::Fresh(guard)),
         // Absence is the overwhelmingly common case and not a failure: start
         // a fresh download on the guard rather than making both backends
         // undo an `Err` identically.
-        Err(PartialOpenError::NotFound(guard)) => Ok(PartialResume::fresh(guard)),
+        Err(PartialOpenError::NotFound(guard)) => Ok(PartialDownload::Fresh(guard)),
         // Recoverable without touching the other names: unlinking ours
         // removes one link, and the fresh download starts on a new inode.
         Err(PartialOpenError::HardLinked { nlink, guard }) => {
@@ -386,7 +388,7 @@ async fn prepare_partial_resume_at(
                 speaker.lead("partial"),
                 guard.display()
             );
-            Ok(PartialResume::fresh(guard.renew().await))
+            Ok(PartialDownload::Fresh(guard.renew().await))
         }
         Err(PartialOpenError::Failed { failure, guard }) => {
             Err(PartialOpenFailure { failure, guard })
@@ -879,7 +881,7 @@ mod tests {
     fn expect_fresh(partial: PartialDownload, why: &str) -> TempPath {
         let guard = match partial {
             PartialDownload::Fresh(guard) => Some(guard),
-            PartialDownload::Volatile | PartialDownload::Resumable { .. } => None,
+            PartialDownload::Scratch | PartialDownload::Resumable(_) => None,
         };
         assert!(guard.is_some(), "expected a fresh download: {why}");
         guard.expect("asserted above")
@@ -918,8 +920,8 @@ mod tests {
         )
         .await
         .expect("no partial is a fresh download");
-        let reserved = resume.partial.reserved_partial(0).expect("a kept partial");
-        let guard = expect_fresh(resume.partial, "no partial on disk");
+        let reserved = resume.reserved_partial().expect("a kept partial");
+        let guard = expect_fresh(resume, "no partial on disk");
         assert!(PartialClaim::acquire(path.clone()).is_none(), "claimed");
 
         drop(guard);
@@ -953,9 +955,9 @@ mod tests {
         )
         .await
         .expect("a scratch download, not a failure");
-        assert_eq!(resume.offset, 0);
-        assert!(matches!(resume.partial, PartialDownload::Volatile));
-        assert!(resume.partial.reserved_partial(0).is_none());
+        assert_eq!(resume.offset(), 0);
+        assert!(matches!(resume, PartialDownload::Scratch));
+        assert!(resume.reserved_partial().is_none());
         assert_eq!(metrics::PARTIAL_CLAIM_CONTENDED.get(), before + 1);
         assert_eq!(
             std::fs::read(&path).expect("read"),
@@ -991,17 +993,21 @@ mod tests {
     /// consistency failure, not a syscall failure: no `CACHE_IO_FAILURE`.
     #[tokio::test]
     async fn into_target_rejects_a_size_mismatch_without_counting_io() {
+        use crate::xattr_helpers::XattrValue as _;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("x.partial");
         tokio::fs::write(&path, b"12345").await.expect("seed");
         let (file, _size, guard) = open_partial_file(claim(&path), None).await.expect("reopen");
         let before = metrics::CACHE_IO_FAILURE.get();
-        let err = PartialDownload::Resumable {
+        let err = PartialDownload::Resumable(ResumablePartial {
             file,
             guard,
-            stored: UpstreamMetadata::default(),
-        }
-        .into_target(Path::new("x.deb"), 4)
+            stored: UpstreamMetadata::from_upstream(Some("\"strong\""), None),
+            offset: crate::nonzero!(4),
+            expected_total: None,
+            validator: ETag::parse("\"strong\"").unwrap().into_strong().unwrap(),
+        })
+        .into_target(Path::new("x.deb"))
         .await
         .expect_err("5 != 4");
         assert_eq!(metrics::CACHE_IO_FAILURE.get(), before);
@@ -1189,9 +1195,9 @@ mod tests {
         .await
         .expect("a hardlinked partial is a fresh download");
         assert_eq!(metrics::PARTIAL_HARDLINKED.get() - before, 1, "counted");
-        assert_eq!(resume.offset, 0);
-        assert_eq!(resume.partial.if_range(), None);
-        let guard = expect_fresh(resume.partial, "a shared inode is never resumed");
+        assert_eq!(resume.offset(), 0);
+        assert_eq!(resume.if_range(), None);
+        let guard = expect_fresh(resume, "a shared inode is never resumed");
         assert!(!path.exists(), "the partial's own name is unlinked");
         assert_eq!(&*guard, path.as_path(), "the guard still reserves the path");
 
@@ -1222,10 +1228,10 @@ mod tests {
         )
         .await
         .expect("a discarded partial is a fresh download");
-        assert_eq!(resume.offset, 0);
-        assert_eq!(resume.expected_total, None);
-        assert_eq!(resume.partial.if_range(), None);
-        let guard = expect_fresh(resume.partial, "no ETag means no resume");
+        assert_eq!(resume.offset(), 0);
+        assert_eq!(resume.expected_total(), None);
+        assert_eq!(resume.if_range(), None);
+        let guard = expect_fresh(resume, "no ETag means no resume");
         assert!(!path.exists(), "the stale partial is unlinked");
         assert_eq!(&*guard, path.as_path(), "the guard still reserves the path");
     }
@@ -1255,14 +1261,14 @@ mod tests {
         )
         .await
         .expect("a discarded partial is a fresh download");
-        assert_eq!(resume.offset, 0);
+        assert_eq!(resume.offset(), 0);
         assert_eq!(
-            resume.partial.if_range(),
+            resume.if_range(),
             None,
             "a weak tag must never be sent as If-Range"
         );
         assert!(
-            matches!(resume.partial, PartialDownload::Fresh(_)),
+            matches!(resume, PartialDownload::Fresh(_)),
             "a weak ETag makes the partial unresumable"
         );
         assert!(!path.exists(), "the stale partial is unlinked");
@@ -1299,16 +1305,16 @@ mod tests {
         )
         .await
         .expect("the partial reopens");
-        assert_eq!(resume.offset, 13);
-        assert_eq!(resume.expected_total, None, "no expected-size xattr");
-        assert_eq!(resume.partial.if_range(), Some("\"strong\""));
+        assert_eq!(resume.offset(), 13);
+        assert_eq!(resume.expected_total(), None, "no expected-size xattr");
+        assert_eq!(resume.if_range(), Some("\"strong\""));
         assert!(
-            matches!(resume.partial, PartialDownload::Resumable { .. }),
+            matches!(resume, PartialDownload::Resumable(_)),
             "a strong ETag makes the partial resumable"
         );
         // Both stored validators ride along, for a `206` that omits them.
         assert_eq!(
-            resume.partial.resumed_validators(),
+            resume.resumed_validators(),
             Some(&UpstreamMetadata::from_upstream(
                 Some("\"strong\""),
                 Some(stored_lm)
@@ -1317,13 +1323,15 @@ mod tests {
 
         // A rejected resume (416 upstream) downgrades to a fresh download on
         // the same path.
-        resume.partial.discard_resume().await;
+        resume.discard_resume().await;
+        assert_eq!(resume.offset(), 0);
+        assert_eq!(resume.expected_total(), None);
         assert!(
-            matches!(resume.partial, PartialDownload::Fresh(_)),
+            matches!(resume, PartialDownload::Fresh(_)),
             "discard_resume yields Fresh"
         );
         assert_eq!(
-            resume.partial.resumed_validators(),
+            resume.resumed_validators(),
             None,
             "a discarded partial's validators describe nothing the download serves"
         );
@@ -1360,13 +1368,13 @@ mod tests {
         )
         .await
         .expect("the partial reopens");
-        assert_eq!(resume.offset, 13);
+        assert_eq!(resume.offset(), 13);
         assert_eq!(
-            resume.expected_total,
+            resume.expected_total(),
             Some(4096),
             "the stored total is what lets a resume detect an upstream size change"
         );
-        assert_eq!(resume.partial.if_range(), Some("\"strong\""));
+        assert_eq!(resume.if_range(), Some("\"strong\""));
     }
 
     /// Every explicit unlink of a kept partial releases its bytes from the
@@ -1396,7 +1404,7 @@ mod tests {
         .await
         .expect("a discarded partial is a fresh download");
         assert_eq!(quota.current_size(), 10 * QUOTA_BLOCK_SIZE);
-        let guard = expect_fresh(resume.partial, "no ETag means no resume");
+        let guard = expect_fresh(resume, "no ETag means no resume");
 
         std::fs::write(&path, b"leftover!").expect("plant leftover");
         let (file, guard) = create_partial_file(guard, 0o640)
@@ -1428,7 +1436,7 @@ mod tests {
         )
         .await
         .expect("an empty partial is a fresh download");
-        assert_eq!(resume.offset, 0);
-        assert!(matches!(resume.partial, PartialDownload::Fresh(_)));
+        assert_eq!(resume.offset(), 0);
+        assert!(matches!(resume, PartialDownload::Fresh(_)));
     }
 }

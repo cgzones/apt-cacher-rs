@@ -76,10 +76,36 @@ impl ETag {
         !etag.starts_with("W/")
     }
 
+    pub(crate) fn into_strong(self) -> Option<StrongETag> {
+        self.is_strong().then_some(StrongETag(self))
+    }
+
     #[cfg(test)]
     pub(crate) fn into_shared(self) -> Arc<str> {
         let Self(etag) = self;
         etag
+    }
+}
+
+/// A validated entity tag suitable for If-Range. Weak tags cannot construct it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StrongETag(ETag);
+
+impl StrongETag {
+    pub(crate) const fn as_etag(&self) -> &ETag {
+        &self.0
+    }
+}
+
+impl AsRef<str> for StrongETag {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for StrongETag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 

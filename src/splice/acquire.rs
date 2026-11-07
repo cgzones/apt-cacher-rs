@@ -641,7 +641,7 @@ pub(super) async fn discard_partial_and_retry(
             exchange,
             conn_details,
             upstream_path,
-            RequestConditions::default(),
+            RequestConditions::Fresh(crate::cache_layout::CachedFlavor::Permanent),
         ))
         .await?;
     }

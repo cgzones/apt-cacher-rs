@@ -355,24 +355,38 @@ pub(crate) struct ResumeState<'a> {
     expected_total: Option<u64>,
     /// The stored `ETag` the request sent as `If-Range`; a 206 naming a
     /// different one is not the representation the partial holds.
-    if_range: Option<&'a str>,
+    if_range: &'a crate::http_etag::StrongETag,
 }
 
 impl<'a> ResumeState<'a> {
-    /// `None` for `offset == 0`: nothing to resume, the request was sent
-    /// without `Range`.
     #[must_use]
-    pub(crate) fn new(
-        offset: u64,
+    pub(crate) const fn new(
+        offset: NonZero<u64>,
         expected_total: Option<u64>,
-        if_range: Option<&'a str>,
-    ) -> Option<Self> {
-        NonZero::new(offset).map(|offset| Self {
+        if_range: &'a crate::http_etag::StrongETag,
+    ) -> Self {
+        Self {
             offset,
             expected_total,
             if_range,
-        })
+        }
     }
+
+    pub(crate) const fn offset(self) -> NonZero<u64> {
+        self.offset
+    }
+    pub(crate) const fn if_range(self) -> &'a crate::http_etag::StrongETag {
+        self.if_range
+    }
+}
+
+/// Mutually exclusive upstream request modes. Revalidation always describes
+/// a volatile cached copy; a resume always carries a strong validator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FetchMode<'a, C> {
+    Fresh(CachedFlavor),
+    Revalidate(C),
+    Resume(ResumeState<'a>),
 }
 
 /// Why a resumed request cannot continue from the partial file.  Every
@@ -762,28 +776,30 @@ impl<C> DownloadPlan<C> {
 
 /// Classify an upstream response.
 ///
-/// `cached` is the stale cached copy a conditional request was sent for
-/// (volatile revalidation); `Some` makes a 304 serve it, `None` relays a 304
-/// like any other non-2xx.  `resume` is the partial a `Range` request was
-/// sent for (permanent files); the two are mutually exclusive by
-/// construction.
+/// `mode` records the request that was sent: an unconditional fetch,
+/// volatile revalidation carrying its cached copy, or a permanent resume.
+/// Revalidation and resume cannot be represented together.
 ///
 /// `Err` reports a resume anomaly: discard the partial, then re-plan through
 /// [`plan_fresh_download`] (see [`ResumeAnomaly::needs_refetch`]).
 pub(crate) fn plan_download<C>(
     head: &UpstreamHead<'_>,
-    resume: Option<ResumeState<'_>>,
-    flavor: CachedFlavor,
-    cached: Option<C>,
+    mode: FetchMode<'_, C>,
     max_object_size: Option<NonZero<u64>>,
 ) -> Result<DownloadPlan<C>, ResumeAnomaly> {
-    debug_assert!(
-        resume.is_none() || cached.is_none(),
-        "a request resumes a permanent partial or revalidates a volatile copy, never both"
-    );
-
-    let Some(resume) = resume else {
-        return Ok(plan_fresh_download(head, flavor, cached, max_object_size));
+    let resume = match mode {
+        FetchMode::Fresh(flavor) => {
+            return Ok(plan_fresh_download(head, flavor, None, max_object_size));
+        }
+        FetchMode::Revalidate(cached) => {
+            return Ok(plan_fresh_download(
+                head,
+                CachedFlavor::Volatile,
+                Some(cached),
+                max_object_size,
+            ));
+        }
+        FetchMode::Resume(resume) => resume,
     };
 
     match head.status {
@@ -792,7 +808,12 @@ pub(crate) fn plan_download<C>(
         StatusCode::PARTIAL_CONTENT => plan_resumed_206(head, resume, max_object_size),
         // 3xx/4xx/5xx: relayed like on a fresh request; the partial is kept
         // for the next attempt.
-        _ => Ok(plan_fresh_download(head, flavor, cached, max_object_size)),
+        _ => Ok(plan_fresh_download(
+            head,
+            CachedFlavor::Permanent,
+            None,
+            max_object_size,
+        )),
     }
 }
 
@@ -805,8 +826,8 @@ fn plan_resumed_206<C>(
     resume: ResumeState<'_>,
     max_object_size: Option<NonZero<u64>>,
 ) -> Result<DownloadPlan<C>, ResumeAnomaly> {
-    if let (Some(etag), Some(if_range)) = (head.etag, resume.if_range)
-        && !etag_strong_match(etag, if_range)
+    if let Some(etag) = head.etag
+        && !etag_strong_match(etag, resume.if_range.as_ref())
     {
         return Err(ResumeAnomaly::ETagMismatch);
     }
@@ -1014,7 +1035,12 @@ mod tests {
         cached: Option<Cached>,
         cap: Option<NonZero<u64>>,
     ) -> DownloadPlan<Cached> {
-        plan_download(head, None, flavor, cached, cap).unwrap()
+        plan_download(
+            head,
+            cached.map_or(FetchMode::Fresh(flavor), FetchMode::Revalidate),
+            cap,
+        )
+        .unwrap()
     }
 
     /// The `If-Range` value every [`resumed`] request carries.
@@ -1028,9 +1054,8 @@ mod tests {
     ) -> Result<DownloadPlan<Cached>, ResumeAnomaly> {
         plan_download(
             head,
-            ResumeState::new(offset, expected_total, Some(IF_RANGE)),
-            CachedFlavor::Permanent,
-            None,
+            resume_state(offset, expected_total)
+                .map_or(FetchMode::Fresh(CachedFlavor::Permanent), FetchMode::Resume),
             cap,
         )
     }
@@ -1043,17 +1068,19 @@ mod tests {
         }
     }
 
+    fn resume_state(offset: u64, expected_total: Option<u64>) -> Option<ResumeState<'static>> {
+        use crate::{http_etag::ETag, xattr_helpers::XattrValue as _};
+        static TAG: std::sync::OnceLock<crate::http_etag::StrongETag> = std::sync::OnceLock::new();
+        let tag = TAG.get_or_init(|| ETag::parse(IF_RANGE).unwrap().into_strong().unwrap());
+        NonZero::new(offset).map(|offset| ResumeState::new(offset, expected_total, tag))
+    }
+
     #[test]
-    fn resume_state_zero_offset_is_none() {
-        assert_eq!(ResumeState::new(0, Some(10), Some(IF_RANGE)), None);
-        assert_eq!(
-            ResumeState::new(5, Some(10), Some(IF_RANGE)),
-            Some(ResumeState {
-                offset: nonzero!(5),
-                expected_total: Some(10),
-                if_range: Some(IF_RANGE),
-            })
-        );
+    fn resume_requires_nonzero_offset_and_strong_validator() {
+        use crate::{http_etag::ETag, xattr_helpers::XattrValue as _};
+        assert_eq!(resume_state(0, Some(10)), None);
+        assert_eq!(resume_state(5, Some(10)).unwrap().offset().get(), 5);
+        assert!(ETag::parse("W/\"weak\"").unwrap().into_strong().is_none());
     }
 
     #[test]

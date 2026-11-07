@@ -98,8 +98,8 @@ use crate::{
     static_assert,
     transfer_error::{CacheError, DeliveryFailure, DownloadFailure, InternalError, UpstreamError},
     upstream_head::{
-        BodyFraming, ContentLength, DownloadPlan, RejectGates, RelayedHeaders, ResumeGates,
-        ResumeState, UpstreamHead, plan_download, plan_fresh_download, resolve_body_framing,
+        BodyFraming, ContentLength, DownloadPlan, FetchMode, RejectGates, RelayedHeaders,
+        ResumeGates, UpstreamHead, plan_download, plan_fresh_download, resolve_body_framing,
     },
     upstream_retry::{self, RetryStop},
     uri_authority,
@@ -1842,9 +1842,7 @@ async fn serve_new_file(
 fn build_fwd_request(
     uri: Uri,
     host: Option<&HeaderValue>,
-    revalidate: Option<&UpstreamMetadata>,
-    resume_offset: u64,
-    resume_if_range: Option<&str>,
+    mode: FetchMode<'_, &UpstreamMetadata>,
 ) -> Request<Empty<bytes::Bytes>> {
     // `Via` names this proxy so a request looping back into it (an
     // `allowed_mirrors` entry covering the proxy's own name) is refused
@@ -1865,10 +1863,10 @@ fn build_fwd_request(
         .body(Empty::new())
         .expect("request should be valid");
 
-    if let Some(UpstreamMetadata {
+    if let FetchMode::Revalidate(UpstreamMetadata {
         etag,
         last_modified,
-    }) = revalidate
+    }) = mode
     {
         // The upstream's own `Last-Modified`, never the local mtime:
         // that only dates the last fetch or revalidation, so a copy
@@ -1896,17 +1894,19 @@ fn build_fwd_request(
         }
     }
 
-    if resume_offset > 0 {
+    if let FetchMode::Resume(resume) = mode {
+        let resume_offset = resume.offset();
         let r = request.headers_mut().append(
             RANGE,
             HeaderValue::try_from(format!("bytes={resume_offset}-")).expect("range value is valid"),
         );
         assert!(!r, "header does not exist by previous construction");
 
-        if let Some(if_range) = resume_if_range {
+        {
+            let if_range = resume.if_range();
             let r = request.headers_mut().append(
                 IF_RANGE,
-                HeaderValue::try_from(if_range).expect("If-Range value is valid"),
+                HeaderValue::try_from(if_range.as_ref()).expect("If-Range value is valid"),
             );
             assert!(!r, "header does not exist by previous construction");
         }
@@ -2027,11 +2027,7 @@ async fn serve_new_file_worker(
 
     // Permanent files only; see `partial_file::PartialDownload` for the
     // open-once and keep-on-drop rules this relies on.
-    let partial_file::PartialResume {
-        offset: resume_offset,
-        expected_total: resume_expected_total,
-        mut partial,
-    } = if conn_details.cached_flavor() == CachedFlavor::Permanent
+    let mut partial = if conn_details.cached_flavor() == CachedFlavor::Permanent
         && matches!(cfstate, CacheFileStat::New)
     {
         match partial_file::prepare_partial_resume(ibarrier, partial_file::ResumeLog::Unprefixed)
@@ -2044,15 +2040,13 @@ async fn serve_new_file_worker(
             }
         }
     } else {
-        partial_file::PartialResume::volatile()
+        partial_file::PartialDownload::Scratch
     };
 
     let fwd_request = build_fwd_request(
         Uri::clone(&req_uri),
         Some(&host),
-        revalidate,
-        resume_offset,
-        partial.if_range(),
+        partial.fetch_mode(conn_details.cached_flavor(), revalidate),
     );
     trace!("Forwarded request: {fwd_request:?}");
 
@@ -2094,9 +2088,7 @@ async fn serve_new_file_worker(
             let redirected_request = build_fwd_request(
                 Uri::clone(&req_uri),
                 Some(&host),
-                revalidate,
-                resume_offset,
-                partial.if_range(),
+                partial.fetch_mode(conn_details.cached_flavor(), revalidate),
             );
 
             trace!("Forwarded redirected request: {redirected_request:?}");
@@ -2157,9 +2149,7 @@ async fn serve_new_file_worker(
 
     let plan = match plan_download(
         &head,
-        ResumeState::new(resume_offset, resume_expected_total, partial.if_range()),
-        conn_details.cached_flavor(),
-        cached,
+        partial.fetch_mode(conn_details.cached_flavor(), cached),
         config.max_object_size,
     ) {
         Ok(plan) => {
@@ -2178,7 +2168,7 @@ async fn serve_new_file_worker(
                     "Failed to resume {} from mirror {}: {}",
                     conn_details.debname,
                     conn_details.mirror,
-                    anomaly.detail(resume_offset)
+                    anomaly.detail(partial.offset())
                 ),
             );
             partial.discard_resume().await;
@@ -2188,8 +2178,11 @@ async fn serve_new_file_worker(
                 // discarded, so from the upstream's perspective this is a
                 // fresh unconditional fetch (no If-Modified-Since, no
                 // If-None-Match, no Range).
-                let retry_request =
-                    build_fwd_request(Uri::clone(&req_uri), Some(&host), None, 0, None);
+                let retry_request = build_fwd_request(
+                    Uri::clone(&req_uri),
+                    Some(&host),
+                    FetchMode::Fresh(conn_details.cached_flavor()),
+                );
 
                 (
                     UpstreamExchange {
@@ -2407,7 +2400,7 @@ async fn serve_new_file_worker(
         global_cache_quota().acquire_for_cleanup(
             total_content_length,
             prev_file_size,
-            partial.reserved_partial(resume_offset),
+            partial.reserved_partial(),
             &conn_details.debname,
         )
     } else {
@@ -2416,7 +2409,7 @@ async fn serve_new_file_worker(
         match global_cache_quota().try_acquire(
             total_content_length,
             prev_file_size,
-            partial.reserved_partial(resume_offset),
+            partial.reserved_partial(),
             &conn_details.debname,
         ) {
             Ok(r) => r,
@@ -2454,7 +2447,7 @@ async fn serve_new_file_worker(
     // Create/open the output file: partial path for permanent files, random temp for volatile.
     // Defuse the guard once we take ownership of the partial path — from here on, the
     // download's own `OnDrop::Keep` TempPath manages the file lifetime.
-    let (outfile, outpath) = partial.into_target(filename, resume_offset).await?;
+    let (outfile, outpath) = partial.into_target(filename).await?;
     // Persist the validators (and the expected total, so a resume can detect
     // an upstream change) early, so they survive an interrupted download.
     // Only a permanent `.partial` is ever resumed
@@ -2967,7 +2960,11 @@ async fn pre_process_client_request(
         .uri
         .authority()
         .map(|_| host_header_from_uri(&parts.uri));
-    let fwd_request = build_fwd_request(parts.uri, host.as_ref(), None, 0, None);
+    let fwd_request = build_fwd_request(
+        parts.uri,
+        host.as_ref(),
+        FetchMode::Fresh(CachedFlavor::Permanent),
+    );
 
     trace!("Forwarded request: {fwd_request:?}");
 
@@ -3389,6 +3386,9 @@ fn log_client_connection_error(client: ClientInfo, err: &hyper::Error) {
 #[cfg(test)]
 mod tests {
     use super::{LoggedHeaderValue, SchemeDecision, UpgradeProbe, Uri, host_header_from_uri};
+    use crate::{
+        cache_layout::CachedFlavor, upstream_head::FetchMode, xattr_helpers::XattrValue as _,
+    };
 
     fn connect_server(
         config: crate::config::Config,
@@ -3556,7 +3556,11 @@ mod tests {
 
         let uri: Uri = "http://mirror.example/package.deb".parse().unwrap();
         let host = host_header_from_uri(&uri);
-        let fresh = super::build_fwd_request(uri.clone(), Some(&host), None, 0, None);
+        let fresh = super::build_fwd_request(
+            uri.clone(),
+            Some(&host),
+            FetchMode::Fresh(CachedFlavor::Permanent),
+        );
         assert_eq!(fresh.method(), Method::GET);
         assert_eq!(fresh.uri(), &uri);
         assert_eq!(
@@ -3582,13 +3586,25 @@ mod tests {
         let metadata =
             crate::cache_metadata::UpstreamMetadata::from_upstream(Some("\"v1\""), Some(date));
         let conditional =
-            super::build_fwd_request(uri.clone(), Some(&host), Some(&metadata), 0, None);
+            super::build_fwd_request(uri.clone(), Some(&host), FetchMode::Revalidate(&metadata));
         assert_eq!(conditional.headers()[IF_MODIFIED_SINCE], date);
         assert_eq!(conditional.headers()[IF_NONE_MATCH], "\"v1\"");
         assert_eq!(conditional.headers()[CACHE_CONTROL], "max-age=300");
         assert!(!conditional.headers().contains_key(RANGE));
 
-        let resumed = super::build_fwd_request(uri, Some(&host), None, 40, Some("\"v1\""));
+        let tag = crate::http_etag::ETag::parse("\"v1\"")
+            .unwrap()
+            .into_strong()
+            .unwrap();
+        let resumed = super::build_fwd_request(
+            uri,
+            Some(&host),
+            FetchMode::Resume(crate::upstream_head::ResumeState::new(
+                crate::nonzero!(40),
+                None,
+                &tag,
+            )),
+        );
         assert_eq!(resumed.headers()[RANGE], "bytes=40-");
         assert_eq!(resumed.headers()[IF_RANGE], "\"v1\"");
         assert!(!resumed.headers().contains_key(IF_NONE_MATCH));

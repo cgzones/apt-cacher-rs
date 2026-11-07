@@ -131,7 +131,7 @@ pub(super) async fn handle_volatile_buffered_download(
         client,
         conn_details,
         upstream_resp,
-        partial_file::PartialDownload::Volatile,
+        partial_file::PartialDownload::Scratch,
         0,
         total_content_length,
         prev_file_size,

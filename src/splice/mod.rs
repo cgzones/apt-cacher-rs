@@ -86,8 +86,7 @@ use crate::transfer_error::{
     ReportedDownloadFailure, ReportedUpstream, UpstreamError,
 };
 use crate::upstream_head::{
-    ContentLength, DownloadPlan, RejectReason, ResumeGates, ResumeState, plan_download,
-    plan_fresh_download,
+    ContentLength, DownloadPlan, RejectReason, ResumeGates, plan_download, plan_fresh_download,
 };
 use crate::{
     AppState,
@@ -113,7 +112,7 @@ use body::{
 };
 use commit::{CompletionBytes, Served};
 use detached::DetachedDownload;
-use http::{RequestConditions, UpstreamRequest, UpstreamResponse};
+use http::{UpstreamRequest, UpstreamResponse};
 use simple_proxy::rewrite_simple_proxy_headers;
 use upstream::{ConnLabel, ResponseBody};
 use volatile::handle_volatile_buffered_download;
@@ -400,7 +399,7 @@ struct HeadValidators {
 /// cache directory, the quota reservation, the temp/partial file per
 /// `partial`, the validator xattrs (plus the expected size on a permanent
 /// file), and the `InitBarrier -> DownloadBarrier` transition. Shared by the streaming drive and the
-/// buffered volatile path (which always passes `PartialDownload::Volatile`).
+/// buffered volatile path (which always passes `PartialDownload::Scratch`).
 ///
 /// `prev_file_size` is the size of the cached copy the commit replaces (the
 /// bytes the overwrite frees), `0` when there is none: the size
@@ -455,7 +454,7 @@ async fn prepare_cache_target(
         global_cache_quota().acquire_for_cleanup(
             ContentLength::Exact(total_content_length),
             prev_file_size,
-            partial.reserved_partial(resume_offset),
+            partial.reserved_partial(),
             &conn_details.debname,
         )
     } else {
@@ -464,7 +463,7 @@ async fn prepare_cache_target(
         match global_cache_quota().try_acquire(
             ContentLength::Exact(total_content_length),
             prev_file_size,
-            partial.reserved_partial(resume_offset),
+            partial.reserved_partial(),
             &conn_details.debname,
         ) {
             Ok(r) => r,
@@ -491,7 +490,7 @@ async fn prepare_cache_target(
     let target_file = partial.target_file();
     let (mut ibarrier, (tempfile, temppath, last_modified, cache_time)) = ibarrier
         .run(async |_barrier| {
-            let (tempfile, temppath) = partial.into_target(filename, resume_offset).await?;
+            let (tempfile, temppath) = partial.into_target(filename).await?;
             let (last_modified, cache_time): (LastModified, HttpDate) = if let Some(value) =
                 download_meta.last_modified.as_ref()
             {
@@ -678,9 +677,9 @@ async fn reject_if_verify_throttled(
 async fn open_partial_resume(
     ibarrier: &InitBarrier,
     conn_details: &ConnectionDetails,
-) -> Result<partial_file::PartialResume, DownloadFailure> {
+) -> Result<partial_file::PartialDownload, DownloadFailure> {
     if conn_details.cached_flavor() != CachedFlavor::Permanent {
-        return Ok(partial_file::PartialResume::volatile());
+        return Ok(partial_file::PartialDownload::Scratch);
     }
     match partial_file::prepare_partial_resume(ibarrier, partial_file::ResumeLog::SpliceProxy).await
     {
@@ -777,7 +776,7 @@ async fn plan_upstream_response(
     conn_details: &ConnectionDetails,
     host_authority: &str,
     upstream_path: &str,
-    resume: &mut partial_file::PartialResume,
+    resume: &mut partial_file::PartialDownload,
     volatile_cond: Option<&VolatileCondHeaders>,
     stale: Option<StaleCopy>,
 ) -> Result<(UpstreamExchange, DownloadPlan<StaleCopy>), UpstreamError> {
@@ -788,7 +787,7 @@ async fn plan_upstream_response(
             exchange,
             conn_details,
             upstream_path,
-            RequestConditions::new(resume.offset, resume.partial.if_range(), volatile_cond),
+            resume.fetch_mode(conn_details.cached_flavor(), volatile_cond),
         ))
         .await?
     } else {
@@ -809,13 +808,7 @@ async fn plan_upstream_response(
 
     match plan_download(
         &exchange.response.head(),
-        ResumeState::new(
-            resume.offset,
-            resume.expected_total,
-            resume.partial.if_range(),
-        ),
-        conn_details.cached_flavor(),
-        stale,
+        resume.fetch_mode(conn_details.cached_flavor(), stale),
         global_config().max_object_size,
     ) {
         Ok(plan) => Ok((exchange, plan)),
@@ -827,7 +820,7 @@ async fn plan_upstream_response(
                     "splice proxy: failed to resume {} from mirror {}: {}",
                     conn_details.debname,
                     conn_details.mirror,
-                    anomaly.detail(resume.offset)
+                    anomaly.detail(resume.offset())
                 ),
             );
             if anomaly.needs_refetch() {
@@ -846,7 +839,7 @@ async fn plan_upstream_response(
                     },
                 );
                 exchange = Box::pin(discard_partial_and_retry(
-                    &mut resume.partial,
+                    resume,
                     upstream_endpoint,
                     host_authority,
                     upstream_path,
@@ -860,7 +853,7 @@ async fn plan_upstream_response(
                 // final response too).
                 exchange.response.discard_invalid_validators(conn_details);
             } else {
-                resume.partial.discard_resume().await;
+                resume.discard_resume().await;
             }
             // A resume never revalidates: there is no cached copy to serve.
             let plan = plan_fresh_download(
@@ -1421,11 +1414,8 @@ pub(crate) async fn splice_proxy(
                 UpstreamRequest {
                     authority: &host_authority,
                     path: upstream_path,
-                    conditions: RequestConditions::new(
-                        resume.offset,
-                        resume.partial.if_range(),
-                        volatile_cond.as_ref(),
-                    ),
+                    conditions: resume
+                        .fetch_mode(conn_details.cached_flavor(), volatile_cond.as_ref()),
                 },
                 None,
             )
@@ -1631,7 +1621,7 @@ pub(crate) async fn splice_proxy(
         client,
         conn_details,
         &upstream_resp,
-        resume.partial,
+        resume,
         resume_offset,
         total_content_length,
         prev_file_size,
