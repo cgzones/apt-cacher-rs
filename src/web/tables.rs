@@ -1324,15 +1324,20 @@ mod tests {
             },
         ));
         started.await.expect("old walk started");
-        let new = tokio::spawn({
-            let walks = Arc::clone(&walks);
-            async move {
-                cached_dir_stats(dir, Footprint::with_host_dir("new"), counted_walk(&walks)).await
-            }
-        });
+        let mut new = std::pin::pin!(cached_dir_stats(
+            dir,
+            Footprint::with_host_dir("new"),
+            counted_walk(&walks),
+        ));
+        assert!(
+            new.as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                .is_pending(),
+            "the newer load waits for the older walk"
+        );
         release.send(()).expect("old walk is waiting");
         assert_eq!(old.await.expect("old load").files(), 1);
-        assert_eq!(new.await.expect("new load").files(), 7);
+        assert_eq!(new.await.files(), 7);
         assert_eq!(
             walks.load(Ordering::SeqCst),
             1,
