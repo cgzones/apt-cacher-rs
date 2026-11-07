@@ -358,7 +358,8 @@ pub(crate) async fn pool_reaper() {
 ///
 /// Expires only this key's entries (at most [`UPSTREAM_POOL_MAX_IDLE_PER_HOST`]);
 /// [`pool_reaper`] handles other keys. Drop removed sockets outside the lock.
-fn pool_return(host: &ClientHost, port: u16, is_tls: bool, conn: UpstreamConn) {
+fn pool_return(host: &ClientHost, port: u16, conn: UpstreamConn) {
+    let is_tls = conn.is_tls();
     let mut map = upstream_pool().lock();
     let now = coarsetime::Instant::now();
     let conns = map.entry((host.clone(), port, is_tls)).or_default();
@@ -427,8 +428,7 @@ impl ResponseBody {
             keep_alive,
         } = self;
         if keep_alive {
-            let is_tls = conn.is_tls();
-            pool_return(&host, port, is_tls, conn);
+            pool_return(&host, port, conn);
         }
     }
 }
@@ -1089,8 +1089,8 @@ mod tests {
         drop(dead_peer);
         let host = test_host("pool-checkout-skips-dead.invalid");
 
-        pool_return(&host, 80, false, UpstreamConn::Tcp(live));
-        pool_return(&host, 80, false, UpstreamConn::Tcp(dead));
+        pool_return(&host, 80, UpstreamConn::Tcp(live));
+        pool_return(&host, 80, UpstreamConn::Tcp(dead));
 
         let conn = if let PoolCheckout::Live(conn) = pool_checkout(&host, 80, false) {
             Some(conn)
@@ -1118,7 +1118,7 @@ mod tests {
         drop(dead_peer);
         let host = test_host("pool-checkout-all-dead.invalid");
 
-        pool_return(&host, 80, false, UpstreamConn::Tcp(dead));
+        pool_return(&host, 80, UpstreamConn::Tcp(dead));
 
         assert!(matches!(
             pool_checkout(&host, 80, false),
@@ -1199,7 +1199,7 @@ mod tests {
             }],
         );
 
-        pool_return(&fresh_host, 80, false, UpstreamConn::Tcp(fresh));
+        pool_return(&fresh_host, 80, UpstreamConn::Tcp(fresh));
 
         let count = upstream_pool()
             .lock()
