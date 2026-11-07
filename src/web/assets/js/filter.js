@@ -32,21 +32,6 @@
     }
   }
 
-  /* `name` identifies the control for autofill and devtools; nothing is
-   * ever submitted (the page has no form, and the CSP forbids one). */
-  function searchBox(name, label, value) {
-    return ACR.el("input", {
-      type: "search",
-      name: name,
-      class: "filter-text",
-      placeholder: "Filter",
-      "aria-label": label,
-      autocomplete: "off",
-      spellcheck: "false",
-      value: value
-    });
-  }
-
   /* ---- Row tables -------------------------------------------------------- */
 
   function filterTable(table, box, shown) {
@@ -73,7 +58,7 @@
     const heading = ACR.sectionOf(table);
     const title = heading ? heading.querySelector("h2") : null;
     const label = "Filter " + (title ? title.textContent : key) + " rows";
-    const box = searchBox("filter-" + key, label, tableTerms.get(key) || "");
+    const box = ACR.searchBox("filter-" + key, label, tableTerms.get(key) || "");
     const shown = ACR.el("span", { class: "filter-shown", role: "status" });
     const bar = ACR.el("div", { class: "filter" });
     bar.append(box, shown);
@@ -150,7 +135,7 @@
     }
     details.setAttribute("data-filtered", "");
     const shown = ACR.el("span", { class: "filter-shown", role: "status" });
-    const box = searchBox("filter-metrics", "Filter metrics by name or explanation", metrics.text);
+    const box = ACR.searchBox("filter-metrics", "Filter metrics by name or explanation", metrics.text);
     const refilter = function () {
       filterMetrics(details, shown);
     };

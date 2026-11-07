@@ -85,6 +85,21 @@ const ACR = (function () {
     return node;
   }
 
+  /* `name` identifies the control for autofill and devtools; nothing is
+   * ever submitted (the page has no form, and the CSP forbids one). */
+  function searchBox(name, label, value) {
+    return el("input", {
+      type: "search",
+      name: name,
+      class: "filter-text",
+      placeholder: "Filter",
+      "aria-label": label,
+      autocomplete: "off",
+      spellcheck: "false",
+      value: value
+    });
+  }
+
   /* An SVG element; geometry goes in attributes, colour in classes. */
   function svg(tag, attrs) {
     return setAttrs(document.createElementNS(SVG_NS, tag), attrs);
@@ -358,6 +373,7 @@ const ACR = (function () {
   return Object.freeze({
     store: store,
     el: el,
+    searchBox: searchBox,
     svg: svg,
     all: all,
     findWithin: findWithin,

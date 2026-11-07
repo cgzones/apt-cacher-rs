@@ -142,15 +142,7 @@
       view.level = level.value;
       apply();
     });
-    const text = ACR.el("input", {
-      type: "search",
-      name: "filter-logs",
-      class: "filter-text",
-      placeholder: "Filter",
-      "aria-label": "Filter log entries",
-      autocomplete: "off",
-      spellcheck: "false"
-    });
+    const text = ACR.searchBox("filter-logs", "Filter log entries");
     text.addEventListener("input", function () {
       view.text = text.value;
       apply();
