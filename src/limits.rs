@@ -926,18 +926,20 @@ mod tests {
 
     #[tokio::test]
     async fn read_line_capped_reuses_line_buf_across_calls() {
-        // The whole point of accepting `line_buf` by &mut is to reuse its
-        // capacity across calls. Verify that a second call to the same buffer
-        // does not re-allocate by checking the capacity does not shrink and
-        // a previously-grown allocation is reused.
+        // Both lines fit in the caller's allocation. Each read must retain
+        // that storage and capacity for the next call.
         let input = b"first\nsecond\n";
         let mut reader = tokio::io::BufReader::new(&input[..]);
-        let mut line_buf = Vec::with_capacity(64);
+        let mut line_buf = Vec::<u8>::with_capacity(64);
         let cap_before = line_buf.capacity();
+        let address_before = line_buf.as_ptr().addr();
 
-        let _: CappedLine<'_> = read_line_capped(&mut reader, &mut line_buf, 64)
+        let result = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect("first line");
+        assert!(matches!(result, CappedLine::Line(b"first\n")), "{result:?}");
+        assert_eq!(line_buf.as_ptr().addr(), address_before);
+        assert_eq!(line_buf.capacity(), cap_before);
         let result = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect("second line");
@@ -946,7 +948,8 @@ mod tests {
             "{result:?}"
         );
 
-        assert!(line_buf.capacity() >= cap_before);
+        assert_eq!(line_buf.as_ptr().addr(), address_before);
+        assert_eq!(line_buf.capacity(), cap_before);
     }
 
     #[test]
