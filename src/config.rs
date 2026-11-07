@@ -213,7 +213,7 @@ impl<'de> Deserialize<'de> for ConfigDomainName {
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum DomainNameInner {
     Dns(std::sync::Arc<str>),
-    Ipv4(std::sync::Arc<str>, Ipv4Addr),
+    Ipv4(std::sync::Arc<str>),
     Ipv6(std::sync::Arc<str>, Ipv6Addr),
 }
 
@@ -261,7 +261,7 @@ impl DomainName {
         }
 
         if let Ok(addr) = domain.parse::<Ipv4Addr>() {
-            return Ok(Self(DomainNameInner::Ipv4(addr.to_string().into(), addr)));
+            return Ok(Self(DomainNameInner::Ipv4(addr.to_string().into())));
         }
 
         // At this point we've already proven there's no `:` and the string
@@ -288,7 +288,7 @@ impl DomainName {
     fn ipv6(text: &str) -> Result<Self, HostError> {
         match text.parse::<Ipv6Addr>() {
             Ok(addr) => Ok(match addr.to_ipv4_mapped() {
-                Some(v4) => Self(DomainNameInner::Ipv4(v4.to_string().into(), v4)),
+                Some(v4) => Self(DomainNameInner::Ipv4(v4.to_string().into())),
                 None => Self(DomainNameInner::Ipv6(addr.to_string().into(), addr)),
             }),
             Err(_err @ std::net::AddrParseError { .. }) => {
@@ -312,7 +312,7 @@ impl DomainName {
     const fn is_dns(&self) -> bool {
         match self {
             Self(DomainNameInner::Dns(_)) => true,
-            Self(DomainNameInner::Ipv4(..) | DomainNameInner::Ipv6(..)) => false,
+            Self(DomainNameInner::Ipv4(_) | DomainNameInner::Ipv6(..)) => false,
         }
     }
 
@@ -323,7 +323,7 @@ impl DomainName {
     const fn is_ipv6_link_local(&self) -> bool {
         match self {
             Self(DomainNameInner::Ipv6(_, addr)) => addr.is_unicast_link_local(),
-            Self(DomainNameInner::Dns(_) | DomainNameInner::Ipv4(..)) => false,
+            Self(DomainNameInner::Dns(_) | DomainNameInner::Ipv4(_)) => false,
         }
     }
 
@@ -332,7 +332,7 @@ impl DomainName {
     #[inline]
     pub(crate) const fn is_ipv6(&self) -> bool {
         match self {
-            Self(DomainNameInner::Dns(_) | DomainNameInner::Ipv4(..)) => false,
+            Self(DomainNameInner::Dns(_) | DomainNameInner::Ipv4(_)) => false,
             Self(DomainNameInner::Ipv6(..)) => true,
         }
     }
@@ -342,7 +342,7 @@ impl DomainName {
     pub(crate) fn as_str(&self) -> &str {
         match self {
             Self(
-                DomainNameInner::Dns(s) | DomainNameInner::Ipv4(s, _) | DomainNameInner::Ipv6(s, _),
+                DomainNameInner::Dns(s) | DomainNameInner::Ipv4(s) | DomainNameInner::Ipv6(s, _),
             ) => s,
         }
     }
@@ -449,7 +449,7 @@ impl From<DomainName> for String {
     fn from(val: DomainName) -> Self {
         match val {
             DomainName(
-                DomainNameInner::Dns(s) | DomainNameInner::Ipv4(s, _) | DomainNameInner::Ipv6(s, _),
+                DomainNameInner::Dns(s) | DomainNameInner::Ipv4(s) | DomainNameInner::Ipv6(s, _),
             ) => Self::from(&*s),
         }
     }
@@ -474,7 +474,7 @@ impl<'q> sqlx::Encode<'q, sqlx::Sqlite> for DomainName {
         // encoder preserves this storage; Arc's encode_by_ref copies the text.
         let text = match &self.0 {
             DomainNameInner::Dns(text)
-            | DomainNameInner::Ipv4(text, _)
+            | DomainNameInner::Ipv4(text)
             | DomainNameInner::Ipv6(text, _) => std::sync::Arc::clone(text),
         };
         <std::sync::Arc<str> as sqlx::Encode<'q, sqlx::Sqlite>>::encode(text, buf)
