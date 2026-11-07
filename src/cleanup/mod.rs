@@ -114,7 +114,9 @@ async fn prune_stale_rows(database: &Database, config: &Config) {
         return;
     }
     let count = gone.len();
-    let kept = match database_task::delete_mirrors(gone.iter().map(|&(id, _)| id).collect()).await {
+    let mut kept = match database_task::delete_mirrors(gone.iter().map(|&(id, _)| id).collect())
+        .await
+    {
         Ok(kept) => kept,
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
@@ -125,8 +127,9 @@ async fn prune_stale_rows(database: &Database, config: &Config) {
             return;
         }
     };
+    kept.sort_unstable();
     for (id, mirror) in gone {
-        if kept.contains(&id) {
+        if kept.binary_search(&id).is_ok() {
             info!(
                 "Keeping mirror row {mirror} without origins or cached files; it was used during this cleanup run"
             );

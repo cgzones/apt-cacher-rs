@@ -337,7 +337,7 @@ async fn stage(
         DatabaseCommand::DeleteMirrors(ids, reply) => {
             // A staged row is newer than the caller's "unused" verdict:
             // keep that mirror, and its row flushes as usual.
-            let (kept, gone): (Vec<i64>, Vec<i64>) =
+            let (kept, mut gone): (Vec<i64>, Vec<i64>) =
                 ids.into_iter().partition(|&id| buf.stages_mirror(id));
             // The requester logs and counts a failure.
             let result = if gone.is_empty() {
@@ -346,7 +346,8 @@ async fn stage(
                 db.delete_mirrors(&gone).await
             };
             if result.is_ok() {
-                cache.retain(|_, entry| !gone.contains(&entry.id));
+                gone.sort_unstable();
+                cache.retain(|_, entry| gone.binary_search(&entry.id).is_err());
                 metrics::DB_MIRROR_CACHE_ENTRIES.set(cache.len() as u64);
             }
             if reply.send(result.map(|()| kept)).is_err() {
