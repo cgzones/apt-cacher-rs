@@ -255,16 +255,6 @@ struct Open<T> {
     batch: Batch,
 }
 
-/// The entry most recently yielded, kept so the [`Entry`] handed out can
-/// borrow it.
-#[derive(Debug)]
-struct Yielded {
-    name: OsString,
-    listing: Arc<DirEntry>,
-    kind: EntryKind,
-    metadata: Option<io::Result<Metadata>>,
-}
-
 /// An iterative depth-first walk over one cache tree.  See the module doc.
 #[derive(Debug)]
 pub(crate) struct Walker<T> {
@@ -276,10 +266,9 @@ pub(crate) struct Walker<T> {
     confined_to: Option<PathBuf>,
     pending: Vec<Frame<T>>,
     current: Option<Open<T>>,
-    yielded: Option<Yielded>,
-    /// Set by [`Entry::descend`]; consumed at the start of the next
-    /// [`Walker::next`] call, when the yielded entry is known to be a dir.
-    descend: Option<T>,
+    /// Set by [`Entry::descend`]; queued at the start of the next
+    /// [`Walker::next`] call, then opened after the current directory.
+    descend: Option<Frame<T>>,
     root_missing: bool,
     aborted: Option<(Logged, io::Error)>,
     /// See [`Walker::io_failures`].
@@ -308,7 +297,6 @@ impl<T: Copy + Send> Walker<T> {
                 tag: root_tag,
             }],
             current: None,
-            yielded: None,
             descend: None,
             root_missing: false,
             aborted: None,
@@ -348,18 +336,11 @@ impl<T: Copy + Send> Walker<T> {
     /// Yield the next entry, or `None` once every directory the caller
     /// descended into has been read (or the walk aborted).
     pub(crate) async fn next(&mut self) -> Option<Entry<'_, T>> {
-        if let Some(tag) = self.descend.take()
-            && let (Some(open), Some(yielded)) = (&self.current, &self.yielded)
-        {
-            self.pending.push(Frame {
-                path: open.frame.path.join(&yielded.name),
-                rel: open.frame.rel.join(&yielded.name),
-                tag,
-            });
+        if let Some(frame) = self.descend.take() {
+            self.pending.push(frame);
         }
-        self.yielded = None;
 
-        let yielded = loop {
+        let (name, listing, kind, metadata) = loop {
             if self.aborted.is_some() {
                 return None;
             }
@@ -382,12 +363,7 @@ impl<T: Copy + Send> Walker<T> {
                     file_type,
                     &mut self.io_failures,
                 ) {
-                    break Yielded {
-                        name,
-                        listing,
-                        kind,
-                        metadata,
-                    };
+                    break (name, listing, kind, metadata);
                 }
             } else if let Some(err) = open.batch.failed.take() {
                 let open = self.current.take()?;
@@ -413,13 +389,6 @@ impl<T: Copy + Send> Walker<T> {
             }
         };
 
-        self.yielded = Some(yielded);
-        let Yielded {
-            name,
-            listing,
-            kind,
-            metadata,
-        } = self.yielded.as_ref()?;
         let open = self.current.as_ref()?;
         Some(Entry {
             ctx: self.ctx,
@@ -428,8 +397,8 @@ impl<T: Copy + Send> Walker<T> {
             listing,
             rel_dir: &open.frame.rel,
             tag: open.frame.tag,
-            kind: *kind,
-            prefetched: metadata.as_ref(),
+            kind,
+            prefetched: metadata,
             descend: &mut self.descend,
             io_failures: &mut self.io_failures,
         })
@@ -607,22 +576,22 @@ fn classify(
     }
 }
 
-/// One listed entry, borrowed from the [`Walker`] until the next
-/// [`Walker::next`] call.
+/// One owned listed entry, borrowing its parent paths and bookkeeping
+/// from the [`Walker`] until the next [`Walker::next`] call.
 #[derive(Debug)]
 pub(crate) struct Entry<'w, T> {
     ctx: &'static WalkContext,
     /// Full path of the directory holding the entry.
     dir: &'w Path,
-    name: &'w OsStr,
+    name: OsString,
     /// The listing's entry, for the on-demand lstat (see [`Listed`]).
-    listing: &'w Arc<DirEntry>,
+    listing: Arc<DirEntry>,
     rel_dir: &'w Path,
     tag: T,
     kind: EntryKind,
     /// The lstat taken while listing, in a [`Walker::stat_files`] walk.
-    prefetched: Option<&'w io::Result<Metadata>>,
-    descend: &'w mut Option<T>,
+    prefetched: Option<io::Result<Metadata>>,
+    descend: &'w mut Option<Frame<T>>,
     /// The walker's [`Walker::io_failures`], bumped by a failed
     /// [`Entry::metadata`].
     io_failures: &'w mut u64,
@@ -637,7 +606,7 @@ impl<T: Copy + Send> Entry<'_, T> {
     /// The entry's file name, verbatim (may not be UTF-8).
     #[must_use]
     pub(crate) fn name(&self) -> &OsStr {
-        self.name
+        &self.name
     }
 
     /// The tag of the directory holding this entry.
@@ -649,7 +618,7 @@ impl<T: Copy + Send> Entry<'_, T> {
     /// Full path of the entry.
     #[must_use]
     pub(crate) fn path(&self) -> PathBuf {
-        self.dir.join(self.name)
+        self.dir.join(&self.name)
     }
 
     /// Path of the entry relative to the walk root (`"a.deb"` for a root
@@ -657,19 +626,23 @@ impl<T: Copy + Send> Entry<'_, T> {
     /// gives [`Entry::path`].
     #[must_use]
     pub(crate) fn rel_path(&self) -> PathBuf {
-        self.rel_dir.join(self.name)
+        self.rel_dir.join(&self.name)
     }
 
     /// Ask the walker to read this directory's contents (after the current
     /// directory), tagging every entry in it with `tag`.  Ignored for
-    /// anything but a directory.
+    /// anything but a directory. Repeated calls use the final tag.
     pub(crate) fn descend(&mut self, tag: T) {
         debug_assert!(
             self.kind == EntryKind::Dir,
             "only a directory can be descended into"
         );
         if self.kind == EntryKind::Dir {
-            *self.descend = Some(tag);
+            *self.descend = Some(Frame {
+                path: self.path(),
+                rel: self.rel_path(),
+                tag,
+            });
         }
     }
 
@@ -715,10 +688,10 @@ impl<T: Copy + Send> Entry<'_, T> {
     /// [`Walker::io_failures`]).
     pub(crate) async fn metadata(&mut self) -> Option<Metadata> {
         let on_demand;
-        let result = if let Some(prefetched) = self.prefetched {
+        let result = if let Some(prefetched) = self.prefetched.as_ref() {
             prefetched.as_ref()
         } else {
-            let listing = Arc::clone(self.listing);
+            let listing = Arc::clone(&self.listing);
             on_demand = tokio::task::spawn_blocking(move || listing.metadata())
                 .await
                 .unwrap_or_else(|err| Err(io::Error::other(err)));
@@ -896,6 +869,9 @@ mod tests {
             let meta = entry.metadata().await.expect("stat");
             assert_eq!(meta.len(), 5);
             assert!(meta.is_file());
+
+            std::fs::write(entry.path(), b"x").expect("replace contents");
+            assert_eq!(entry.metadata().await.expect("fresh stat").len(), 1);
         }
         assert!(walker.next().await.is_none());
     }
@@ -919,6 +895,28 @@ mod tests {
             ],
             "each entry carries the tag of the directory holding it"
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_descend_visits_the_directory_once_with_the_final_tag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("sub")).expect("sub");
+        std::fs::write(dir.path().join("sub/f"), b"x").expect("f");
+
+        let mut walker = Walker::new(dir.path(), &CONTINUE, OnMissing::Fail, 0u8);
+        {
+            let mut entry = walker.next().await.expect("sub");
+            assert_eq!(entry.kind(), EntryKind::Dir);
+            entry.descend(1);
+            entry.descend(2);
+        }
+        {
+            let entry = walker.next().await.expect("f");
+            assert_eq!(entry.rel_path(), Path::new("sub/f"));
+            assert_eq!(entry.tag(), 2);
+        }
+        assert!(walker.next().await.is_none(), "sub is visited only once");
+        assert!(matches!(walker.finish(), WalkOutcome::Complete));
     }
 
     /// A directory larger than one listing batch is read across several
@@ -977,6 +975,10 @@ mod tests {
                     let meta = entry.metadata().await.expect("prefetched stat");
                     assert_eq!(meta.len(), 5);
                     assert!(meta.is_file());
+                    assert_eq!(
+                        entry.metadata().await.expect("same prefetched stat").len(),
+                        5
+                    );
                 }
                 EntryKind::Dir | EntryKind::NonRegular => {
                     assert_eq!(entry.kind(), EntryKind::Dir, "no non-regular entry exists");
