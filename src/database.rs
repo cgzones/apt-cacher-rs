@@ -1080,7 +1080,9 @@ impl Database {
     /// Issues one UPDATE per chunk: a CTE injects all pairs as a single
     /// `VALUES` clause, then the UPDATE joins on it and uses `MAX(existing, new)`
     /// so flushes are idempotent even if a stale timestamp arrives after a
-    /// fresh one. Chunked by [`SQLITE_MAX_BIND_PARAMETERS`]; all chunks share
+    /// fresh one. `UPDATE FROM` scans the values once and looks up each target
+    /// by primary key, avoiding a correlated values scan for every row.
+    /// Chunked by [`SQLITE_MAX_BIND_PARAMETERS`]; all chunks share
     /// one transaction. Returns the total rows affected.
     pub(crate) async fn batch_update_mirror_last_seen(
         &self,
@@ -1103,9 +1105,8 @@ impl Database {
             });
             qb.push(
                 ") UPDATE mirrors_v2 \
-                  SET last_seen = MAX(last_seen, \
-                      (SELECT ts FROM new_seen WHERE new_seen.id = mirrors_v2.id)) \
-                  WHERE id IN (SELECT id FROM new_seen)",
+                  SET last_seen = MAX(mirrors_v2.last_seen, new_seen.ts) \
+                  FROM new_seen WHERE mirrors_v2.id = new_seen.id",
             );
             // Not persistent: the SQL text changes with the chunk's row
             // count, so caching it would park up to one prepared statement
@@ -1718,6 +1719,41 @@ mod retention_tests {
 
     async fn insert_mirror(db: &Database, path: &str) -> i64 {
         db.insert_mirror_host("deb.example.org", path).await
+    }
+
+    #[tokio::test]
+    async fn mirror_last_seen_updates_are_monotonic_across_chunks() {
+        let (_dir, db) = Database::temp().await;
+        assert_eq!(db.batch_update_mirror_last_seen(&[]).await.unwrap(), 0);
+        let mut pairs = Vec::new();
+        let mut expected = Vec::new();
+        let mut tx = db.conn.begin().await.expect("begin seed");
+        // More than two full chunks exercises the bind limit and the tail.
+        for index in 0..1_001usize {
+            let (id,): (i64,) = query_as(
+                "INSERT INTO mirrors_v2 (host, port, path, last_seen) \
+                 VALUES ('mirror.test', 0, ?, 100) RETURNING id",
+            )
+            .bind(format!("repo{index}"))
+            .fetch_one(&mut *tx)
+            .await
+            .expect("seed mirror");
+            let seen = if index.is_multiple_of(2) { 50 } else { 200 };
+            pairs.push((id, seen));
+            expected.push((id, seen.max(100)));
+        }
+        tx.commit().await.expect("commit seed");
+        // An absent id must be ignored rather than creating a mirror.
+        pairs.push((i64::MAX, 300));
+        assert_eq!(
+            db.batch_update_mirror_last_seen(&pairs).await.unwrap(),
+            1_001
+        );
+        let actual: Vec<(i64, i64)> = query_as("SELECT id, last_seen FROM mirrors_v2 ORDER BY id")
+            .fetch_all(&db.conn)
+            .await
+            .expect("read timestamps");
+        assert_eq!(actual, expected);
     }
 
     fn origin(mirror_id: i64, distribution: &str) -> OriginRow {
