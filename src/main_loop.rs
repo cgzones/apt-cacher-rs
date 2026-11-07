@@ -40,7 +40,7 @@ use crate::hyper_conn::{HttpClient, Traffic, UpstreamExchange, request_with_retr
 #[cfg(feature = "sendfile")]
 use crate::sendfile_conn;
 use crate::{
-    AppState, DB_DRAIN_TIMEOUT, OUTPUT_LOG_FILE, RUNTIMEDETAILS,
+    AppState, DB_DRAIN_TIMEOUT, OUTPUT_LOG_REOPEN, RUNTIMEDETAILS,
     active_downloads::ActiveDownloads,
     cache_paths::CachePaths,
     cleanup::{
@@ -579,9 +579,9 @@ pub(crate) async fn main_loop(
                 continue;
             },
             _ = usr1_signal.recv() => {
-                if let Some(output_log_file) = OUTPUT_LOG_FILE.get() {
-                    info!("SIGUSR1 received, requesting reopen of log file `{}`...", output_log_file.path.display());
-                    output_log_file.request_reopen();
+                if let Some(reopen) = OUTPUT_LOG_REOPEN.get() {
+                    info!("SIGUSR1 received, requesting reopen of log file `{}`...", reopen.path.display());
+                    reopen.request_reopen();
                 } else {
                     info!("Ignoring SIGUSR1 because logging is set to console");
                 }

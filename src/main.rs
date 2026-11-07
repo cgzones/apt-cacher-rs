@@ -234,11 +234,22 @@ struct RuntimeDetails {
     webif_hosts: web::host_gate::WebifHosts,
 }
 
-#[derive(Clone, Debug)]
-struct ReopenableLogFile {
+#[derive(Debug)]
+struct LogReopen {
     path: PathBuf,
-    file: Arc<parking_lot::Mutex<std::fs::File>>,
-    reopen_requested: Arc<AtomicBool>,
+    requested: AtomicBool,
+}
+
+impl LogReopen {
+    fn request_reopen(&self) {
+        self.requested.store(true, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+struct ReopenableLogFile {
+    file: std::fs::File,
+    control: Arc<LogReopen>,
 }
 
 impl ReopenableLogFile {
@@ -248,23 +259,21 @@ impl ReopenableLogFile {
             .create(true)
             .open(path)?;
         Ok(Self {
-            path: path.to_path_buf(),
-            file: Arc::new(parking_lot::Mutex::new(file)),
-            reopen_requested: Arc::new(AtomicBool::new(false)),
+            file,
+            control: Arc::new(LogReopen {
+                path: path.to_path_buf(),
+                requested: AtomicBool::new(false),
+            }),
         })
     }
 
-    fn reopen(&self) -> std::io::Result<()> {
+    fn reopen(&mut self) -> std::io::Result<()> {
         let file = fs_open::nofollow_options()
             .append(true)
             .create(true)
-            .open(&self.path)?;
-        *self.file.lock() = file;
+            .open(&self.control.path)?;
+        self.file = file;
         Ok(())
-    }
-
-    fn request_reopen(&self) {
-        self.reopen_requested.store(true, Ordering::Relaxed);
     }
 }
 
@@ -275,17 +284,17 @@ impl std::io::Write for ReopenableLogFile {
     )]
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         /* Deferred here so the swap happens on the single non-blocking worker thread. */
-        if self.reopen_requested.load(Ordering::Relaxed)
-            && self.reopen_requested.swap(false, Ordering::Relaxed)
+        if self.control.requested.load(Ordering::Relaxed)
+            && self.control.requested.swap(false, Ordering::Relaxed)
             && let Err(err) = self.reopen()
         {
             eprintln!(
                 "Failed to reopen log file `{}`; continuing to write to the previously opened file:  {}",
-                self.path.display(),
+                self.control.path.display(),
                 error::ErrorReport(&err)
             );
         }
-        std::io::Write::write(&mut *self.file.lock(), buf)
+        std::io::Write::write(&mut self.file, buf)
     }
 
     #[inline]
@@ -312,7 +321,7 @@ impl tracing_subscriber::fmt::time::FormatTime for UtcTimer {
 
 static RUNTIMEDETAILS: OnceLock<RuntimeDetails> = OnceLock::new();
 static LOGSTORE: OnceLock<logstore::LogStore> = OnceLock::new();
-static OUTPUT_LOG_FILE: OnceLock<ReopenableLogFile> = OnceLock::new();
+static OUTPUT_LOG_REOPEN: OnceLock<Arc<LogReopen>> = OnceLock::new();
 
 #[must_use]
 #[inline]
@@ -586,8 +595,8 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
                     return Ok(std::process::ExitCode::FAILURE);
                 }
             };
-            OUTPUT_LOG_FILE
-                .set(log_file_handle.clone())
+            OUTPUT_LOG_REOPEN
+                .set(Arc::clone(&log_file_handle.control))
                 .expect("Initial set in main() should succeed");
 
             let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
@@ -802,4 +811,62 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
     result
         .map(|()| std::process::ExitCode::SUCCESS)
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+
+    use super::*;
+
+    #[test]
+    fn log_reopen_is_deferred_and_repeated_requests_coalesce() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("current.log");
+        let old = dir.path().join("old.log");
+        let rotated = dir.path().join("rotated.log");
+        let mut writer = ReopenableLogFile::new(&path).expect("open log");
+        let control = Arc::clone(&writer.control);
+        writer.write_all(b"before\n").expect("initial write");
+        std::fs::rename(&path, &old).expect("rotate log");
+        control.request_reopen();
+        control.request_reopen();
+        assert!(!path.exists(), "reopen waits for the next write");
+        writer.write_all(b"after\n").expect("write after rotation");
+        assert_eq!(std::fs::read(&old).unwrap(), b"before\n");
+        assert_eq!(std::fs::read(&path).unwrap(), b"after\n");
+
+        std::fs::rename(&path, &rotated).expect("rotate again");
+        writer.write_all(b"later\n").expect("continued write");
+        assert!(!path.exists(), "the repeated request was already consumed");
+        assert_eq!(std::fs::read(&rotated).unwrap(), b"after\nlater\n");
+    }
+
+    #[test]
+    fn failed_log_reopen_retains_the_previous_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("current.log");
+        let old = dir.path().join("old.log");
+        let target = dir.path().join("symlink-target");
+        let mut writer = ReopenableLogFile::new(&path).expect("open log");
+        let control = Arc::clone(&writer.control);
+        writer.write_all(b"before\n").expect("initial write");
+        std::fs::rename(&path, &old).expect("rotate log");
+        std::fs::write(&target, b"untouched").expect("target");
+        std::os::unix::fs::symlink(&target, &path).expect("symlink");
+        control.request_reopen();
+        writer
+            .write_all(b"after\n")
+            .expect("old file remains usable");
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        assert_eq!(std::fs::read(&old).unwrap(), b"before\nafter\n");
+
+        std::fs::remove_file(&path).expect("remove symlink");
+        writer.write_all(b"later\n").expect("continued write");
+        assert!(!path.exists(), "failed requests are consumed too");
+        control.request_reopen();
+        writer.write_all(b"new\n").expect("reopen corrected path");
+        assert_eq!(std::fs::read(&old).unwrap(), b"before\nafter\nlater\n");
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+    }
 }
