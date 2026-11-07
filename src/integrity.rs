@@ -33,7 +33,7 @@
 //! an index from cache.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{BinaryHeap, VecDeque};
 use std::fmt;
 use std::fs::Metadata;
 use std::hash::BuildHasher as _;
@@ -379,7 +379,7 @@ pub(crate) struct RenamePlan {
 /// default port's downloads are checked against. (For layer-C keys
 /// `mirror_path` is a redundant prefix of `relpath`; for layer-B basenames it
 /// is the sole discriminator.)
-#[derive(Debug, Eq, Hash, PartialEq)]
+#[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct RegistryScope {
     authority: String,
     mirror_path: String,
@@ -1038,9 +1038,17 @@ fn index_hash(hasher: &DefaultHashBuilder, slots: &VecDeque<Slot>, base: u64, se
 /// is newer) are skipped and do not count against the quota.
 fn evict(inner: &mut RegistryInner, cap: usize, epochs: &Mutex<EvictionEpochs>) {
     let quota = (cap / 4).max(1) + inner.len.saturating_sub(cap + 1);
+    // A selected scope is drained or finishes the pass, so the remaining
+    // scopes' sizes never change. Heapify once instead of rescanning the
+    // map after every drained scope (quadratic for many small scopes).
+    let mut scopes: BinaryHeap<_> = inner
+        .map
+        .iter()
+        .map(|(scope, state)| (state.len(), Arc::clone(scope)))
+        .collect();
     let mut live = 0usize;
     while live < quota {
-        let Some(scope) = largest_scope(inner) else {
+        let Some((_, scope)) = scopes.pop() else {
             break;
         };
         let Some(state) = inner.map.get_mut(&scope) else {
@@ -1134,16 +1142,6 @@ fn scope_bytes(scope: &RegistryScope) -> usize {
         mirror_path,
     } = scope;
     size_of::<RegistryScope>() + authority.capacity() + mirror_path.capacity()
-}
-
-/// The scope holding the most live entries, if any.
-fn largest_scope(inner: &RegistryInner) -> Option<Arc<RegistryScope>> {
-    // A maximum is order-independent; ties pick an arbitrary scope.
-    inner
-        .map
-        .iter()
-        .max_by_key(|(_, state)| state.len())
-        .map(|(scope, _)| Arc::clone(scope))
 }
 
 /// Rebuild a scope's slot log keeping only the live slots, in their order,
@@ -2918,6 +2916,32 @@ mod tests {
         }
         assert_eq!(reg.scope_epoch("b", "m"), 1, "one pass");
         assert_eq!(reg.scope_epoch("a", "m"), 0);
+    }
+
+    #[test]
+    fn eviction_drains_scopes_in_size_order_and_stops_at_the_quota() {
+        let reg = ChecksumRegistry::new(NonZero::new(2).unwrap());
+        {
+            let mut inner = reg.inner.lock();
+            for (host, count) in [("largest", 4), ("medium", 3), ("small", 2), ("tiny", 1)] {
+                let slots: Vec<_> = (0..count)
+                    .map(|i| Slot::for_key(&format!("p{i}"), [0; 32]))
+                    .collect();
+                inner.insert(host, "m", &slots);
+            }
+            // Ten live entries at cap two: remove eight, draining the
+            // largest two scopes and only the oldest of the third.
+            evict(&mut inner, 2, &reg.epochs);
+            assert_eq!(inner.len, 2);
+            assert_eq!(inner.map.len(), 2);
+        }
+        assert_eq!(reg.lookup("small", "m", "p0"), None);
+        assert_eq!(reg.lookup("small", "m", "p1"), Some([0; 32]));
+        assert_eq!(reg.lookup("tiny", "m", "p0"), Some([0; 32]));
+        assert_eq!(reg.scope_epoch("largest", "m"), 1);
+        assert_eq!(reg.scope_epoch("medium", "m"), 2);
+        assert_eq!(reg.scope_epoch("small", "m"), 3);
+        assert_eq!(reg.scope_epoch("tiny", "m"), 0);
     }
 
     #[test]
