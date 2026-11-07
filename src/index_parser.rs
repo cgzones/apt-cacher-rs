@@ -15,18 +15,6 @@ use crate::{
     sticky, warn_once, warn_once_or_debug,
 };
 
-/// Extract the `Filename:` field's relative-path value from a Debian
-/// `Packages` stanza line, discarding the reject reason. Production code
-/// goes through [`Stanza::ingest`], which keeps the reason so it can log a
-/// rejected value against its mirror.
-#[cfg(test)]
-pub(crate) fn parse_filename_field(line: &str) -> Option<&str> {
-    match split_field(line.as_bytes())? {
-        (b"Filename", value) => filename_value(field_text(value).ok()?).ok(),
-        _ => None,
-    }
-}
-
 /// Split one stanza line into its deb822 field name and trimmed value.
 ///
 /// **Security**: `None` for a continuation line (leading space or tab) - it
@@ -924,6 +912,168 @@ pub(crate) fn hash_open_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Extract the `Filename:` field's relative-path value from a Debian
+    /// `Packages` stanza line, discarding the reject reason. Production code
+    /// goes through [`Stanza::ingest`], which keeps the reason so it can log a
+    /// rejected value against its mirror.
+    fn parse_filename_field(line: &str) -> Option<&str> {
+        match split_field(line.as_bytes())? {
+            (b"Filename", value) => filename_value(field_text(value).ok()?).ok(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn parse_filename_field_strips_lf() {
+        assert_eq!(
+            parse_filename_field("Filename: pool/main/a/abc/abc_1.0_amd64.deb\n"),
+            Some("pool/main/a/abc/abc_1.0_amd64.deb"),
+        );
+    }
+
+    #[test]
+    fn parse_filename_field_strips_crlf() {
+        assert_eq!(
+            parse_filename_field("Filename: pool/main/a/abc/abc_1.0_amd64.deb\r\n"),
+            Some("pool/main/a/abc/abc_1.0_amd64.deb"),
+        );
+    }
+
+    #[test]
+    fn parse_filename_field_no_terminator() {
+        assert_eq!(
+            parse_filename_field("Filename: pool/main/a/abc/abc_1.0_amd64.deb"),
+            Some("pool/main/a/abc/abc_1.0_amd64.deb"),
+        );
+    }
+
+    #[test]
+    fn parse_filename_field_handles_udeb_extension() {
+        assert_eq!(
+            parse_filename_field("Filename: pool/main/i/inst/inst_1.0_amd64.udeb\n"),
+            Some("pool/main/i/inst/inst_1.0_amd64.udeb"),
+        );
+    }
+
+    #[test]
+    fn parse_filename_field_returns_nested_relpath_for_flat() {
+        // Flat repos cite paths relative to the repo root; cleanup needs
+        // to disambiguate same-basename debs across sub-directories.
+        assert_eq!(
+            parse_filename_field("Filename: amd64/twilio-cli_5.0.0_amd64.deb\n"),
+            Some("amd64/twilio-cli_5.0.0_amd64.deb"),
+        );
+    }
+
+    #[test]
+    fn parse_filename_field_skips_other_keys() {
+        assert_eq!(parse_filename_field("Package: stub\n"), None);
+        assert_eq!(parse_filename_field("\n"), None);
+        assert_eq!(parse_filename_field(""), None);
+    }
+
+    #[test]
+    fn parse_filename_field_rejects_traversal() {
+        // Path-traversal hardening: an attacker-controlled upstream
+        // Packages stanza must not be able to inject `..` segments or
+        // absolute paths that could later be joined to a filesystem path.
+        assert_eq!(
+            parse_filename_field("Filename: ../../../etc/passwd\n"),
+            None,
+        );
+        assert_eq!(parse_filename_field("Filename: pool/../escape.deb\n"), None);
+        assert_eq!(parse_filename_field("Filename: /etc/shadow\n"), None);
+        assert_eq!(parse_filename_field("Filename: a//b.deb\n"), None);
+        // A leading `./` is NOT traversal and is normalised away rather than
+        // rejected (flat archives publish every stanza that way); a `..`
+        // behind it still is.
+        assert_eq!(
+            parse_filename_field("Filename: ./foo.deb\n"),
+            Some("foo.deb"),
+        );
+        assert_eq!(parse_filename_field("Filename: ./../escape.deb\n"), None);
+        assert_eq!(
+            parse_filename_field("Filename: pool\\main\\evil.deb\n"),
+            None,
+        );
+        // NUL byte rejection — Rust strings allow `\0`; rust source uses
+        // an explicit escape to materialise the test input.
+        assert_eq!(parse_filename_field("Filename: pool/x\0y.deb\n"), None,);
+        // Other ASCII control characters (tab, vertical tab, bare CR/LF
+        // embedded mid-segment, etc.) are likewise rejected so they can
+        // never reach a downstream HashMap lookup or future filesystem
+        // join.
+        assert_eq!(parse_filename_field("Filename: pool/x\ty.deb\n"), None);
+        assert_eq!(parse_filename_field("Filename: pool/x\x0by.deb\n"), None);
+        assert_eq!(parse_filename_field("Filename: pool/x\x7fy.deb\n"), None);
+    }
+
+    #[test]
+    fn structured_lookup_key_extracts_basename() {
+        assert_eq!(
+            structured_lookup_key("pool/main/a/abc/abc_1.0_amd64.deb"),
+            "abc_1.0_amd64.deb",
+        );
+        assert_eq!(
+            structured_lookup_key("abc_1.0_amd64.deb"),
+            "abc_1.0_amd64.deb",
+        );
+    }
+
+    #[test]
+    fn hex_decode_exact_round_trip_lowercase() {
+        let bytes: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
+        let s = hex_encode(&bytes);
+        assert_eq!(s, "deadbeef");
+        assert_eq!(hex_decode_exact::<4>(&s), Some(bytes));
+    }
+
+    #[test]
+    fn hex_decode_exact_accepts_uppercase() {
+        assert_eq!(
+            hex_decode_exact::<4>("DEADBEEF"),
+            Some([0xde, 0xad, 0xbe, 0xef])
+        );
+    }
+
+    #[test]
+    fn hex_decode_exact_rejects_wrong_length() {
+        assert_eq!(hex_decode_exact::<4>("deadbe"), None); // too short
+        assert_eq!(hex_decode_exact::<4>("deadbeef00"), None); // too long
+    }
+
+    #[test]
+    fn hex_decode_exact_rejects_non_hex() {
+        assert_eq!(hex_decode_exact::<4>("deadbeeg"), None);
+        assert_eq!(hex_decode_exact::<4>("deadbe!f"), None);
+    }
+
+    #[test]
+    fn stanza_chosen_falls_back_to_sha512() {
+        let mut s = Stanza::new();
+        s.sha512 = Some([0x33u8; 64]);
+        assert_eq!(
+            s.chosen(),
+            Some((HashAlgo::Sha512, [0x33u8; 64].as_slice()))
+        );
+    }
+
+    #[test]
+    fn stanza_chosen_returns_none_without_hash() {
+        let s = Stanza::new();
+        assert_eq!(s.chosen(), None);
+    }
+
+    #[test]
+    fn stanza_ingest_ignores_unrelated_lines() {
+        let mut s = Stanza::new();
+        s.ingest_text("Package: stub\n");
+        s.ingest_text("Description: a stub\n");
+        s.ingest_text(" continued description text\n");
+        assert_eq!(s.filename(), None);
+        assert_eq!(s.chosen(), None);
+    }
 
     #[test]
     fn hash_open_file_matches_one_shot_across_buffer_boundaries() {
