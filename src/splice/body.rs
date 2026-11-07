@@ -2642,7 +2642,7 @@ fn range_overlap(
 }
 
 /// Splice everything a pipe holds into the cache file at `file_offset`,
-/// advance the offset by what landed, and return that count.
+/// advancing the offset by what landed.
 ///
 /// Count-free by design. Every caller wants the pipe emptied -- `pipe_B`'s
 /// batch, `pipe_A` when it cannot join it, either pipe on the exit salvage --
@@ -2666,7 +2666,7 @@ async fn drain_pipe_to_file(
     rx: &Arc<OwnedFd>,
     file: &Arc<CacheFile>,
     file_offset: &mut i64,
-) -> std::io::Result<usize> {
+) -> std::io::Result<()> {
     let src = Arc::clone(rx);
     let dst = Arc::clone(file);
     let start = *file_offset;
@@ -2703,7 +2703,7 @@ async fn drain_pipe_to_file(
         "the offset advances by exactly what landed"
     );
     *file_offset = off;
-    outcome.map(|()| landed)
+    outcome
 }
 
 #[cfg(test)]
