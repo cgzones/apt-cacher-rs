@@ -30,7 +30,7 @@ pub(crate) struct LastModified {
 impl LastModified {
     pub(crate) fn from_date(time: HttpDate) -> Self {
         Self {
-            raw: time.format().into(),
+            raw: Arc::from(&*time.format_inline()),
             time,
         }
     }

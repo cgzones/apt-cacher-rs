@@ -105,7 +105,7 @@ impl HttpDate {
 
     /// [`Self::format`] into an inline buffer, without allocating.
     #[must_use]
-    fn format_inline(self) -> HttpDateText {
+    pub(crate) fn format_inline(self) -> HttpDateText {
         let secs_i64 = i64::try_from(self.0).expect("HttpDate is clamped to MAX_SECS");
         let odt = OffsetDateTime::from_unix_timestamp(secs_i64)
             .expect("MAX_SECS is the last instant OffsetDateTime represents");
