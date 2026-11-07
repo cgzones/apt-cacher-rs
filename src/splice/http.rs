@@ -552,7 +552,7 @@ fn is_bodyless_status(status: StatusCode) -> bool {
 /// arrived with the head (`buf[header_end..]`) are credited as downloaded;
 /// an unparsable response is neither. Later reads of the body credit
 /// themselves.
-pub(super) fn parse_upstream_response(
+fn parse_upstream_response(
     buf: &[u8],
     header_end: usize,
     request_sent_at: PreciseInstant,

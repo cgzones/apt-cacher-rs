@@ -30,7 +30,7 @@ pub(crate) struct HttpDateText([u8; IMF_FIXDATE_LEN]);
 
 impl HttpDateText {
     #[must_use]
-    pub(crate) fn as_str(&self) -> &str {
+    fn as_str(&self) -> &str {
         let Self(bytes) = self;
         std::str::from_utf8(bytes).expect("an IMF-fixdate is ASCII")
     }

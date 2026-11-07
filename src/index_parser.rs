@@ -323,7 +323,7 @@ impl Stanza {
     /// stanza [`Self::repeated`] and keeps nothing of the repeat. `Err` for a
     /// tracked field whose value is not UTF-8 ([`field_text`]), repeated or
     /// not.
-    pub(crate) fn ingest(&mut self, line: &[u8]) -> io::Result<()> {
+    fn ingest(&mut self, line: &[u8]) -> io::Result<()> {
         let Some((name, value)) = split_field(line) else {
             return Ok(());
         };
