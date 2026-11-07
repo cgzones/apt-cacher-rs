@@ -3583,8 +3583,10 @@ mod tests {
         assert_eq!(fresh.headers()[ACCEPT_ENCODING], "identity");
 
         let date = "Thu, 01 Jan 1970 00:00:00 GMT";
-        let metadata =
-            crate::cache_metadata::UpstreamMetadata::from_upstream(Some("\"v1\""), Some(date));
+        let metadata = crate::cache_metadata::UpstreamMetadata::from_upstream(
+            Some("\"v1\""),
+            Some("Thu, 01 Jan 1970 00:00:00 +0000"),
+        );
         let conditional =
             super::build_fwd_request(uri.clone(), Some(&host), FetchMode::Revalidate(&metadata));
         assert_eq!(conditional.headers()[IF_MODIFIED_SINCE], date);

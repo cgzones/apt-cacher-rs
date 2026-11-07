@@ -97,8 +97,8 @@ use crate::{
 /// as the post-flight cache entry.
 ///
 /// `last_modified` stores both the raw header string (for `Last-Modified`
-/// response headers) and its parsed [`crate::http_range::HttpDate`] (for If-Modified-Since
-/// comparison) so consumers don't re-parse on every hit.
+/// response headers) and its parsed [`HttpDate`](crate::http_range::HttpDate)
+/// (for If-Modified-Since comparison) so consumers don't re-parse on every hit.
 ///
 /// The strings are `Arc<str>` so per-serve [`crate::cache_conditional::CacheInfo`]
 /// construction is a refcount bump instead of a String clone.
@@ -109,14 +109,12 @@ pub(crate) struct UpstreamMetadata {
 }
 
 impl UpstreamMetadata {
-    /// Build from raw upstream header strings.  The Last-Modified pair is
-    /// produced only if the value parses as a valid HTTP-date.
+    /// Build from raw upstream header strings, retaining only valid validators.
     #[must_use]
     pub(crate) fn from_upstream(etag: Option<&str>, last_modified: Option<&str>) -> Self {
-        let last_modified = last_modified.and_then(LastModified::parse);
         Self {
             etag: etag.and_then(ETag::parse),
-            last_modified,
+            last_modified: last_modified.and_then(LastModified::parse),
         }
     }
 
@@ -218,6 +216,9 @@ pub(crate) fn write_upstream_metadata(
     expected_size: Option<u64>,
     target: TargetFile,
 ) {
+    if !xattr_helpers::xattr_supported() {
+        return;
+    }
     let UpstreamMetadata {
         etag,
         last_modified,
@@ -225,7 +226,7 @@ pub(crate) fn write_upstream_metadata(
     // One blocking section for all three attributes: writing them through
     // the `tokio::fs::File` target would demote the worker once per
     // attribute, and every fresh download writes up to three.
-    let write = || {
+    tokio::task::block_in_place(|| {
         let file = &xattr_helpers::XattrFile(file);
         match etag {
             Some(etag) => xattr_helpers::write(file, display_path, etag),
@@ -246,13 +247,7 @@ pub(crate) fn write_upstream_metadata(
         if let Some(size) = expected_size {
             xattr_helpers::write(file, display_path, &ExpectedSize(size));
         }
-    };
-    if xattr_helpers::xattr_supported() {
-        tokio::task::block_in_place(write);
-    } else {
-        // The disabled helpers perform no I/O.
-        write();
-    }
+    });
 }
 
 /// A malformed upstream validator discarded by [`check_upstream_validators`],
@@ -749,8 +744,10 @@ mod tests {
         if !supports_user_xattrs(&path) {
             return;
         }
-        let meta =
-            UpstreamMetadata::from_upstream(Some("\"abc\""), Some("Thu, 01 Jan 1970 00:00:00 GMT"));
+        let meta = UpstreamMetadata::from_upstream(
+            Some("\"abc\""),
+            Some("Thu, 01 Jan 1970 00:00:00 +0000"),
+        );
         write_upstream_metadata(&file, &path, &meta, Some(4096), TargetFile::New);
 
         let resolved = store.resolve(&fixture_key().as_ref(), &file, &path);
@@ -1104,8 +1101,17 @@ mod tests {
     async fn disabled_xattrs_do_not_require_a_blocking_runtime() {
         let (_dir, file, path) = fixture_file().await;
         xattr_helpers::set_xattr_supported(false);
-        let meta = UpstreamMetadata::from_upstream(Some("\"abc\""), None);
+        let meta =
+            UpstreamMetadata::from_upstream(Some("\"abc\""), Some("Thu, 01 Jan 1970 00:00:00 GMT"));
         write_upstream_metadata(&file, &path, &meta, Some(12), TargetFile::Resumed);
+        write_upstream_metadata(&file, &path, &meta, None, TargetFile::New);
+        write_upstream_metadata(
+            &file,
+            &path,
+            &UpstreamMetadata::default(),
+            None,
+            TargetFile::Resumed,
+        );
         let malformed = UpstreamMetadata::from_upstream(Some("bad"), Some("bad"));
         assert_eq!(malformed, UpstreamMetadata::default());
         write_upstream_metadata(&file, &path, &malformed, None, TargetFile::New);

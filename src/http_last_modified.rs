@@ -20,7 +20,7 @@ pub(crate) fn is_valid_http_date(s: &str) -> bool {
 /// origin's value). Carries both the raw header string (for the
 /// `Last-Modified` response header) and its parsed [`HttpDate`] (for
 /// `If-Modified-Since` comparison), so consumers never re-parse.
-/// Constructed only by [`XattrValue::parse`], so it is always an IMF-fixdate.
+/// Parsed headers retain their accepted spelling; [`Self::from_date`] constructs an IMF-fixdate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LastModified {
     raw: Arc<str>,
@@ -37,12 +37,6 @@ impl LastModified {
 
     pub(crate) const fn time(&self) -> HttpDate {
         self.time
-    }
-
-    #[cfg(test)]
-    pub(crate) fn into_parts(self) -> (Arc<str>, HttpDate) {
-        let Self { raw, time } = self;
-        (raw, time)
     }
 }
 
@@ -107,12 +101,12 @@ mod tests {
 
     #[test]
     fn last_modified_parse_and_render() {
-        let value = "Tue, 21 Mar 2361 19:15:09 GMT";
-        let parsed = LastModified::parse(value).expect("IMF-fixdate");
+        let value = "Tue, 21 Mar 2361 19:15:09 +0000";
+        let parsed = LastModified::parse(value).expect("accepted HTTP-date");
         assert_eq!(parsed.render(), value);
-        let (raw, time) = parsed.into_parts();
-        assert_eq!(raw.as_ref(), value);
-        assert_eq!(time, HttpDate::from_secs(12_345_678_909));
+        assert_eq!(parsed.as_ref(), value);
+        assert_eq!(parsed.time(), HttpDate::from_secs(12_345_678_909));
+        assert_eq!(parsed.time().format(), "Tue, 21 Mar 2361 19:15:09 GMT");
         assert!(LastModified::parse("garbage").is_none());
         assert!(LastModified::parse("").is_none());
     }

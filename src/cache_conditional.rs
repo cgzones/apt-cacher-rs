@@ -846,17 +846,15 @@ mod tests {
         assert_eq!(info.last_modified.as_ref(), expected.format());
 
         // An upstream `Last-Modified` wins over the file timestamp.
-        let upstream = HttpDate::parse(LAST_MODIFIED).unwrap();
+        let raw = "Sun, 06 Nov 1994 08:49:37 +0000";
+        let upstream = HttpDate::parse(raw).unwrap();
         let info = CacheInfo::with_meta(
             &metadata,
-            &UpstreamMetadata {
-                etag: ETag::parse(ETAG),
-                last_modified: LastModified::parse(LAST_MODIFIED),
-            },
+            &UpstreamMetadata::from_upstream(Some(ETAG), Some(raw)),
         );
         assert_eq!(info.file_etag.as_deref(), Some(ETAG));
         assert_eq!(info.last_modified.time(), upstream);
-        assert_eq!(info.last_modified.as_ref(), LAST_MODIFIED);
+        assert_eq!(info.last_modified.as_ref(), raw);
     }
 
     #[cfg(feature = "splice")]

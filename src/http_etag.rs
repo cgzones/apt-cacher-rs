@@ -79,12 +79,6 @@ impl ETag {
     pub(crate) fn into_strong(self) -> Option<StrongETag> {
         self.is_strong().then_some(StrongETag(self))
     }
-
-    #[cfg(test)]
-    pub(crate) fn into_shared(self) -> Arc<str> {
-        let Self(etag) = self;
-        etag
-    }
 }
 
 /// A validated entity tag suitable for If-Range. Weak tags cannot construct it.
@@ -421,7 +415,7 @@ mod tests {
     fn etag_parse_and_render() {
         let strong = ETag::parse("\"abc\"").expect("strong ETag");
         assert_eq!(strong.render(), "\"abc\"");
-        assert_eq!(strong.into_shared().as_ref(), "\"abc\"");
+        assert_eq!(&*strong, "\"abc\"");
         let weak = ETag::parse("W/\"abc\"").expect("weak ETag");
         assert_eq!(weak.render(), "W/\"abc\"");
         assert!(ETag::parse("abc").is_none());
