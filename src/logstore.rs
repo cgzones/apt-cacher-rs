@@ -41,15 +41,13 @@ const TRUNCATION_MARK: &str = " [truncated]";
 fn entry_from_line(line: &[u8], truncated: bool) -> String {
     // A cut record can end inside a scalar; drop that partial scalar rather
     // than decode it to U+FFFD.
-    let line = match line.utf8_chunks().last() {
-        Some(chunk)
-            if truncated
-                && std::str::from_utf8(chunk.invalid())
-                    .is_err_and(|err| err.error_len().is_none()) =>
-        {
-            &line[..line.len() - chunk.invalid().len()]
-        }
-        _ => line,
+    let line = if truncated
+        && let Some(chunk) = line.utf8_chunks().last()
+        && std::str::from_utf8(chunk.invalid()).is_err_and(|err| err.error_len().is_none())
+    {
+        &line[..line.len() - chunk.invalid().len()]
+    } else {
+        line
     };
     let decoded = String::from_utf8_lossy(line);
     let trimmed = decoded.trim();
