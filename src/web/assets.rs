@@ -143,7 +143,7 @@ mod tests {
             "{version}"
         );
         assert_eq!(version, &*version_of(STYLESHEET.body));
-        assert_ne!(&*version_of("a"), &*version_of("b"));
+        assert_eq!(&*version_of("a"), "ca978112ca1bbdca");
         assert_eq!(
             STYLESHEET.url().to_string(),
             format!("/style.css?v={version}")
