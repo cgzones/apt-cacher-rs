@@ -90,6 +90,23 @@ pub(crate) struct WalkContext {
     pub(crate) anomalies: AnomalyLevel,
 }
 
+impl WalkContext {
+    fn report_anomaly(&self, kind: &str, path: &Path, consequence: &str) {
+        match self.anomalies {
+            AnomalyLevel::Warn => warn!(
+                "Unrecognized {kind} entry `{}` in {}; {consequence}",
+                path.display(),
+                self.what
+            ),
+            AnomalyLevel::Debug => debug!(
+                "Unrecognized {kind} entry `{}` in {}; {consequence}",
+                path.display(),
+                self.what
+            ),
+        }
+    }
+}
+
 /// Level of a walk's anomaly lines (`docs/logging.md`, "Flood control"):
 /// a plain `warn!` per artifact is earned only by a walk whose rate no
 /// client drives.
@@ -490,20 +507,7 @@ fn report_non_regular(ctx: &'static WalkContext, path: &Path, ft: FileType) {
     } else {
         "non-regular"
     };
-    match ctx.anomalies {
-        AnomalyLevel::Warn => warn!(
-            "Unrecognized {kind} entry `{}` in {}; {}",
-            path.display(),
-            ctx.what,
-            ctx.non_regular
-        ),
-        AnomalyLevel::Debug => debug!(
-            "Unrecognized {kind} entry `{}` in {}; {}",
-            path.display(),
-            ctx.what,
-            ctx.non_regular
-        ),
-    }
+    ctx.report_anomaly(kind, path, ctx.non_regular);
 }
 
 /// The first component of `root` below `base` that is neither a directory
@@ -665,19 +669,7 @@ impl<T: Copy + Send> Entry<'_, T> {
             }
             EntryKind::NonRegular => return,
         };
-        let path = self.path();
-        match self.ctx.anomalies {
-            AnomalyLevel::Warn => warn!(
-                "Unrecognized {kind} entry `{}` in {}; {consequence}",
-                path.display(),
-                self.ctx.what
-            ),
-            AnomalyLevel::Debug => debug!(
-                "Unrecognized {kind} entry `{}` in {}; {consequence}",
-                path.display(),
-                self.ctx.what
-            ),
-        }
+        self.ctx.report_anomaly(kind, &self.path(), consequence);
     }
 
     /// `lstat` the entry, or hand out the lstat a [`Walker::stat_files`]
