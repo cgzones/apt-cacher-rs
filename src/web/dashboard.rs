@@ -383,9 +383,7 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
     // below a ~525ms cold walk the sequential path is still the faster of
     // the two, and above it the gap asymptotes to ~200ms of a multi-second
     // load. Restoring the overlap costs a second memo slot for the mirror
-    // query alone; measure a large cache before paying for it, and note
-    // that the walk's own per-file blocking-pool hop (R4 in
-    // `docs/perf-review-2026-09-02.md`) is the bigger lever there.
+    // query alone; measure a large cache before paying for it.
     let fs_start = Instant::now();
     let (mirror_table, aggregate_dir_stats, free_disk_bytes) =
         build_mirror_fs_section(mirror_rows, &snapshots, now_epoch).await;

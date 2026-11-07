@@ -540,9 +540,8 @@ impl ConnectionDetails {
     /// so a reader loading the parts before the parent never sees them
     /// exceed it; an index bumps `VOLATILE_HIT` / `VOLATILE_REFETCHED`.
     ///
-    /// Called only at the lookup sites (`src/CLAUDE.md`, `metrics.rs`), once
-    /// per request.  Cleanup's synthetic index fetches are bookkeeping, not
-    /// client demand, and count nothing.
+    /// Called only at the lookup sites, once per request. Cleanup's
+    /// synthetic index fetches are bookkeeping, not client demand, and count nothing.
     pub(crate) fn count_lookup(&self, outcome: LookupOutcome) {
         if self.client.is_cleanup_synthetic() {
             return;

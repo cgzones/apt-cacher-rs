@@ -541,7 +541,7 @@ mod tests {
 
 /// The scan's totals on a mixed tree, pinned: the layout rules moved into
 /// `cache_tree`, which the dashboard's walk shares, and the quota must keep
-/// counting exactly what it counted before (src/CLAUDE.md, `cache_quota`).
+/// counting exactly what it counted before.
 #[cfg(test)]
 mod layout_totals_tests {
     use super::*;

@@ -641,8 +641,7 @@ impl DownloadFailure {
     }
 
     /// The response a backend still able to answer sends for this failure.
-    /// Every backend and every joiner consumes this; CLAUDE.md's 5xx
-    /// convention lists the bodies.
+    /// Every backend and every joiner consumes this shared status/body mapping.
     pub(crate) fn response_parts(&self) -> (StatusCode, &'static str) {
         match self {
             Self::Upstream(_) => (StatusCode::BAD_GATEWAY, "Upstream Error"),
