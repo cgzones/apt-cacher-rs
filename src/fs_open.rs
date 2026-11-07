@@ -413,16 +413,18 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let link = planted_symlink(dir.path());
 
-        let err = nofollow_options()
-            .read(true)
-            .open_async(&link)
-            .await
-            .expect_err("O_NOFOLLOW must refuse a symlink at the final component");
-        assert_eq!(
-            err.raw_os_error(),
-            Some(nix::libc::ELOOP),
-            "a refused symlink is recognized by ELOOP"
-        );
+        for mut options in [nofollow_options(), nofollow_nonblock_options()] {
+            let err = options
+                .read(true)
+                .open_async(&link)
+                .await
+                .expect_err("O_NOFOLLOW must refuse a symlink at the final component");
+            assert_eq!(
+                err.raw_os_error(),
+                Some(nix::libc::ELOOP),
+                "a refused symlink is recognized by ELOOP"
+            );
+        }
     }
 
     /// A refused symlink and a directory opened for writing are non-regular
@@ -567,19 +569,18 @@ mod tests {
 
     /// The typed sibling carries the path in the error instead of a log line,
     /// and keeps the same `CACHE_NON_REGULAR` accounting.
-    #[tokio::test]
-    async fn typed_metadata_rejects_a_fifo_and_counts_it() {
+    #[test]
+    fn typed_metadata_rejects_a_fifo_without_waiting_for_a_writer() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("fifo");
         nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
-        // O_RDWR|O_NONBLOCK is the one FIFO open that never blocks on a
-        // missing peer.
-        let file = nofollow_nonblock_options()
-            .read(true)
-            .write(true)
-            .open_async(&path)
-            .await
-            .expect("open fifo");
+        let file = crate::test_support::fifo_read_timeout(&path, async {
+            nofollow_nonblock_options()
+                .read(true)
+                .open_async(&path)
+                .await
+                .expect("open fifo without a writer")
+        });
         let before = metrics::CACHE_NON_REGULAR.get();
         let err = regular_file_metadata_typed(&file, &path, "cache file metadata")
             .expect_err("fifo is not regular");

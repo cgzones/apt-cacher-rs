@@ -17,7 +17,7 @@ use crate::cleanup::{FetchFailure, IndexAnswer};
 use crate::deb_mirror::Mirror;
 use crate::error::{ErrorReport, UpstreamFetchError};
 use crate::fs_open::{
-    CacheAccessFailure, count_cache_failure, hint_sequential_read, nofollow_options,
+    CacheAccessFailure, count_cache_failure, hint_sequential_read, nofollow_nonblock_options,
     regular_file_metadata,
 };
 use crate::humanfmt::HumanFmt;
@@ -106,7 +106,11 @@ pub(crate) async fn cleanup_index_fetch(
     max_bytes: NonZero<u64>,
 ) -> Result<IndexAnswer<Vec<u8>>, FetchFailure> {
     let cache_path = conn_details.cache_file_path();
-    match nofollow_options().read(true).open_async(&cache_path).await {
+    match nofollow_nonblock_options()
+        .read(true)
+        .open_async(&cache_path)
+        .await
+    {
         Ok(file) => {
             if let Some(answer) =
                 read_cached_index(file, &cache_path, max_bytes, SystemTime::now()).await

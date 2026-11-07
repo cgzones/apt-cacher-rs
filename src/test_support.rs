@@ -107,6 +107,34 @@ pub(crate) async fn connected_tcp_pair() -> (tokio::net::TcpStream, tokio::net::
     (connected, accepted)
 }
 
+/// Run a FIFO read with no writer, failing without stranding a blocking open
+/// during runtime shutdown. A regression to a blocking read can outlive the
+/// timed-out future, including `Release`'s whole-read blocking job.
+pub(crate) fn fifo_read_timeout<T>(path: &std::path::Path, read: impl Future<Output = T>) -> T {
+    use std::time::Duration;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("FIFO test runtime");
+    let result =
+        runtime.block_on(async { tokio::time::timeout(Duration::from_secs(5), read).await });
+    if result.is_err() {
+        // O_RDWR|O_NONBLOCK needs no peer and releases an original
+        // O_RDONLY open. Keep it alive while the blocking job resumes;
+        // bound shutdown too if that older job then waits in a read.
+        let peer = crate::fs_open::nofollow_nonblock_options()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open FIFO recovery peer");
+        runtime.shutdown_timeout(Duration::from_secs(1));
+        // An older whole-read job now sees EOF and can finish too.
+        drop(peer);
+    }
+    result.expect("FIFO read waited for a writer")
+}
+
 /// Permit an IPv6 integration test to skip only when the host lacks IPv6
 /// and this run has not required it (CI sets the environment flag).
 pub(crate) fn assert_ipv6_unavailable(err: &std::io::Error) {

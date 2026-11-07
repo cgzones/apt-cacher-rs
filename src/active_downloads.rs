@@ -40,7 +40,7 @@ use crate::cache_layout::{CacheEntryKey, CacheEntryKeyRef, ConnectionDetails};
 use crate::cache_metadata::UpstreamMetadata;
 use crate::client_info::ClientInfo;
 use crate::error::ErrorReport;
-use crate::fs_open::{count_cache_failure, nofollow_options};
+use crate::fs_open::{count_cache_failure, nofollow_nonblock_options};
 use crate::guards::CANCELLED_DOWNLOAD;
 use crate::humanfmt::HumanFmt;
 use crate::mem_usage::{ARC_HEADER, Footprint};
@@ -384,7 +384,11 @@ pub(crate) async fn await_serveable(
         path: &std::path::Path,
         conn_details: &ConnectionDetails,
     ) -> Result<Option<tokio::fs::File>, JoinFailure> {
-        match nofollow_options().read(true).open_async(path).await {
+        match nofollow_nonblock_options()
+            .read(true)
+            .open_async(path)
+            .await
+        {
             Ok(file) => Ok(Some(file)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => {
@@ -1020,6 +1024,54 @@ mod tests {
 
     fn test_mirror() -> Mirror {
         structured_mirror("deb.debian.org", "")
+    }
+
+    #[test]
+    fn fifo_joiner_releases_the_status_lock_for_the_writer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("partial");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+        let (_tx, rx) = tokio::sync::watch::channel(());
+        let meta = Arc::new(UpstreamMetadata::default());
+        let status = Arc::new(tokio::sync::RwLock::new(ActiveDownloadStatus::Download {
+            path: path.clone(),
+            content_length: ContentLength::Exact(crate::nonzero!(1)),
+            rx,
+            meta: Arc::clone(&meta),
+        }));
+        let conn = crate::test_support::connection_details("test.deb");
+        let before = metrics::CACHE_NON_REGULAR.get();
+        let before_io = metrics::CACHE_IO_FAILURE.get();
+
+        crate::test_support::fifo_read_timeout(&path, async {
+            let joiner = async {
+                let Serveable::InProgress { file, path, .. } = await_serveable(&status, &conn)
+                    .await
+                    .expect("opened partial")
+                else {
+                    unreachable!("joiner must observe the downloading state");
+                };
+                // The serving backend rejects the descriptor after the shared
+                // state machine opens it and releases its status read lock.
+                crate::fs_open::regular_file_metadata_typed(&file, &path, "joiner metadata")
+                    .expect_err("FIFO must be rejected before serving");
+            };
+            let writer = async {
+                *status.write().await = ActiveDownloadStatus::Verifying {
+                    path: path.clone(),
+                    meta: Arc::clone(&meta),
+                };
+            };
+            // Poll the joiner first so its open owns the read lock before
+            // the writer attempts the transition that needs the write lock.
+            tokio::join!(biased; joiner, writer);
+            assert!(matches!(
+                &*status.read().await,
+                ActiveDownloadStatus::Verifying { .. }
+            ));
+        });
+        assert_eq!(metrics::CACHE_NON_REGULAR.get(), before + 1);
+        assert_eq!(metrics::CACHE_IO_FAILURE.get(), before_io);
     }
 
     #[test]

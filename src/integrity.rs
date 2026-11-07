@@ -51,7 +51,7 @@ use tracing::{debug, error, warn};
 
 use crate::config::HostText;
 use crate::error::ErrorReport;
-use crate::fs_open::{hint_sequential_read, nofollow_options};
+use crate::fs_open::{hint_sequential_read, nofollow_nonblock_options};
 use crate::ingest_ledger::{Claim, IngestLedger, Outcome};
 use crate::limits::{self, PackagesCompression};
 use crate::mem_usage::{ARC_HEADER, Footprint, buffer_bytes};
@@ -1896,15 +1896,40 @@ fn ingest_kind(file: &IndexFile<'_>) -> Option<IngestKind> {
     kind
 }
 
-/// The ledger outcome of one admitted ingest run. An error carrying an OS
-/// errno is the file system failing (or cleanup removing the file) and may
-/// pass; every other error was built by the decode pipeline itself -- a size
-/// or bomb cap, a corrupt stream, an over-cap or non-UTF-8
-/// `Release` -- and repeats on the same bytes.
+/// A filesystem anomaly that may be corrected before the next request,
+/// unlike decode failures that repeat on the same index bytes.
+#[derive(Debug, thiserror::Error)]
+#[error("cached index is not a regular file")]
+struct NonRegularIndex;
+
+fn require_regular_index(metadata: &Metadata) -> std::io::Result<()> {
+    if metadata.is_file() {
+        Ok(())
+    } else {
+        metrics::CACHE_NON_REGULAR.increment();
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            NonRegularIndex,
+        ))
+    }
+}
+
+/// The ledger outcome of one admitted ingest run. An OS error or a
+/// nonregular cache entry may pass after the filesystem is corrected. Every
+/// other error was built by the decode pipeline itself -- a size or bomb cap,
+/// a corrupt stream, an over-cap or non-UTF-8 `Release` -- and repeats on the
+/// same bytes.
 fn ingest_outcome(result: &std::io::Result<()>) -> Outcome {
     match result {
         Ok(()) => Outcome::Ingested,
-        Err(err) if err.raw_os_error().is_some() => Outcome::Retry,
+        Err(err)
+            if err.raw_os_error().is_some()
+                || err
+                    .get_ref()
+                    .is_some_and(<dyn std::error::Error + Send + Sync>::is::<NonRegularIndex>) =>
+        {
+            Outcome::Retry
+        }
         Err(_) => Outcome::Failed,
     }
 }
@@ -2102,7 +2127,17 @@ async fn ingest_packages_file(
     compression: Option<PackagesCompression>,
     buffer_size: usize,
 ) -> std::io::Result<()> {
-    let mut file = nofollow_options().read(true).open_async(path).await?;
+    let mut file = nofollow_nonblock_options()
+        .read(true)
+        .open_async(path)
+        .await?;
+    let metadata = file.metadata().await;
+    // Reject a known nonregular descriptor before sniffing or decoding. Keep
+    // a stat failure until after sniffing, preserving its non-fatal fallback
+    // and the priority of any compression-sniff error.
+    if let Ok(metadata) = &metadata {
+        require_regular_index(metadata)?;
+    }
     let compression = match compression {
         Some(compression) => compression,
         None => sniff_packages_compression(&mut file).await?,
@@ -2110,7 +2145,7 @@ async fn ingest_packages_file(
 
     // Compute the decompressed-output ceiling from the compressed file size.
     // Fall back to the absolute cap if stat fails (non-fatal).
-    let compressed_size = match file.metadata().await {
+    let compressed_size = match metadata {
         Ok(m) => {
             limits::check_packages_file_size(compression, m.len())?;
             m.len()
@@ -2167,10 +2202,10 @@ async fn ingest_packages_file(
 }
 
 /// Read a cached `Release` / `InRelease` file to a string with the cache's
-/// standard hardening: `O_NOFOLLOW` (reject a symlinked final component) and a
-/// read capped at `MAX_RELEASE_SIZE`, so a hostile or buggy mirror serving a
-/// multi-GB `Release` (which passes the `max_object_size` admission check)
-/// cannot balloon memory unbounded. An over-cap file fails with
+/// standard hardening: a nonblocking, symlink-refusing open, a regular-file
+/// check, and a read capped at `MAX_RELEASE_SIZE`, so a hostile or buggy
+/// mirror serving a multi-GB `Release` (which passes the `max_object_size`
+/// admission check) cannot balloon memory unbounded. An over-cap file fails with
 /// `io::ErrorKind::InvalidData` rather than truncating silently.
 ///
 /// Shared by registry ingest ([`ingest_release_file`]) and the by-hash cleanup
@@ -2196,8 +2231,9 @@ async fn read_release(path: &Path) -> std::io::Result<(String, std::time::System
 fn read_release_sync(path: &Path) -> std::io::Result<(String, std::time::SystemTime)> {
     use std::io::Read as _;
 
-    let file = nofollow_options().read(true).open(path)?;
+    let file = nofollow_nonblock_options().read(true).open(path)?;
     let metadata = file.metadata()?;
+    require_regular_index(&metadata)?;
     let mtime = metadata
         .modified()
         .expect("Platform should support modification timestamps via setup check");
@@ -2357,6 +2393,7 @@ impl PendingDigests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs_open::nofollow_options;
     use crate::test_support::structured_mirror;
     use std::io::Write as _;
 
@@ -3448,6 +3485,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn index_ingests_reject_fifos_and_retry_after_correction() {
+        for kind in [
+            IngestKind::Packages {
+                compression: Some(PackagesCompression::Raw),
+            },
+            IngestKind::Packages { compression: None },
+            IngestKind::Release {
+                release_dir: "debian/dists/sid".to_owned(),
+            },
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("index");
+            nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+            let reg = ChecksumRegistry::new(crate::nonzero!(16));
+            let ledger = IngestLedger::new(16);
+            let slots = Semaphore::new(1);
+            let mirror = structured_mirror("fifo.test", "debian");
+            let before = metrics::CACHE_NON_REGULAR.get();
+            let before_io = metrics::CACHE_IO_FAILURE.get();
+            let before_failed = metrics::INGEST_FAILED_MARKED.get();
+            crate::test_support::fifo_read_timeout(&path, async {
+                let Admission::Admitted(mut claim, slot) = admit(&ledger, &slots, &path, 0) else {
+                    unreachable!("first ingest must be admitted");
+                };
+                let result = ingest_once(&reg, &kind, &mirror, &path, 64 * 1024).await;
+                assert!(
+                    result.is_err(),
+                    "a FIFO must fail before sniffing or parsing"
+                );
+                let outcome = ingest_outcome(&result);
+                assert_eq!(outcome, Outcome::Retry);
+                log_ingest_result(&result, outcome, "fifo.test", "debian", &path);
+                assert!(!claim.finish(outcome, 0));
+                drop((claim, slot));
+                assert_eq!(slots.available_permits(), 1, "admission slot released");
+                assert_eq!(
+                    PACKAGES_INGEST_PERMITS.available_permits(),
+                    PACKAGES_INGEST_CONCURRENCY,
+                    "decoder permits released"
+                );
+                assert_eq!(metrics::CACHE_NON_REGULAR.get(), before + 1);
+                assert_eq!(metrics::CACHE_IO_FAILURE.get(), before_io);
+                assert_eq!(metrics::INGEST_FAILED_MARKED.get(), before_failed);
+
+                // Correct the path without a commit invalidating the ledger:
+                // the very next touch must be able to ingest it.
+                std::fs::remove_file(&path).expect("remove FIFO");
+                let (content, key) = match &kind {
+                    IngestKind::Packages { .. } => (
+                        format!(
+                            "Package: a\nFilename: pool/main/a/a/a_1_amd64.deb\nSHA256: {HELLO_SHA256}\n"
+                        ),
+                        "a_1_amd64.deb",
+                    ),
+                    IngestKind::Release { .. } => (
+                        format!("SHA256:\n {HELLO_SHA256} 1 main/binary-amd64/Packages.xz\n"),
+                        "debian/dists/sid/main/binary-amd64/Packages.xz",
+                    ),
+                };
+                std::fs::write(&path, content).expect("write regular index");
+                let Admission::Admitted(mut claim, slot) = admit(&ledger, &slots, &path, 0) else {
+                    unreachable!("a corrected path must remain retryable");
+                };
+                let result = ingest_once(&reg, &kind, &mirror, &path, 64 * 1024).await;
+                result.as_ref().expect("corrected index ingests");
+                assert!(!claim.finish(ingest_outcome(&result), 0));
+                drop((claim, slot));
+                assert_eq!(
+                    reg.lookup("fifo.test", "debian", key),
+                    Some(index_parser::hex_decode_exact::<32>(HELLO_SHA256).unwrap())
+                );
+                assert_eq!(slots.available_permits(), 1);
+                assert!(matches!(
+                    admit(&ledger, &slots, &path, 0),
+                    Admission::Nothing
+                ));
+            });
+        }
+    }
+
     #[tokio::test]
     async fn ingest_packages_populates_registry() {
         use std::num::NonZero;
@@ -3907,13 +4025,19 @@ mod tests {
     }
 
     #[test]
-    fn ingest_errors_with_an_errno_are_retried_and_synthetic_ones_are_not() {
+    fn ingest_filesystem_errors_retry_but_decode_errors_remain_failed() {
         use crate::ingest_ledger::Outcome;
         let os = std::io::Error::from_raw_os_error(nix::libc::EIO);
         let gone = std::io::Error::from_raw_os_error(nix::libc::ENOENT);
         let cap = limits::check_packages_file_size(PackagesCompression::Xz, u64::MAX)
             .expect_err("over the cap");
         let corrupt = std::io::Error::new(std::io::ErrorKind::InvalidData, "corrupt xz");
+        let nonregular = std::io::Error::new(std::io::ErrorKind::InvalidInput, NonRegularIndex);
+        let unsupported = std::io::Error::new(std::io::ErrorKind::Unsupported, "compression");
+        let invalid = std::io::Error::new(std::io::ErrorKind::InvalidInput, "decoder input");
+        assert_eq!(ingest_outcome(&Err(nonregular)), Outcome::Retry);
+        assert_eq!(ingest_outcome(&Err(unsupported)), Outcome::Failed);
+        assert_eq!(ingest_outcome(&Err(invalid)), Outcome::Failed);
         assert_eq!(ingest_outcome(&Err(os)), Outcome::Retry);
         assert_eq!(ingest_outcome(&Err(gone)), Outcome::Retry);
         assert_eq!(ingest_outcome(&Err(cap)), Outcome::Failed);

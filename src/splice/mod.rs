@@ -63,7 +63,10 @@ use crate::cache_conditional::{RangeRequestHeaders, ServeParams};
 use crate::cache_layout::{CachedFlavor, ConnectionDetails, FetchRole};
 use crate::cache_quota::QuotaExceeded;
 use crate::error::ErrorReport;
-use crate::fs_open::{nofollow_options, regular_file_metadata_typed, touch_volatile_mtime_with};
+use crate::fs_open::{
+    nofollow_nonblock_options, nofollow_options, regular_file_metadata_typed,
+    touch_volatile_mtime_with,
+};
 use crate::guards::{Consequence, DownloadBarrier, InitBarrier};
 use crate::http_helpers::{ClientConn, ConnectionAction, WritePhase, write_all_to_stream};
 use crate::http_range::{HttpDate, ParsedRange, cache_file_http_date, http_parse_range};
@@ -704,7 +707,11 @@ async fn read_volatile_validators(
     }
     let cache_path = conn_details.cache_file_path();
 
-    let file = match nofollow_options().read(true).open_async(&cache_path).await {
+    let file = match nofollow_nonblock_options()
+        .read(true)
+        .open_async(&cache_path)
+        .await
+    {
         Ok(f) => f,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => {
