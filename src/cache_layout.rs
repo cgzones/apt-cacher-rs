@@ -1187,7 +1187,10 @@ fn decode_validate(raw: &str, kind: ValidateKind) -> Result<Cow<'_, str>, Classi
         }
     };
 
-    if kind.spans_segments() && decoded.matches('/').count() != raw.matches('/').count() {
+    if kind.spans_segments()
+        && matches!(decoded, Cow::Owned(_))
+        && decoded.matches('/').count() != raw.matches('/').count()
+    {
         return Err(ClassifyError::EncodedSeparator { kind, raw });
     }
 
