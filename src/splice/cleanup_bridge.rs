@@ -41,7 +41,7 @@ const CACHE_FAILURE: IndexAnswer<Vec<u8>> = IndexAnswer::Status(StatusCode::INTE
 /// exceeds `max_bytes`, and the caller should fetch upstream; `Some` carries
 /// either the cached bytes or a 500 on cache anomalies.
 async fn read_cached_index(
-    mut file: tokio::fs::File,
+    file: tokio::fs::File,
     cache_path: &Path,
     max_bytes: NonZero<u64>,
     now: SystemTime,
@@ -65,10 +65,14 @@ async fn read_cached_index(
     let size = usize::try_from(mdata.len()).expect("size below buffering cap fits usize");
 
     hint_sequential_read(&file, mdata.len(), cache_path);
-    // A file growing past this stat is read whole; cleanup's reduce checks the
-    // caps against the bytes actually read.
+    // One extra byte lets cleanup's reducer reject a file that grew past
+    // the cap after the stat without buffering the rest.
     let mut body = Vec::with_capacity(size);
-    match file.read_to_end(&mut body).await {
+    match file
+        .take(max_bytes.get().saturating_add(1))
+        .read_to_end(&mut body)
+        .await
+    {
         Ok(_bytes) => {
             debug!(
                 "splice cleanup: serving `{}` from cache (age {} within {})",
@@ -92,7 +96,7 @@ async fn read_cached_index(
 
 /// One format attempt of cleanup's index fetch in hyper-less builds, for the
 /// index at `uri`, buffering at most `max_bytes` (`limits::packages_file_cap`
-/// of its compression).
+/// of its compression), plus one byte to detect a growing cached file.
 ///
 /// Only copies younger than `VOLATILE_CACHE_MAX_AGE` (30s) may supply
 /// references. Older named indexes can omit packages introduced since their
@@ -233,6 +237,50 @@ async fn cleanup_upstream_fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_copy_growing_after_stat_is_bounded_and_still_detected_as_oversized() {
+        use std::time::Duration;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        for grown_size in [4, 5, 1024] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("Packages");
+            std::fs::write(&path, b"x").expect("initial index");
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            let file = runtime.block_on(tokio::fs::File::open(&path)).unwrap();
+            let resume = crate::test_support::pause_blocking_pool(&runtime);
+            runtime.block_on(async {
+                let mut read =
+                    std::pin::pin!(read_cached_index(file, &path, crate::nonzero!(4), modified,));
+                // Metadata is read inline; the first file read now waits
+                // behind the paused worker, so growth occurs after the stat.
+                assert!(
+                    read.as_mut()
+                        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                        .is_pending()
+                );
+                std::fs::write(&path, vec![b'x'; grown_size]).expect("grow index");
+                drop(resume);
+                let answer = tokio::time::timeout(Duration::from_secs(5), read)
+                    .await
+                    .expect("read completes after releasing the worker");
+                let Some(IndexAnswer::Complete(body)) = answer else {
+                    unreachable!("the fresh file passed its original size check");
+                };
+                assert_eq!(body, vec![b'x'; grown_size.min(5)]);
+                assert_eq!(
+                    body.len() > 4,
+                    grown_size > 4,
+                    "oversize remains detectable"
+                );
+            });
+        }
+    }
 
     #[tokio::test]
     async fn freshness_uses_thirty_seconds_regardless_of_the_request() {
