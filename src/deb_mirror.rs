@@ -2310,28 +2310,33 @@ mod tests {
         ));
     }
 
+    const INVALID_PATH_SEGMENTS: [&str; 15] = [
+        "",
+        ".",
+        "..",
+        "-foo",
+        ".foo",
+        "_foo",
+        "foo\nbar",
+        "foo/bar",
+        "foo/./bar",
+        "foo/../bar",
+        "foo//bar",
+        "/",
+        "/debian",
+        "~/foo",
+        "~foo",
+    ];
+
     #[test]
     fn test_invalid_distribution() {
         /* valid */
         assert!(valid_distribution("sid"));
         assert!(valid_distribution("lunar-updates"));
 
-        /* invalid */
-        assert!(!valid_distribution(""));
-        assert!(!valid_distribution("."));
-        assert!(!valid_distribution(".."));
-        assert!(!valid_distribution("-foo"));
-        assert!(!valid_distribution(".foo"));
-        assert!(!valid_distribution("_foo"));
-        assert!(!valid_distribution("foo\nbar"));
-        assert!(!valid_distribution("foo/bar"));
-        assert!(!valid_distribution("foo/./bar"));
-        assert!(!valid_distribution("foo/../bar"));
-        assert!(!valid_distribution("foo//bar"));
-        assert!(!valid_distribution("/"));
-        assert!(!valid_distribution("/debian"));
-        assert!(!valid_distribution("~/foo"));
-        assert!(!valid_distribution("~foo"));
+        for segment in INVALID_PATH_SEGMENTS {
+            assert!(!valid_distribution(segment), "distribution: {segment:?}");
+        }
     }
 
     #[test]
@@ -2342,22 +2347,9 @@ mod tests {
         assert!(valid_component("mysql-8.0"));
         assert!(valid_component("foo_bar"));
 
-        /* invalid */
-        assert!(!valid_component(""));
-        assert!(!valid_component("."));
-        assert!(!valid_component(".."));
-        assert!(!valid_component("-foo"));
-        assert!(!valid_component(".foo"));
-        assert!(!valid_component("_foo"));
-        assert!(!valid_component("foo\nbar"));
-        assert!(!valid_component("foo/bar"));
-        assert!(!valid_component("foo/./bar"));
-        assert!(!valid_component("foo/../bar"));
-        assert!(!valid_component("foo//bar"));
-        assert!(!valid_component("/"));
-        assert!(!valid_component("/debian"));
-        assert!(!valid_component("~/foo"));
-        assert!(!valid_component("~foo"));
+        for segment in INVALID_PATH_SEGMENTS {
+            assert!(!valid_component(segment), "component: {segment:?}");
+        }
     }
 
     #[test]
@@ -2365,22 +2357,9 @@ mod tests {
         /* valid */
         assert!(valid_architecture("binary-amd64"));
 
-        /* invalid */
-        assert!(!valid_architecture(""));
-        assert!(!valid_architecture("."));
-        assert!(!valid_architecture(".."));
-        assert!(!valid_architecture("-foo"));
-        assert!(!valid_architecture(".foo"));
-        assert!(!valid_architecture("_foo"));
-        assert!(!valid_architecture("foo\nbar"));
-        assert!(!valid_architecture("foo/bar"));
-        assert!(!valid_architecture("foo/./bar"));
-        assert!(!valid_architecture("foo/../bar"));
-        assert!(!valid_architecture("foo//bar"));
-        assert!(!valid_architecture("/"));
-        assert!(!valid_architecture("/debian"));
-        assert!(!valid_architecture("~/foo"));
-        assert!(!valid_architecture("~foo"));
+        for segment in INVALID_PATH_SEGMENTS {
+            assert!(!valid_architecture(segment), "architecture: {segment:?}");
+        }
     }
 
     #[test]
