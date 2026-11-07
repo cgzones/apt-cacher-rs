@@ -81,6 +81,7 @@ use crate::{
         valid_architecture, valid_component, valid_directory, valid_distribution, valid_filename,
         valid_mirrorname,
     },
+    flat_blocklist::path_collides_with_flat_layout,
     index_parser::HashAlgo,
     metrics,
     partial_file::PARTIAL_SUFFIX,
@@ -790,6 +791,29 @@ pub(crate) struct RequestClass {
     pub(crate) debname: String,
     pub(crate) resource_kind: ResourceKind,
     pub(crate) origin_fields: Option<OriginFields>,
+}
+
+/// A classified resource whose on-disk name or layout cannot be stored.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StorageError {
+    NameTooLong,
+    FlatAnchoredMirror,
+}
+
+impl RequestClass {
+    /// Validate the constructed storage identity separately from URL field
+    /// classification, so request policy can give query handling precedence.
+    pub(crate) fn validate_storage(&self) -> Result<(), StorageError> {
+        if self.debname.len() > MAX_DEBNAME_LEN {
+            return Err(StorageError::NameTooLong);
+        }
+        if !self.resource_kind.layout().is_flat()
+            && path_collides_with_flat_layout(&self.mirror_path)
+        {
+            return Err(StorageError::FlatAnchoredMirror);
+        }
+        Ok(())
+    }
 }
 
 /// Errors returned by [`classify_request`].  Each call site translates these

@@ -8,12 +8,11 @@ use hashbrown::HashMap;
 use tracing::debug;
 
 use crate::{
-    cache_layout::{MAX_DEBNAME_LEN, classify_request},
+    cache_layout::classify_request,
     cache_paths::{MirrorSite, SUBDIR_DISTS, SUBDIR_FLAT_BYHASH, SUBDIR_TMP},
     client_info::ClientInfo,
     config::{CacheHost, ClientHost},
     database::{self, MirrorEntry},
-    flat_blocklist::path_collides_with_flat_layout,
     index_parser::HashAlgo,
 };
 
@@ -329,14 +328,11 @@ impl Origin {
         let normalized = normalize_uri_path(path);
         let resource = parse_request_path(&normalized)?;
         let class = classify_request(&resource, client).ok()?;
-        let kind = class.resource_kind.layout().mirror_kind();
-        if is_unsafe_cache_path(&normalized)
-            || class.debname.len() > MAX_DEBNAME_LEN
-            || (kind == MirrorKind::Structured
-                && path_collides_with_flat_layout(&class.mirror_path))
-        {
+        if is_unsafe_cache_path(&normalized) {
             return None;
         }
+        class.validate_storage().ok()?;
+        let kind = class.resource_kind.layout().mirror_kind();
         let fields = class.origin_fields?;
         Some(Self {
             mirror: Mirror::new(host, port, class.mirror_path, kind),
@@ -2811,6 +2807,9 @@ mod tests {
         let from = |path: &str| Origin::from_path(path, host(), None, &local_client());
 
         for path in [
+            // Structured mirrors under the host's flat tree.
+            "/flat/dists/a/b/binary-x/Packages",
+            "/flat/x/dists/a/b/binary-x/Packages",
             // Trailing slash.
             "/flat/dists/a/b/binary-x/Packages/",
             "/debian/dists/sid/main/binary-amd64/Packages.xz/",
@@ -2838,6 +2837,19 @@ mod tests {
             .expect("an encoded letter is still the same index");
         assert_eq!(decoded.mirror.path(), "debian");
         assert_eq!(decoded.fields.distribution, "sid");
+
+        // Individually valid fields can join to a name the cache cannot
+        // store. Origin registration shares the same exact byte boundary.
+        let distribution = "a".repeat(128);
+        let fixed_len = distribution.len() + "__binary-amd64_Packages".len();
+        let max_len = crate::cache_layout::MAX_DEBNAME_LEN;
+        for name_len in [max_len, max_len + 1] {
+            let path = format!(
+                "/debian/dists/{distribution}/{}/binary-amd64/Packages",
+                "b".repeat(name_len - fixed_len)
+            );
+            assert_eq!(from(&path).is_some(), name_len == max_len, "{path}");
+        }
     }
 
     #[test]

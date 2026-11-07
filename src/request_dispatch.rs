@@ -45,7 +45,7 @@ use tracing::trace;
 
 use crate::{
     build_info::APP_VIA_PSEUDONYM,
-    cache_layout::{self, ClassifyError, ConnectionDetails, MAX_DEBNAME_LEN},
+    cache_layout::{self, ClassifyError, ConnectionDetails, MAX_DEBNAME_LEN, StorageError},
     client_info::ClientInfo,
     client_trouble::{self, Trouble},
     config::{Alias, CacheHost, ClientHost, Config, IpNetOrAddr, resolve_alias},
@@ -54,8 +54,7 @@ use crate::{
         normalize_uri_path, parse_request_path,
     },
     error::ErrorReport,
-    flat_blocklist::{self, path_collides_with_flat_layout},
-    global_config, info_once, metrics,
+    flat_blocklist, global_config, info_once, metrics,
     precise_instant::PreciseInstant,
     uncacheables::record_uncacheable,
     upstream_head::{ContentLengthError, parse_content_length_list},
@@ -688,17 +687,22 @@ fn decide_request(
                         "Query string on cacheable path {uri_path} from client {client}; forwarding it upstream uncached"
                     );
                     PassthroughReason::QueryString
-                } else if class.debname.len() > MAX_DEBNAME_LEN {
-                    warn_once_or_info!(
-                        "Uncacheable path {uri_path} from client {client} (its {}-byte cache name exceeds {MAX_DEBNAME_LEN} bytes); forwarding it upstream uncached",
-                        class.debname.len()
-                    );
-                    PassthroughReason::NameTooLong
-                } else if !layout.is_flat() && path_collides_with_flat_layout(&class.mirror_path) {
-                    warn_once_or_info!(
-                        "Uncacheable path {uri_path} from client {client} (a structured mirror path under `flat` would share the host's flat-repository cache tree); forwarding it upstream uncached"
-                    );
-                    PassthroughReason::FlatAnchoredMirror
+                } else if let Err(reason) = class.validate_storage() {
+                    match reason {
+                        StorageError::NameTooLong => {
+                            warn_once_or_info!(
+                                "Uncacheable path {uri_path} from client {client} (its {}-byte cache name exceeds {MAX_DEBNAME_LEN} bytes); forwarding it upstream uncached",
+                                class.debname.len()
+                            );
+                            PassthroughReason::NameTooLong
+                        }
+                        StorageError::FlatAnchoredMirror => {
+                            warn_once_or_info!(
+                                "Uncacheable path {uri_path} from client {client} (a structured mirror path under `flat` would share the host's flat-repository cache tree); forwarding it upstream uncached"
+                            );
+                            PassthroughReason::FlatAnchoredMirror
+                        }
+                    }
                 } else if layout.is_flat() && is_flat_blocked(cache_id, requested_port) {
                     warn_once_or_info!(
                         "Flat caching disabled for host `{requested_host}` due to colliding structured mirror; passing {uri_path} through uncached for client {client}"
@@ -1397,10 +1401,17 @@ mod tests {
     /// one is relayed uncached rather than cached under the plain name.
     #[test]
     fn passthrough_query_string_on_a_cacheable_path() {
+        // Query handling precedes the constructed name/layout checks.
+        let too_long = format!(
+            "/debian/pool/main/f/foo/{}_1_all.deb?x=1",
+            "f".repeat(MAX_DEBNAME_LEN + 1 - "_1_all.deb".len())
+        );
         for target in [
             "/debian/pool/main/f/firefox/firefox_1.0_amd64.deb?x=1",
             "/debian/dists/sid/main/binary-amd64/Packages.gz?",
             "/apt/Packages.gz?a=b&c=d",
+            &too_long,
+            "/flat/dists/sid/InRelease?x=1",
         ] {
             let decision = decide_default(target);
             assert!(
