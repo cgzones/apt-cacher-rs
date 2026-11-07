@@ -44,18 +44,20 @@ use crate::upstream_head::{BodyFraming, RelayedHeaders};
 /// de-chunked for HTTP/1.0). Forwarding them would let a client
 /// frame the body by a line the relay ignored (a second `Transfer-Encoding`,
 /// a conflicting `Content-Length`) or lose it to a `Connection:` nomination,
-/// and read the body's tail as a forged next response. `conn_action` must
-/// already be `framing`'s verdict (`BodyFraming::client_action`).
+/// and read the body's tail as a forged next response. The requested action
+/// is adjusted by `BodyFraming::client_action` and returned alongside the
+/// rewritten headers, so the caller keeps the announced connection policy.
 ///
 /// Extracted from `splice_simple_proxy` so the filtering invariants can be
 /// unit-tested without requiring a live upstream socket.
 pub(super) fn rewrite_simple_proxy_headers(
     raw_headers: &[u8],
     conn_version: ConnectionVersion,
-    conn_action: ConnectionAction,
+    requested_action: ConnectionAction,
     status_code: StatusCode,
     framing: BodyFraming,
-) -> std::io::Result<Vec<u8>> {
+) -> std::io::Result<(Vec<u8>, ConnectionAction)> {
+    let conn_action = framing.client_action(requested_action, conn_version);
     let mut headers = [httparse::EMPTY_HEADER; MAX_UPSTREAM_HEADERS];
     let mut parsed = httparse::Response::new(&mut headers);
     if parsed.parse(raw_headers).is_err() {
@@ -92,7 +94,7 @@ pub(super) fn rewrite_simple_proxy_headers(
     buf.extend_from_slice(APP_VIA.as_bytes());
     buf.extend_from_slice(b"\r\n");
     buf.extend_from_slice(b"\r\n");
-    Ok(buf)
+    Ok((buf, conn_action))
 }
 
 /// Connects to upstream, sends a GET request, and forwards the complete response
@@ -182,11 +184,10 @@ pub(crate) async fn splice_simple_proxy(
     // to match the client's protocol version and keep-alive strategy, which
     // a body relayed close-delimited overrides (a close-delimited upstream
     // body, or a chunked one de-chunked for an HTTP/1.0 client).
-    let conn_action = resp.framing.client_action(conn.action, conn.version);
-    let rewritten_headers = match rewrite_simple_proxy_headers(
+    let (rewritten_headers, conn_action) = match rewrite_simple_proxy_headers(
         &hdr_buf[..hdr_end],
         conn.version,
-        conn_action,
+        conn.action,
         resp.status_code,
         resp.framing,
     ) {
@@ -273,7 +274,7 @@ mod tests {
                     Content-Type: text/plain\r\n\
                     Content-Length: 5\r\n\
                     \r\n";
-        let out = rewrite_simple_proxy_headers(
+        let (out, _) = rewrite_simple_proxy_headers(
             raw,
             ConnectionVersion::Http11,
             ConnectionAction::KeepAlive,
@@ -369,10 +370,10 @@ mod tests {
                 vec![],
             ),
         ] {
-            let out = rewrite_simple_proxy_headers(
+            let (out, _) = rewrite_simple_proxy_headers(
                 raw,
                 version,
-                framing.client_action(ConnectionAction::KeepAlive, version),
+                ConnectionAction::KeepAlive,
                 status,
                 framing,
             )
@@ -419,20 +420,29 @@ mod tests {
                 "close",
             ),
         ] {
-            assert_eq!(
-                framing
-                    .client_action(ConnectionAction::KeepAlive, version)
-                    .to_string(),
-                expected,
-                "{version} {framing:?}"
-            );
-            assert_eq!(
-                framing
-                    .client_action(ConnectionAction::Close, version)
-                    .to_string(),
-                "close",
-                "{version} {framing:?}"
-            );
+            for (requested, expected) in [
+                (ConnectionAction::KeepAlive, expected),
+                (ConnectionAction::Close, "close"),
+            ] {
+                let (out, action) = rewrite_simple_proxy_headers(
+                    b"HTTP/1.1 200 OK\r\n\r\n",
+                    version,
+                    requested,
+                    StatusCode::OK,
+                    framing,
+                )
+                .expect("rewrite should succeed");
+                assert_eq!(
+                    action.to_string(),
+                    expected,
+                    "{version} {framing:?} requested {requested}"
+                );
+                let out = String::from_utf8(out).unwrap();
+                assert!(
+                    out.contains(&format!("Connection: {expected}\r\n")),
+                    "{version} {framing:?} requested {requested}:\n{out}"
+                );
+            }
         }
     }
 
@@ -444,7 +454,7 @@ mod tests {
                     Transfer-Encoding: chunked\r\n\
                     Content-Length: 12345\r\n\
                     \r\n";
-        let out = rewrite_simple_proxy_headers(
+        let (out, _) = rewrite_simple_proxy_headers(
             raw,
             ConnectionVersion::Http11,
             ConnectionAction::Close,
@@ -466,7 +476,7 @@ mod tests {
                     X-Custom-Hop: secret\r\n\
                     Content-Type: text/plain\r\n\
                     \r\n";
-        let out = rewrite_simple_proxy_headers(
+        let (out, _) = rewrite_simple_proxy_headers(
             raw,
             ConnectionVersion::Http11,
             ConnectionAction::Close,
@@ -501,7 +511,7 @@ mod opaque_headers_tests {
     #[test]
     fn relay_preserves_opaque_header_bytes() {
         let raw = b"HTTP/1.1 200 OK\r\nX-Opaque: \xff\x80\r\nContent-Length: 0\r\n\r\n";
-        let out = rewrite_simple_proxy_headers(
+        let (out, _) = rewrite_simple_proxy_headers(
             raw,
             ConnectionVersion::Http11,
             ConnectionAction::KeepAlive,

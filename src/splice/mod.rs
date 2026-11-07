@@ -890,13 +890,10 @@ async fn relay_passthrough(
     // framing the relay applies instead of the upstream's, and append `Via:`.
     // Nothing has been written to the client yet, so a malformed-header
     // error can safely bail to a 502 via the outer arm.
-    let conn_action = upstream_resp
-        .framing
-        .client_action(client.action, client.version);
-    let passthrough_headers = match rewrite_simple_proxy_headers(
+    let (passthrough_headers, conn_action) = match rewrite_simple_proxy_headers(
         &header_buf[..header_end],
         client.version,
-        conn_action,
+        client.action,
         upstream_resp.status_code,
         upstream_resp.framing,
     ) {
