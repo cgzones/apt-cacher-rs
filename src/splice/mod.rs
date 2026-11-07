@@ -64,8 +64,7 @@ use crate::cache_layout::{CachedFlavor, ConnectionDetails, FetchRole};
 use crate::cache_quota::QuotaExceeded;
 use crate::error::ErrorReport;
 use crate::fs_open::{
-    nofollow_nonblock_options, nofollow_options, regular_file_metadata_typed,
-    touch_volatile_mtime_with,
+    nofollow_nonblock_options, regular_file_metadata_typed, touch_volatile_mtime_with,
 };
 use crate::guards::{Consequence, DownloadBarrier, InitBarrier};
 use crate::http_helpers::{ClientConn, ConnectionAction, WritePhase, write_all_to_stream};
@@ -1054,12 +1053,12 @@ fn lost_prefix_client(
 
 /// Send the overlap of the existing partial with the requested range. A
 /// failed client write preserves both its byte count and the shared download;
-/// a partial that cannot be reopened is a *cache* failure instead, reported
-/// with its path, and ends this delivery without touching the download.
+/// the download's open descriptor keeps the prefix tied to the same file even
+/// if its pathname is removed or replaced.
 async fn send_resumed_prefix<'a>(
     client: BodyClient<'a>,
     conn_details: &ConnectionDetails,
-    temppath: &TempPath,
+    partial_reader: &tokio::fs::File,
     range_plan: &ServeParams,
     resume_offset: u64,
 ) -> (BodyClient<'a>, u64) {
@@ -1071,30 +1070,9 @@ async fn send_resumed_prefix<'a>(
     if send_end <= send_start {
         return (client, 0);
     }
-    let partial_reader = match nofollow_options()
-        .read(true)
-        .open_async(temppath.as_ref())
-        .await
-    {
-        Ok(reader) => reader,
-        Err(err) => {
-            // A cache-side failure, not a client one: the peer is fine, the
-            // proxy just cannot read back what it already stored. Name the
-            // path so the operator can act on it, then release the client and
-            // let the download finish into the cache.
-            let failure: DeliveryFailure =
-                CacheError::counted_io("reopen resumed prefix", temppath, err).into();
-            shutdown_client_write(client_stream);
-            let reported = failure.conclude(Some(&conn_details.client), format_args!(
-                "splice proxy: failed to reopen partial file for the resumed prefix of {} from mirror {}; continuing cache-only",
-                conn_details.debname, conn_details.mirror,
-            ));
-            return (BodyClient::Aborted(reported), 0);
-        }
-    };
     let outcome = async_sendfile(
         client_stream,
-        &partial_reader,
+        partial_reader,
         send_start,
         send_end - send_start,
     )
@@ -1709,7 +1687,7 @@ pub(crate) async fn splice_proxy(
     let (body_client, resumed_bytes) = send_resumed_prefix(
         body_client,
         conn_details,
-        &target.temppath,
+        target.writer.file(),
         &range_plan,
         resume_offset,
     )

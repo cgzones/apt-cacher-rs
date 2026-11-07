@@ -451,6 +451,11 @@ impl CacheWriter {
         })
     }
 
+    /// Borrow the owned descriptor for explicit-offset reads of the cached prefix.
+    pub(super) fn file(&self) -> &tokio::fs::File {
+        &self.tempfile
+    }
+
     /// Prefixes and fully buffered bodies use the same append path as TLS
     /// chunks. Publish only after the owned blocking write has completed.
     pub(super) async fn write_prefix(&mut self, bytes: &[u8]) -> Result<(), DownloadFailure> {
@@ -3222,10 +3227,8 @@ mod tests {
         assert_eq!(outcome.client_bytes, 0);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn successful_demotion_serves_only_the_remaining_range_after_client_progress() {
+    fn install_sendfile_config() {
         use crate::nonzero;
-        use tokio::io::AsyncWriteExt as _;
 
         // The spawned sendfile task reads the process-wide configuration.
         crate::RUNTIMEDETAILS
@@ -3241,6 +3244,83 @@ mod tests {
                 webif_hosts: crate::web::host_gate::WebifHosts::NONE,
             })
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resumed_prefix_uses_original_descriptor_and_preserves_cursor() {
+        use crate::cache_conditional::ServeParams;
+        use crate::cache_layout::{ConnectionDetails, ResourceKind};
+        use tokio::io::AsyncSeekExt as _;
+
+        install_sendfile_config();
+        let mirror = crate::test_support::structured_mirror("writer.test", "/debian");
+        let details = ConnectionDetails {
+            client: local_client(),
+            request_received_at: crate::precise_instant::PreciseInstant::now(),
+            upstream_host: mirror.host().clone(),
+            mirror,
+            debname: "writer.deb".into(),
+            resource_kind: ResourceKind::Pool,
+            origin_fields: None,
+        };
+        for replace in [false, true] {
+            let mut scratch = ScratchFile::new();
+            std::fs::write(&scratch.path, b"0123456789").unwrap();
+            scratch
+                .file
+                .seek(std::io::SeekFrom::Start(3))
+                .await
+                .unwrap();
+            let barrier = cache_barrier(&scratch.path).await;
+            let writer = CacheWriter::new(
+                scratch.file,
+                6,
+                CacheWriteMode::Kernel,
+                &barrier,
+                &scratch.path,
+            )
+            .await
+            .unwrap();
+            std::fs::remove_file(&scratch.path).unwrap();
+            if replace {
+                std::fs::write(&scratch.path, b"replacement").unwrap();
+            }
+            for (start, length, expected) in [(2, 5, b"2345".as_slice()), (7, 2, b"".as_slice())] {
+                let (mut peer, client) = crate::test_support::connected_tcp_pair().await;
+                let range = ServeParams::Partial(
+                    crate::http_range::ContentRange::new(start, start + length - 1, 10).unwrap(),
+                );
+                let (state, sent) = super::super::send_resumed_prefix(
+                    BodyClient::Attached(&client, local_client()),
+                    &details,
+                    writer.file(),
+                    &range,
+                    6,
+                )
+                .await;
+                assert!(matches!(state, BodyClient::Attached(..)));
+                assert_eq!(sent, expected.len() as u64);
+                drop(client);
+                let mut received = Vec::new();
+                tokio::time::timeout(Duration::from_secs(5), peer.read_to_end(&mut received))
+                    .await
+                    .expect("prefix delivery completes")
+                    .unwrap();
+                assert_eq!(received, expected, "replace={replace}, start={start}");
+                assert_eq!(
+                    nix::unistd::lseek(writer.file(), 0, nix::unistd::Whence::SeekCur).unwrap(),
+                    3
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn successful_demotion_serves_only_the_remaining_range_after_client_progress() {
+        use crate::nonzero;
+        use tokio::io::AsyncWriteExt as _;
+
+        install_sendfile_config();
         let scratch = ScratchFile::new();
         std::fs::write(&scratch.path, b"resume-").unwrap();
         let mut barrier = cache_barrier(&scratch.path).await;
