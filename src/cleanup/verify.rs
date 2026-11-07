@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::fs_open::{
     hint_sequential_read, is_non_regular_errno, nofollow_nonblock_options, release_page_cache,
 };
-use crate::index_parser::{HashAlgo, hash_open_file};
+use crate::index_parser::{Digest, hash_open_file};
 use crate::metrics;
 use crate::verified_marker::{FileIdentity, has_valid_marker, stamp};
 
@@ -15,7 +15,7 @@ pub(super) enum Verdict {
     /// Computed digest differs from the expected one and the underlying file
     /// kept its [`FileIdentity`] during hashing. `size` is the on-disk size
     /// observed before hashing, which the caller bills to the eviction.
-    Mismatch { computed: Vec<u8>, size: u64 },
+    Mismatch { computed: Digest, size: u64 },
     /// The file's [`FileIdentity`] (inode, size, mtime) changed between hash
     /// start and finish, so a concurrent writer raced us; the cleanup leaves
     /// the file alone.
@@ -46,21 +46,21 @@ enum Opened {
 /// hashing: [`open_and_check_marker`] then [`hash_and_compare`], the two
 /// steps [`verify_cache_file`] runs as separate blocking jobs.
 #[cfg(test)]
-fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> Verdict {
-    match open_and_check_marker(path, algo, expected) {
+fn verify_file_sync(path: &Path, expected: &Digest) -> Verdict {
+    match open_and_check_marker(path, expected) {
         Opened::Decided(verdict) => verdict,
         Opened::NeedsHash {
             file,
             pre_identity,
             pre_size,
-        } => hash_and_compare(file, path, pre_identity, pre_size, algo, expected),
+        } => hash_and_compare(file, path, pre_identity, pre_size, expected),
     }
 }
 
 /// Open the cache file and take the memoized fast path if its marker still
 /// vouches for it. Blocking, but reads nothing of the file's contents: one
 /// open, one fstat and one xattr read.
-fn open_and_check_marker(path: &Path, algo: HashAlgo, expected: &[u8]) -> Opened {
+fn open_and_check_marker(path: &Path, expected: &Digest) -> Opened {
     let file = match nofollow_nonblock_options().read(true).open(path) {
         Ok(f) => f,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -92,7 +92,7 @@ fn open_and_check_marker(path: &Path, algo: HashAlgo, expected: &[u8]) -> Opened
     // Memoized fast path: verified in an earlier cycle and unchanged since
     // (same inode/size/mtime, same expected digest) — skip the full
     // read+hash.
-    if has_valid_marker(&file, path, pre_identity, algo, expected) {
+    if has_valid_marker(&file, path, pre_identity, expected) {
         metrics::CLEANUP_CHECKSUM_SKIPS.increment();
         return Opened::Decided(Verdict::Match);
     }
@@ -112,14 +112,13 @@ fn hash_and_compare(
     path: &Path,
     pre_identity: FileIdentity,
     pre_size: u64,
-    algo: HashAlgo,
-    expected: &[u8],
+    expected: &Digest,
 ) -> Verdict {
     // Past the memo fast path, which reads nothing but one xattr: from here
     // the whole file is read, so the readahead hint is worth its syscall.
     hint_sequential_read(&file, pre_size, path);
 
-    let computed = match hash_open_file(algo, &mut file, pre_size) {
+    let computed = match hash_open_file(expected.algo(), &mut file, pre_size) {
         Ok(hash) => hash,
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
@@ -132,13 +131,13 @@ fn hash_and_compare(
     // cache and evicts the hot serving set.
     release_page_cache(&file, path);
 
-    if computed.as_slice() == expected {
+    if &computed == expected {
         // Only stamp when the file is still the one we hashed — a swap or
         // an in-place rewrite mid-hash must not mark the *new* content as
         // verified.
         match std::fs::symlink_metadata(path) {
             Ok(post_meta) if FileIdentity::of(&post_meta) == pre_identity => {
-                stamp(&file, path, pre_identity, algo, expected);
+                stamp(&file, path, pre_identity, expected);
             }
             Ok(_) | Err(_) => {}
         }
@@ -188,9 +187,9 @@ static VERIFY_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(
 /// never stall other mirrors' microsecond marker checks behind them. The
 /// hash job keeps the descriptor the first job opened, so its type and
 /// identity checks still hold for the file it reads.
-pub(super) async fn verify_cache_file(path: PathBuf, algo: HashAlgo, expected: Vec<u8>) -> Verdict {
+pub(super) async fn verify_cache_file(path: PathBuf, expected: Digest) -> Verdict {
     let (opened, path, expected) = match tokio::task::spawn_blocking(move || {
-        let opened = open_and_check_marker(&path, algo, &expected);
+        let opened = open_and_check_marker(&path, &expected);
         (opened, path, expected)
     })
     .await
@@ -223,7 +222,7 @@ pub(super) async fn verify_cache_file(path: PathBuf, algo: HashAlgo, expected: V
     // awaits its hashes inline); this keeps the bound from resting on that.
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        hash_and_compare(file, &path, pre_identity, pre_size, algo, &expected)
+        hash_and_compare(file, &path, pre_identity, pre_size, &expected)
     })
     .await
     {
@@ -235,6 +234,7 @@ pub(super) async fn verify_cache_file(path: PathBuf, algo: HashAlgo, expected: V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index_parser::HashAlgo;
 
     #[test]
     fn verify_file_sync_match_and_mismatch() {
@@ -251,12 +251,19 @@ mod tests {
 
         let expected_sha256 = sha2::Sha256::digest(payload).to_vec();
         assert!(matches!(
-            verify_file_sync(&path, HashAlgo::Sha256, &expected_sha256),
+            verify_file_sync(
+                &path,
+                &Digest::from_bytes(HashAlgo::Sha256, &expected_sha256)
+                    .expect("matching digest length")
+            ),
             Verdict::Match
         ));
 
         let wrong: Vec<u8> = vec![0u8; 32];
-        let v = verify_file_sync(&path, HashAlgo::Sha256, &wrong);
+        let v = verify_file_sync(
+            &path,
+            &Digest::from_bytes(HashAlgo::Sha256, &wrong).expect("matching digest length"),
+        );
         assert!(
             matches!(v, Verdict::Mismatch { .. }),
             "expected Mismatch verdict, got {v:?}"
@@ -267,12 +274,16 @@ mod tests {
             None
         };
         let (computed, size) = mismatch.expect("asserted above");
-        assert_eq!(computed, expected_sha256);
+        assert_eq!(computed.as_slice(), expected_sha256);
         assert_eq!(size, payload.len() as u64, "size is billed to the eviction");
 
         let expected_sha512 = sha2::Sha512::digest(payload).to_vec();
         assert!(matches!(
-            verify_file_sync(&path, HashAlgo::Sha512, &expected_sha512),
+            verify_file_sync(
+                &path,
+                &Digest::from_bytes(HashAlgo::Sha512, &expected_sha512)
+                    .expect("matching digest length")
+            ),
             Verdict::Match
         ));
     }
@@ -285,7 +296,10 @@ mod tests {
         let missing = dir.path().join("does_not_exist");
         let io_failure = metrics::CACHE_IO_FAILURE.get();
         assert!(matches!(
-            verify_file_sync(&missing, HashAlgo::Sha256, &[0u8; 32]),
+            verify_file_sync(
+                &missing,
+                &Digest::from_bytes(HashAlgo::Sha256, &[0u8; 32]).expect("matching digest length")
+            ),
             Verdict::Vanished
         ));
         assert_eq!(metrics::CACHE_IO_FAILURE.get(), io_failure);
@@ -303,7 +317,10 @@ mod tests {
 
         let non_regular = metrics::CACHE_NON_REGULAR.get();
         let io_failure = metrics::CACHE_IO_FAILURE.get();
-        let verdict = verify_file_sync(&link, HashAlgo::Sha256, &[0u8; 32]);
+        let verdict = verify_file_sync(
+            &link,
+            &Digest::from_bytes(HashAlgo::Sha256, &[0u8; 32]).expect("matching digest length"),
+        );
         assert!(matches!(verdict, Verdict::NonRegular), "{verdict:?}");
         assert_eq!(metrics::CACHE_NON_REGULAR.get(), non_regular + 1);
         assert_eq!(metrics::CACHE_IO_FAILURE.get(), io_failure);
@@ -326,7 +343,10 @@ mod tests {
         let expected = sha2::Sha256::digest(payload).to_vec();
 
         assert!(matches!(
-            verify_file_sync(&path, HashAlgo::Sha256, &expected),
+            verify_file_sync(
+                &path,
+                &Digest::from_bytes(HashAlgo::Sha256, &expected).expect("matching digest length")
+            ),
             Verdict::Match
         ));
 
@@ -337,15 +357,18 @@ mod tests {
                 &file,
                 &path,
                 FileIdentity::of(&meta),
-                HashAlgo::Sha256,
-                &expected,
+                &Digest::from_bytes(HashAlgo::Sha256, &expected).expect("matching digest length")
             ));
             // The counter is process-global and other unit tests in this
             // binary bump it concurrently, so assert the delta as a lower
             // bound.
             let before = metrics::CLEANUP_CHECKSUM_SKIPS.get();
             assert!(matches!(
-                verify_file_sync(&path, HashAlgo::Sha256, &expected),
+                verify_file_sync(
+                    &path,
+                    &Digest::from_bytes(HashAlgo::Sha256, &expected)
+                        .expect("matching digest length")
+                ),
                 Verdict::Match
             ));
             assert!(
@@ -358,7 +381,10 @@ mod tests {
         // re-hashed and mismatches for real.
         let wrong: Vec<u8> = vec![0u8; 32];
         assert!(matches!(
-            verify_file_sync(&path, HashAlgo::Sha256, &wrong),
+            verify_file_sync(
+                &path,
+                &Digest::from_bytes(HashAlgo::Sha256, &wrong).expect("matching digest length")
+            ),
             Verdict::Mismatch { .. }
         ));
     }
@@ -384,7 +410,10 @@ mod tests {
         }
         let expected = sha2::Sha256::digest(payload).to_vec();
         assert!(matches!(
-            verify_file_sync(&path, HashAlgo::Sha256, &expected),
+            verify_file_sync(
+                &path,
+                &Digest::from_bytes(HashAlgo::Sha256, &expected).expect("matching digest length")
+            ),
             Verdict::Match
         ));
         let stamped = std::fs::metadata(&path).expect("stat");
@@ -395,8 +424,8 @@ mod tests {
                     &file,
                     &path,
                     FileIdentity::of(&stamped),
-                    HashAlgo::Sha256,
-                    &expected
+                    &Digest::from_bytes(HashAlgo::Sha256, &expected)
+                        .expect("matching digest length")
                 ),
                 "the first verification must stamp the marker"
             );
@@ -421,7 +450,10 @@ mod tests {
         assert_eq!(rewritten.ino(), stamped.ino(), "rewritten in place");
         assert_eq!(rewritten.len(), stamped.len(), "same length");
 
-        let verdict = verify_file_sync(&path, HashAlgo::Sha256, &expected);
+        let verdict = verify_file_sync(
+            &path,
+            &Digest::from_bytes(HashAlgo::Sha256, &expected).expect("matching digest length"),
+        );
         assert!(
             matches!(verdict, Verdict::Mismatch { .. }),
             "the stale marker must not vouch for rewritten content, got {verdict:?}"

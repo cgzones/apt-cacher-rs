@@ -3352,7 +3352,10 @@ mod tests {
         let digest = digest.unwrap();
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"prefix-body");
         assert_eq!(digest.bytes, 11);
-        assert_eq!(digest.digest, sha2::Sha256::digest(b"prefix-body").to_vec());
+        assert_eq!(
+            digest.digest.as_slice(),
+            sha2::Sha256::digest(b"prefix-body").to_vec()
+        );
     }
 
     /// The userspace-TLS loop's batch buffer across several batches: reads
@@ -3446,7 +3449,10 @@ mod tests {
             "the cache file holds the prefix and the body once, in order"
         );
         assert_eq!(digest.bytes, u64::try_from(expected.len()).unwrap());
-        assert_eq!(digest.digest, sha2::Sha256::digest(&expected).to_vec());
+        assert_eq!(
+            digest.digest.as_slice(),
+            sha2::Sha256::digest(&expected).to_vec()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -3495,7 +3501,10 @@ mod tests {
         let (_file, digest) = writer.finish();
         let digest = digest.unwrap();
         assert_eq!(digest.bytes, 10);
-        assert_eq!(digest.digest, sha2::Sha256::digest(b"whole body").to_vec());
+        assert_eq!(
+            digest.digest.as_slice(),
+            sha2::Sha256::digest(b"whole body").to_vec()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

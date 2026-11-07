@@ -14,7 +14,7 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
-use crate::index_parser::{HashAlgo, byhash_digest_for_algo, hex_encode};
+use crate::index_parser::{Digest, HashAlgo, byhash_digest_for_algo, hex_encode};
 use crate::xattr_helpers::{self, XattrValue};
 
 /// The on-disk identity a marker is bound to: inode, size and modification
@@ -95,45 +95,29 @@ enum MarkerIdentity {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CleanupMarker {
     identity: MarkerIdentity,
-    algo: HashAlgo,
-    digest: Vec<u8>,
+    digest: Digest,
 }
 
 impl CleanupMarker {
-    /// `expected` must be the digest `algo` produces: [`Self::parse`] decodes
-    /// through `byhash_digest_for_algo`, which cross-checks the length, so a
-    /// marker built from a mismatched pair renders a value that never parses
-    /// back and silently disables the memo. Both writers pass the digest they
-    /// just compared against, so the pairing is structural today.
-    fn new(identity: FileIdentity, algo: HashAlgo, expected: &[u8]) -> Self {
-        debug_assert_eq!(
-            expected.len(),
-            match algo {
-                HashAlgo::Sha256 => 32,
-                HashAlgo::Sha512 => 64,
-            },
-            "a marker's digest length must match its algorithm, or `parse` rejects what `render` wrote"
-        );
+    fn new(identity: FileIdentity, digest: Digest) -> Self {
         Self {
             identity: MarkerIdentity::Bound(identity),
-            algo,
-            digest: expected.to_vec(),
+            digest,
         }
     }
 
     /// Whether the marker was stamped for exactly this file identity and
     /// expected digest. A legacy marker never matches.
-    fn matches(&self, identity: FileIdentity, algo: HashAlgo, expected: &[u8]) -> bool {
+    fn matches(&self, identity: FileIdentity, expected: &Digest) -> bool {
         let Self {
             identity: stamped,
-            algo: my_algo,
             digest,
         } = self;
         let identity_matches = match stamped {
             MarkerIdentity::Bound(stamped) => *stamped == identity,
             MarkerIdentity::Legacy { ino: _, size: _ } => false,
         };
-        identity_matches && *my_algo == algo && digest == expected
+        identity_matches && digest == expected
     }
 }
 
@@ -181,20 +165,12 @@ impl XattrValue for CleanupMarker {
         };
         let algo = HashAlgo::parse(algo)?;
         let digest = byhash_digest_for_algo(algo, digest)?;
-        Some(Self {
-            identity,
-            algo,
-            digest,
-        })
+        Some(Self { identity, digest })
     }
 
     fn render(&self) -> Cow<'_, str> {
-        let Self {
-            identity,
-            algo,
-            digest,
-        } = self;
-        let algo = algo.as_str();
+        let Self { identity, digest } = self;
+        let algo = digest.algo().as_str();
         let digest = hex_encode(digest);
         Cow::Owned(match identity {
             MarkerIdentity::Bound(FileIdentity {
@@ -216,24 +192,17 @@ pub(crate) fn has_valid_marker(
     file: &std::fs::File,
     path: &Path,
     identity: FileIdentity,
-    algo: HashAlgo,
-    expected: &[u8],
+    expected: &Digest,
 ) -> bool {
     xattr_helpers::read::<CleanupMarker>(file, path)
-        .is_some_and(|marker| marker.matches(identity, algo, expected))
+        .is_some_and(|marker| marker.matches(identity, expected))
 }
 
 /// Stamp the verified marker after a successful digest match. Best-effort:
 /// a failure (logged once by the xattr layer, e.g. a filesystem without
 /// xattr support) just means the next cycle re-hashes.
-pub(crate) fn stamp(
-    file: &std::fs::File,
-    path: &Path,
-    identity: FileIdentity,
-    algo: HashAlgo,
-    expected: &[u8],
-) {
-    xattr_helpers::write(file, path, &CleanupMarker::new(identity, algo, expected));
+pub(crate) fn stamp(file: &std::fs::File, path: &Path, identity: FileIdentity, expected: &Digest) {
+    xattr_helpers::write(file, path, &CleanupMarker::new(identity, expected.clone()));
 }
 
 #[cfg(test)]
@@ -245,7 +214,10 @@ mod tests {
     #[test]
     fn cleanup_marker_parse_and_render() {
         let digest = [0xabu8; 32];
-        let marker = CleanupMarker::new(ID, HashAlgo::Sha256, &digest);
+        let marker = CleanupMarker::new(
+            ID,
+            Digest::from_bytes(HashAlgo::Sha256, &digest).expect("matching digest length"),
+        );
         let rendered = marker.render();
         assert_eq!(
             rendered,
@@ -258,7 +230,10 @@ mod tests {
 
         let sha512 = [0x11u8; 64];
         let id = FileIdentity::new(7, 0, 5, 0);
-        let marker = CleanupMarker::new(id, HashAlgo::Sha512, &sha512);
+        let marker = CleanupMarker::new(
+            id,
+            Digest::from_bytes(HashAlgo::Sha512, &sha512).expect("matching digest length"),
+        );
         assert_eq!(
             marker.render(),
             format!("7:0:5.000000000:SHA512:{}", hex_encode(&sha512))
@@ -267,11 +242,23 @@ mod tests {
             CleanupMarker::parse(&marker.render()).as_ref(),
             Some(&marker)
         );
-        assert!(marker.matches(id, HashAlgo::Sha512, &sha512));
-        assert!(!marker.matches(FileIdentity::new(8, 0, 5, 0), HashAlgo::Sha512, &sha512));
-        assert!(!marker.matches(FileIdentity::new(7, 1, 5, 0), HashAlgo::Sha512, &sha512));
-        assert!(!marker.matches(id, HashAlgo::Sha256, &sha512));
-        assert!(!marker.matches(id, HashAlgo::Sha512, &[0x22u8; 64]));
+        assert!(marker.matches(
+            id,
+            &Digest::from_bytes(HashAlgo::Sha512, &sha512).expect("matching digest length")
+        ));
+        assert!(!marker.matches(
+            FileIdentity::new(8, 0, 5, 0),
+            &Digest::from_bytes(HashAlgo::Sha512, &sha512).expect("matching digest length")
+        ));
+        assert!(!marker.matches(
+            FileIdentity::new(7, 1, 5, 0),
+            &Digest::from_bytes(HashAlgo::Sha512, &sha512).expect("matching digest length")
+        ));
+        assert!(!marker.matches(id, &Digest::Sha256(Box::new([0u8; 32]))));
+        assert!(!marker.matches(
+            id,
+            &Digest::from_bytes(HashAlgo::Sha512, &[0x22u8; 64]).expect("matching digest length")
+        ));
 
         let hex = hex_encode(&digest);
         assert!(CleanupMarker::parse("").is_none());
@@ -293,14 +280,23 @@ mod tests {
     #[test]
     fn cleanup_marker_rejects_an_mtime_only_change() {
         let digest = [0x5au8; 32];
-        let marker = CleanupMarker::new(ID, HashAlgo::Sha256, &digest);
-        assert!(marker.matches(ID, HashAlgo::Sha256, &digest));
+        let marker = CleanupMarker::new(
+            ID,
+            Digest::from_bytes(HashAlgo::Sha256, &digest).expect("matching digest length"),
+        );
+        assert!(marker.matches(
+            ID,
+            &Digest::from_bytes(HashAlgo::Sha256, &digest).expect("matching digest length")
+        ));
         for rewritten in [
             FileIdentity::new(42, 1234, 1_789_900_001, 123_456_789),
             FileIdentity::new(42, 1234, 1_789_900_000, 123_456_790),
         ] {
             assert!(
-                !marker.matches(rewritten, HashAlgo::Sha256, &digest),
+                !marker.matches(
+                    rewritten,
+                    &Digest::from_bytes(HashAlgo::Sha256, &digest).expect("matching digest length")
+                ),
                 "an mtime change must invalidate the marker: {rewritten:?}"
             );
         }
@@ -311,7 +307,10 @@ mod tests {
     fn cleanup_marker_round_trips_a_negative_mtime() {
         let digest = [0x01u8; 32];
         let id = FileIdentity::new(3, 9, -86_400, 1);
-        let marker = CleanupMarker::new(id, HashAlgo::Sha256, &digest);
+        let marker = CleanupMarker::new(
+            id,
+            Digest::from_bytes(HashAlgo::Sha256, &digest).expect("matching digest length"),
+        );
         assert_eq!(
             marker.render(),
             format!("3:9:-86400.000000001:SHA256:{}", hex_encode(&digest))
@@ -328,7 +327,10 @@ mod tests {
             (HashAlgo::Sha256, vec![0x5au8; 32]),
             (HashAlgo::Sha512, vec![0xa5u8; 64]),
         ] {
-            let marker = CleanupMarker::new(FileIdentity::new(9, 4096, 1, 2), algo, &digest);
+            let marker = CleanupMarker::new(
+                FileIdentity::new(9, 4096, 1, 2),
+                Digest::from_bytes(algo, &digest).expect("matching digest length"),
+            );
             assert_eq!(
                 CleanupMarker::parse(&marker.render()).as_ref(),
                 Some(&marker),
@@ -358,14 +360,20 @@ mod tests {
             raw,
             "a legacy marker renders back verbatim"
         );
-        assert!(!marker.matches(ID, HashAlgo::Sha256, &digest));
+        assert!(!marker.matches(
+            ID,
+            &Digest::from_bytes(HashAlgo::Sha256, &digest).expect("matching digest length")
+        ));
     }
 
     #[test]
     fn cleanup_marker_scrubs_malformed_and_round_trips() {
         use crate::xattr_helpers::tests::assert_scrubs_malformed_and_round_trips;
 
-        let marker = CleanupMarker::new(ID, HashAlgo::Sha256, &[0xcdu8; 32]);
+        let marker = CleanupMarker::new(
+            ID,
+            Digest::from_bytes(HashAlgo::Sha256, &[0xcdu8; 32]).expect("matching digest length"),
+        );
         assert_scrubs_malformed_and_round_trips(b"42:1234:1.0:SHA256:nothex", &marker);
     }
 
@@ -392,8 +400,7 @@ mod tests {
                 &file,
                 &path,
                 identity,
-                HashAlgo::Sha256,
-                &digest
+                &Digest::from_bytes(HashAlgo::Sha256, &digest).expect("matching digest length")
             ));
         });
         assert!(

@@ -199,6 +199,50 @@ impl HashAlgo {
     }
 }
 
+/// An algorithm and its exact-size digest. Boxing keeps async state compact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Digest {
+    Sha256(Box<[u8; 32]>),
+    Sha512(Box<[u8; 64]>),
+}
+
+impl Digest {
+    pub(crate) const fn algo(&self) -> HashAlgo {
+        match self {
+            Self::Sha256(_) => HashAlgo::Sha256,
+            Self::Sha512(_) => HashAlgo::Sha512,
+        }
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Sha256(digest) => digest.as_slice(),
+            Self::Sha512(digest) => digest.as_slice(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_bytes(algo: HashAlgo, bytes: &[u8]) -> Option<Self> {
+        match algo {
+            HashAlgo::Sha256 => bytes
+                .try_into()
+                .ok()
+                .map(|value| Self::Sha256(Box::new(value))),
+            HashAlgo::Sha512 => bytes
+                .try_into()
+                .ok()
+                .map(|value| Self::Sha512(Box::new(value))),
+        }
+    }
+}
+
+impl std::ops::Deref for Digest {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 /// The stanza fields [`Stanza`] reads. A stanza may carry each at most once
 /// (see [`Stanza::repeated`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -381,6 +425,12 @@ impl Stanza {
         }
     }
 
+    pub(crate) fn chosen_digest(&self) -> Option<Digest> {
+        self.sha256
+            .map(|value| Digest::Sha256(Box::new(value)))
+            .or_else(|| self.sha512.map(|value| Digest::Sha512(Box::new(value))))
+    }
+
     /// Preferred `(algo, expected-digest)` pair: SHA256 wins, SHA512 fallback.
     pub(crate) fn chosen(&self) -> Option<(HashAlgo, &[u8])> {
         self.sha256
@@ -531,10 +581,10 @@ impl<R: AsyncBufRead + Unpin> StanzaStream<R> {
 /// hex length must match `algo` (64 for SHA256, 128 for SHA512); a length/algo
 /// mismatch or non-hex input returns `None`, so verification treats the
 /// resource as unverifiable rather than hashing with the wrong algorithm.
-pub(crate) fn byhash_digest_for_algo(algo: HashAlgo, filename: &str) -> Option<Vec<u8>> {
+pub(crate) fn byhash_digest_for_algo(algo: HashAlgo, filename: &str) -> Option<Digest> {
     match algo {
-        HashAlgo::Sha256 => hex_decode_exact::<32>(filename).map(|d| d.to_vec()),
-        HashAlgo::Sha512 => hex_decode_exact::<64>(filename).map(|d| d.to_vec()),
+        HashAlgo::Sha256 => hex_decode_exact::<32>(filename).map(|d| Digest::Sha256(Box::new(d))),
+        HashAlgo::Sha512 => hex_decode_exact::<64>(filename).map(|d| Digest::Sha512(Box::new(d))),
     }
 }
 
@@ -768,8 +818,7 @@ pub(crate) fn parse_release_byhash_digests(
 /// one: `integrity::VerifyInput` carries the `Option` in every build.
 #[derive(Clone)]
 pub(crate) struct StreamedDigest {
-    pub(crate) algo: HashAlgo,
-    pub(crate) digest: Vec<u8>,
+    pub(crate) digest: Digest,
     /// Bytes fed through `StreamHasher::update`. Every one of them was also
     /// written to the cache file (both update sites hash exactly what they
     /// write), so this is the size the finished file must have.
@@ -830,15 +879,11 @@ impl StreamHasher {
     pub(crate) fn finalize(self) -> StreamedDigest {
         use sha2::Digest as _;
         let Self { state, bytes } = self;
-        let (algo, digest) = match state {
-            StreamHasherState::Sha256(h) => (HashAlgo::Sha256, h.finalize().to_vec()),
-            StreamHasherState::Sha512(h) => (HashAlgo::Sha512, h.finalize().to_vec()),
+        let digest = match state {
+            StreamHasherState::Sha256(h) => Digest::Sha256(Box::new(h.finalize().into())),
+            StreamHasherState::Sha512(h) => Digest::Sha512(Box::new(h.finalize().into())),
         };
-        StreamedDigest {
-            algo,
-            digest,
-            bytes,
-        }
+        StreamedDigest { digest, bytes }
     }
 }
 
@@ -852,7 +897,7 @@ pub(crate) fn hash_open_file(
     algo: HashAlgo,
     file: &mut impl io::Read,
     size_hint: u64,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<Digest> {
     /// Largest read for whole-file hashing. 1 MiB rather than the kernel's
     /// default readahead window: cleanup hashes the whole cache and commit
     /// hashes every download, so this is the read-syscall count for both.
@@ -896,7 +941,7 @@ mod tests {
             let mut file = io::Cursor::new(&payload);
             let streamed = hash_open_file(HashAlgo::Sha256, &mut file, size_hint).expect("hash");
             assert_eq!(
-                streamed,
+                streamed.as_slice(),
                 sha2::Sha256::digest(&payload).to_vec(),
                 "{size_hint}"
             );
@@ -904,7 +949,7 @@ mod tests {
 
         let mut file = io::Cursor::new(&payload);
         let streamed = hash_open_file(HashAlgo::Sha512, &mut file, 0).expect("hash");
-        assert_eq!(streamed, sha2::Sha512::digest(&payload).to_vec());
+        assert_eq!(streamed.as_slice(), sha2::Sha512::digest(&payload).to_vec());
     }
 
     #[test]

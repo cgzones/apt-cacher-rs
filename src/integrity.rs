@@ -60,7 +60,7 @@ use crate::{
     cache_quota::QuotaReservation,
     deb_mirror::{Mirror, normalize_uri_path},
     guards::DownloadWriteLease,
-    index_parser::{self, HashAlgo, ReleaseHeader, StanzaStream, StreamedDigest},
+    index_parser::{self, Digest, HashAlgo, ReleaseHeader, StanzaStream, StreamedDigest},
     metrics,
     mirror_indexes::{self, SuiteIndex},
     partial_file::TempPath,
@@ -145,7 +145,7 @@ enum VerifyKind {
     /// the parser validated for the `<algo>` URL path segment
     /// (`SHA256`/`SHA512`) and carried on the `ResourceKind`, never inferred
     /// from the digest length; for a registry-backed one it is always SHA256.
-    Expected { algo: HashAlgo, digest: Vec<u8> },
+    Expected(Digest),
     /// The resource *could* have been verified but no expected digest is
     /// known - a registry miss, or a by-hash URL whose algorithm segment and
     /// digest did not agree. Cached unverified and counted as a coverage gap
@@ -179,7 +179,7 @@ fn byhash_verify_kind(algo: HashAlgo, filename: &str) -> VerifyKind {
         );
         return VerifyKind::Unknown;
     };
-    VerifyKind::Expected { algo, digest }
+    VerifyKind::Expected(digest)
 }
 
 /// Result of the pure verification decision.
@@ -201,11 +201,7 @@ enum VerifyOutcome {
 /// worker must wrap that case in `spawn_blocking` (`verify_and_rename` runs it
 /// inside its commit job).
 fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
-    let VerifyKind::Expected {
-        algo,
-        digest: expected,
-    } = &input.kind
-    else {
+    let VerifyKind::Expected(expected) = &input.kind else {
         // Best-effort: no known digest -> cache unverified. Only count the
         // kinds that *could* have been verified, so the metric reflects a real
         // coverage gap rather than every metadata / flat-pool file.
@@ -214,7 +210,7 @@ fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
         }
         return VerifyOutcome::Proceed;
     };
-    let algo = *algo;
+    let algo = expected.algo();
 
     let reused = reuse_streamed_digest(
         input.streamed.as_ref(),
@@ -245,7 +241,7 @@ fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
 
     if computed == expected.as_slice() {
         metrics::CHECKSUM_VERIFIED.increment();
-        stamp_verified(input.file, input.meta, input.temp_path, algo, expected);
+        stamp_verified(input.file, input.meta, input.temp_path, expected);
         VerifyOutcome::Proceed
     } else {
         metrics::CHECKSUM_MISMATCH.increment();
@@ -283,7 +279,7 @@ fn reuse_streamed_digest<'a>(
     path: &Path,
 ) -> Option<&'a [u8]> {
     let streamed = streamed?;
-    if streamed.algo != algo {
+    if streamed.digest.algo() != algo {
         return None;
     }
     if on_disk != streamed.bytes {
@@ -309,7 +305,7 @@ fn hash_file(
     size: u64,
     path: &Path,
     algo: HashAlgo,
-) -> std::io::Result<Vec<u8>> {
+) -> std::io::Result<Digest> {
     use std::io::Seek as _;
 
     let mut reader = file;
@@ -330,14 +326,8 @@ fn hash_file(
 /// it, so the identity is the commit job's `fstat` (`meta`). Best-effort: an
 /// xattr failure only means the next cleanup cycle hashes the file, so it is
 /// not worth failing a commit.
-fn stamp_verified(
-    file: &std::fs::File,
-    meta: &Metadata,
-    path: &Path,
-    algo: HashAlgo,
-    expected: &[u8],
-) {
-    verified_marker::stamp(file, path, FileIdentity::of(meta), algo, expected);
+fn stamp_verified(file: &std::fs::File, meta: &Metadata, path: &Path, expected: &Digest) {
+    verified_marker::stamp(file, path, FileIdentity::of(meta), expected);
 }
 
 /// Everything `verify_and_rename` needs. Built in exactly one place,
@@ -1233,10 +1223,7 @@ fn registry_verify_kind(plan: &RenamePlan, key: &str) -> VerifyKind {
             log_registry_miss(plan, key, miss);
             VerifyKind::Unknown
         },
-        |digest| VerifyKind::Expected {
-            algo: HashAlgo::Sha256,
-            digest: digest.to_vec(),
-        },
+        |digest| VerifyKind::Expected(Digest::Sha256(Box::new(digest))),
     )
 }
 
@@ -2357,20 +2344,14 @@ mod tests {
 
     /// A registry-style expectation: SHA256 over the 64-hex `digest`.
     fn expect_sha256(digest: &str) -> VerifyKind {
-        VerifyKind::Expected {
-            algo: HashAlgo::Sha256,
-            digest: index_parser::hex_decode_exact::<32>(digest)
-                .expect("test digest must be 64 hex chars")
-                .to_vec(),
-        }
+        VerifyKind::Expected(Digest::Sha256(Box::new(
+            index_parser::hex_decode_exact::<32>(digest).expect("test digest must be 64 hex chars"),
+        )))
     }
 
     /// An expectation nothing can match: 32 zero bytes.
     fn expect_zero_sha256() -> VerifyKind {
-        VerifyKind::Expected {
-            algo: HashAlgo::Sha256,
-            digest: vec![0u8; 32],
-        }
+        VerifyKind::Expected(Digest::Sha256(Box::new([0u8; 32])))
     }
 
     #[tokio::test]
@@ -2498,7 +2479,6 @@ mod tests {
             meta: &f.as_file().metadata().unwrap(),
             temp_path: f.path(),
             streamed: Some(StreamedDigest {
-                algo: HashAlgo::Sha256,
                 digest: index_parser::byhash_digest_for_algo(HashAlgo::Sha256, HELLO_SHA256)
                     .expect("HELLO_SHA256 is valid hex"),
                 bytes: b"not hello at all".len() as u64,
@@ -2516,8 +2496,7 @@ mod tests {
             meta: &f.as_file().metadata().unwrap(),
             temp_path: f.path(),
             streamed: Some(StreamedDigest {
-                algo: HashAlgo::Sha256,
-                digest: vec![0u8; 32],
+                digest: Digest::Sha256(Box::new([0u8; 32])),
                 bytes: b"hello world".len() as u64,
             }),
         };
@@ -2540,8 +2519,7 @@ mod tests {
             temp_path: f.path(),
             // Right length for SHA-512, wrong algorithm for this resource.
             streamed: Some(StreamedDigest {
-                algo: HashAlgo::Sha512,
-                digest: vec![0u8; 64],
+                digest: Digest::Sha512(Box::new([0u8; 64])),
                 bytes: b"hello world".len() as u64,
             }),
         };
@@ -2562,8 +2540,7 @@ mod tests {
             temp_path: f.path(),
             // Right algorithm, but it saw more bytes than the file holds.
             streamed: Some(StreamedDigest {
-                algo: HashAlgo::Sha256,
-                digest: vec![0u8; 32],
+                digest: Digest::Sha256(Box::new([0u8; 32])),
                 bytes: 999,
             }),
         };
@@ -3160,7 +3137,7 @@ mod tests {
     #[test]
     fn byhash_well_formed_pair_becomes_an_expectation() {
         let resolved = match byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256) {
-            VerifyKind::Expected { algo, digest } => Some((algo, digest)),
+            VerifyKind::Expected(digest) => Some((digest.algo(), digest)),
             VerifyKind::Unknown | VerifyKind::Unverifiable => None,
         };
         let (algo, digest) = resolved.expect("a matching algorithm/digest pair must be verifiable");
@@ -3768,10 +3745,7 @@ mod tests {
         };
 
         let outcome = verify_temp_file(&VerifyInput {
-            kind: VerifyKind::Expected {
-                algo: HashAlgo::Sha256,
-                digest: digest.to_vec(),
-            },
+            kind: VerifyKind::Expected(Digest::Sha256(Box::new(digest))),
             file: &temp_file,
             meta: &temp_file.metadata().unwrap(),
             temp_path: &temp_path,
@@ -3786,8 +3760,7 @@ mod tests {
                 &file,
                 &temp_path,
                 FileIdentity::of(&meta),
-                HashAlgo::Sha256,
-                &digest,
+                &Digest::from_bytes(HashAlgo::Sha256, &digest).expect("matching digest length")
             ),
             "commit must leave a marker cleanup accepts, or the first cleanup pass re-hashes every fresh download"
         );

@@ -90,7 +90,7 @@ async fn process_stanza(
     if file_list.remove(OsStr::new(lookup_key)).is_none() {
         return;
     }
-    let Some((algo, expected)) = stanza.chosen() else {
+    let Some(expected) = stanza.chosen_digest() else {
         // Retained without verification; `StanzaStream` already warned about
         // the digest-less stanza.
         return;
@@ -101,7 +101,7 @@ async fn process_stanza(
     // O_NONBLOCK` and `fstat`s the descriptor it actually hashed, so it detects
     // a concurrent type swap without a second syscall (and without the
     // lstat-then-open race an extra stat would only narrow).
-    match verify_cache_file(path.clone(), algo, expected.to_vec()).await {
+    match verify_cache_file(path.clone(), expected.clone()).await {
         Verdict::Match => {}
         Verdict::NonRegular => {
             warn!(
@@ -116,8 +116,8 @@ async fn process_stanza(
             warn!(
                 "Cache file `{}` failed {} verification (expected {}, computed {}); removing it",
                 path.display(),
-                algo.as_str(),
-                hex_encode(expected),
+                expected.algo().as_str(),
+                hex_encode(&expected),
                 hex_encode(&computed),
             );
             if let Err(err) = tokio::fs::remove_file(&path).await {
@@ -145,7 +145,7 @@ async fn process_stanza(
             warn!(
                 "Cache file `{}` changed during {} verification; retaining (concurrent re-cache)",
                 path.display(),
-                algo.as_str(),
+                expected.algo().as_str(),
             );
         }
         Verdict::IoError(err) => {
@@ -153,7 +153,7 @@ async fn process_stanza(
             error!(
                 "Failed to verify cache file `{}` against its {} digest; retaining it:  {}",
                 path.display(),
-                algo.as_str(),
+                expected.algo().as_str(),
                 ErrorReport(&err),
             );
         }
