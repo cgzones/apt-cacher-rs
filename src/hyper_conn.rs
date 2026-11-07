@@ -1570,6 +1570,21 @@ async fn download_file(
     // Flushed by the worker; the commit takes the idle file whole.
     let outfile = writer.writer.into_inner();
 
+    let (dbarrier, outfile) = match dbarrier
+        .run(Consequence::Abandon, async |_barrier| {
+            crate::integrity::FinishedCacheFile::flush(outfile, &outpath)
+                .await
+                .map_err(DownloadFailure::from)
+        })
+        .await
+    {
+        Ok(finished) => finished,
+        Err(failed) => {
+            let _reported = failed.salvage(async || {}).await;
+            return;
+        }
+    };
+
     // Not created here: `integrity::rename_into_cache` creates it at commit
     // time, and only on `ENOENT`. The `warn_on_override` `try_exists` below
     // reads a missing directory as "no file to overwrite", which is right.
@@ -1613,7 +1628,7 @@ async fn download_file(
         // commit re-reads and hashes the finished file as before. No
         // prepare step either: this backend has never `fsync`ed a download.
         if rbarrier
-            .commit(outfile, outpath, dest_file_path, None, None)
+            .commit(outfile, outpath, dest_file_path, None)
             .await
             .is_err()
         {

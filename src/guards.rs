@@ -56,7 +56,6 @@ use crate::{
     fs_open::count_cache_failure,
     global_verify_throttle,
     humanfmt::HumanFmt,
-    index_parser::StreamedDigest,
     integrity::{self, CommitError, CommitFailure, PrepareStep, RenamePlan, TempFile},
     metrics,
     mirror_health::{self, MirrorFault},
@@ -764,12 +763,12 @@ impl RenameBarrier {
     /// mismatch and verify-IO failures are logged by `verify_and_rename`.
     pub(crate) async fn commit(
         mut self,
-        temp_file: tokio::fs::File,
+        finished: integrity::FinishedCacheFile,
         temp_path: TempPath,
         dest_path: PathBuf,
-        streamed_digest: Option<StreamedDigest>,
         prepare: Option<PrepareStep>,
     ) -> Result<(), CommitError> {
+        let (temp_file, streamed_digest) = finished.into_parts();
         // No blocking hop: the file is idle, so this only waits out an
         // in-flight operation that cannot exist.
         let temp = TempFile {

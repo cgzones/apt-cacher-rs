@@ -316,6 +316,11 @@ struct CacheFile {
 /// write lease travel together. All direct writes flush earlier batched
 /// bytes internally; policy flushes retain the existing batching thresholds.
 pub(super) struct CacheWriter {
+    core: CacheWriterCore,
+    sink: CacheSink,
+}
+
+pub(super) struct CacheWriterCore {
     tempfile: tokio::fs::File,
     path: PathBuf,
     // Duplicate once, before the first write. Blocking jobs retain their own
@@ -323,18 +328,74 @@ pub(super) struct CacheWriter {
     file: Arc<CacheFile>,
     file_offset: i64,
     hasher: Option<StreamHasher>,
-    /// Where batched bytes wait for the file: the body loop installs its
-    /// own sink before its first read.
-    sink: CacheSink,
     /// Some byte of this transfer reached the file (a body prefix or a
     /// batch): the barrier's unbatched first ping went out with it, so the
     /// batch no longer needs its eager first flush.
     landed_once: sticky::Bool,
 }
 
+impl std::ops::Deref for CacheWriter {
+    type Target = CacheWriterCore;
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+impl std::ops::DerefMut for CacheWriter {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.core
+    }
+}
+
+/// Typed borrow of the active sink. The owner retains the sink across failure
+/// and cancellation so the existing salvage path can still land its bytes.
+pub(super) struct CacheWriterRef<'a, S> {
+    core: &'a mut CacheWriterCore,
+    sink: &'a mut S,
+}
+
+impl<S> std::ops::Deref for CacheWriterRef<'_, S> {
+    type Target = CacheWriterCore;
+    fn deref(&self) -> &Self::Target {
+        self.core
+    }
+}
+
+impl<S> std::ops::DerefMut for CacheWriterRef<'_, S> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.core
+    }
+}
+
+/// A writer whose pending bytes and Tokio I/O have both drained. No writable
+/// access escapes this wrapper; only the commit file can be extracted.
+pub(crate) struct DrainedCacheWriter(CacheWriter);
+
+impl DrainedCacheWriter {
+    pub(crate) fn into_parts(self) -> (tokio::fs::File, Option<StreamedDigest>) {
+        let CacheWriterCore {
+            tempfile, hasher, ..
+        } = self.0.core;
+        (tempfile, hasher.map(StreamHasher::finalize))
+    }
+}
+
+pub(super) struct FinishFailure {
+    pub(super) writer: Box<CacheWriter>,
+    pub(super) failure: DownloadFailure,
+}
+
+impl std::fmt::Debug for FinishFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FinishFailure")
+            .field("failure", &self.failure)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The batch a [`CacheWriter`] lands from, installed by the body loop that
 /// fills it.
-enum CacheSink {
+pub(super) enum CacheSink {
     /// No body loop yet: a prefix or a fully buffered body writes straight
     /// through, with nothing batched.
     Direct,
@@ -375,16 +436,18 @@ impl CacheWriter {
             CacheWriteMode::Kernel | CacheWriteMode::Userspace(_) => None,
         };
         Ok(Self {
-            tempfile,
-            path: path.to_owned(),
-            file: Arc::new(CacheFile {
-                fd,
-                _write_lease: dbarrier.write_lease(),
-            }),
-            file_offset,
-            hasher,
+            core: CacheWriterCore {
+                tempfile,
+                path: path.to_owned(),
+                file: Arc::new(CacheFile {
+                    fd,
+                    _write_lease: dbarrier.write_lease(),
+                }),
+                file_offset,
+                hasher,
+                landed_once: sticky::Bool::new(),
+            },
             sink: CacheSink::Direct,
-            landed_once: sticky::Bool::new(),
         })
     }
 
@@ -408,23 +471,250 @@ impl CacheWriter {
         self.write_cache_chunk(buf).await
     }
 
-    /// Only a drained writer can hand its file and whole-file digest to commit.
-    pub(super) fn finish(self) -> (tokio::fs::File, Option<StreamedDigest>) {
-        assert!(
-            match &self.sink {
-                CacheSink::Direct => true,
-                CacheSink::Pipes(pipes) => pipes.cache.is_empty(),
-                CacheSink::Buffer(batch) => batch.sink.is_landed(),
-            },
-            "all queued cache bytes must land before commit"
-        );
-        (self.tempfile, self.hasher.map(StreamHasher::finalize))
+    pub(super) async fn drain(mut self) -> Result<DrainedCacheWriter, FinishFailure> {
+        use tokio::io::AsyncWriteExt as _;
+        let result = async {
+            self.flush().await?;
+            self.core.tempfile.flush().await.map_err(|err| {
+                DownloadFailure::from(CacheError::counted_io(
+                    "flush splice cache file",
+                    &self.core.path,
+                    err,
+                ))
+            })
+        }
+        .await;
+        match result {
+            Ok(()) => Ok(DrainedCacheWriter(self)),
+            Err(failure) => Err(FinishFailure {
+                writer: Box::new(self),
+                failure,
+            }),
+        }
     }
 
     pub(super) fn position(&self) -> u64 {
+        self.core.position()
+    }
+
+    fn view(&mut self) -> CacheWriterRef<'_, CacheSink> {
+        CacheWriterRef {
+            core: &mut self.core,
+            sink: &mut self.sink,
+        }
+    }
+
+    async fn flush(&mut self) -> Result<(), DownloadFailure> {
+        self.view().flush().await
+    }
+
+    /// `pwrite` a userspace chunk to the cache file at the current offset,
+    /// after the batched bytes that precede it. The transfer owner publishes
+    /// its progress.
+    async fn write_cache_chunk(&mut self, buf: &mut Vec<u8>) -> Result<(), DownloadFailure> {
+        self.view().write_cache_chunk(buf).await
+    }
+
+    /// Preserve received bytes on failure, at the one exit of either body
+    /// loop. They were consumed from the upstream socket, so nothing delivers
+    /// them again; without this the `.partial` a later attempt resumes from
+    /// would be short of what was received.
+    ///
+    /// The pipe owner resolves duplicate bytes before appending the remaining
+    /// unique tail; the read buffer lands only its unwritten tail, so nothing
+    /// lands twice. The cache file keeps its write lease even when the barrier
+    /// has already published an abort. The barrier is not pinged: the guarded
+    /// runner already retained the failure and will publish it after salvage,
+    /// or on cancellation. Nothing is counted either: the bytes were counted
+    /// as downloaded when they arrived, whether or not `note_chunk` got to
+    /// run. A failed salvage is reported here and does not replace the
+    /// transfer's own error.
+    pub(super) async fn salvage(&mut self) {
+        let landed = match std::mem::replace(&mut self.sink, CacheSink::Direct) {
+            CacheSink::Pipes(pipes) => {
+                pipes
+                    .salvage_into(&self.core.file, &mut self.core.file_offset)
+                    .await
+            }
+            sink @ (CacheSink::Direct | CacheSink::Buffer(_)) => {
+                self.sink = sink;
+                match &mut self.sink {
+                    CacheSink::Buffer(batch) => land_buffer(&mut self.core, batch).await,
+                    CacheSink::Direct | CacheSink::Pipes(_) => Ok(()),
+                }
+            }
+        };
+        if let Err(err) = landed {
+            let _logged = Logged::cache_io_failure(format_args!(
+                "splice proxy: failed to land the last received bytes of `{}` in the partial file; a later attempt resumes from a shorter partial:  {}",
+                self.path.display(),
+                ErrorReport(&err)
+            ));
+        }
+    }
+}
+
+impl CacheWriterCore {
+    fn position(&self) -> u64 {
         self.file_offset
             .try_into()
             .expect("cache offsets are non-negative")
+    }
+}
+
+pub(super) trait CacheMode {
+    fn cache_due(&self, landed_once: bool) -> bool;
+    fn flush(
+        &mut self,
+        core: &mut CacheWriterCore,
+    ) -> impl Future<Output = Result<(), DownloadFailure>> + Send;
+}
+
+impl CacheMode for CacheSink {
+    fn cache_due(&self, landed_once: bool) -> bool {
+        match self {
+            Self::Direct => false,
+            Self::Pipes(pipes) => pipes.cache_due(landed_once),
+            Self::Buffer(batch) => batch.is_due(landed_once),
+        }
+    }
+    async fn flush(&mut self, core: &mut CacheWriterCore) -> Result<(), DownloadFailure> {
+        match self {
+            Self::Direct => Ok(()),
+            Self::Pipes(pipes) => pipes.flush(core).await,
+            Self::Buffer(batch) => CacheMode::flush(batch, core).await,
+        }
+    }
+}
+
+impl CacheMode for SplicePipes {
+    fn cache_due(&self, landed_once: bool) -> bool {
+        self.cache.is_due(landed_once)
+    }
+    async fn flush(&mut self, core: &mut CacheWriterCore) -> Result<(), DownloadFailure> {
+        if self.cache.is_empty() {
+            return Ok(());
+        }
+        self.cache.mark_flushed();
+        core.landed_once.set();
+        drain_pipe_to_file(&self.cache.sink.rx, &core.file, &mut core.file_offset)
+            .await
+            .map_err(|err| CacheError::counted_io("splice cache write", &core.path, err))?;
+        Ok(())
+    }
+}
+
+impl CacheMode for CacheBatch<BufferSink> {
+    fn cache_due(&self, landed_once: bool) -> bool {
+        self.is_due(landed_once)
+    }
+    async fn flush(&mut self, core: &mut CacheWriterCore) -> Result<(), DownloadFailure> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        self.mark_flushed();
+        core.landed_once.set();
+        land_buffer(core, self)
+            .await
+            .map_err(|err| CacheError::counted_io("splice cache write", &core.path, err).into())
+    }
+}
+
+async fn land_buffer(
+    core: &mut CacheWriterCore,
+    batch: &mut CacheBatch<BufferSink>,
+) -> std::io::Result<()> {
+    let BufferSink { buf, landed } = &mut batch.sink;
+    let unlanded = *landed..buf.len();
+    if unlanded.is_empty() {
+        return Ok(());
+    }
+    let count = unlanded.len();
+    pwrite_buf_to_file(
+        &core.file,
+        buf,
+        unlanded,
+        core.file_offset,
+        &mut core.hasher,
+    )
+    .await?;
+    *landed = buf.len();
+    core.file_offset += i64::try_from(count).expect("a batch fits in i64");
+    Ok(())
+}
+
+impl<S: CacheMode> CacheWriterRef<'_, S> {
+    async fn write_cache_chunk(&mut self, buf: &mut Vec<u8>) -> Result<(), DownloadFailure> {
+        let got = buf.len();
+        self.flush().await?;
+        pwrite_buf_to_file(
+            &self.core.file,
+            buf,
+            0..got,
+            self.core.file_offset,
+            &mut self.core.hasher,
+        )
+        .await
+        .map_err(|err| CacheError::counted_io("splice cache write", &self.path, err))?;
+        self.core.landed_once.set();
+        self.core.file_offset +=
+            i64::try_from(got).expect("a chunk is bounded by its read buffer, which fits in i64");
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<(), DownloadFailure> {
+        self.sink.flush(self.core).await
+    }
+    async fn flush_if_due(&mut self) -> Result<(), DownloadFailure> {
+        if self.sink.cache_due(self.core.landed_once.get()) {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+}
+
+impl CacheWriterRef<'_, SplicePipes> {
+    fn pipes(&self) -> &SplicePipes {
+        self.sink
+    }
+    fn pipes_mut(&mut self) -> &mut SplicePipes {
+        self.sink
+    }
+    fn batch(&self) -> &CacheBatch<PipeSink> {
+        &self.sink.cache
+    }
+    async fn write_through(&mut self) -> Result<(), DownloadFailure> {
+        self.flush().await?;
+        let rx = Arc::clone(&self.sink.upstream_fd);
+        drain_pipe_to_file(&rx, &self.core.file, &mut self.core.file_offset)
+            .await
+            .map_err(|err| CacheError::counted_io("splice cache write", &self.core.path, err))?;
+        Ok(())
+    }
+}
+
+impl CacheWriterRef<'_, CacheBatch<BufferSink>> {
+    fn buffer(&self) -> &CacheBatch<BufferSink> {
+        self.sink
+    }
+    fn buffer_mut(&mut self) -> &mut CacheBatch<BufferSink> {
+        self.sink
+    }
+}
+
+#[cfg(test)]
+impl CacheWriter {
+    async fn flush_if_due(&mut self) -> Result<(), DownloadFailure> {
+        self.view().flush_if_due().await
+    }
+    async fn write_through(&mut self) -> Result<(), DownloadFailure> {
+        let Self { core, sink } = self;
+        match sink {
+            CacheSink::Pipes(pipes) => CacheWriterRef { core, sink: pipes }.write_through().await,
+            CacheSink::Direct | CacheSink::Buffer(_) => {
+                Err(InternalError::invalid("test pipe writer", "unexpected sink").into())
+            }
+        }
     }
 
     fn pipes(&self) -> &SplicePipes {
@@ -461,161 +751,6 @@ impl CacheWriter {
             CacheSink::Direct | CacheSink::Pipes(_) => None,
         }
         .expect("the userspace loop installed its buffer")
-    }
-
-    /// `pwrite` a userspace chunk to the cache file at the current offset,
-    /// after the batched bytes that precede it. The transfer owner publishes
-    /// its progress.
-    async fn write_cache_chunk(&mut self, buf: &mut Vec<u8>) -> Result<(), DownloadFailure> {
-        let got = buf.len();
-        self.flush().await?;
-        pwrite_buf_to_file(&self.file, buf, 0..got, self.file_offset, &mut self.hasher)
-            .await
-            .map_err(|err| CacheError::counted_io("splice cache write", &self.path, err))?;
-        self.landed_once.set();
-        self.file_offset +=
-            i64::try_from(got).expect("a chunk is bounded by its read buffer, which fits in i64");
-        Ok(())
-    }
-
-    /// Land the userspace batch: `pwrite` the bytes of the read buffer that
-    /// are not on disk yet. They stay in the buffer -- a delivery may still
-    /// be reading them -- until [`BufferSink::recycle`] reclaims it.
-    async fn land_buffer(&mut self) -> std::io::Result<()> {
-        let CacheSink::Buffer(batch) = &mut self.sink else {
-            return Ok(());
-        };
-        let BufferSink { buf, landed } = &mut batch.sink;
-        let unlanded = *landed..buf.len();
-        if unlanded.is_empty() {
-            return Ok(());
-        }
-        let count = unlanded.len();
-        pwrite_buf_to_file(
-            &self.file,
-            buf,
-            unlanded,
-            self.file_offset,
-            &mut self.hasher,
-        )
-        .await?;
-        *landed = buf.len();
-        self.file_offset +=
-            i64::try_from(count).expect("a batch is bounded by its buffer, which fits in i64");
-        Ok(())
-    }
-
-    /// Drain a pipe into the cache file at the current offset. The transfer
-    /// owner publishes its progress. Count-free like [`drain_pipe_to_file`]: the pipe
-    /// holds exactly the bytes to land.
-    async fn drain_pipe_to_cache(&mut self) -> Result<(), DownloadFailure> {
-        // These bytes go pipe-to-file inside the kernel and are never in
-        // userspace, so kernel mode never creates an incremental digest.
-        debug_assert!(
-            self.hasher.is_none(),
-            "the zero-copy path cannot hash: its bytes never reach userspace"
-        );
-        let pipes = self.pipes();
-        debug_assert!(
-            matches!(pipes.head, PipeHead::Unique),
-            "cache-only writes consume unique pipe bytes"
-        );
-        let rx = Arc::clone(&pipes.upstream_fd);
-        let _landed = drain_pipe_to_file(&rx, &self.file, &mut self.file_offset)
-            .await
-            .map_err(|err| CacheError::counted_io("splice cache write", &self.path, err))?;
-        Ok(())
-    }
-
-    /// Land the installed batch -- `pipe_B`, or the read buffer's unwritten
-    /// tail -- in the cache file. The transfer owner publishes the resulting
-    /// progress. A no-op while nothing is pending, so it is free to call
-    /// wherever the file has to be current.
-    async fn flush(&mut self) -> Result<(), DownloadFailure> {
-        match &mut self.sink {
-            CacheSink::Direct => Ok(()),
-            CacheSink::Buffer(batch) => {
-                if batch.is_empty() {
-                    return Ok(());
-                }
-                batch.mark_flushed();
-                self.landed_once.set();
-                self.land_buffer().await.map_err(|err| {
-                    CacheError::counted_io("splice cache write", &self.path, err).into()
-                })
-            }
-            CacheSink::Pipes(pipes) => {
-                if pipes.cache.is_empty() {
-                    return Ok(());
-                }
-                pipes.cache.mark_flushed();
-                self.landed_once.set();
-                debug_assert!(
-                    self.hasher.is_none(),
-                    "tee bytes cannot feed an incremental digest"
-                );
-                let _landed =
-                    drain_pipe_to_file(&pipes.cache.sink.rx, &self.file, &mut self.file_offset)
-                        .await
-                        .map_err(|err| {
-                            CacheError::counted_io("splice cache write", &self.path, err)
-                        })?;
-                Ok(())
-            }
-        }
-    }
-
-    /// Flush once the installed batch is due: at the threshold, or while
-    /// nothing of the transfer is on disk yet.
-    async fn flush_if_due(&mut self) -> Result<(), DownloadFailure> {
-        let landed_once = self.landed_once.get();
-        let due = match &self.sink {
-            CacheSink::Direct => false,
-            CacheSink::Pipes(pipes) => pipes.cache.is_due(landed_once),
-            CacheSink::Buffer(batch) => batch.is_due(landed_once),
-        };
-        if due {
-            self.flush().await?;
-        }
-        Ok(())
-    }
-
-    /// Write `pipe_A` straight to the cache file, after the pending `pipe_B`
-    /// bytes that precede it in the body.
-    async fn write_through(&mut self) -> Result<(), DownloadFailure> {
-        self.flush().await?;
-        self.drain_pipe_to_cache().await
-    }
-
-    /// Preserve received bytes on failure, at the one exit of either body
-    /// loop. They were consumed from the upstream socket, so nothing delivers
-    /// them again; without this the `.partial` a later attempt resumes from
-    /// would be short of what was received.
-    ///
-    /// The pipe owner resolves duplicate bytes before appending the remaining
-    /// unique tail; the read buffer lands only its unwritten tail, so nothing
-    /// lands twice. The cache file keeps its write lease even when the barrier
-    /// has already published an abort. The barrier is not pinged: the guarded
-    /// runner already retained the failure and will publish it after salvage,
-    /// or on cancellation. Nothing is counted either: the bytes were counted
-    /// as downloaded when they arrived, whether or not `note_chunk` got to
-    /// run. A failed salvage is reported here and does not replace the
-    /// transfer's own error.
-    pub(super) async fn salvage(&mut self) {
-        let landed = match std::mem::replace(&mut self.sink, CacheSink::Direct) {
-            CacheSink::Pipes(pipes) => pipes.salvage_into(&self.file, &mut self.file_offset).await,
-            sink @ (CacheSink::Direct | CacheSink::Buffer(_)) => {
-                self.sink = sink;
-                self.land_buffer().await
-            }
-        };
-        if let Err(err) = landed {
-            let _logged = Logged::cache_io_failure(format_args!(
-                "splice proxy: failed to land the last received bytes of `{}` in the partial file; a later attempt resumes from a shorter partial:  {}",
-                self.path.display(),
-                ErrorReport(&err)
-            ));
-        }
     }
 }
 
@@ -752,7 +887,7 @@ impl std::fmt::Display for DemoteTrigger {
 /// Built by the caller (`transfer_body` in `mod.rs`) from the body's
 /// geometry and handed to one of the two loops by value; it comes back as
 /// the [`BodyOutcome`].
-pub(super) struct BodyTransfer<'a> {
+pub(super) struct BodyTransfer<'a, S = CacheSink> {
     /// Dropped at the demotion transition so the spawned
     /// `serve_remaining_from_file` task's own `ClientDownload` (in
     /// `async_sendfile_unfinished`) takes over the accounting cleanly; see
@@ -760,7 +895,7 @@ pub(super) struct BodyTransfer<'a> {
     /// and `None` from the start for a client-less transfer, which ships no
     /// bytes to any client and so must not bump `ACTIVE_CLIENT_DOWNLOADS`.
     counter: Option<client_counter::ClientDownload>,
-    cache: &'a mut CacheWriter,
+    cache: CacheWriterRef<'a, S>,
     barrier: &'a mut DownloadBarrier,
     rate_checker: Option<RateChecker>,
     client_rate_checker: Option<RateChecker>,
@@ -835,7 +970,7 @@ impl<'a> BodyTransfer<'a> {
 
         Self {
             counter,
-            cache,
+            cache: cache.view(),
             barrier,
             rate_checker,
             client_rate_checker,
@@ -850,6 +985,72 @@ impl<'a> BodyTransfer<'a> {
         }
     }
 
+    fn into_pipes(self) -> Result<BodyTransfer<'a, SplicePipes>, DownloadFailure> {
+        self.map_cache(|CacheWriterRef { core, sink }| {
+            *sink = CacheSink::Pipes(SplicePipes::new().map_err(internal_io)?);
+            core.hasher = None;
+            match sink {
+                CacheSink::Pipes(pipes) => Ok(CacheWriterRef { core, sink: pipes }),
+                CacheSink::Direct | CacheSink::Buffer(_) => {
+                    Err(InternalError::invalid("install pipe writer", "unexpected sink").into())
+                }
+            }
+        })
+    }
+
+    fn into_buffer(self) -> Result<BodyTransfer<'a, CacheBatch<BufferSink>>, DownloadFailure> {
+        let remaining = self.remaining;
+        self.map_cache(|CacheWriterRef { core, sink }| {
+            *sink = CacheSink::Buffer(CacheBatch::with_sink(BufferSink::new(remaining)));
+            match sink {
+                CacheSink::Buffer(batch) => Ok(CacheWriterRef { core, sink: batch }),
+                CacheSink::Direct | CacheSink::Pipes(_) => {
+                    Err(InternalError::invalid("install buffer writer", "unexpected sink").into())
+                }
+            }
+        })
+    }
+
+    fn map_cache<T>(
+        self,
+        map: impl FnOnce(
+            CacheWriterRef<'a, CacheSink>,
+        ) -> Result<CacheWriterRef<'a, T>, DownloadFailure>,
+    ) -> Result<BodyTransfer<'a, T>, DownloadFailure> {
+        let BodyTransfer {
+            counter,
+            cache,
+            barrier,
+            rate_checker,
+            client_rate_checker,
+            demotion_floor,
+            remaining,
+            client_status,
+            bytes_done,
+            client_file_pos,
+            client_remaining,
+            range_filter,
+            peer,
+        } = self;
+        Ok(BodyTransfer {
+            counter,
+            cache: map(cache)?,
+            barrier,
+            rate_checker,
+            client_rate_checker,
+            demotion_floor,
+            remaining,
+            client_status,
+            bytes_done,
+            client_file_pos,
+            client_remaining,
+            range_filter,
+            peer,
+        })
+    }
+}
+
+impl<'a, S: CacheMode> BodyTransfer<'a, S> {
     fn check_upstream_rate(&self) -> Result<(), DownloadFailure> {
         if let Some(rate) = self.rate_checker.as_ref().and_then(RateChecker::check_fail) {
             return Err(UpstreamError::rate(rate).into());
@@ -857,57 +1058,33 @@ impl<'a> BodyTransfer<'a> {
         Ok(())
     }
 
-    /// Run a [`CacheWriter`] operation, then publish the bytes it landed to
-    /// the barrier: every cache write of the body loops goes through here.
-    async fn tracked(
-        &mut self,
-        op: impl AsyncFnOnce(&mut CacheWriter) -> Result<(), DownloadFailure>,
-    ) -> Result<(), DownloadFailure> {
+    #[cfg(test)]
+    async fn write_chunk(&mut self, buf: &mut Vec<u8>) -> Result<(), DownloadFailure> {
         let before = self.cache.position();
-        op(&mut *self.cache).await?;
+        self.cache.write_cache_chunk(buf).await?;
+        self.publish_progress(before);
+        Ok(())
+    }
+
+    fn publish_progress(&mut self, before: u64) {
         let written = self.cache.position() - before;
         if written != 0 {
             self.barrier.ping_batched(written);
         }
+    }
+
+    async fn flush(&mut self) -> Result<(), DownloadFailure> {
+        let before = self.cache.position();
+        self.cache.flush().await?;
+        self.publish_progress(before);
         Ok(())
     }
 
-    /// Hand the `got` bytes `pipe_A` holds to the cache alone (no client
-    /// to write: absent, gone or demoted, or the bytes are outside its
-    /// Range). They join the `pipe_B` batch and land under the
-    /// [`CacheBatch`] policy, like a teed batch: draining `pipe_A` straight
-    /// to the file cost one blocking-pool round trip per batch, and a batch
-    /// ends at every `EAGAIN`, a few KiB apart on a trickling upstream.
-    async fn write_cache_only(&mut self, got: usize) -> Result<(), DownloadFailure> {
-        let mut remaining = got;
-        while remaining > 0 {
-            match self.cache.pipes_mut().stash(remaining) {
-                Ok(0) => {
-                    return Err(internal_io(std::io::Error::new(
-                        ErrorKind::UnexpectedEof,
-                        "pipe closed while moving bytes to the cache batch",
-                    )));
-                }
-                Ok(n) => remaining -= n,
-                Err(nix::errno::Errno::EINTR) => {}
-                // `pipe_B` is full; landing it empties it.
-                Err(nix::errno::Errno::EAGAIN) if !self.cache.batch().is_empty() => {
-                    self.tracked(CacheWriter::flush).await?;
-                }
-                // No room in an empty `pipe_B`: land `pipe_A` directly
-                // instead, which is what it holds.
-                Err(nix::errno::Errno::EAGAIN) => {
-                    return self.tracked(CacheWriter::write_through).await;
-                }
-                Err(err) => {
-                    return Err(internal_io(errno_to_io_error(
-                        err,
-                        "splice to the cache batch failed",
-                    )));
-                }
-            }
-        }
-        self.tracked(CacheWriter::flush_if_due).await
+    async fn flush_if_due(&mut self) -> Result<(), DownloadFailure> {
+        let before = self.cache.position();
+        self.cache.flush_if_due().await?;
+        self.publish_progress(before);
+        Ok(())
     }
 
     /// Account a chunk just pulled from upstream and return the body-offset
@@ -1124,6 +1301,53 @@ impl<'a> BodyTransfer<'a> {
     }
 }
 
+impl BodyTransfer<'_, SplicePipes> {
+    async fn write_through(&mut self) -> Result<(), DownloadFailure> {
+        let before = self.cache.position();
+        self.cache.write_through().await?;
+        self.publish_progress(before);
+        Ok(())
+    }
+
+    /// Hand the `got` bytes `pipe_A` holds to the cache alone (no client
+    /// to write: absent, gone or demoted, or the bytes are outside its
+    /// Range). They join the `pipe_B` batch and land under the
+    /// [`CacheBatch`] policy, like a teed batch: draining `pipe_A` straight
+    /// to the file cost one blocking-pool round trip per batch, and a batch
+    /// ends at every `EAGAIN`, a few KiB apart on a trickling upstream.
+    async fn write_cache_only(&mut self, got: usize) -> Result<(), DownloadFailure> {
+        let mut remaining = got;
+        while remaining > 0 {
+            match self.cache.pipes_mut().stash(remaining) {
+                Ok(0) => {
+                    return Err(internal_io(std::io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "pipe closed while moving bytes to the cache batch",
+                    )));
+                }
+                Ok(n) => remaining -= n,
+                Err(nix::errno::Errno::EINTR) => {}
+                // `pipe_B` is full; landing it empties it.
+                Err(nix::errno::Errno::EAGAIN) if !self.cache.batch().is_empty() => {
+                    self.flush().await?;
+                }
+                // No room in an empty `pipe_B`: land `pipe_A` directly
+                // instead, which is what it holds.
+                Err(nix::errno::Errno::EAGAIN) => {
+                    return self.write_through().await;
+                }
+                Err(err) => {
+                    return Err(internal_io(errno_to_io_error(
+                        err,
+                        "splice to the cache batch failed",
+                    )));
+                }
+            }
+        }
+        self.flush_if_due().await
+    }
+}
+
 /// Splice data from upstream TCP socket to client socket, with zero-copy tee to a cache file.
 ///
 /// Data flow (all in kernel space, zero userspace copies):
@@ -1138,12 +1362,12 @@ impl<'a> BodyTransfer<'a> {
 /// bytes consumed), so its socket still holds undelivered bytes -- the caller
 /// drops the unfinished response, keeping the connection out of the pool.
 pub(super) async fn splice_proxy_body(
-    mut xfer: BodyTransfer<'_>,
+    xfer: BodyTransfer<'_>,
     upstream: &TcpStream,
 ) -> Result<BodyOutcome, DownloadFailure> {
-    xfer.cache.sink = CacheSink::Pipes(SplicePipes::new().map_err(internal_io)?);
+    let mut xfer = xfer.into_pipes()?;
     drive_batches(&mut xfer, upstream).await?;
-    xfer.tracked(CacheWriter::flush).await?;
+    xfer.flush().await?;
     Ok(xfer.finish())
 }
 
@@ -1155,7 +1379,7 @@ pub(super) async fn splice_proxy_body(
 /// the fan-out -- returns through the one [`CacheWriter::salvage`] at the call
 /// site. No failure path in here has to remember what either pipe holds.
 async fn drive_batches(
-    xfer: &mut BodyTransfer<'_>,
+    xfer: &mut BodyTransfer<'_, SplicePipes>,
     upstream: &TcpStream,
 ) -> Result<(), DownloadFailure> {
     let config = global_config();
@@ -1269,7 +1493,7 @@ async fn drive_batches(
                         () = xfer.cache.batch().until_stale(), if !xfer.cache.batch().is_empty() => true,
                     };
                     if batch_is_stale {
-                        xfer.tracked(CacheWriter::flush).await?;
+                        xfer.flush().await?;
                     }
                     continue;
                 }
@@ -1433,12 +1657,12 @@ async fn pwrite_buf_to_file(
 /// bytes consumed), so its socket still holds undelivered bytes -- the caller
 /// drops the unfinished response, keeping the connection out of the pool.
 pub(super) async fn splice_proxy_body_tls(
-    mut xfer: BodyTransfer<'_>,
+    xfer: BodyTransfer<'_>,
     upstream: &mut UpstreamConn,
 ) -> Result<BodyOutcome, DownloadFailure> {
-    xfer.cache.sink = CacheSink::Buffer(CacheBatch::with_sink(BufferSink::new(xfer.remaining)));
+    let mut xfer = xfer.into_buffer()?;
     drive_reads(&mut xfer, upstream).await?;
-    xfer.tracked(CacheWriter::flush).await?;
+    xfer.flush().await?;
     Ok(xfer.finish())
 }
 
@@ -1450,7 +1674,7 @@ pub(super) async fn splice_proxy_body_tls(
 /// the batch for the caller's [`CacheWriter::salvage`]; nothing in here has
 /// to remember them.
 async fn drive_reads(
-    xfer: &mut BodyTransfer<'_>,
+    xfer: &mut BodyTransfer<'_, CacheBatch<BufferSink>>,
     upstream: &mut UpstreamConn,
 ) -> Result<(), DownloadFailure> {
     let config = global_config();
@@ -1473,7 +1697,7 @@ async fn drive_reads(
         // holding unwritten bytes (an early flush left its batch below the
         // threshold) is landed first.
         if xfer.cache.buffer().sink.is_full() {
-            xfer.tracked(CacheWriter::flush).await?;
+            xfer.flush().await?;
         }
         xfer.cache.buffer_mut().sink.recycle();
 
@@ -1566,7 +1790,7 @@ async fn drive_reads(
                 }
             };
             let Some(n) = parked else {
-                xfer.tracked(CacheWriter::flush).await?;
+                xfer.flush().await?;
                 continue;
             };
             if n == 0 {
@@ -1588,7 +1812,7 @@ async fn drive_reads(
         // concurrent clients see progress without being gated on this
         // client's send speed.
         xfer.cache.buffer_mut().queue(got);
-        xfer.tracked(CacheWriter::flush_if_due).await?;
+        xfer.flush_if_due().await?;
 
         // Step 3: deliver the read. It stays in the buffer until the next
         // iteration, landed or not, so the delivery reads it in place.
@@ -1630,7 +1854,7 @@ fn tls_premature_eof() -> DownloadFailure {
 /// the batch, which borrows the buffer, so it cannot hold a slice of it
 /// across one.
 async fn write_client_or_demote<'a>(
-    xfer: &mut BodyTransfer<'a>,
+    xfer: &mut BodyTransfer<'a, CacheBatch<BufferSink>>,
     client: &'a TcpStream,
     batched: Range<usize>,
 ) -> Result<(), DownloadFailure> {
@@ -1647,7 +1871,7 @@ async fn write_client_or_demote<'a>(
             Ok(n) => {
                 written += n;
                 if let Some(trigger) = xfer.note_client_bytes(n) {
-                    xfer.tracked(CacheWriter::flush).await?;
+                    xfer.flush().await?;
                     xfer.request_demote(client, trigger);
                     return Ok(());
                 }
@@ -1655,7 +1879,7 @@ async fn write_client_or_demote<'a>(
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
                 // Nothing grows the partial while this task waits here, so a
                 // slow client would otherwise throttle every other reader.
-                xfer.tracked(CacheWriter::flush).await?;
+                xfer.flush().await?;
                 if let Err(err) = wait_writable_rated(
                     client,
                     &mut xfer.client_rate_checker,
@@ -1822,7 +2046,7 @@ enum PipeHead {
 /// `duplicate` tees them; `send_to_client` and `discard_duplicate` retire only
 /// that duplicated head. Failure recovery first lands B, discards A's copies,
 /// then lands its unique tail, including a tail behind a partial tee.
-struct SplicePipes {
+pub(super) struct SplicePipes {
     upstream_tx: pipe::Sender,
     upstream_rx: pipe::Receiver,
     upstream_fd: Arc<OwnedFd>,
@@ -1990,7 +2214,7 @@ impl SplicePipes {
 ///   from `client_file_pos`;
 /// - before anything else writes the cache file (a direct `pipe_A` drain):
 ///   `CacheWriter::file_offset` is one cursor and the pending bytes come
-///   earlier in the body ([`CacheWriter::write_through`] pairs the two
+///   earlier in the body ([`CacheWriterRef::write_through`] pairs the two
 ///   drains). The zero-copy loop's cache-only batches do not write directly:
 ///   they join `pipe_B` ([`BodyTransfer::write_cache_only`]);
 /// - a batch older than [`Self::MAX_BATCH_AGE`] while parked for upstream.
@@ -2001,7 +2225,7 @@ impl SplicePipes {
 ///   them at this granularity anyway. A client that *joins* during the park
 ///   reads the file's current size, though, so the age bounds how far behind
 ///   the received bytes that size may be;
-/// - loop end ([`CacheWriter::flush`] at the exit of both loops), and the
+/// - loop end ([`CacheWriterRef::flush`] at the exit of both loops), and the
 ///   exit [`CacheWriter::salvage`] on failure.
 ///
 /// Neither sink ever makes the client wait for the cache file: the client
@@ -2010,7 +2234,7 @@ impl SplicePipes {
 /// `pending` is a heuristic for that policy, never a splice count: the
 /// pipe drains empty the pipe whatever it says, so a drift could only
 /// mis-time a flush, not wedge one.
-struct CacheBatch<S> {
+pub(super) struct CacheBatch<S> {
     sink: S,
     /// Bytes queued since the last flush.
     pending: usize,
@@ -2094,7 +2318,7 @@ impl PipeSink {
 /// bytes before `landed` are in the cache file, the rest are the batch.
 /// Landed bytes stay until [`Self::recycle`], because a delivery may still
 /// be reading them: the client is written from the buffer in place.
-struct BufferSink {
+pub(super) struct BufferSink {
     buf: Vec<u8>,
     landed: usize,
 }
@@ -2204,7 +2428,10 @@ impl<'a> ClientStatus<'a> {
 /// `ClientStatus::DemoteRequested` so the caller ([`BodyTransfer::maybe_demote`]) can either promote it to
 /// `ClientStatus::Demoted` (spawn a file-serve task) or abort the splice with
 /// an upstream-rate timeout when the upstream is the actual bottleneck.
-async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), DownloadFailure> {
+async fn tee_and_splice(
+    xfer: &mut BodyTransfer<'_, SplicePipes>,
+    got: usize,
+) -> Result<(), DownloadFailure> {
     let mut remaining = got;
 
     while remaining > 0 {
@@ -2233,7 +2460,7 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), D
                     // failed and the pipe is smaller than
                     // `CacheBatch::FLUSH_THRESHOLD`.
                     Err(nix::errno::Errno::EAGAIN) if !xfer.cache.batch().is_empty() => {
-                        xfer.tracked(CacheWriter::flush).await?;
+                        xfer.flush().await?;
                         continue;
                     }
                     // EAGAIN/EWOULDBLOCK: see module-level static_assert.
@@ -2257,7 +2484,7 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), D
             // A due batch is written before the client splice below, so
             // concurrent clients still see progress without being gated on a
             // potentially slow first client.
-            xfer.tracked(CacheWriter::flush_if_due).await?;
+            xfer.flush_if_due().await?;
 
             // Step 4: splice pipe_A → client (may be slow, but no longer blocks cache)
             // pipe_A always has data on entry (just filled by tee), so try the
@@ -2301,7 +2528,7 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), D
                             // takes over from `client_file_pos` by reading
                             // the partial file, so every byte delivered so
                             // far has to be on disk first.
-                            xfer.tracked(CacheWriter::flush).await?;
+                            xfer.flush().await?;
                             xfer.request_demote(client, trigger);
                             break;
                         }
@@ -2318,7 +2545,7 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), D
                         // other reader until it recovers, times out or is
                         // demoted. Parking on *upstream* is deliberately not a
                         // flush point -- see [`CacheBatch`].
-                        xfer.tracked(CacheWriter::flush).await?;
+                        xfer.flush().await?;
                         clear_pipe_readable_cache(&xfer.cache.pipes().upstream_rx);
                         clear_tcp_writable_cache(client);
                         tokio::select! {
@@ -3044,13 +3271,9 @@ mod tests {
             &config,
         );
         // The range excludes both "xx" and "-outside" from the resumed body.
-        xfer.tracked(async |cache| {
-            cache
-                .write_cache_chunk(&mut b"xxsentsuffix-outside".to_vec())
-                .await
-        })
-        .await
-        .unwrap();
+        xfer.write_chunk(&mut b"xxsentsuffix-outside".to_vec())
+            .await
+            .unwrap();
         assert_eq!(xfer.note_chunk(20), 0..20);
         let trigger = xfer
             .note_client_bytes(4)
@@ -3204,7 +3427,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut xfer = BodyTransfer::new(
+        let xfer = BodyTransfer::new(
             BodyClient::Absent,
             &mut writer,
             &mut barrier,
@@ -3213,13 +3436,11 @@ mod tests {
             None,
             &crate::config::Config::default(),
         );
-        xfer.cache.sink = CacheSink::Pipes(SplicePipes::new().unwrap());
+        let mut xfer = xfer.into_pipes().unwrap();
         // Model an earlier teed batch whose client bytes have been delivered.
         queue_cache(xfer.cache.pipes_mut(), b"queued-").await;
         let mut direct = b"direct-".to_vec();
-        xfer.tracked(async |cache| cache.write_cache_chunk(&mut direct).await)
-            .await
-            .unwrap();
+        xfer.write_chunk(&mut direct).await.unwrap();
         assert_eq!(xfer.cache.file_offset, 21);
         assert!(receiver.has_changed().unwrap());
         receiver.borrow_and_update();
@@ -3231,7 +3452,7 @@ mod tests {
         // Switching to cache-only must also land the next queued bytes first.
         queue_cache(xfer.cache.pipes_mut(), b"queued2-").await;
         accumulate(xfer.cache.pipes_mut(), b"tail");
-        xfer.tracked(CacheWriter::write_through).await.unwrap();
+        xfer.write_through().await.unwrap();
         assert_eq!(xfer.cache.file_offset, 33);
         assert!(xfer.cache.batch().is_empty());
         drop(xfer);
@@ -3259,7 +3480,7 @@ mod tests {
         .await
         .unwrap();
         let filter = SpliceRangeFilter { skip: 0, send: 0 };
-        let mut xfer = BodyTransfer::new(
+        let xfer = BodyTransfer::new(
             BodyClient::Absent,
             &mut writer,
             &mut barrier,
@@ -3268,7 +3489,7 @@ mod tests {
             None,
             &crate::config::Config::default(),
         );
-        xfer.cache.sink = CacheSink::Pipes(SplicePipes::new().unwrap());
+        let mut xfer = xfer.into_pipes().unwrap();
 
         // Nothing of the transfer is on disk yet, so the first batch lands.
         let mut expected = b"first-".to_vec();
@@ -3294,7 +3515,7 @@ mod tests {
             !xfer.cache.batch().is_empty(),
             "small batches wait for the threshold"
         );
-        xfer.tracked(CacheWriter::flush).await.unwrap();
+        xfer.flush().await.unwrap();
         assert_eq!(
             xfer.cache.file_offset,
             i64::try_from(expected.len()).unwrap()
@@ -3325,8 +3546,8 @@ mod tests {
         writer.flush_if_due().await.unwrap();
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"first");
         assert_eq!(writer.batch().pending, 6);
-        writer.flush().await.unwrap();
-        drop(writer);
+        let drained = writer.drain().await.expect("drained pending pipe batch");
+        let (_file, _digest) = drained.into_parts();
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"firstsecond");
     }
 
@@ -3348,13 +3569,46 @@ mod tests {
         writer.write_prefix(b"prefix-").await.unwrap();
         let mut body = b"body".to_vec();
         writer.write_cache_chunk(&mut body).await.unwrap();
-        let (_file, digest) = writer.finish();
+        let (_file, digest) = writer.drain().await.expect("drained writer").into_parts();
         let digest = digest.unwrap();
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"prefix-body");
         assert_eq!(digest.bytes, 11);
         assert_eq!(
             digest.digest.as_slice(),
             sha2::Sha256::digest(b"prefix-body").to_vec()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn finalization_lands_pending_buffer_before_exposing_digest() {
+        use crate::index_parser::HashAlgo;
+        use sha2::Digest as _;
+        let scratch = ScratchFile::new();
+        let barrier = cache_barrier(&scratch.path).await;
+        let mut writer = CacheWriter::new(
+            scratch.file,
+            0,
+            CacheWriteMode::Userspace(Some(HashAlgo::Sha256)),
+            &barrier,
+            &scratch.path,
+        )
+        .await
+        .unwrap();
+        writer.sink = CacheSink::Buffer(CacheBatch::with_sink(BufferSink::new(7)));
+        writer.buffer_mut().sink.buf.extend_from_slice(b"pending");
+        writer.buffer_mut().queue(7);
+        assert_eq!(std::fs::read(&scratch.path).unwrap(), b"");
+        let (_file, digest) = writer
+            .drain()
+            .await
+            .expect("drained pending buffer")
+            .into_parts();
+        let digest = digest.expect("userspace digest");
+        assert_eq!(std::fs::read(&scratch.path).unwrap(), b"pending");
+        assert_eq!(digest.bytes, 7);
+        assert_eq!(
+            digest.digest.as_slice(),
+            sha2::Sha256::digest(b"pending").as_slice()
         );
     }
 
@@ -3440,7 +3694,7 @@ mod tests {
             "batches landed from a non-zero cursor: {landed_mid_buffer}"
         );
 
-        let (_file, digest) = writer.finish();
+        let (_file, digest) = writer.drain().await.expect("drained writer").into_parts();
         let digest = digest.expect("a fresh userspace transfer streams a digest");
         let mut expected = prefix.to_vec();
         expected.extend_from_slice(&body);
@@ -3476,7 +3730,7 @@ mod tests {
             .write_cache_chunk(&mut b"body".to_vec())
             .await
             .unwrap();
-        let (_file, digest) = writer.finish();
+        let (_file, digest) = writer.drain().await.expect("drained writer").into_parts();
         assert!(digest.is_none(), "a suffix is not a whole-file digest");
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"resume-prefix-body");
     }
@@ -3498,7 +3752,7 @@ mod tests {
         .unwrap();
         writer.write_prefix(b"whole body").await.unwrap();
         writer.write_prefix(b"").await.unwrap();
-        let (_file, digest) = writer.finish();
+        let (_file, digest) = writer.drain().await.expect("drained writer").into_parts();
         let digest = digest.unwrap();
         assert_eq!(digest.bytes, 10);
         assert_eq!(

@@ -43,11 +43,13 @@ use tracing::{error, info};
 use crate::cache_layout::{CachedFlavor, ConnectionDetails};
 use crate::database_task::{DatabaseCommand, DbCmdTransfer, TransferKind, send_db_command};
 use crate::error::ErrorReport;
+use crate::guards::Consequence;
 use crate::guards::RenameBarrier;
 use crate::humanfmt::HumanFmt;
-use crate::index_parser::StreamedDigest;
+use crate::integrity::FinishedCacheFile;
 use crate::partial_file::TempPath;
 use crate::precise_instant::PreciseInstant;
+use crate::transfer_error::ReportedDownloadFailure;
 use crate::{metrics, mirror_perf, rate_log};
 
 use super::CacheTarget;
@@ -104,8 +106,8 @@ impl CacheTarget {
     /// End the download on the calling task: the `Download -> Verifying`
     /// flip that drops the `max_upstream_downloads` slot and the watch sender
     /// (`DownloadBarrier::begin_rename`, which also flushes the final ping).
-    /// No I/O happens here, which is why it belongs on the connection task
-    /// rather than in the spawned tail: the slot goes back at the same point
+    /// Finalization drains any pending cache writes before this flip. It
+    /// belongs on the connection task: the slot goes back at the same point
     /// as in the hyper backend, and a demoted file-serve task parked on the
     /// sender is awake before anyone can await it.
     ///
@@ -118,7 +120,7 @@ impl CacheTarget {
         conn_label: ConnLabel,
         bytes: CompletionBytes,
         start: PreciseInstant,
-    ) -> CommitTail {
+    ) -> Result<CommitTail, ReportedDownloadFailure> {
         let Self {
             writer,
             dbarrier,
@@ -126,19 +128,37 @@ impl CacheTarget {
             dest_path,
             validators: _,
         } = self;
-        let (tempfile, streamed_digest) = writer.finish();
+        let drained = match writer.drain().await {
+            Ok(drained) => drained,
+            Err(super::body::FinishFailure {
+                mut writer,
+                failure,
+            }) => {
+                match dbarrier
+                    .run(Consequence::Abandon, async |_barrier| {
+                        Err::<std::convert::Infallible, _>(failure)
+                    })
+                    .await
+                {
+                    Err(failed) => {
+                        return Err(failed.salvage(async || writer.salvage().await).await);
+                    }
+                    Ok((_, never)) => match never {},
+                }
+            }
+        };
+        let tempfile = FinishedCacheFile::from_writer(drained);
         let rbarrier = dbarrier.begin_rename().await;
-        CommitTail {
+        Ok(CommitTail {
             tempfile,
             temppath,
             dest_path,
             rbarrier,
-            streamed_digest,
             conn_details,
             conn_label,
             bytes,
             start,
-        }
+        })
     }
 }
 
@@ -153,12 +173,10 @@ impl CacheTarget {
 /// is left to commit.
 #[must_use = "the download is only committed once the tail is spawned, finished or committed"]
 pub(super) struct CommitTail {
-    tempfile: tokio::fs::File,
+    tempfile: FinishedCacheFile,
     temppath: TempPath,
     dest_path: PathBuf,
     rbarrier: RenameBarrier,
-    /// The incremental digest, if one was kept.
-    streamed_digest: Option<StreamedDigest>,
     conn_details: ConnectionDetails,
     conn_label: ConnLabel,
     bytes: CompletionBytes,
@@ -326,20 +344,13 @@ impl CommitTail {
             temppath,
             dest_path,
             rbarrier,
-            streamed_digest,
             conn_details,
             conn_label,
             bytes,
             start,
         } = self;
         let committed = rbarrier
-            .commit(
-                tempfile,
-                temppath,
-                dest_path,
-                streamed_digest,
-                Some(sync_cache_file),
-            )
+            .commit(tempfile, temppath, dest_path, Some(sync_cache_file))
             .await;
         let elapsed = start.elapsed();
         if committed.is_err() {

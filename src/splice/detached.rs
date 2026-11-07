@@ -148,10 +148,11 @@ impl DetachedDownload {
         // cached, so no DB rows and no completion line. Upstream side only:
         // no client was ever served, so there is no `SERVED_*` /
         // `BYTES_SERVED_SPLICE` bump and no `Delivery` row.
-        target
+        if let Ok(tail) = target
             .begin_rename(conn_details, conn_label, bytes, start)
             .await
-            .finish(rates, CompletionClient::Absent)
-            .await;
+        {
+            tail.finish(rates, CompletionClient::Absent).await;
+        }
     }
 }

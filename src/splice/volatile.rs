@@ -168,27 +168,26 @@ pub(super) async fn handle_volatile_buffered_download(
     // Commit on a task of its own, only if the body reached the temp file, and
     // start it before serving: the client does not wait for the `fsync`,
     // the verify + rename or the `Download` row. `begin_rename` stays here on
-    // the connection task (no I/O), so the slot goes back before the client
+    // the connection task, after draining writes, so the slot goes back before the client
     // write. When the write failed, the target went with the failure: its
     // barrier published the terminal aborted state (correct, since nothing is
     // on disk for late joiners to serve) and gave the `max_upstream_downloads`
     // slot back with the entry, so the client write below holds neither.
     let verdict = match cache_write {
-        Ok(target) => Some(
-            target
-                .begin_rename(
-                    conn_details.clone(),
-                    conn_label,
-                    CompletionBytes {
-                        total: total_content_length,
-                        upstream: total_content_length.get(),
-                        resume_offset: 0,
-                    },
-                    start,
-                )
-                .await
-                .spawn_before_serving(rates),
-        ),
+        Ok(target) => target
+            .begin_rename(
+                conn_details.clone(),
+                conn_label,
+                CompletionBytes {
+                    total: total_content_length,
+                    upstream: total_content_length.get(),
+                    resume_offset: 0,
+                },
+                start,
+            )
+            .await
+            .ok()
+            .map(|tail| tail.spawn_before_serving(rates)),
         Err(_reported) => None,
     };
 

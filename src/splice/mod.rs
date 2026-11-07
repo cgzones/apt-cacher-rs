@@ -105,6 +105,7 @@ use acquire::{
     UpstreamExchange, discard_partial_and_retry, follow_redirect, standard_upstream_connect,
     warn_upstream_reject,
 };
+pub(crate) use body::DrainedCacheWriter;
 use body::{
     BodyClient, BodyOutcome, BodyTransfer, CacheWriteMode, CacheWriter, ClientEnd,
     SpliceRangeFilter, range_slice, shutdown_client_write, splice_proxy_body,
@@ -1762,10 +1763,12 @@ pub(crate) async fn splice_proxy(
     // `max_upstream_downloads` slot back (where the hyper backend gives its
     // own back), flips the entry to `Verifying` so a request arriving
     // meanwhile still late-joins it, and drops the watch sender -- the
-    // wake-up a demoted file-serve task may be parked on. No I/O yet.
+    // wake-up a demoted file-serve task may be parked on, after draining
+    // any remaining cache writes.
     let tail = target
         .begin_rename(conn_details.clone(), conn_label, bytes, start)
-        .await;
+        .await
+        .map_err(SpliceProxyError::ReportedAfterHeader)?;
 
     // Start the commit immediately, independently of the demoted writer.
     // The returned settlement proves the watch sender is gone and the commit

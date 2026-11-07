@@ -1298,6 +1298,37 @@ fn check_path_names_file(path: &Path, verified: &Metadata) -> std::io::Result<()
     }
 }
 
+/// A file whose writer has completed and flushed all pending I/O. Commit
+/// consumes this proof rather than accepting an arbitrary writable file.
+pub(crate) struct FinishedCacheFile {
+    file: tokio::fs::File,
+    digest: Option<StreamedDigest>,
+}
+
+impl FinishedCacheFile {
+    #[cfg(feature = "hyper")]
+    pub(crate) async fn flush(
+        mut file: tokio::fs::File,
+        path: &Path,
+    ) -> Result<Self, crate::transfer_error::CacheError> {
+        use tokio::io::AsyncWriteExt as _;
+        file.flush().await.map_err(|err| {
+            crate::transfer_error::CacheError::counted_io("flush cache file for commit", path, err)
+        })?;
+        Ok(Self { file, digest: None })
+    }
+
+    #[cfg(feature = "splice")]
+    pub(crate) fn from_writer(writer: crate::splice::DrainedCacheWriter) -> Self {
+        let (file, digest) = writer.into_parts();
+        Self { file, digest }
+    }
+
+    pub(crate) fn into_parts(self) -> (tokio::fs::File, Option<StreamedDigest>) {
+        (self.file, self.digest)
+    }
+}
+
 /// A step the commit job runs on the open temp file before anything else:
 /// splice's `fsync` (`splice/commit.rs::sync_cache_file`). It reports its own
 /// failure; the commit goes on either way.
