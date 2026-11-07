@@ -686,11 +686,6 @@ mod tests {
     // ReferencedOrAge (flat; group order = [hybrid?, root?, colocated], colocated ALWAYS last)
 
     #[test]
-    fn age_owning_complete_is_grace() {
-        assert_eq!(decide_sweep(AGE, &[gr(GroupOutcome::Complete)]), grace());
-    }
-
-    #[test]
     fn age_colocated_only_complete_is_grace() {
         assert_eq!(decide_sweep(AGE, &[gr(GroupOutcome::Complete)]), grace());
     }
