@@ -1391,7 +1391,9 @@ mod tests {
         };
         let tagged = VolatileCondHeaders {
             if_modified_since: None,
-            if_none_match: Some("\"index-v2\"".into()),
+            if_none_match: <crate::http_etag::ETag as crate::xattr_helpers::XattrValue>::parse(
+                "\"index-v2\"",
+            ),
         };
         let both = VolatileCondHeaders {
             if_modified_since: modified.if_modified_since.clone(),

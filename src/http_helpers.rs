@@ -202,9 +202,9 @@ impl<'a> ClientConn<'a> {
     /// Times out after the configured HTTP timeout.
     pub(crate) async fn write_304(
         self,
-        last_modified_str: &str,
+        last_modified_str: &crate::http_last_modified::LastModified,
         age: u32,
-        etag: Option<&str>,
+        etag: Option<&crate::http_etag::ETag>,
     ) -> std::io::Result<()> {
         ResponseHead::not_modified(last_modified_str, etag, age)
             .write_to(self, WireBody::None)

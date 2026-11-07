@@ -332,8 +332,8 @@ async fn prepare_partial_resume_at(
             };
             if let Some((if_range, last_modified, expected_total)) = validators {
                 let stored = UpstreamMetadata {
-                    etag: Some(if_range.into_shared()),
-                    last_modified: last_modified.map(LastModified::into_parts),
+                    etag: Some(if_range),
+                    last_modified,
                 };
                 let expected_total = expected_total.map(|xattr_helpers::ExpectedSize(size)| size);
                 // The total is only known when the partial carries the

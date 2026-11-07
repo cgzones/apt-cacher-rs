@@ -76,9 +76,23 @@ impl ETag {
         !etag.starts_with("W/")
     }
 
+    #[cfg(test)]
     pub(crate) fn into_shared(self) -> Arc<str> {
         let Self(etag) = self;
         etag
+    }
+}
+
+impl std::ops::Deref for ETag {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ETag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 

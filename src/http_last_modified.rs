@@ -28,9 +28,33 @@ pub(crate) struct LastModified {
 }
 
 impl LastModified {
+    pub(crate) fn from_date(time: HttpDate) -> Self {
+        Self {
+            raw: time.format().into(),
+            time,
+        }
+    }
+
+    pub(crate) const fn time(&self) -> HttpDate {
+        self.time
+    }
+
+    #[cfg(test)]
     pub(crate) fn into_parts(self) -> (Arc<str>, HttpDate) {
         let Self { raw, time } = self;
         (raw, time)
+    }
+}
+
+impl AsRef<str> for LastModified {
+    fn as_ref(&self) -> &str {
+        &self.raw
+    }
+}
+
+impl std::fmt::Display for LastModified {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.raw.fmt(f)
     }
 }
 

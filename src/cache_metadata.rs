@@ -87,7 +87,6 @@ use crate::{
     deb_mirror::Mirror,
     http_etag::{ETag, MAX_ETAG_LEN, is_valid_etag},
     http_last_modified::{LastModified, is_valid_http_date},
-    http_range::HttpDate,
     mem_usage::{ARC_HEADER, Footprint},
     warn_once_or_info,
     xattr_helpers::{self, ExpectedSize, XattrValue as _},
@@ -98,15 +97,15 @@ use crate::{
 /// as the post-flight cache entry.
 ///
 /// `last_modified` stores both the raw header string (for `Last-Modified`
-/// response headers) and its parsed [`HttpDate`] (for If-Modified-Since
+/// response headers) and its parsed [`crate::http_range::HttpDate`] (for If-Modified-Since
 /// comparison) so consumers don't re-parse on every hit.
 ///
 /// The strings are `Arc<str>` so per-serve [`crate::cache_conditional::CacheInfo`]
 /// construction is a refcount bump instead of a String clone.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UpstreamMetadata {
-    pub(crate) etag: Option<Arc<str>>,
-    pub(crate) last_modified: Option<(Arc<str>, HttpDate)>,
+    pub(crate) etag: Option<ETag>,
+    pub(crate) last_modified: Option<LastModified>,
 }
 
 impl UpstreamMetadata {
@@ -114,10 +113,9 @@ impl UpstreamMetadata {
     /// produced only if the value parses as a valid HTTP-date.
     #[must_use]
     pub(crate) fn from_upstream(etag: Option<&str>, last_modified: Option<&str>) -> Self {
-        let last_modified =
-            last_modified.and_then(|s| HttpDate::parse(s).map(|t| (Arc::from(s), t)));
+        let last_modified = last_modified.and_then(LastModified::parse);
         Self {
-            etag: etag.filter(|value| is_valid_etag(value)).map(Arc::from),
+            etag: etag.and_then(ETag::parse),
             last_modified,
         }
     }
@@ -212,9 +210,7 @@ pub(crate) enum TargetFile {
 /// absent one is success). A [`TargetFile::New`] file skips those removals:
 /// they could only ever answer `ENODATA`.
 ///
-/// `meta`'s strings were validated once per upstream response by
-/// [`check_upstream_validators`], so the re-parse here cannot fail; the
-/// skip arm is the defensive fallback for a caller that bypassed it.
+/// The metadata owns validated values, which are written without reparsing.
 pub(crate) fn write_upstream_metadata(
     file: &tokio::fs::File,
     display_path: &Path,
@@ -232,17 +228,7 @@ pub(crate) fn write_upstream_metadata(
     let write = || {
         let file = &xattr_helpers::XattrFile(file);
         match etag {
-            Some(etag) => {
-                if let Some(etag) = ETag::parse(etag) {
-                    xattr_helpers::write(file, display_path, &etag);
-                } else {
-                    warn_once_or_info!(
-                        "Skipping write of malformed ETag to `{}`: `{}`",
-                        display_path.display(),
-                        etag.escape_debug()
-                    );
-                }
-            }
+            Some(etag) => xattr_helpers::write(file, display_path, etag),
             None => {
                 if target == TargetFile::Resumed {
                     xattr_helpers::remove_stale::<ETag>(file, display_path);
@@ -250,17 +236,7 @@ pub(crate) fn write_upstream_metadata(
             }
         }
         match last_modified {
-            Some((raw, _time)) => {
-                if let Some(lm) = LastModified::parse(raw) {
-                    xattr_helpers::write(file, display_path, &lm);
-                } else {
-                    warn_once_or_info!(
-                        "Skipping write of malformed Last-Modified to `{}`: `{}`",
-                        display_path.display(),
-                        raw.escape_debug()
-                    );
-                }
-            }
+            Some(lm) => xattr_helpers::write(file, display_path, lm),
             None => {
                 if target == TargetFile::Resumed {
                     xattr_helpers::remove_stale::<LastModified>(file, display_path);
@@ -274,7 +250,7 @@ pub(crate) fn write_upstream_metadata(
     if xattr_helpers::xattr_supported() {
         tokio::task::block_in_place(write);
     } else {
-        // Keep defensive validation warnings, but the disabled helpers perform no I/O.
+        // The disabled helpers perform no I/O.
         write();
     }
 }
@@ -591,8 +567,6 @@ impl CacheMetadataStore {
         // If either read errors, surface a best-effort `Arc` containing
         // whichever fields succeeded for this request but do not insert —
         // see the "Negative caching and transient errors" module docs.
-        let etag_res = etag_res.map(|o| o.map(ETag::into_shared));
-        let last_modified_res = last_modified_res.map(|o| o.map(LastModified::into_parts));
         let (etag, last_modified) = match (etag_res, last_modified_res) {
             (Ok(etag), Ok(last_modified)) => (etag, last_modified),
             (etag_res, last_modified_res) => {
@@ -676,7 +650,7 @@ impl CacheMetadataStore {
                     + etag.as_ref().map_or(0, |etag| ARC_HEADER + etag.len())
                     + last_modified
                         .as_ref()
-                        .map_or(0, |(raw, _)| ARC_HEADER + raw.len())
+                        .map_or(0, |value| ARC_HEADER + value.as_ref().len())
             })
             .sum();
         let shared: usize = inner
@@ -1132,10 +1106,8 @@ mod tests {
         xattr_helpers::set_xattr_supported(false);
         let meta = UpstreamMetadata::from_upstream(Some("\"abc\""), None);
         write_upstream_metadata(&file, &path, &meta, Some(12), TargetFile::Resumed);
-        let malformed = UpstreamMetadata {
-            etag: Some(Arc::from("bad")),
-            last_modified: Some((Arc::from("bad"), HttpDate::UNIX_EPOCH)),
-        };
+        let malformed = UpstreamMetadata::from_upstream(Some("bad"), Some("bad"));
+        assert_eq!(malformed, UpstreamMetadata::default());
         write_upstream_metadata(&file, &path, &malformed, None, TargetFile::New);
     }
 
@@ -1144,8 +1116,8 @@ mod tests {
         let m =
             UpstreamMetadata::from_upstream(Some("\"abc\""), Some("Thu, 01 Jan 1970 00:00:00 GMT"));
         assert_eq!(m.etag.as_deref(), Some("\"abc\""));
-        let (s, _date) = m.last_modified.expect("parsed");
-        assert_eq!(&*s, "Thu, 01 Jan 1970 00:00:00 GMT");
+        let s = m.last_modified.expect("parsed");
+        assert_eq!(s.as_ref(), "Thu, 01 Jan 1970 00:00:00 GMT");
     }
 
     #[test]
@@ -1155,8 +1127,8 @@ mod tests {
             Some("Thu, 01 Jan 1970 00:00:00 GMT"),
         );
         assert!(m.etag.is_none());
-        let (s, _date) = m.last_modified.expect("valid Last-Modified is retained");
-        assert_eq!(&*s, "Thu, 01 Jan 1970 00:00:00 GMT");
+        let s = m.last_modified.expect("valid Last-Modified is retained");
+        assert_eq!(s.as_ref(), "Thu, 01 Jan 1970 00:00:00 GMT");
     }
 
     #[test]

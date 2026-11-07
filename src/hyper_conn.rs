@@ -1099,8 +1099,8 @@ async fn serve_cached_file(
             );
 
             let head = ResponseHead::not_modified(
-                &cache_info.last_modified_str,
-                cache_info.file_etag.as_deref(),
+                &cache_info.last_modified,
+                cache_info.file_etag.as_ref(),
                 cache_info.age,
             );
             let response = head.into_hyper(empty_body());
@@ -1874,10 +1874,10 @@ fn build_fwd_request(
         // that only dates the last fetch or revalidation, so a copy
         // replayed or lagging behind the upstream would keep drawing
         // 304s. Without a stored date, `If-None-Match` alone asks.
-        if let Some((_raw, date)) = last_modified {
+        if let Some(date) = last_modified {
             let r = request.headers_mut().append(
                 IF_MODIFIED_SINCE,
-                HeaderValue::try_from(date.format()).expect("HTTP datetime should be valid"),
+                HeaderValue::try_from(date.time().format()).expect("HTTP datetime should be valid"),
             );
             assert!(!r, "header does not exist by previous construction");
         }

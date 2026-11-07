@@ -15,7 +15,6 @@
 use std::{
     borrow::Cow,
     path::Path,
-    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -31,7 +30,8 @@ use crate::http_helpers::find_header;
 use crate::{
     cache_metadata::UpstreamMetadata,
     client_info::ClientInfo,
-    http_etag::if_none_match,
+    http_etag::{ETag, if_none_match},
+    http_last_modified::LastModified,
     http_range::{HttpDate, ParsedRange, cache_file_http_date, compute_age, http_parse_range},
     humanfmt::HumanFmt,
     limits::VOLATILE_CACHE_MAX_AGE,
@@ -296,9 +296,8 @@ pub(crate) enum ServePlan {
 /// request headers and to populate response headers (`Last-Modified`, `ETag`,
 /// `Age`).
 pub(crate) struct CacheInfo {
-    pub(crate) file_etag: Option<Arc<str>>,
-    pub(crate) last_modified_for_ims: HttpDate,
-    pub(crate) last_modified_str: Arc<str>,
+    pub(crate) file_etag: Option<ETag>,
+    pub(crate) last_modified: LastModified,
     pub(crate) age: u32,
 }
 
@@ -332,17 +331,16 @@ impl CacheInfo {
     pub(crate) fn with_meta(metadata: &std::fs::Metadata, meta: &UpstreamMetadata) -> Self {
         let cache_ts = cache_file_http_date(metadata);
 
-        let (last_modified_for_ims, last_modified_str) = match meta.last_modified.as_ref() {
-            Some((s, time)) => (*time, Arc::clone(s)),
-            None => (cache_ts, cache_ts.format().into()),
-        };
+        let last_modified = meta
+            .last_modified
+            .clone()
+            .unwrap_or_else(|| LastModified::from_date(cache_ts));
 
         let age = compute_age(metadata);
 
         Self {
             file_etag: meta.etag.clone(),
-            last_modified_for_ims,
-            last_modified_str,
+            last_modified,
             age,
         }
     }
@@ -366,7 +364,7 @@ impl CacheInfo {
         if let Some(ims) = if_modified_since_header
             && let Some(ims_time) = HttpDate::parse(ims)
         {
-            return self.last_modified_for_ims <= ims_time;
+            return self.last_modified.time() <= ims_time;
         }
 
         false
@@ -395,7 +393,7 @@ impl CacheInfo {
                 range,
                 headers.if_range,
                 file_size,
-                self.last_modified_for_ims,
+                self.last_modified.time(),
                 self.file_etag.as_deref(),
             );
             if matches!(parsed, ParsedRange::Invalid) {
@@ -424,6 +422,7 @@ impl CacheInfo {
 mod tests {
     use super::*;
     use crate::test_support::local_client;
+    use crate::xattr_helpers::XattrValue as _;
 
     const ETAG: &str = "\"abc123\"";
     const LAST_MODIFIED: &str = "Sun, 06 Nov 1994 08:49:37 GMT";
@@ -431,9 +430,8 @@ mod tests {
 
     fn info(etag: Option<&str>) -> CacheInfo {
         CacheInfo {
-            file_etag: etag.map(Arc::from),
-            last_modified_for_ims: HttpDate::parse(LAST_MODIFIED).unwrap(),
-            last_modified_str: Arc::from(LAST_MODIFIED),
+            file_etag: etag.and_then(ETag::parse),
+            last_modified: LastModified::parse(LAST_MODIFIED).unwrap(),
             age: 7,
         }
     }
@@ -830,7 +828,7 @@ mod tests {
             Some(&UpstreamMetadata::default()),
         );
         assert!(info.file_etag.is_none());
-        assert_eq!(info.last_modified_for_ims, cache_file_http_date(&metadata));
+        assert_eq!(info.last_modified.time(), cache_file_http_date(&metadata));
     }
 
     #[test]
@@ -847,21 +845,21 @@ mod tests {
             },
         );
         assert_eq!(info.file_etag, None);
-        assert_eq!(info.last_modified_for_ims, expected);
-        assert_eq!(info.last_modified_str.as_ref(), expected.format());
+        assert_eq!(info.last_modified.time(), expected);
+        assert_eq!(info.last_modified.as_ref(), expected.format());
 
         // An upstream `Last-Modified` wins over the file timestamp.
         let upstream = HttpDate::parse(LAST_MODIFIED).unwrap();
         let info = CacheInfo::with_meta(
             &metadata,
             &UpstreamMetadata {
-                etag: Some(Arc::from(ETAG)),
-                last_modified: Some((Arc::from(LAST_MODIFIED), upstream)),
+                etag: ETag::parse(ETAG),
+                last_modified: LastModified::parse(LAST_MODIFIED),
             },
         );
         assert_eq!(info.file_etag.as_deref(), Some(ETAG));
-        assert_eq!(info.last_modified_for_ims, upstream);
-        assert_eq!(info.last_modified_str.as_ref(), LAST_MODIFIED);
+        assert_eq!(info.last_modified.time(), upstream);
+        assert_eq!(info.last_modified.as_ref(), LAST_MODIFIED);
     }
 
     #[cfg(feature = "splice")]

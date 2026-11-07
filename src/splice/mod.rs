@@ -101,6 +101,7 @@ use crate::{
 
 pub(crate) use upstream::UpstreamEndpoint;
 
+use crate::{http_etag::ETag, http_last_modified::LastModified};
 use acquire::{
     UpstreamExchange, discard_partial_and_retry, follow_redirect, standard_upstream_connect,
     warn_upstream_reject,
@@ -131,7 +132,7 @@ static_assert!(nix::errno::Errno::EAGAIN as i32 == nix::errno::Errno::EWOULDBLOC
 /// none was stored.
 struct VolatileCondHeaders {
     if_modified_since: Option<String>,
-    if_none_match: Option<Arc<str>>,
+    if_none_match: Option<ETag>,
 }
 
 /// The splice-only answers of the client side ([`ClientConn`]).
@@ -282,7 +283,7 @@ fn splice_response_head<'a>(
         range.content_range.as_deref(),
         content_type,
         last_modified,
-        etag.as_deref(),
+        etag.as_ref(),
         0,
     )
 }
@@ -387,12 +388,12 @@ impl CacheTarget {
 /// reports and what hyper's joining serve sends.
 #[derive(Clone)]
 struct HeadValidators {
-    etag: Option<Arc<str>>,
+    etag: Option<ETag>,
     /// Always set: the settled value, else the temp file's creation date,
     /// which the rename preserves and every later cache hit therefore
     /// reports too (`CacheInfo::with_meta`); a resumed partial keeps its
     /// first attempt's.
-    last_modified: Arc<str>,
+    last_modified: LastModified,
 }
 
 /// Reserve the cache quota and open the file the body is written into: the
@@ -491,10 +492,10 @@ async fn prepare_cache_target(
     let (mut ibarrier, (tempfile, temppath, last_modified, cache_time)) = ibarrier
         .run(async |_barrier| {
             let (tempfile, temppath) = partial.into_target(filename, resume_offset).await?;
-            let (last_modified, cache_time): (Arc<str>, HttpDate) = if let Some((raw, time)) =
+            let (last_modified, cache_time): (LastModified, HttpDate) = if let Some(value) =
                 download_meta.last_modified.as_ref()
             {
-                (Arc::clone(raw), *time)
+                (value.clone(), value.time())
             } else {
                 // The creation date the synthesized `Last-Modified` falls back
                 // to; read now, before any byte lands, so a resumed partial
@@ -504,7 +505,7 @@ async fn prepare_cache_target(
                 let mdata =
                     regular_file_metadata_typed(&tempfile, &temppath, "stat download temp file")?;
                 let file_date = cache_file_http_date(&mdata);
-                (file_date.format().into(), file_date)
+                (LastModified::from_date(file_date), file_date)
             };
             Ok((tempfile, temppath, last_modified, cache_time))
         })
@@ -745,7 +746,7 @@ async fn read_volatile_validators(
         etag,
         last_modified,
     } = &*cache_metadata::store().resolve(&key, &file, &cache_path);
-    let if_modified_since = last_modified.as_ref().map(|(_raw, date)| date.format());
+    let if_modified_since = last_modified.as_ref().map(|date| date.time().format());
     let if_none_match = etag.clone();
     Ok(Some((
         VolatileCondHeaders {
@@ -1902,17 +1903,17 @@ mod tests {
     fn splice_response_head_is_the_cache_hit_head() {
         use crate::cache_conditional::CacheInfo;
         use crate::http_helpers::cached_file_head;
+        use crate::xattr_helpers::XattrValue as _;
 
         const LAST_MODIFIED: &str = "Thu, 01 Jan 2025 00:00:00 GMT";
         let cache_info = |etag: Option<&str>| CacheInfo {
-            file_etag: etag.map(Arc::from),
-            last_modified_for_ims: HttpDate::parse(LAST_MODIFIED).unwrap(),
-            last_modified_str: Arc::from(LAST_MODIFIED),
+            file_etag: etag.and_then(ETag::parse),
+            last_modified: LastModified::parse(LAST_MODIFIED).unwrap(),
             age: 0,
         };
         let validators = |etag: Option<&str>| HeadValidators {
-            etag: etag.map(Arc::from),
-            last_modified: Arc::from(LAST_MODIFIED),
+            etag: etag.and_then(ETag::parse),
+            last_modified: LastModified::parse(LAST_MODIFIED).unwrap(),
         };
 
         let whole = ServeParams::from_parsed(None, 1000).expect("no range");

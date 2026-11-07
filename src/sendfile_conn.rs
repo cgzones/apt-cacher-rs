@@ -1541,9 +1541,9 @@ async fn serve_planned(
         ServePlan::NotModified => {
             if let Err(err) = conn
                 .write_304(
-                    &cache_info.last_modified_str,
+                    &cache_info.last_modified,
                     cache_info.age,
-                    cache_info.file_etag.as_deref(),
+                    cache_info.file_etag.as_ref(),
                 )
                 .await
             {

@@ -50,9 +50,9 @@ use std::borrow::Cow;
 
 use http::StatusCode;
 
-use crate::cache_conditional::CacheInfo;
 #[cfg(feature = "sendfile")]
 use crate::http_helpers::{ClientConn, ConnectionAction, ConnectionVersion};
+use crate::{cache_conditional::CacheInfo, http_etag::ETag, http_last_modified::LastModified};
 
 /// Whether a response advertises the proxy as its origin.
 ///
@@ -92,8 +92,8 @@ pub(crate) struct ResponseHead<'a> {
     pub(crate) content_type: Option<&'static str>,
     /// Emit `Accept-Ranges: bytes`.
     pub(crate) accept_ranges: bool,
-    pub(crate) last_modified: Option<&'a str>,
-    pub(crate) etag: Option<&'a str>,
+    pub(crate) last_modified: Option<&'a LastModified>,
+    pub(crate) etag: Option<&'a ETag>,
     pub(crate) age: Option<u32>,
     pub(crate) content_range: Option<Cow<'a, str>>,
     /// `Retry-After`, in seconds.
@@ -142,7 +142,11 @@ impl<'a> ResponseHead<'a> {
     /// representation-bearing responses only. Both backends answer a 304
     /// with this head, so the shape cannot drift between them.
     #[must_use]
-    pub(crate) fn not_modified(last_modified: &'a str, etag: Option<&'a str>, age: u32) -> Self {
+    pub(crate) fn not_modified(
+        last_modified: &'a LastModified,
+        etag: Option<&'a ETag>,
+        age: u32,
+    ) -> Self {
         Self {
             last_modified: Some(last_modified),
             etag,
@@ -165,8 +169,8 @@ impl<'a> ResponseHead<'a> {
         content_length: Option<u64>,
         content_range: Option<&'a str>,
         content_type: &'static str,
-        last_modified: &'a str,
-        etag: Option<&'a str>,
+        last_modified: &'a LastModified,
+        etag: Option<&'a ETag>,
         age: u32,
     ) -> Self {
         Self {
@@ -197,8 +201,8 @@ impl<'a> ResponseHead<'a> {
             content_length,
             content_range,
             content_type,
-            &cache_info.last_modified_str,
-            cache_info.file_etag.as_deref(),
+            &cache_info.last_modified,
+            cache_info.file_etag.as_ref(),
             cache_info.age,
         )
     }
@@ -334,13 +338,13 @@ impl ResponseHead<'_> {
         if let Some(last_modified) = last_modified {
             builder = builder.header(
                 LAST_MODIFIED,
-                HeaderValue::try_from(last_modified).expect("HTTP date is valid"),
+                HeaderValue::try_from(last_modified.as_ref()).expect("HTTP date is valid"),
             );
         }
         if let Some(etag) = etag {
             builder = builder.header(
                 ETAG,
-                HeaderValue::try_from(etag).expect("ETag is validated before passing"),
+                HeaderValue::try_from(&**etag).expect("ETag is validated before passing"),
             );
         }
         if accept_ranges {
@@ -483,6 +487,9 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::parallel_hack::NUDGE_BODY;
+    use crate::{
+        http_etag::ETag, http_last_modified::LastModified, xattr_helpers::XattrValue as _,
+    };
 
     /// A config with the parallel-download hack on its defaults (`429`,
     /// `Retry-After: 5`), for the two nudge-head renderer tests.
@@ -513,8 +520,10 @@ mod tests {
                 content_length: Some(12),
                 content_type: Some("application/octet-stream"),
                 accept_ranges: true,
-                last_modified: Some("Wed, 20 Dec 2023 04:45:32 GMT"),
-                etag: Some("\"abc\""),
+                last_modified: Some(
+                    &LastModified::parse("Wed, 20 Dec 2023 04:45:32 GMT").expect("valid date"),
+                ),
+                etag: Some(&ETag::parse("\"abc\"").expect("valid tag")),
                 age: Some(7),
                 ..ResponseHead::bare(StatusCode::OK, ResponseKind::Success)
             });
@@ -604,8 +613,8 @@ mod tests {
         #[test]
         fn not_modified_head_carries_validators_only() {
             let response = render(ResponseHead::not_modified(
-                "Wed, 20 Dec 2023 04:45:32 GMT",
-                Some("\"abc\""),
+                &LastModified::parse("Wed, 20 Dec 2023 04:45:32 GMT").expect("valid date"),
+                ETag::parse("\"abc\"").as_ref(),
                 7,
             ));
             let headers = response.headers();
@@ -687,8 +696,10 @@ mod tests {
                 content_length: Some(12),
                 content_type: Some("application/octet-stream"),
                 accept_ranges: true,
-                last_modified: Some("Wed, 20 Dec 2023 04:45:32 GMT"),
-                etag: Some("\"abc\""),
+                last_modified: Some(
+                    &LastModified::parse("Wed, 20 Dec 2023 04:45:32 GMT").expect("valid date"),
+                ),
+                etag: Some(&ETag::parse("\"abc\"").expect("valid tag")),
                 age: Some(7),
                 ..ResponseHead::bare(StatusCode::OK, ResponseKind::Success)
             });
@@ -789,8 +800,8 @@ mod tests {
         #[test]
         fn not_modified_head_carries_validators_only() {
             let wire = render(&ResponseHead::not_modified(
-                "Wed, 20 Dec 2023 04:45:32 GMT",
-                Some("\"abc\""),
+                &LastModified::parse("Wed, 20 Dec 2023 04:45:32 GMT").expect("valid date"),
+                ETag::parse("\"abc\"").as_ref(),
                 7,
             ));
             assert!(wire.starts_with("HTTP/1.1 304 Not Modified\r\n"), "{wire}");
