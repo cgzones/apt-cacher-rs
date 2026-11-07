@@ -2395,7 +2395,7 @@ impl PendingDigests {
 mod tests {
     use super::*;
     use crate::fs_open::nofollow_options;
-    use crate::test_support::structured_mirror;
+    use crate::test_support::{gzip, structured_mirror};
     use std::io::Write as _;
 
     fn temp_file_with(content: &[u8]) -> tempfile::NamedTempFile {
@@ -3798,7 +3798,6 @@ mod tests {
     #[tokio::test]
     async fn ingest_packages_rejects_decompression_bomb() {
         use std::num::NonZero;
-        use tokio::io::AsyncWriteExt as _;
         // Registry ingest shares `limits::packages_reader` with cleanup's
         // reduce, so the ratio cap must bound it too: a gzip stream whose
         // decompressed size exceeds `compressed * MAX_DECOMPRESSION_RATIO` has
@@ -3807,14 +3806,7 @@ mod tests {
 
         // Highly-compressible payload: ~4 MiB of zero bytes gzips to a few KiB,
         // far past the 100x ratio cap.
-        let mut encoder =
-            async_compression::tokio::write::GzipEncoder::new(Vec::<u8>::with_capacity(4096));
-        encoder
-            .write_all(&vec![0u8; 4 * 1024 * 1024])
-            .await
-            .expect("write");
-        encoder.shutdown().await.expect("shutdown");
-        let compressed = encoder.into_inner();
+        let compressed = gzip(&vec![0u8; 4 * 1024 * 1024]).await;
 
         let f = temp_file_with(&compressed);
 
@@ -3842,18 +3834,13 @@ mod tests {
     /// lost to the decoder.
     #[tokio::test]
     async fn ingest_packages_sniffs_the_compression_it_parses() {
-        use tokio::io::AsyncWriteExt as _;
-
         let reg = ChecksumRegistry::new(NonZero::new(100).expect("non-zero"));
         let sha = [0x5au8; 32];
         let packages = format!(
             "Package: a\nFilename: pool/main/a/a/a_1_amd64.deb\nSHA256: {}\n",
             index_parser::hex_encode(&sha),
         );
-        let mut encoder = async_compression::tokio::write::GzipEncoder::new(Vec::<u8>::new());
-        encoder.write_all(packages.as_bytes()).await.expect("write");
-        encoder.shutdown().await.expect("shutdown");
-        let f = temp_file_with(&encoder.into_inner());
+        let f = temp_file_with(&gzip(packages.as_bytes()).await);
 
         ingest_packages_file(&reg, "deb.debian.org", "debian", f.path(), None, 64 * 1024)
             .await

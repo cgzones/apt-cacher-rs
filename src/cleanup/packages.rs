@@ -278,7 +278,7 @@ mod tests {
         deb_mirror::MirrorKind,
         index_parser::{HashAlgo, hex_decode_exact, parse_filename_field},
         limits::{MAX_COMPRESSED_PACKAGES_SIZE, MAX_METADATA_LINE_LEN, PackagesInput},
-        test_support::structured_mirror,
+        test_support::{gzip, structured_mirror},
     };
 
     /// A test fixture as the fetch would hand it over: the whole file,
@@ -534,15 +534,9 @@ mod tests {
     async fn reduce_file_list_rejects_decompression_bomb() {
         use std::num::NonZero;
 
-        use async_compression::tokio::write::GzipEncoder;
-        use tokio::io::AsyncWriteExt as _;
-
         // 4 MiB of newlines compresses to a few KiB -- a ratio far above the cap.
         let raw = vec![b'\n'; 4 * 1024 * 1024];
-        let mut encoder = GzipEncoder::new(Vec::new());
-        encoder.write_all(&raw).await.expect("gzip write");
-        encoder.shutdown().await.expect("gzip finish");
-        let compressed = encoder.into_inner();
+        let compressed = gzip(&raw).await;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("Packages.gz");
@@ -809,16 +803,6 @@ mod tests {
         0x00, 0xc3, 0x8e, 0xad, 0x7d, 0x3e, 0x30, 0x0d, 0x8b, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
         0x59, 0x5a,
     ];
-
-    async fn gzip(raw: &[u8]) -> Vec<u8> {
-        use async_compression::tokio::write::GzipEncoder;
-        use tokio::io::AsyncWriteExt as _;
-
-        let mut encoder = GzipEncoder::new(Vec::new());
-        encoder.write_all(raw).await.expect("gzip write");
-        encoder.shutdown().await.expect("gzip finish");
-        encoder.into_inner()
-    }
 
     async fn encoded_index(compression: PackagesCompression) -> Vec<u8> {
         match compression {

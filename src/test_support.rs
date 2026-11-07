@@ -93,6 +93,17 @@ pub(crate) fn pause_blocking_pool(
     resume
 }
 
+/// Encode and finalize a gzip fixture using the default compression level.
+pub(crate) async fn gzip(raw: &[u8]) -> Vec<u8> {
+    use async_compression::tokio::write::GzipEncoder;
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut encoder = GzipEncoder::new(Vec::new());
+    encoder.write_all(raw).await.expect("gzip write");
+    encoder.shutdown().await.expect("gzip finish");
+    encoder.into_inner()
+}
+
 /// A connected loopback TCP pair, returned as (connecting socket, accepted socket).
 #[cfg(feature = "splice")]
 pub(crate) async fn connected_tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
