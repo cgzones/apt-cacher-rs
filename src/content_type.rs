@@ -6,9 +6,9 @@ use crate::{deb_mirror, warn_once_or_info};
 /// Whether an upstream `Content-Type` is acceptable for a file whose name
 /// implies `expected` (as [`content_type_for_cached_file`] derives it).
 ///
-/// Comparison is case-insensitive, and three historical spellings Debian
-/// mirrors still emit count as equal rather than as a mismatch worth
-/// logging:
+/// Comparison ignores parameters and is case-insensitive. Three historical
+/// spellings Debian mirrors still emit count as equal rather than as a
+/// mismatch worth logging:
 ///
 /// - `binary/octet-stream`, a non-standard spelling advertised for
 ///   everything by many mirrors;
@@ -22,6 +22,10 @@ use crate::{deb_mirror, warn_once_or_info};
 /// This exception does not apply to packages, compressed indexes or signatures.
 #[must_use]
 fn content_type_matches(upstream: &str, expected: &str) -> bool {
+    let upstream = upstream
+        .split_once(';')
+        .map_or(upstream, |(media_type, _parameters)| media_type)
+        .trim_matches([' ', '\t']);
     if upstream.eq_ignore_ascii_case(expected)
         || upstream.eq_ignore_ascii_case("binary/octet-stream")
     {
@@ -92,6 +96,27 @@ mod tests {
         // Exact, and case-insensitively so (RFC 9110 section 8.3).
         assert!(content_type_matches("text/plain", "text/plain"));
         assert!(content_type_matches("TEXT/PLAIN", "text/plain"));
+        assert!(content_type_matches(
+            "text/plain; charset=utf-8",
+            "text/plain"
+        ));
+        assert!(content_type_matches(
+            "\tTEXT/PLAIN \t; charset=\"utf-8\"",
+            "text/plain"
+        ));
+        assert!(content_type_matches(
+            "application/x-gzip; name=Packages.gz",
+            "application/gzip"
+        ));
+        assert!(!content_type_matches(
+            "text/html; charset=utf-8",
+            "text/plain"
+        ));
+        assert!(!content_type_matches(
+            "application/octet-stream; name=package.deb",
+            "application/vnd.debian.binary-package"
+        ));
+        assert!(!content_type_matches("; charset=utf-8", "text/plain"));
 
         // Generic downloads are accepted for text repository indexes only.
         assert!(content_type_matches(
