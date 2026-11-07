@@ -1,10 +1,9 @@
 use std::{
     borrow::Cow,
-    iter::FusedIterator,
     sync::{Arc, atomic::AtomicBool},
 };
 
-use crate::{sticky, xattr_helpers::XattrValue};
+use crate::xattr_helpers::XattrValue;
 
 /// Return the opaque-tag portion of an `ETag`, stripping the `W/` prefix if present.
 ///
@@ -149,53 +148,17 @@ pub(crate) fn etag_strong_match(a: &str, b: &str) -> bool {
 /// Commas are only treated as list separators when outside a quoted
 /// opaque-tag, because RFC 9110 §8.8.3 permits `,` (0x2C) inside the
 /// opaque-tag. Each yielded token is trimmed of surrounding OWS.
-fn split_if_none_match(header: &str) -> IfNoneMatchSplit<'_> {
-    IfNoneMatchSplit {
-        header,
-        pos: 0,
-        done: sticky::Bool::new(),
-    }
-}
-
-struct IfNoneMatchSplit<'a> {
-    header: &'a str,
-    pos: usize,
-    done: sticky::Bool,
-}
-
-impl<'a> Iterator for IfNoneMatchSplit<'a> {
-    type Item = &'a str;
-
-    #[expect(
-        clippy::string_slice,
-        reason = "splits land on `,` (ASCII) or end-of-string, which are always UTF-8 boundaries"
-    )]
-    fn next(&mut self) -> Option<&'a str> {
-        if self.done.get() {
-            return None;
-        }
-        let bytes = self.header.as_bytes();
-        let start = self.pos;
-        let mut in_quotes = false;
-        let mut i = self.pos;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'"' => in_quotes = !in_quotes,
-                b',' if !in_quotes => {
-                    let part = &self.header[start..i];
-                    self.pos = i + 1;
-                    return Some(part.trim());
-                }
-                _ => {}
+fn split_if_none_match(header: &str) -> impl Iterator<Item = &str> {
+    let mut in_quotes = false;
+    header
+        .split(move |ch| {
+            if ch == '"' {
+                in_quotes = !in_quotes;
             }
-            i += 1;
-        }
-        self.done.set();
-        Some(self.header[start..].trim())
-    }
+            ch == ',' && !in_quotes
+        })
+        .map(str::trim)
 }
-
-impl FusedIterator for IfNoneMatchSplit<'_> {}
 
 /// Check if a stored `ETag` matches an `If-None-Match` header value.
 ///
