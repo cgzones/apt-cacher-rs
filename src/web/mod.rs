@@ -111,11 +111,9 @@ pub(crate) async fn serve_web_interface(uri: &http::Uri, appstate: &AppState) ->
     let location = uri.path();
     debug!("Requested local web interface resource `{location}`");
 
-    let options = parse_query(uri.query());
-
     let response = match location {
-        "/" => serve_dashboard(appstate, options).await,
-        "/logs" => serve_logs(options).await,
+        "/" => serve_dashboard(appstate, parse_query(uri.query())).await,
+        "/logs" => serve_logs(parse_query(uri.query())).await,
         "/healthcheck" => serve_healthcheck().await,
         "/favicon.svg" | "/favicon.ico" => {
             WebResponse::static_resource("image/svg+xml", FAVICON_SVG, Caching::Day)
