@@ -114,6 +114,7 @@ mod xattr_helpers;
 mod xz_stream;
 
 use std::{
+    convert::Infallible as Never,
     fmt::Debug,
     io::IsTerminal as _,
     path::{Path, PathBuf},
@@ -131,9 +132,6 @@ use time::format_description::well_known::Rfc2822;
 use tokio::runtime::Builder;
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
-
-// TODO: replace usages with ! once stable
-enum Never {}
 
 mod sticky {
     /// A boolean value that is sticky, i.e. once set to `true` it remains `true`.
