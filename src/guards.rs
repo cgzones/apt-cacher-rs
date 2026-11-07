@@ -1061,7 +1061,8 @@ mod tests {
         drop(barrier);
         assert!(matches!(&*status.read().await,
             ActiveDownloadStatus::Aborted(AbortReason::Failed(failure))
-                if matches!(failure.as_ref(), DownloadFailure::Cancelled)));
+                if matches!(failure.as_ref(), DownloadFailure::Cancelled)
+                    && Arc::ptr_eq(failure, &CANCELLED_DOWNLOAD)));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1549,14 +1550,6 @@ mod tests {
             .await;
         let reported = result.expect_err("worker failed after consuming the sink");
         assert!(matches!(reported.failure(), DownloadFailure::Cancelled));
-    }
-
-    #[test]
-    fn cancelled_publication_shares_one_static_arc() {
-        let a = Arc::clone(&CANCELLED_DOWNLOAD);
-        let b = Arc::clone(&CANCELLED_DOWNLOAD);
-        assert!(Arc::ptr_eq(&a, &b));
-        assert!(matches!(a.as_ref(), DownloadFailure::Cancelled));
     }
 
     #[test]
