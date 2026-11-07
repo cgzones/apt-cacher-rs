@@ -425,14 +425,17 @@ mod tests {
     use crate::test_support::structured_mirror;
 
     #[test]
-    fn age_reference_time_returns_live_timestamp() {
+    fn age_reference_time_prefers_creation_with_modification_fallback() {
         let dir = tempfile::tempdir().expect("tempdir");
         let p = dir.path().join("f");
         std::fs::write(&p, b"x").expect("write");
         let meta = std::fs::metadata(&p).expect("meta");
         let t = age_reference_time(&meta, &p).expect("some timestamp");
-        // created() is available on the test fs (ext4/tmpfs); it must not be in the future.
-        assert!(t <= SystemTime::now());
+        let expected = meta
+            .created()
+            .or_else(|_| meta.modified())
+            .expect("creation or modification timestamp");
+        assert_eq!(t, expected);
     }
 
     fn test_mirror() -> Mirror {
