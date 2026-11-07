@@ -731,14 +731,12 @@ pub(super) async fn build_mirror_table(
     // `DIR_SCAN_CONCURRENCY` walks run at once and (b) the collected order
     // matches `footprints` (and therefore `sorted`).
     let mut dir_stats: Vec<DirStats> = Vec::with_capacity(footprints.len());
-    for (keys, footprints) in keys
-        .chunks(DIR_SCAN_CONCURRENCY)
-        .zip(footprints.chunks(DIR_SCAN_CONCURRENCY))
-    {
+    let mut footprints = footprints.into_iter();
+    for keys in keys.chunks(DIR_SCAN_CONCURRENCY) {
         let chunk_stats = futures_util::future::join_all(
             keys.iter()
-                .zip(footprints)
-                .map(|(key, footprint)| cached_footprint_stats(key, footprint.clone())),
+                .zip(footprints.by_ref().take(keys.len()))
+                .map(|(key, footprint)| cached_footprint_stats(key, footprint)),
         )
         .await;
         dir_stats.extend(chunk_stats);
