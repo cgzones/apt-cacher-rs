@@ -938,6 +938,7 @@ mod tests {
 
     use crate::config::ClientHost;
     use crate::deb_mirror::MirrorKind;
+    use crate::test_support::connected_tcp_pair;
 
     use super::*;
 
@@ -1004,14 +1005,10 @@ mod tests {
         }
     }
 
-    /// A loopback socket pair: the client side, the server side, and the
-    /// client side's local address (to tell pooled connections apart).
-    async fn tcp_pair(listener: &tokio::net::TcpListener) -> (TcpStream, TcpStream, SocketAddr) {
-        let addr = listener.local_addr().unwrap();
-        let (client, (server, _)) = tokio::try_join!(TcpStream::connect(addr), listener.accept())
-            .expect("loopback connect");
-        let local = client.local_addr().unwrap();
-        (client, server, local)
+    /// Both endpoints identify a connection even when separate listeners
+    /// allow its connecting-side port to be reused.
+    fn connection_identity(conn: &TcpStream) -> (SocketAddr, SocketAddr) {
+        (conn.local_addr().unwrap(), conn.peer_addr().unwrap())
     }
 
     fn test_host(name: &str) -> ClientHost {
@@ -1023,8 +1020,7 @@ mod tests {
     #[tokio::test]
     async fn unfinished_response_is_closed_even_before_first_poll() {
         use tokio::io::AsyncReadExt as _;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (conn, mut peer, _) = tcp_pair(&listener).await;
+        let (conn, mut peer) = connected_tcp_pair().await;
         let host = test_host("unfinished-response.invalid");
         let response = ResponseBody::new(UpstreamConn::Tcp(conn), host.clone(), 80, true);
         let unpolled = async move {
@@ -1049,9 +1045,9 @@ mod tests {
     #[tokio::test]
     async fn completed_response_reuses_only_keep_alive_connections() {
         use tokio::io::AsyncReadExt as _;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let host = test_host("completed-response.invalid");
-        let (conn, _peer, local) = tcp_pair(&listener).await;
+        let (conn, _peer) = connected_tcp_pair().await;
+        let identity = connection_identity(&conn);
         ResponseBody::new(UpstreamConn::Tcp(conn), host.clone(), 80, true).complete();
         let conn = if let PoolCheckout::Live(conn) = pool_checkout(&host, 80, false) {
             Some(conn)
@@ -1059,10 +1055,10 @@ mod tests {
             None
         };
         let conn = conn.expect("completed response should be reusable");
-        assert_eq!(conn.zero_copy().unwrap().local_addr().unwrap(), local);
+        assert_eq!(connection_identity(conn.zero_copy().unwrap()), identity);
         drop(conn);
 
-        let (conn, mut peer, _) = tcp_pair(&listener).await;
+        let (conn, mut peer) = connected_tcp_pair().await;
         ResponseBody::new(UpstreamConn::Tcp(conn), host.clone(), 80, false).complete();
         assert!(matches!(
             pool_checkout(&host, 80, false),
@@ -1083,9 +1079,9 @@ mod tests {
     /// report a miss and leave that live socket idling.
     #[tokio::test]
     async fn pool_checkout_skips_a_dead_entry_for_a_live_one() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (live, _live_peer, live_addr) = tcp_pair(&listener).await;
-        let (dead, dead_peer, _) = tcp_pair(&listener).await;
+        let (live, _live_peer) = connected_tcp_pair().await;
+        let live_identity = connection_identity(&live);
+        let (dead, dead_peer) = connected_tcp_pair().await;
         drop(dead_peer);
         let host = test_host("pool-checkout-skips-dead.invalid");
 
@@ -1099,8 +1095,8 @@ mod tests {
         };
         let conn = conn.expect("a live connection was in the pool");
         assert_eq!(
-            conn.zero_copy().unwrap().local_addr().unwrap(),
-            live_addr,
+            connection_identity(conn.zero_copy().unwrap()),
+            live_identity,
             "checkout must hand out the live connection"
         );
         assert!(
@@ -1113,8 +1109,7 @@ mod tests {
     /// were there but unusable), distinct from an `Empty` one.
     #[tokio::test]
     async fn pool_checkout_reports_dead_when_every_entry_is_closed() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (dead, dead_peer, _) = tcp_pair(&listener).await;
+        let (dead, dead_peer) = connected_tcp_pair().await;
         drop(dead_peer);
         let host = test_host("pool-checkout-all-dead.invalid");
 
@@ -1136,11 +1131,11 @@ mod tests {
     async fn pool_checkout_discards_expired_entries_without_counting_them_dead() {
         use tokio::io::AsyncReadExt as _;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let host = test_host("pool-checkout-expired.invalid");
         for with_live in [false, true] {
-            let (live, _live_peer, live_addr) = tcp_pair(&listener).await;
-            let (expired, mut expired_peer, _) = tcp_pair(&listener).await;
+            let (live, _live_peer) = connected_tcp_pair().await;
+            let live_identity = connection_identity(&live);
+            let (expired, mut expired_peer) = connected_tcp_pair().await;
             let now = coarsetime::Instant::now();
             let mut entries = Vec::new();
             if with_live {
@@ -1160,7 +1155,10 @@ mod tests {
             match pool_checkout(&host, 80, false) {
                 PoolCheckout::Live(conn) => {
                     assert!(with_live, "expired entries cannot be reused");
-                    assert_eq!(conn.zero_copy().unwrap().local_addr().unwrap(), live_addr);
+                    assert_eq!(
+                        connection_identity(conn.zero_copy().unwrap()),
+                        live_identity
+                    );
                 }
                 PoolCheckout::Empty => assert!(!with_live, "the live entry must be found"),
                 PoolCheckout::Dead => unreachable!("expiry is an empty miss, not a dead peer"),
@@ -1183,10 +1181,8 @@ mod tests {
     async fn pool_return_reaps_idle_entries_of_same_host() {
         use tokio::io::AsyncReadExt as _;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-
-        let (stale, mut stale_peer, _) = tcp_pair(&listener).await;
-        let (fresh, _fresh_peer, _) = tcp_pair(&listener).await;
+        let (stale, mut stale_peer) = connected_tcp_pair().await;
+        let (fresh, _fresh_peer) = connected_tcp_pair().await;
         let stale_host = test_host("pool-reap-stale.invalid");
         let fresh_host = stale_host.clone();
 
@@ -1215,9 +1211,8 @@ mod tests {
     /// traffic (and so no `pool_return`) still loses its idled-out sockets.
     #[tokio::test]
     async fn reap_idle_pool_drops_expired_entries_without_a_return() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (stale, _stale_peer, _) = tcp_pair(&listener).await;
-        let (fresh, _fresh_peer, _) = tcp_pair(&listener).await;
+        let (stale, _stale_peer) = connected_tcp_pair().await;
+        let (fresh, _fresh_peer) = connected_tcp_pair().await;
         let stale_host = test_host("pool-reap-idle-stale.invalid");
         let fresh_host = test_host("pool-reap-idle-fresh.invalid");
 
