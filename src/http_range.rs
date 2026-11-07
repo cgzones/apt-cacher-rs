@@ -615,104 +615,35 @@ mod tests {
             ParsedRange::IfRangeFailed
         ));
 
-        assert_eq!(
-            satisfiable(http_parse_range(
-                "bytes=0-1023",
-                None,
-                8192,
-                HttpDate::UNIX_EPOCH,
-                None
-            )),
-            Some(("bytes 0-1023/8192".to_string(), 0, 1024))
-        );
-
-        assert_eq!(
-            satisfiable(http_parse_range(
+        for (range, size, content_range, start, length) in [
+            ("bytes=0-1023", 8192, "bytes 0-1023/8192", 0, 1024),
+            (
                 "bytes=5000-6999",
-                None,
                 10000,
-                HttpDate::UNIX_EPOCH,
-                None
-            )),
-            Some(("bytes 5000-6999/10000".to_string(), 5000, 2000))
-        );
-
-        assert_eq!(
-            satisfiable(http_parse_range(
-                "bytes=5000-6999",
-                None,
-                6000,
-                HttpDate::UNIX_EPOCH,
-                None
-            )),
-            Some(("bytes 5000-5999/6000".to_string(), 5000, 1000))
-        );
-
-        assert_eq!(
-            satisfiable(http_parse_range(
-                "bytes=0-0",
-                None,
-                10000,
-                HttpDate::UNIX_EPOCH,
-                None
-            )),
-            Some(("bytes 0-0/10000".to_string(), 0, 1))
-        );
-
-        assert_eq!(
-            satisfiable(http_parse_range(
-                "bytes=9999-9999",
-                None,
-                10000,
-                HttpDate::UNIX_EPOCH,
-                None
-            )),
-            Some(("bytes 9999-9999/10000".to_string(), 9999, 1))
-        );
-
-        assert_eq!(
-            satisfiable(http_parse_range(
-                "bytes=-1",
-                None,
-                10000,
-                HttpDate::UNIX_EPOCH,
-                None
-            )),
-            Some(("bytes 9999-9999/10000".to_string(), 9999, 1))
-        );
-
-        assert_eq!(
-            satisfiable(http_parse_range(
-                "bytes=-500",
-                None,
-                10000,
-                HttpDate::UNIX_EPOCH,
-                None
-            )),
-            Some(("bytes 9500-9999/10000".to_string(), 9500, 500))
-        );
-
-        assert_eq!(
-            satisfiable(http_parse_range(
-                "bytes=-1000",
-                None,
-                400,
-                HttpDate::UNIX_EPOCH,
-                None
-            )),
-            Some(("bytes 0-399/400".to_string(), 0, 400))
-        );
-
-        assert_eq!(
-            satisfiable(http_parse_range(
-                "bytes=4096-",
-                None,
-                10000,
-                HttpDate::UNIX_EPOCH,
-                None
-            )),
-            Some(("bytes 4096-9999/10000".to_string(), 4096, 5904))
-        );
+                "bytes 5000-6999/10000",
+                5000,
+                2000,
+            ),
+            ("bytes=5000-6999", 6000, "bytes 5000-5999/6000", 5000, 1000),
+            ("bytes=0-0", 10000, "bytes 0-0/10000", 0, 1),
+            ("bytes=9999-9999", 10000, "bytes 9999-9999/10000", 9999, 1),
+            ("bytes=-1", 10000, "bytes 9999-9999/10000", 9999, 1),
+            ("bytes=-500", 10000, "bytes 9500-9999/10000", 9500, 500),
+            ("bytes=-1000", 400, "bytes 0-399/400", 0, 400),
+            ("bytes=4096-", 10000, "bytes 4096-9999/10000", 4096, 5904),
+        ] {
+            assert_eq!(
+                satisfiable(http_parse_range(
+                    range,
+                    None,
+                    size,
+                    HttpDate::UNIX_EPOCH,
+                    None,
+                )),
+                Some((content_range.to_owned(), start, length)),
+                "{range}, size={size}"
+            );
+        }
 
         /* Sub-second cache time rounds up: If-Range = 1s matches rounded cache = 1s */
 
@@ -877,57 +808,29 @@ mod tests {
          * syntactically invalid (serve 200 per RFC 9110 §14.2)
          */
 
-        assert!(matches!(
-            http_parse_range(
-                "bytes=1000-2000 foo",
-                None,
-                8192,
-                HttpDate::UNIX_EPOCH,
-                None
-            ),
-            ParsedRange::Invalid
-        ));
-
-        assert!(matches!(
-            http_parse_range("bytes=foo-bar", None, 8192, HttpDate::UNIX_EPOCH, None),
-            ParsedRange::Invalid
-        ));
-
-        assert!(matches!(
-            http_parse_range("ABCDEFG", None, 8192, HttpDate::UNIX_EPOCH, None),
-            ParsedRange::Invalid
-        ));
-
-        assert!(matches!(
-            http_parse_range("bytes=", None, 8192, HttpDate::UNIX_EPOCH, None),
-            ParsedRange::Invalid
-        ));
-
-        assert!(matches!(
-            http_parse_range("bytes=-", None, 8192, HttpDate::UNIX_EPOCH, None),
-            ParsedRange::Invalid
-        ));
+        for range in [
+            "bytes=1000-2000 foo",
+            "bytes=foo-bar",
+            "ABCDEFG",
+            "bytes=",
+            "bytes=-",
+            // TODO: multi range — syntactically valid but unsupported, treat as invalid
+            "bytes=0-50, 100-150",
+            "bytes=0-50,100-150",
+        ] {
+            assert!(
+                matches!(
+                    http_parse_range(range, None, 8192, HttpDate::UNIX_EPOCH, None),
+                    ParsedRange::Invalid
+                ),
+                "{range}, size=8192"
+            );
+        }
 
         // suffix length of zero is well-formed but unsatisfiable (416)
         assert!(matches!(
             http_parse_range("bytes=-0", None, 8192, HttpDate::UNIX_EPOCH, None),
             ParsedRange::NotSatisfiable
-        ));
-
-        // TODO: multi range — syntactically valid but unsupported, treat as invalid
-        assert!(matches!(
-            http_parse_range(
-                "bytes=0-50, 100-150",
-                None,
-                8192,
-                HttpDate::UNIX_EPOCH,
-                None
-            ),
-            ParsedRange::Invalid
-        ));
-        assert!(matches!(
-            http_parse_range("bytes=0-50,100-150", None, 8192, HttpDate::UNIX_EPOCH, None),
-            ParsedRange::Invalid
         ));
     }
 
