@@ -816,7 +816,6 @@ pub(crate) fn parse_release_byhash_digests(
 ///
 /// Not gated on the `splice` feature even though only that backend produces
 /// one: `integrity::VerifyInput` carries the `Option` in every build.
-#[derive(Clone)]
 pub(crate) struct StreamedDigest {
     pub(crate) digest: Digest,
     /// Bytes fed through `StreamHasher::update`. Every one of them was also

@@ -330,21 +330,15 @@ fn stamp_verified(file: &std::fs::File, meta: &Metadata, path: &Path, expected: 
     verified_marker::stamp(file, path, FileIdentity::of(meta), expected);
 }
 
-/// Everything `verify_and_rename` needs. Built in exactly one place,
-/// `RenameBarrier::commit` (`guards.rs`), from the identity the barrier chain
-/// carries since `InitBarrier::new` - no download backend assembles one.
+/// Rename paths and resource identity for `verify_and_rename`. Built in
+/// exactly one place, `RenameBarrier::commit` (`guards.rs`), from the identity
+/// the barrier chain carries since `InitBarrier::new` - no download backend
+/// assembles one.
 pub(crate) struct RenamePlan {
     /// The finished `.partial` / temp file to verify and rename.
     pub(crate) temp_path: PathBuf,
     /// The final cache path to rename into.
     pub(crate) dest_path: PathBuf,
-    /// The digest the download computed incrementally over the bytes it
-    /// wrote, when it could; spares `verify_temp_file` the re-read. `None`
-    /// from every path that cannot produce one -- the zero-copy splice loop
-    /// (the plaintext never reaches userspace), a resumed
-    /// download whose temp file already held a prefix, `volatile.rs`, and the
-    /// hyper backend.
-    pub(crate) streamed_digest: Option<StreamedDigest>,
     /// Precise resource kind, from `ConnectionDetails::resource_kind`.
     pub(crate) resource_kind: ResourceKind,
     /// On-disk leaf name. For a by-hash resource this is the hex digest, used
@@ -1334,9 +1328,17 @@ pub(crate) type PrepareStep = fn(&std::fs::File, &Path);
 
 /// The finished temp file, handed to the commit job whole: the open
 /// descriptor (the job's `fstat`, and the read the verification may need), the
-/// guard over its path, and the optional [`PrepareStep`].
+/// guard over its path, its optional streamed digest, and the optional
+/// [`PrepareStep`].
 pub(crate) struct TempFile {
     pub(crate) file: std::fs::File,
+    /// The digest the download computed incrementally over the bytes it
+    /// wrote, when it could; spares `verify_temp_file` the re-read. `None`
+    /// from every path that cannot produce one -- the zero-copy splice loop
+    /// (the plaintext never reaches userspace), a resumed
+    /// download whose temp file already held a prefix, `volatile.rs`, and the
+    /// hyper backend.
+    pub(crate) streamed_digest: Option<StreamedDigest>,
     /// Owned by the job, not the awaiting future, so a cancelled commit cannot
     /// race the job's `rename(2)` with a scratch guard's unlink. The job
     /// defuses it after the rename and hands it back on every other exit.
@@ -1406,11 +1408,11 @@ pub(crate) async fn verify_and_rename(
     let renaming = Arc::new(AtomicBool::new(false));
     let job = {
         let dest_path = plan.dest_path.clone();
-        let streamed = plan.streamed_digest.clone();
         let renaming = Arc::clone(&renaming);
         move |lease: &DownloadWriteLease| -> Result<(), (CommitError, TempPath)> {
             let TempFile {
                 file,
+                streamed_digest: streamed,
                 guard,
                 prepare,
             } = temp;
@@ -1825,7 +1827,6 @@ impl<'a> From<&'a RenamePlan> for IndexFile<'a> {
         let RenamePlan {
             temp_path: _,
             dest_path,
-            streamed_digest: _,
             resource_kind,
             debname,
             mirror,

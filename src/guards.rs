@@ -773,6 +773,7 @@ impl RenameBarrier {
         // in-flight operation that cannot exist.
         let temp = TempFile {
             file: temp_file.into_std().await,
+            streamed_digest,
             guard: temp_path,
             prepare,
         };
@@ -788,7 +789,6 @@ impl RenameBarrier {
                 debname: data.lease.key.debname.clone(),
                 mirror: data.lease.key.mirror.clone(),
                 raw_uri_path: std::mem::take(&mut data.raw_uri_path),
-                streamed_digest,
             }
         };
         let reservation = self
