@@ -20,6 +20,7 @@ use std::{
 
 #[cfg(feature = "hyper")]
 use http::HeaderMap;
+#[cfg(test)]
 use http::StatusCode;
 use tracing::debug;
 
@@ -200,14 +201,9 @@ fn combine_conditions<'a>(values: impl Iterator<Item = &'a [u8]>) -> Option<Cow<
 /// `Content-Range` *is* the 206-ness of the delivery, so the status and the
 /// partial flag are derived rather than stored alongside it.
 #[derive(Debug, PartialEq, Eq)]
-#[expect(
-    clippy::struct_field_names,
-    reason = "the fields are named after the response headers they render into"
-)]
-pub(crate) struct ServeParams {
-    pub(crate) content_start: u64,
-    pub(crate) content_length: u64,
-    pub(crate) content_range: Option<String>,
+pub(crate) enum ServeParams {
+    Full { length: u64 },
+    Partial(crate::http_range::ContentRange),
 }
 
 /// The client's `Range` is syntactically valid but no byte of the
@@ -219,11 +215,7 @@ impl ServeParams {
     /// The whole representation as a 200.
     #[must_use]
     pub(crate) const fn full(file_size: u64) -> Self {
-        Self {
-            content_start: 0,
-            content_length: file_size,
-            content_range: None,
-        }
+        Self::Full { length: file_size }
     }
 
     /// Resolve an already-parsed `Range` (`None` when the request carried
@@ -240,36 +232,50 @@ impl ServeParams {
     ) -> Result<Self, RangeNotSatisfiable> {
         match parsed {
             Some(ParsedRange::NotSatisfiable) => Err(RangeNotSatisfiable),
-            Some(ParsedRange::Satisfiable {
-                content_range,
-                start,
-                length,
-            }) => Ok(Self {
-                content_start: start,
-                content_length: length,
-                content_range: Some(content_range),
-            }),
+            Some(ParsedRange::Satisfiable(range)) => Ok(Self::Partial(range)),
             Some(ParsedRange::Invalid | ParsedRange::IfRangeFailed) | None => {
                 Ok(Self::full(file_size))
             }
         }
     }
 
+    pub(crate) const fn content_start(&self) -> u64 {
+        match self {
+            Self::Full { .. } => 0,
+            Self::Partial(range) => range.start(),
+        }
+    }
+
+    pub(crate) fn content_length(&self) -> u64 {
+        match self {
+            Self::Full { length } => *length,
+            Self::Partial(range) => range.span().get(),
+        }
+    }
+
+    pub(crate) const fn content_range(&self) -> Option<crate::http_range::ContentRange> {
+        match self {
+            Self::Full { .. } => None,
+            Self::Partial(range) => Some(*range),
+        }
+    }
+
     /// Whether this is a 206 delivery of a sub-range.
     #[must_use]
     pub(crate) fn is_partial(&self) -> bool {
-        self.content_range.is_some()
+        matches!(self, Self::Partial(_))
     }
 
     /// One past the last representation byte to send. Only the splice
     /// backend needs it: the others hand a start and a length to the kernel.
     #[cfg(feature = "splice")]
     #[must_use]
-    pub(crate) const fn content_end(&self) -> u64 {
-        self.content_start + self.content_length
+    pub(crate) fn content_end(&self) -> u64 {
+        self.content_start() + self.content_length()
     }
 
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn http_status(&self) -> StatusCode {
         if self.is_partial() {
             StatusCode::PARTIAL_CONTENT
@@ -437,11 +443,7 @@ mod tests {
     }
 
     fn full() -> ServePlan {
-        ServePlan::Serve(ServeParams {
-            content_start: 0,
-            content_length: SIZE,
-            content_range: None,
-        })
+        ServePlan::Serve(ServeParams::full(SIZE))
     }
 
     #[test]
@@ -542,9 +544,15 @@ mod tests {
         };
         let params = params.expect("asserted above");
         assert_eq!(params.http_status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(params.content_start, 100);
-        assert_eq!(params.content_length, 100);
-        assert_eq!(params.content_range.as_deref(), Some("bytes 100-199/1000"));
+        assert_eq!(params.content_start(), 100);
+        assert_eq!(params.content_length(), 100);
+        assert_eq!(
+            params
+                .content_range()
+                .map(|range| range.to_string())
+                .as_deref(),
+            Some("bytes 100-199/1000")
+        );
         assert!(params.is_partial());
     }
 
@@ -580,11 +588,7 @@ mod tests {
         assert!(
             matches!(
                 &plan,
-                ServePlan::Serve(ServeParams {
-                    content_start: 500,
-                    content_length: 500,
-                    content_range: Some(_),
-                })
+                ServePlan::Serve(ServeParams::Partial(range)) if range.start() == 500 && range.span().get() == 500
             ),
             "expected 206, got {plan:?}"
         );
@@ -761,10 +765,7 @@ mod tests {
         };
         assert!(matches!(
             info(None).plan(SIZE, &exact, &local_client()),
-            ServePlan::Serve(ServeParams {
-                content_range: Some(_),
-                ..
-            })
+            ServePlan::Serve(ServeParams::Partial(_))
         ));
         let later = RangeRequestHeaders {
             if_range: Some("Sun, 06 Nov 1994 08:49:38 GMT"),
@@ -793,21 +794,17 @@ mod tests {
             Err(RangeNotSatisfiable)
         );
         let partial = ServeParams::from_parsed(
-            Some(ParsedRange::Satisfiable {
-                content_range: String::from("bytes 2-4/7"),
-                start: 2,
-                length: 3,
-            }),
+            Some(ParsedRange::Satisfiable(
+                crate::http_range::parse_content_range("bytes 2-4/7").expect("valid range"),
+            )),
             7,
         )
         .expect("satisfiable");
         assert_eq!(
             partial,
-            ServeParams {
-                content_start: 2,
-                content_length: 3,
-                content_range: Some(String::from("bytes 2-4/7")),
-            }
+            ServeParams::Partial(
+                crate::http_range::parse_content_range("bytes 2-4/7").expect("valid range")
+            )
         );
         assert!(partial.is_partial());
         assert_eq!(partial.http_status(), StatusCode::PARTIAL_CONTENT);
@@ -868,11 +865,9 @@ mod tests {
         let whole = ServeParams::full(SIZE);
         assert_eq!(whole.content_end(), SIZE);
 
-        let partial = ServeParams {
-            content_start: 100,
-            content_length: 100,
-            content_range: Some(String::from("bytes 100-199/1000")),
-        };
+        let partial = ServeParams::Partial(
+            crate::http_range::parse_content_range("bytes 100-199/1000").expect("valid range"),
+        );
         assert_eq!(partial.content_end(), 200);
     }
 }

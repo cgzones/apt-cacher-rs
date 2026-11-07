@@ -46,8 +46,6 @@
 //! [RFC 9110 §7.6.3]: https://www.rfc-editor.org/rfc/rfc9110#section-7.6.3
 //! [RFC 9110 §15.5.6]: https://www.rfc-editor.org/rfc/rfc9110#section-15.5.6
 
-use std::borrow::Cow;
-
 use http::StatusCode;
 
 #[cfg(feature = "sendfile")]
@@ -59,7 +57,7 @@ use crate::{cache_conditional::CacheInfo, http_etag::ETag, http_last_modified::L
 /// Selects the `Server:` and `Connection:` policy in the renderers; see the
 /// module documentation for the contract.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub(crate) enum ResponseKind {
+enum ResponseKind {
     /// Cache hit, conditional `304`, or another response that answers the
     /// request on the origin's behalf: no `Server:`.
     Success,
@@ -72,38 +70,68 @@ pub(crate) enum ResponseKind {
     TunnelEstablished,
 }
 
+/// Framing of a representation-bearing response. Partial responses carry
+/// their bounds; full responses may have an unknown streaming length.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Representation {
+    Full(Option<u64>),
+    Partial(crate::http_range::ContentRange),
+}
+
+impl From<&crate::cache_conditional::ServeParams> for Representation {
+    fn from(params: &crate::cache_conditional::ServeParams) -> Self {
+        params
+            .content_range()
+            .map_or_else(|| Self::Full(Some(params.content_length())), Self::Partial)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RangeHeader {
+    Satisfied(crate::http_range::ContentRange),
+    Unsatisfied(u64),
+}
+
+impl std::fmt::Display for RangeHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Satisfied(range) => range.fmt(f),
+            Self::Unsatisfied(total) => write!(f, "bytes */{total}"),
+        }
+    }
+}
+
 /// Content type of every proxy-generated error body.
 const TEXT_PLAIN_UTF8: &str = "text/plain; charset=utf-8";
 
 /// A proxy-generated response head, independent of the serving backend.
 ///
-/// Construct via the `ResponseHead::*` constructors and fill the remaining
-/// fields with struct-update syntax; every field is `pub(crate)` so a call
-/// site states exactly which optional headers it emits.
+/// Constructors own status and framing together. Private fields prevent
+/// callers from changing a representation's status or range independently.
 #[derive(Clone, Debug)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct ResponseHead<'a> {
-    pub(crate) status: StatusCode,
-    pub(crate) kind: ResponseKind,
+    status: StatusCode,
+    kind: ResponseKind,
     /// `Content-Length`.  The hyper renderer emits it only when set (hyper
     /// derives it from the body otherwise); the raw-socket renderer emits
     /// it only when set, so bodiless heads must set `Some(0)` explicitly.
-    pub(crate) content_length: Option<u64>,
-    pub(crate) content_type: Option<&'static str>,
+    content_length: Option<u64>,
+    content_type: Option<&'static str>,
     /// Emit `Accept-Ranges: bytes`.
-    pub(crate) accept_ranges: bool,
-    pub(crate) last_modified: Option<&'a LastModified>,
-    pub(crate) etag: Option<&'a ETag>,
-    pub(crate) age: Option<u32>,
-    pub(crate) content_range: Option<Cow<'a, str>>,
+    accept_ranges: bool,
+    last_modified: Option<&'a LastModified>,
+    etag: Option<&'a ETag>,
+    age: Option<u32>,
+    content_range: Option<RangeHeader>,
     /// `Retry-After`, in seconds.
-    pub(crate) retry_after: Option<u32>,
+    retry_after: Option<u32>,
 }
 
 impl<'a> ResponseHead<'a> {
     /// A head with only the status and kind set; every optional header off.
     #[must_use]
-    pub(crate) const fn bare(status: StatusCode, kind: ResponseKind) -> Self {
+    const fn bare(status: StatusCode, kind: ResponseKind) -> Self {
         Self {
             status,
             kind,
@@ -124,6 +152,29 @@ impl<'a> ResponseHead<'a> {
         Self {
             content_type: Some(TEXT_PLAIN_UTF8),
             ..Self::bare(status, ResponseKind::Error)
+        }
+    }
+
+    pub(crate) fn error_with_retry(status: StatusCode, retry_after: Option<u32>) -> Self {
+        Self {
+            retry_after,
+            ..Self::error(status)
+        }
+    }
+
+    #[cfg(feature = "sendfile")]
+    pub(crate) fn error_body(status: StatusCode, length: u64, retry_after: Option<u32>) -> Self {
+        Self {
+            content_length: Some(length),
+            ..Self::error_with_retry(status, retry_after)
+        }
+    }
+
+    pub(crate) fn nudge(status: StatusCode, length: u64, retry_after: u32) -> Self {
+        Self {
+            content_length: Some(length),
+            retry_after: Some(retry_after),
+            ..Self::bare(status, ResponseKind::Success)
         }
     }
 
@@ -165,14 +216,20 @@ impl<'a> ResponseHead<'a> {
     /// and joiner through [`Self::cached`].
     #[must_use]
     pub(crate) fn representation(
-        status: StatusCode,
-        content_length: Option<u64>,
-        content_range: Option<&'a str>,
+        representation: Representation,
         content_type: &'static str,
         last_modified: &'a LastModified,
         etag: Option<&'a ETag>,
         age: u32,
     ) -> Self {
+        let (status, content_length, content_range) = match representation {
+            Representation::Full(length) => (StatusCode::OK, length, None),
+            Representation::Partial(range) => (
+                StatusCode::PARTIAL_CONTENT,
+                Some(range.span().get()),
+                Some(RangeHeader::Satisfied(range)),
+            ),
+        };
         Self {
             content_length,
             content_type: Some(content_type),
@@ -180,7 +237,7 @@ impl<'a> ResponseHead<'a> {
             last_modified: Some(last_modified),
             etag,
             age: Some(age),
-            content_range: content_range.map(Cow::Borrowed),
+            content_range,
             ..Self::bare(status, ResponseKind::Success)
         }
     }
@@ -190,16 +247,12 @@ impl<'a> ResponseHead<'a> {
     /// sendfile backends.
     #[must_use]
     pub(crate) fn cached(
-        status: StatusCode,
-        content_length: Option<u64>,
-        content_range: Option<&'a str>,
+        representation: Representation,
         content_type: &'static str,
         cache_info: &'a CacheInfo,
     ) -> Self {
         Self::representation(
-            status,
-            content_length,
-            content_range,
+            representation,
             content_type,
             &cache_info.last_modified,
             cache_info.file_etag.as_ref(),
@@ -210,22 +263,15 @@ impl<'a> ResponseHead<'a> {
     /// The `416 Range Not Satisfiable` head for a request no byte of the
     /// representation satisfies.
     ///
-    /// An `Error` head, so it carries `Server:` like every other
-    /// proxy-generated rejection. The wire renderer adds
-    /// `content_length: Some(0)` to frame the empty body for keep-alive;
-    /// hyper emits that itself for an empty body.
+    /// An error head with an explicitly empty body, including its length
+    /// so the raw-socket response can keep the connection alive.
     #[must_use]
     pub(crate) fn range_not_satisfiable(file_size: u64) -> Self {
         Self {
-            content_range: Some(Self::unsatisfied_range(file_size)),
+            content_range: Some(RangeHeader::Unsatisfied(file_size)),
+            content_length: Some(0),
             ..Self::bare(StatusCode::RANGE_NOT_SATISFIABLE, ResponseKind::Error)
         }
-    }
-
-    /// The `Content-Range: bytes */<size>` value of a `416`.
-    #[must_use]
-    fn unsatisfied_range(file_size: u64) -> Cow<'a, str> {
-        Cow::Owned(format!("bytes */{file_size}"))
     }
 
     /// Whether the renderers emit `Server:`.
@@ -332,7 +378,7 @@ impl ResponseHead<'_> {
         if let Some(content_range) = content_range {
             builder = builder.header(
                 CONTENT_RANGE,
-                HeaderValue::try_from(content_range.into_owned()).expect("content range is valid"),
+                HeaderValue::try_from(content_range.to_string()).expect("content range is valid"),
             );
         }
         if let Some(last_modified) = last_modified {
@@ -432,7 +478,7 @@ impl ResponseHead<'_> {
             "{}{}{}{}{}{}{}{}{}\r\n",
             OptHeader("Content-Type", *content_type),
             OptHeader("Content-Length", *content_length),
-            OptHeader("Content-Range", content_range.as_deref()),
+            OptHeader("Content-Range", *content_range),
             OptHeader("Last-Modified", *last_modified),
             OptHeader("ETag", *etag),
             OptHeader("Accept-Ranges", (*accept_ranges).then_some("bytes")),
@@ -600,7 +646,7 @@ mod tests {
             assert_eq!(headers.get(CONTENT_RANGE).unwrap(), "bytes */1234");
             assert!(headers.contains_key(SERVER));
             assert!(!headers.contains_key(CONTENT_TYPE));
-            assert!(!headers.contains_key(CONTENT_LENGTH));
+            assert_eq!(headers.get(CONTENT_LENGTH).unwrap(), "0");
         }
 
         /// The `304` head `hyper_conn.rs`'s `ServePlan::NotModified` arm

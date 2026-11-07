@@ -9,7 +9,7 @@ use time::macros::format_description;
 use time::{OffsetDateTime, macros::offset};
 
 use crate::http_etag::etag_strong_match;
-use crate::{swrite, warn_once_or_info};
+use crate::warn_once_or_info;
 
 const HTTP_DATE_FORMAT: &[FormatItem<'_>] = format_description!(
     "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
@@ -239,17 +239,10 @@ pub(crate) fn compute_age(metadata: &std::fs::Metadata) -> u32 {
 }
 
 /// Result of parsing an HTTP Range request header.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ParsedRange {
     /// Valid, satisfiable range.
-    Satisfiable {
-        /// Ready-to-send `Content-Range` header value.
-        content_range: String,
-        /// First byte of the representation to send.
-        start: u64,
-        /// Number of bytes to send.
-        length: u64,
-    },
+    Satisfiable(ContentRange),
     /// The Range header is syntactically malformed. Per RFC 9110 §14.2, the recipient
     /// should ignore the header and serve the full entity (200).
     Invalid,
@@ -367,13 +360,9 @@ pub(crate) fn http_parse_range(
         "range {start}+{content_length} must not exceed file_size {file_size}"
     );
 
-    let mut content_range = String::with_capacity(32);
-    swrite!(content_range, "bytes {start}-{end}/{file_size}");
-    ParsedRange::Satisfiable {
-        content_range,
-        start,
-        length: content_length,
-    }
+    ParsedRange::Satisfiable(
+        ContentRange::new(start, end, file_size).expect("resolved range is bounded"),
+    )
 }
 
 /// Evaluate an `If-Range` precondition (RFC 9110 §13.1.5) against the
@@ -399,8 +388,7 @@ fn if_range_matches(if_range: &str, cache_time: HttpDate, file_etag: Option<&str
 
 /// A parsed `Content-Range: bytes <start>-<end>/<total>` response header.
 ///
-/// [`parse_content_range`] is the only constructor and it rejects everything
-/// but `start <= end < total`.  Those bounds are what make [`Self::total`]
+/// The constructors reject everything but `start <= end < total`.  Those bounds are what make [`Self::total`]
 /// and [`Self::span`] `NonZero` and [`Self::runs_to_end`] wrap-free.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ContentRange {
@@ -410,6 +398,14 @@ pub(crate) struct ContentRange {
 }
 
 impl ContentRange {
+    pub(crate) fn new(start: u64, end: u64, total: u64) -> Option<Self> {
+        (start <= end && end < total).then(|| Self {
+            start,
+            end,
+            total: NonZero::new(total).expect("bounded range has nonzero total"),
+        })
+    }
+
     /// First byte of the range.
     #[must_use]
     pub(crate) const fn start(self) -> u64 {
@@ -435,6 +431,12 @@ impl ContentRange {
     }
 }
 
+impl std::fmt::Display for ContentRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bytes {}-{}/{}", self.start, self.end, self.total)
+    }
+}
+
 /// Parse an HTTP `Content-Range` response header value.
 ///
 /// Expects the complete `bytes {start}-{end}/{total}` form; the `*`
@@ -450,16 +452,7 @@ pub(crate) fn parse_content_range(value: &str) -> Option<ContentRange> {
     let end = end_str.parse::<u64>().ok()?;
     let total = total_str.parse::<u64>().ok()?;
 
-    if start > end || end >= total {
-        return None;
-    }
-
-    Some(ContentRange {
-        start,
-        end,
-        // `end >= total` was rejected above, so `total` is at least 1.
-        total: NonZero::new(total)?,
-    })
+    ContentRange::new(start, end, total)
 }
 
 #[cfg(test)]
@@ -475,11 +468,9 @@ mod tests {
     /// Helper to unwrap a `ParsedRange::Satisfiable` for concise test assertions.
     fn satisfiable(r: ParsedRange) -> Option<(String, u64, u64)> {
         match r {
-            ParsedRange::Satisfiable {
-                content_range,
-                start,
-                length,
-            } => Some((content_range, start, length)),
+            ParsedRange::Satisfiable(range) => {
+                Some((range.to_string(), range.start(), range.span().get()))
+            }
             ParsedRange::Invalid | ParsedRange::NotSatisfiable | ParsedRange::IfRangeFailed => None,
         }
     }

@@ -1030,7 +1030,11 @@ async fn serve_unfinished_file(
         ContentLength::Exact(size) => Some(size.get()),
         ContentLength::Unknown(_) => None,
     };
-    let head = ResponseHead::cached(StatusCode::OK, exact_size, None, content_type, &cache_info);
+    let head = ResponseHead::cached(
+        crate::response_head::Representation::Full(exact_size),
+        content_type,
+        &cache_info,
+    );
 
     let body = rated_client_body(
         ChannelBody::new(rx, content_length),
@@ -1116,7 +1120,7 @@ async fn serve_cached_file(
 
     // The file is streamed straight through; let the kernel grow its
     // readahead window accordingly.
-    hint_sequential_read(&file, params.content_length, &file_path);
+    hint_sequential_read(&file, params.content_length(), &file_path);
 
     debug!(
         "Serving cached file {} from mirror {}{} for client {} via stream...",
@@ -1148,8 +1152,8 @@ async fn serve_cached_file_buf(
     cache_info: &CacheInfo,
     params: ServeParams,
 ) -> Response<ProxyCacheBody> {
-    let start = params.content_start;
-    let content_length = params.content_length;
+    let start = params.content_start();
+    let content_length = params.content_length();
     debug_assert!(
         start + content_length <= file_size,
         "range {start}+{content_length} must not exceed file size {file_size}"
@@ -1201,13 +1205,7 @@ async fn serve_cached_file_buf(
         },
     );
 
-    let head = ResponseHead::cached(
-        params.http_status(),
-        Some(content_length),
-        params.content_range.as_deref(),
-        content_type,
-        cache_info,
-    );
+    let head = ResponseHead::cached((&params).into(), content_type, cache_info);
 
     let response = head.into_hyper(body);
 
@@ -1286,10 +1284,10 @@ async fn serve_joined(
         Err(failure) => {
             drop(status);
             let (status_code, msg) = failure.response_parts();
-            let head = ResponseHead {
-                retry_after: failure.retry_after().map(retry_after_secs),
-                ..ResponseHead::error(status_code)
-            };
+            let head = ResponseHead::error_with_retry(
+                status_code,
+                failure.retry_after().map(retry_after_secs),
+            );
             head.into_hyper(full_body(msg))
         }
     }
@@ -1754,10 +1752,7 @@ async fn decline_with_response(
 ) -> (Settled, Response<ProxyCacheBody>) {
     let settled = ibarrier.decline(why).await;
     let (status, msg) = why.response_parts();
-    let head = ResponseHead {
-        retry_after: why.retry_after().map(retry_after_secs),
-        ..ResponseHead::error(status)
-    };
+    let head = ResponseHead::error_with_retry(status, why.retry_after().map(retry_after_secs));
     (settled, head.into_hyper(full_body(msg)))
 }
 

@@ -18,7 +18,7 @@ use tracing::debug;
 
 use crate::cache_layout::{CachedFlavor, ConnectionDetails};
 use crate::config::Config;
-use crate::response_head::{ResponseHead, ResponseKind};
+use crate::response_head::ResponseHead;
 
 /// Body of the nudge response.
 ///
@@ -77,18 +77,15 @@ pub(crate) fn should_nudge(
 /// The head of the nudge response: the configured status code, the configured
 /// `Retry-After` and the [`NUDGE_BODY`] length.
 ///
-/// [`ResponseKind::Success`] on purpose: the nudge answers on the origin's
+/// Uses the success header policy: the nudge answers on the origin's
 /// behalf and must not advertise `Server:` (see the `response_head` contract).
 #[must_use]
 pub(crate) fn nudge_head(config: &Config) -> ResponseHead<'static> {
-    ResponseHead {
-        retry_after: Some(u32::from(config.experimental_parallel_hack_retryafter)),
-        content_length: Some(NUDGE_BODY.len() as u64),
-        ..ResponseHead::bare(
-            config.experimental_parallel_hack_statuscode,
-            ResponseKind::Success,
-        )
-    }
+    ResponseHead::nudge(
+        config.experimental_parallel_hack_statuscode,
+        NUDGE_BODY.len() as u64,
+        u32::from(config.experimental_parallel_hack_retryafter),
+    )
 }
 
 /// The debug line both backends emit right before writing the nudge.
@@ -306,10 +303,25 @@ mod tests {
         config.experimental_parallel_hack_statuscode = StatusCode::SERVICE_UNAVAILABLE;
         config.experimental_parallel_hack_retryafter = 17;
         let head = nudge_head(&config);
-        assert_eq!(head.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(head.kind, ResponseKind::Success);
-        assert_eq!(head.retry_after, Some(17));
-        assert_eq!(head.content_length, Some(20));
+        #[cfg(feature = "hyper")]
+        {
+            let response = head.into_hyper(());
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()["retry-after"], "17");
+            assert_eq!(response.headers()["content-length"], "20");
+            assert!(!response.headers().contains_key("server"));
+        }
+        #[cfg(not(feature = "hyper"))]
+        {
+            let rendered = head.render(
+                crate::http_helpers::ConnectionVersion::Http11,
+                crate::http_helpers::ConnectionAction::KeepAlive,
+            );
+            assert!(rendered.starts_with("HTTP/1.1 503"));
+            assert!(rendered.contains("Retry-After: 17\r\n"));
+            assert!(rendered.contains("Content-Length: 20\r\n"));
+            assert!(!rendered.contains("Server:"));
+        }
         assert_eq!(NUDGE_BODY.len(), 20, "the pinned body length");
     }
 }

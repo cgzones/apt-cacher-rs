@@ -460,10 +460,7 @@ async fn write_request_error_response(
     buf: &[u8],
 ) -> std::io::Result<()> {
     // Retain the error representation's length, as hyper does for HEAD.
-    let head = ResponseHead {
-        content_length: Some(msg.len() as u64),
-        ..ResponseHead::error(status)
-    };
+    let head = ResponseHead::error_body(status, msg.len() as u64, None);
     let body = if buf.starts_with(b"HEAD ") {
         WireBody::None
     } else {
@@ -1565,8 +1562,8 @@ async fn serve_planned(
         }
     };
     let partial = params.is_partial();
-    let content_start = params.content_start;
-    let content_length = params.content_length;
+    let content_start = params.content_start();
+    let content_length = params.content_length();
 
     debug!(
         "Serving {what} file {} from mirror {}{aliased} for {who} {client} via sendfile...",

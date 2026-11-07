@@ -276,15 +276,7 @@ fn splice_response_head<'a>(
         etag,
         last_modified,
     } = validators;
-    ResponseHead::representation(
-        range.http_status(),
-        Some(range.content_length),
-        range.content_range.as_deref(),
-        content_type,
-        last_modified,
-        etag.as_ref(),
-        0,
-    )
+    ResponseHead::representation(range.into(), content_type, last_modified, etag.as_ref(), 0)
 }
 
 /// Write the response head of a splice-served body to the client. The
@@ -1077,7 +1069,7 @@ async fn send_resumed_prefix<'a>(
     let BodyClient::Attached(client_stream, _peer) = client else {
         return (client, 0);
     };
-    let send_start = range_plan.content_start.min(resume_offset);
+    let send_start = range_plan.content_start().min(resume_offset);
     let send_end = range_plan.content_end().min(resume_offset);
     if send_end <= send_start {
         return (client, 0);
@@ -1200,8 +1192,8 @@ async fn write_body_prefix<'a>(
     let client_slice = range_slice(
         body_prefix,
         resume_offset,
-        range_plan.content_start,
-        range_plan.content_length,
+        range_plan.content_start(),
+        range_plan.content_length(),
     );
     if !client_slice.is_empty() {
         // The loop's `BodyTransfer` binds its own once it starts; a body that
@@ -1283,7 +1275,7 @@ async fn transfer_body(
     //   client_send = min(500, 1000) - (0 + 200) = 300 (send exactly the range)
     // If the range ends past the splice region (e.g. due to a body prefix already
     // consumed), the min() clamps to splice_file_end and saturating_sub clamps at 0.
-    let client_skip = range_plan.content_start.saturating_sub(splice_file_start);
+    let client_skip = range_plan.content_start().saturating_sub(splice_file_start);
     // How many bytes to send to client from within the splice region.
     let client_send = client_range_end
         .min(splice_file_end)
@@ -1784,7 +1776,7 @@ pub(crate) async fn splice_proxy(
             rates,
             client_end,
             Served {
-                bytes: range_plan.content_length,
+                bytes: range_plan.content_length(),
                 partial: range_plan.is_partial(),
             },
         )
@@ -1908,11 +1900,9 @@ mod tests {
 
         let whole = ServeParams::from_parsed(None, 1000).expect("no range");
         let partial = ServeParams::from_parsed(
-            Some(ParsedRange::Satisfiable {
-                content_range: "bytes 200-499/1000".to_owned(),
-                start: 200,
-                length: 300,
-            }),
+            Some(ParsedRange::Satisfiable(
+                crate::http_range::parse_content_range("bytes 200-499/1000").expect("valid range"),
+            )),
             1000,
         )
         .expect("satisfiable");

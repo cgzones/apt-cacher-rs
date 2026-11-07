@@ -214,7 +214,7 @@ pub(super) async fn handle_volatile_buffered_download(
             metrics::SERVED_SPLICE.increment();
             metrics::SERVED_TOTAL.increment();
             let served = Served {
-                bytes: range_plan.content_length,
+                bytes: range_plan.content_length(),
                 partial: range_plan.is_partial(),
             };
             (CompletionClient::Served(served), SpliceProxyOutcome::Served)
@@ -304,7 +304,7 @@ async fn write_buffered_response(
     .map_err(|failure| conclude_write(conn_details, HEAD_PHASE, failure))?;
 
     #[expect(clippy::cast_possible_truncation, reason = "body capped at 1 MiB")]
-    let body_slice = &body[range_plan.content_start as usize..range_plan.content_end() as usize];
+    let body_slice = &body[range_plan.content_start() as usize..range_plan.content_end() as usize];
     let config = global_config();
     let mut volatile_rc = RateChecker::from_config(config);
     let before = rates.client_bytes_sent;

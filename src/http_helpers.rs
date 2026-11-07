@@ -218,10 +218,7 @@ impl<'a> ClientConn<'a> {
         // `Content-Length: 0` frames the empty body for keep-alive; hyper emits
         // the same automatically for its empty body, so the constructor leaves it
         // to the renderer that needs it.
-        let head = ResponseHead {
-            content_length: Some(0),
-            ..ResponseHead::range_not_satisfiable(file_size)
-        };
+        let head = ResponseHead::range_not_satisfiable(file_size);
         head.write_to(self, WireBody::None).await
     }
 
@@ -234,11 +231,8 @@ impl<'a> ClientConn<'a> {
         msg: &'static str,
         retry_after: Option<std::time::Duration>,
     ) -> std::io::Result<()> {
-        let head = ResponseHead {
-            content_length: Some(msg.len() as u64),
-            retry_after: retry_after.map(retry_after_secs),
-            ..ResponseHead::error(status)
-        };
+        let head =
+            ResponseHead::error_body(status, msg.len() as u64, retry_after.map(retry_after_secs));
         head.write_to(self, WireBody::Inline(msg)).await
     }
 
@@ -268,13 +262,7 @@ pub(crate) fn cached_file_head<'a>(
     content_type: &'static str,
     cache_info: &'a CacheInfo,
 ) -> ResponseHead<'a> {
-    ResponseHead::cached(
-        params.http_status(),
-        Some(params.content_length),
-        params.content_range.as_deref(),
-        content_type,
-        cache_info,
-    )
+    ResponseHead::cached(params.into(), content_type, cache_info)
 }
 
 /// Which syscall the shared write loop issues, and which timeout counter its
