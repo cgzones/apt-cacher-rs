@@ -231,10 +231,9 @@ impl ServeParams {
     /// and a failed `If-Range` precondition both serve the whole
     /// representation (RFC 9110 sections 14.2 and 13.1.5).
     ///
-    /// The cached-serve planner ([`CacheInfo::plan`]) resolves the same three
-    /// outcomes inline because it also owns the malformed-`Range` warning and
-    /// the 304 precedence; every other serve path goes through here, so they
-    /// cannot drift.
+    /// The cached-serve planner ([`CacheInfo::plan`]) handles the
+    /// malformed-`Range` warning and 304 precedence before resolving these
+    /// outcomes here too, so the serve paths cannot drift.
     pub(crate) fn from_parsed(
         parsed: Option<ParsedRange>,
         file_size: u64,
