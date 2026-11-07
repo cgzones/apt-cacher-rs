@@ -331,17 +331,14 @@ pub(crate) const fn no_fallback_reason(mode: HttpsUpgradeMode) -> &'static str {
 /// Resolve the upstream scheme for `key` from the cache and config — the single
 /// entry point both backends use to decide HTTP vs HTTPS.
 pub(crate) fn resolve(key: SchemeKeyRef<'_>, config: &Config) -> SchemeDecision {
-    let https_permitted = https_permitted(key, config);
+    if !https_permitted(key, config) {
+        return SchemeDecision::Http;
+    }
     let cached = cached_scheme_at(key, Instant::now());
     // `decide` returns on `cached` before reading `is_http_only`; skip the
     // `http_only_mirrors` scan on a cache hit.
     let is_http_only = cached.is_none() && is_http_only(key, config);
-    decide(
-        cached,
-        is_http_only,
-        https_permitted,
-        config.https_upgrade_mode,
-    )
+    decide(cached, is_http_only, true, config.https_upgrade_mode)
 }
 
 /// Whether `allowed_mirror_ports` lets `key` be dialled over https at all.
