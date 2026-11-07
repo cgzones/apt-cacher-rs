@@ -637,25 +637,13 @@ mod tests {
         tokio::fs::write(&path, b"").await.expect("write empty");
         let file = tokio::fs::File::open(&path).await.expect("open empty");
 
-        let mirror = structured_mirror("example.com", "debian");
-        let mut file_list = cands(&["keep-me.deb"]);
-        let mut tally = UnitStats::default();
-        let mut ctx = ReduceContext {
-            root: Path::new("/tmp"),
-            mirror: &mirror,
-            layout: CacheLayout::StructuredPool,
-            tally: &mut tally,
-            keymap: KeyMapper::Basename,
-        };
-
-        let err = reduce_file_list(
+        let (result, file_list) = reduce_keys(
             fetched(PackagesCompression::Gz, file, "Packages.gz").await,
-            &mut file_list,
-            &mut ctx,
-            BUFFER_SIZE,
+            dir.path(),
+            &["keep-me.deb"],
         )
-        .await
-        .expect_err("an empty compressed index must bail the mirror");
+        .await;
+        let err = result.expect_err("an empty compressed index must bail the mirror");
         assert!(
             matches!(err, ReduceError::ZeroSizeCompressed { ref filename } if filename == "Packages.gz"),
             "got {err:?}"
@@ -698,7 +686,6 @@ mod tests {
         tokio::fs::write(&path, &raw).await.expect("write fixture");
         let file = tokio::fs::File::open(&path).await.expect("open fixture");
 
-        let mirror = structured_mirror("example.com", "debian");
         // `dummy_1.0_amd64.deb` is the structured-lookup-key (basename) of
         // the Filename: above; reaching `StanzaStream::complete` with the stanza
         // intact removes the entry from the candidate list, proving the
@@ -706,24 +693,13 @@ mod tests {
         tokio::fs::write(dir.path().join("dummy_1.0_amd64.deb"), deb_body)
             .await
             .expect("write deb");
-        let mut file_list = cands(&["dummy_1.0_amd64.deb", "keep-me.deb"]);
-        let mut tally = UnitStats::default();
-        let mut ctx = ReduceContext {
-            root: dir.path(),
-            mirror: &mirror,
-            layout: CacheLayout::StructuredPool,
-            tally: &mut tally,
-            keymap: KeyMapper::Basename,
-        };
-
-        reduce_file_list(
+        let (result, file_list) = reduce_keys(
             fetched(PackagesCompression::Raw, file, "Packages").await,
-            &mut file_list,
-            &mut ctx,
-            BUFFER_SIZE,
+            dir.path(),
+            &["dummy_1.0_amd64.deb", "keep-me.deb"],
         )
-        .await
-        .expect("oversize lines must be skipped, not aborted");
+        .await;
+        result.expect("oversize lines must be skipped, not aborted");
 
         assert!(
             !file_list.contains_key(OsStr::new("dummy_1.0_amd64.deb")),
@@ -745,25 +721,13 @@ mod tests {
         tokio::fs::write(&path, b"").await.expect("write empty");
         let file = tokio::fs::File::open(&path).await.expect("open empty");
 
-        let mirror = structured_mirror("example.com", "debian");
-        let mut file_list = cands(&["keep-me.deb"]);
-        let mut tally = UnitStats::default();
-        let mut ctx = ReduceContext {
-            root: Path::new("/tmp"),
-            mirror: &mirror,
-            layout: CacheLayout::StructuredPool,
-            tally: &mut tally,
-            keymap: KeyMapper::Basename,
-        };
-
-        reduce_file_list(
+        let (result, file_list) = reduce_keys(
             fetched(PackagesCompression::Raw, file, "Packages").await,
-            &mut file_list,
-            &mut ctx,
-            BUFFER_SIZE,
+            dir.path(),
+            &["keep-me.deb"],
         )
-        .await
-        .expect("an empty raw Packages file must be treated as zero stanzas");
+        .await;
+        result.expect("an empty raw Packages file must be treated as zero stanzas");
 
         assert!(
             file_list.contains_key(OsStr::new("keep-me.deb")),
