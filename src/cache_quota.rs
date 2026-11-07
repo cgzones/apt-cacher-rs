@@ -52,9 +52,8 @@
 //!   its directory was repaired away, under-counting the cache until the
 //!   next cleanup.
 //!
-//! A [`QuotaReservation`] is minted only by [`CacheQuota::try_acquire`] /
-//! [`CacheQuota::acquire_for_cleanup`], is required to build a download
-//! barrier (`guards.rs`), is finalised inside the rename step
+//! A [`QuotaReservation`] is minted through [`CacheQuota::acquire`],
+//! is required to build a download barrier (`guards.rs`), is finalised inside the rename step
 //! (`integrity::verify_and_rename`, in the same blocking closure as the
 //! `rename(2)`, so a cancelled commit future cannot land the file and revert
 //! the reservation), and reverts itself on drop -- keeping the bytes its
@@ -92,8 +91,8 @@ use std::{
 use tracing::{debug, error, info, trace};
 
 use crate::{
-    error::ErrorReport, healthcheck::filesystem_space, humanfmt::HumanFmt, metrics,
-    partial_claim::PartialClaim, sticky, upstream_head::ContentLength, warn_once_or_debug,
+    client_info::ClientInfo, error::ErrorReport, healthcheck::filesystem_space, humanfmt::HumanFmt,
+    metrics, partial_claim::PartialClaim, sticky, upstream_head::ContentLength, warn_once_or_debug,
     warn_once_or_info,
 };
 
@@ -493,9 +492,8 @@ impl CacheQuota {
     }
 
     /// Take a new free-space sample for the `min_disk_free` admission check
-    /// when the current one is older than [`DISK_SAMPLE_TTL`]. The quota
-    /// gates await it right before [`Self::try_acquire`], which is
-    /// synchronous and only reads the sample.
+    /// when the current one is older than [`DISK_SAMPLE_TTL`].
+    /// [`Self::acquire`] awaits it before the synchronous admission check.
     ///
     /// Single flight: a request arriving while a probe is outstanding goes
     /// on with the current sample, which still charges every download in
@@ -509,7 +507,7 @@ impl CacheQuota {
     /// were the flag cleared on timeout, every later miss would strand one
     /// more blocking thread and stall for the timeout again, until the
     /// blocking pool every `tokio::fs` call shares ran dry.
-    pub(crate) async fn refresh_disk_headroom(&self) {
+    async fn refresh_disk_headroom(&self) {
         self.refresh_disk_headroom_with(DISK_PROBE_TIMEOUT, |dir| async move {
             filesystem_space(&dir).await.map(|space| space.free_bytes)
         })
@@ -585,8 +583,27 @@ impl CacheQuota {
         }
     }
 
-    /// Atomically check quota and reserve space for a download.
-    ///
+    /// Admit a download and reserve its space in one operation.
+    /// Normal requests refresh the free-space sample before checking the
+    /// limits; cleanup's synthetic index fetches bypass both limits so a
+    /// full cache can still fetch the reference set needed to shrink it.
+    /// These choices stay here rather than in each backend's quota gate.
+    pub(crate) async fn acquire(
+        &self,
+        client: &ClientInfo,
+        content_length: ContentLength,
+        prev_file_size: u64,
+        partial: Option<ReservedPartial>,
+        debname: &str,
+    ) -> Result<QuotaReservation, QuotaExceeded> {
+        if client.is_cleanup_synthetic() {
+            Ok(self.acquire_for_cleanup(content_length, prev_file_size, partial, debname))
+        } else {
+            self.refresh_disk_headroom().await;
+            self.try_acquire(content_length, prev_file_size, partial, debname)
+        }
+    }
+
     /// `content_length.upper()` is the maximum size we might write.
     /// `prev_file_size` is the size of an existing file being replaced
     /// (subtracted from the delta). It must be the real on-disk size when a
@@ -606,7 +623,7 @@ impl CacheQuota {
     /// sample, may write ([`Self::refresh_disk_headroom`]).
     /// Both refusals are the same [`QuotaExceeded`]: the client sees one
     /// "Disk quota reached" 503 either way.
-    pub(crate) fn try_acquire(
+    fn try_acquire(
         &self,
         content_length: ContentLength,
         prev_file_size: u64,
@@ -663,7 +680,7 @@ impl CacheQuota {
     /// caused it sweeps it back below the limit. Serving a stale cached index
     /// instead is not an option: reconciling against an outdated reference
     /// set would grace-sweep live debs.
-    pub(crate) fn acquire_for_cleanup(
+    fn acquire_for_cleanup(
         &self,
         content_length: ContentLength,
         prev_file_size: u64,
@@ -1041,6 +1058,7 @@ impl Drop for QuotaReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{client_info::CLEANUP_CLIENT_ADDR, test_support::local_client};
 
     /// `n` whole quota blocks, in bytes. Every size the quota handles is
     /// rounded up to a block, so the tests count in blocks.
@@ -1734,10 +1752,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn low_disk_space_admits_cleanup_index_fetches() {
+    #[tokio::test]
+    async fn low_disk_space_admits_only_cleanup_index_fetches() {
         let quota = headroom_quota(600, Some(1000));
-        let reservation = quota.acquire_for_cleanup(exact(900), 0, None, "Packages.xz");
+        let real_client = ClientInfo::new(CLEANUP_CLIENT_ADDR);
+        assert!(
+            quota
+                .acquire(&real_client, exact(900), 0, None, "Packages.xz")
+                .await
+                .is_err(),
+            "even a real peer using the cleanup address must obey the limits"
+        );
+        let reservation = quota
+            .acquire(
+                &ClientInfo::new_cleanup(),
+                exact(900),
+                0,
+                None,
+                "Packages.xz",
+            )
+            .await
+            .expect("cleanup must be able to fetch the reference set on a full disk");
         assert_eq!(quota.current_size(), b(900));
         drop(reservation);
     }
@@ -1819,7 +1854,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_samples_the_cache_filesystem() {
+    async fn admission_samples_the_cache_filesystem() {
         let dir = tempfile::tempdir().expect("tempdir");
         // More free space than any filesystem has.
         let quota = CacheQuota::with_disk_headroom(
@@ -1830,7 +1865,12 @@ mod tests {
                 NonZero::new(u64::MAX / 2).expect("non-zero"),
             )),
         );
-        quota.refresh_disk_headroom().await;
-        assert!(quota.try_acquire(exact(1), 0, None, "tiny").is_err());
+        assert!(
+            quota
+                .acquire(&local_client(), exact(1), 0, None, "tiny")
+                .await
+                .is_err(),
+            "admission must sample the disk before applying min_disk_free"
+        );
     }
 }

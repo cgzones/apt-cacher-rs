@@ -439,31 +439,22 @@ async fn prepare_cache_target(
     // `dest_path` is pure path construction.
     let dest_path = conn_details.cache_file_path();
     let filename = Path::new(&conn_details.debname);
-    let reservation = if conn_details.client.is_cleanup_synthetic() {
-        // Mirrors the hyper gate: cleanup's own index fetches are admitted
-        // over quota (`CacheQuota::acquire_for_cleanup`).
-        global_cache_quota().acquire_for_cleanup(
+    let reservation = match global_cache_quota()
+        .acquire(
+            &conn_details.client,
             ContentLength::Exact(total_content_length),
             prev_file_size,
             partial.reserved_partial(),
             &conn_details.debname,
         )
-    } else {
-        // The `min_disk_free` half of the gate reads a cached sample.
-        global_cache_quota().refresh_disk_headroom().await;
-        match global_cache_quota().try_acquire(
-            ContentLength::Exact(total_content_length),
-            prev_file_size,
-            partial.reserved_partial(),
-            &conn_details.debname,
-        ) {
-            Ok(r) => r,
-            Err(_err @ QuotaExceeded) => {
-                client
-                    .decline(&mut ibarrier, Declined::QuotaExceeded, quota_phase)
-                    .await?;
-                return Ok(None);
-            }
+        .await
+    {
+        Ok(reservation) => reservation,
+        Err(_err @ QuotaExceeded) => {
+            client
+                .decline(&mut ibarrier, Declined::QuotaExceeded, quota_phase)
+                .await?;
+            return Ok(None);
         }
     };
 

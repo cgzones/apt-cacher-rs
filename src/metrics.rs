@@ -642,7 +642,7 @@ pub(crate) static POOL_MISS_NO_SCHEME: Counter = Counter::new();
 /// evicted (raise `UPSTREAM_POOL_MAX_IDLE_PER_HOST` if recurring).
 pub(crate) static POOL_RETURN_EVICTED: Counter = Counter::new();
 
-/// Downloads rejected by `CacheQuota::try_acquire` (would exceed `disk_quota`
+/// Downloads rejected by `CacheQuota::acquire` (would exceed `disk_quota`
 /// or leave less than `min_disk_free` on the cache filesystem).
 pub(crate) static DOWNLOAD_REJECTED_QUOTA: Signal = Signal::new();
 /// Downloads rejected because the upstream-declared object size exceeded the

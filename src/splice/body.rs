@@ -3048,7 +3048,8 @@ mod tests {
         let origination = active.originate_uncapped(details.key());
         let length = ContentLength::Exact(NonZero::new(1024 * 1024).unwrap());
         let quota = CacheQuota::new(0, None)
-            .try_acquire(length, 0, None, "writer.deb")
+            .acquire(&details.client, length, 0, None, "writer.deb")
+            .await
             .expect("unlimited quota");
         InitBarrier::new(origination, active.clone(), &details, "/debian/writer.deb")
             .download(

@@ -449,8 +449,8 @@ impl Drop for InitBarrier {
 }
 
 struct DownloadBarrierData {
-    /// Minted only by `CacheQuota::try_acquire`, so holding a barrier proves
-    /// the quota was checked; `commit` finalises it, `Drop` reverts it.
+    /// Minted through `CacheQuota::acquire`, so holding a barrier proves
+    /// admission succeeded; `commit` finalises it, `Drop` reverts it.
     /// Declared (so dropped) before `lease`: an unfinalised reservation keeps
     /// what the partial holds, which it reads while the lease still keeps
     /// every other writer off the path (and its own share of the partial's
@@ -1083,7 +1083,8 @@ mod tests {
             if download {
                 let length = ContentLength::Exact(std::num::NonZero::new(1024).unwrap());
                 let quota = crate::cache_quota::CacheQuota::new(0, None)
-                    .try_acquire(length, 0, None, &key.debname)
+                    .acquire(&details.client, length, 0, None, &key.debname)
+                    .await
                     .expect("unlimited quota");
                 let mut transition = Box::pin(barrier.download(
                     PathBuf::from("test.partial"),
@@ -1388,7 +1389,8 @@ mod tests {
         let details = details_for(key);
         let length = ContentLength::Exact(std::num::NonZero::new(1024).unwrap());
         let quota = crate::cache_quota::CacheQuota::new(0, None)
-            .try_acquire(length, 0, None, &key.debname)
+            .acquire(&details.client, length, 0, None, &key.debname)
+            .await
             .expect("unlimited quota");
         InitBarrier::new(
             active.originate_uncapped(key.as_ref()),
@@ -1495,7 +1497,8 @@ mod tests {
         let identity = Arc::clone(&init.key);
         let length = ContentLength::Exact(std::num::NonZero::new(1024).unwrap());
         let quota = CacheQuota::new(0, None)
-            .try_acquire(length, 0, None, &key.debname)
+            .acquire(&details.client, length, 0, None, &key.debname)
+            .await
             .expect("unlimited quota");
         let (_settled, download) = init
             .download(
