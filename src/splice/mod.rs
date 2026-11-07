@@ -63,9 +63,7 @@ use crate::cache_conditional::{RangeRequestHeaders, ServeParams};
 use crate::cache_layout::{CachedFlavor, ConnectionDetails, FetchRole};
 use crate::cache_quota::QuotaExceeded;
 use crate::error::ErrorReport;
-use crate::fs_open::{
-    regular_file_metadata_typed, tokio_nofollow_options, touch_volatile_mtime_with,
-};
+use crate::fs_open::{nofollow_options, regular_file_metadata_typed, touch_volatile_mtime_with};
 use crate::guards::{Consequence, DownloadBarrier, InitBarrier};
 use crate::http_helpers::{ClientConn, ConnectionAction, WritePhase, write_all_to_stream};
 use crate::http_range::{HttpDate, ParsedRange, cache_file_http_date, http_parse_range};
@@ -715,7 +713,7 @@ async fn read_volatile_validators(
     }
     let cache_path = conn_details.cache_file_path();
 
-    let file = match tokio_nofollow_options().read(true).open(&cache_path).await {
+    let file = match nofollow_options().read(true).open_async(&cache_path).await {
         Ok(f) => f,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => {
@@ -1075,9 +1073,9 @@ async fn send_resumed_prefix<'a>(
     if send_end <= send_start {
         return (client, 0);
     }
-    let partial_reader = match tokio_nofollow_options()
+    let partial_reader = match nofollow_options()
         .read(true)
-        .open(temppath.as_ref())
+        .open_async(temppath.as_ref())
         .await
     {
         Ok(reader) => reader,

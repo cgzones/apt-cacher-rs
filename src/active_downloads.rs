@@ -40,7 +40,7 @@ use crate::cache_layout::{CacheEntryKey, CacheEntryKeyRef, ConnectionDetails};
 use crate::cache_metadata::UpstreamMetadata;
 use crate::client_info::ClientInfo;
 use crate::error::ErrorReport;
-use crate::fs_open::{count_cache_failure, tokio_nofollow_options};
+use crate::fs_open::{count_cache_failure, nofollow_options};
 use crate::guards::CANCELLED_DOWNLOAD;
 use crate::humanfmt::HumanFmt;
 use crate::mem_usage::{ARC_HEADER, Footprint};
@@ -384,7 +384,7 @@ pub(crate) async fn await_serveable(
         path: &std::path::Path,
         conn_details: &ConnectionDetails,
     ) -> Result<Option<tokio::fs::File>, JoinFailure> {
-        match tokio_nofollow_options().read(true).open(path).await {
+        match nofollow_options().read(true).open_async(path).await {
             Ok(file) => Ok(Some(file)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => {

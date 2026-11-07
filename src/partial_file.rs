@@ -30,7 +30,7 @@ use crate::{
     cache_quota::{CacheQuota, ReservedPartial, partial_len},
     deb_mirror,
     error::ErrorReport,
-    fs_open::{count_cache_failure, tokio_nofollow_options},
+    fs_open::{count_cache_failure, nofollow_options},
     global_cache_quota,
     guards::InitBarrier,
     http_etag::{ETag, StrongETag},
@@ -643,12 +643,12 @@ pub(crate) async fn tokio_tempfile(
             "buf is non-empty so adding a new extension must succeed"
         );
 
-        let _: Never = match tokio_nofollow_options()
+        let _: Never = match nofollow_options()
             .create_new(true)
             .read(true)
             .write(true)
             .mode(mode)
-            .open(&buf)
+            .open_async(&buf)
             .await
         {
             Ok(file) => {
@@ -728,10 +728,10 @@ async fn open_partial_file(
     }
 
     async fn file_ops(path: &Path) -> Result<(tokio::fs::File, u64), FileOpsError> {
-        let mut file = tokio_nofollow_options()
+        let mut file = nofollow_options()
             .write(true)
             .read(true)
-            .open(path)
+            .open_async(path)
             .await
             .map_err(|err| {
                 // NotFound is the normal "no partial file" case; the caller
@@ -793,12 +793,12 @@ async fn create_partial_file(
     mode: u32,
 ) -> Result<(tokio::fs::File, TempPath), CacheError> {
     async fn open(path: &Path, mode: u32) -> Result<tokio::fs::File, tokio::io::Error> {
-        tokio_nofollow_options()
+        nofollow_options()
             .create_new(true)
             .write(true)
             .read(true)
             .mode(mode)
-            .open(path)
+            .open_async(path)
             .await
     }
 

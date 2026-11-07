@@ -51,7 +51,7 @@ use tracing::{debug, error, warn};
 
 use crate::config::HostText;
 use crate::error::ErrorReport;
-use crate::fs_open::{hint_sequential_read, nofollow_options, tokio_nofollow_options};
+use crate::fs_open::{hint_sequential_read, nofollow_options};
 use crate::ingest_ledger::{Claim, IngestLedger, Outcome};
 use crate::limits::{self, PackagesCompression};
 use crate::mem_usage::{ARC_HEADER, Footprint, buffer_bytes};
@@ -2104,7 +2104,7 @@ async fn ingest_packages_file(
     compression: Option<PackagesCompression>,
     buffer_size: usize,
 ) -> std::io::Result<()> {
-    let mut file = tokio_nofollow_options().read(true).open(path).await?;
+    let mut file = nofollow_options().read(true).open_async(path).await?;
     let compression = match compression {
         Some(compression) => compression,
         None => sniff_packages_compression(&mut file).await?,

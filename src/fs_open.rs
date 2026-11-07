@@ -3,9 +3,10 @@
 //! serve path applies.
 //!
 //! The `*nofollow*_options()` helpers are the clippy `disallowed-methods`
-//! blessed construction sites for `OpenOptions`: every open of a path under
-//! the cache directory goes through one of them so a symlink at the final
-//! component is refused.
+//! blessed construction sites for [`NoFollowOptions`]. Its private options
+//! cannot be extracted or have their `custom_flags` overwritten, so both
+//! [`NoFollowOptions::open`] and [`NoFollowOptions::open_async`] always refuse
+//! a symlink at the final component.
 
 use std::path::Path;
 
@@ -15,22 +16,79 @@ use crate::transfer_error::CacheError;
 use crate::volatile_metrics::Renewal;
 use crate::{error::ErrorReport, log_once::Logged, metrics, warn_once_or_debug};
 
-/// [`std::fs::OpenOptions`] with `O_NOFOLLOW` pre-set: every open of a path
-/// under the cache directory must refuse a symlink at the final component.
-/// Callers chain the remaining flags on the returned options.
-///
-/// `custom_flags` overwrites rather than ORs, so callers must NOT call
-/// `.custom_flags()` again on the returned options.
-pub(crate) fn nofollow_options() -> std::fs::OpenOptions {
-    use std::os::unix::fs::OpenOptionsExt as _;
+/// File options whose `O_NOFOLLOW` flag cannot be cleared by a caller.
+/// Deliberately exposes neither `custom_flags`, `Deref` nor a conversion to
+/// raw options: adding an unrelated flag must not silently allow symlinks.
+#[derive(Debug)]
+pub(crate) struct NoFollowOptions(std::fs::OpenOptions);
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "single blessed construction site"
-    )]
-    let mut options = std::fs::OpenOptions::new();
-    options.custom_flags(nix::libc::O_NOFOLLOW);
-    options
+impl NoFollowOptions {
+    fn new(flags: nix::libc::c_int) -> Self {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "single blessed construction site"
+        )]
+        let mut options = std::fs::OpenOptions::new();
+        options.custom_flags(nix::libc::O_NOFOLLOW | flags);
+        Self(options)
+    }
+
+    pub(crate) fn read(&mut self, read: bool) -> &mut Self {
+        self.0.read(read);
+        self
+    }
+
+    pub(crate) fn write(&mut self, write: bool) -> &mut Self {
+        self.0.write(write);
+        self
+    }
+
+    pub(crate) fn append(&mut self, append: bool) -> &mut Self {
+        self.0.append(append);
+        self
+    }
+
+    pub(crate) fn truncate(&mut self, truncate: bool) -> &mut Self {
+        self.0.truncate(truncate);
+        self
+    }
+
+    pub(crate) fn create(&mut self, create: bool) -> &mut Self {
+        self.0.create(create);
+        self
+    }
+
+    pub(crate) fn create_new(&mut self, create_new: bool) -> &mut Self {
+        self.0.create_new(create_new);
+        self
+    }
+
+    pub(crate) fn mode(&mut self, mode: u32) -> &mut Self {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        self.0.mode(mode);
+        self
+    }
+
+    pub(crate) fn open(&self, path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
+        self.0.open(path)
+    }
+
+    pub(crate) async fn open_async(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> std::io::Result<tokio::fs::File> {
+        tokio::fs::OpenOptions::from(self.0.clone())
+            .open(path)
+            .await
+    }
+}
+
+/// Options for cache-path opens, with `O_NOFOLLOW` enforced by the type.
+pub(crate) fn nofollow_options() -> NoFollowOptions {
+    NoFollowOptions::new(0)
 }
 
 /// [`nofollow_options`] plus `O_NONBLOCK`, for opening a cache path that may
@@ -42,16 +100,8 @@ pub(crate) fn nofollow_options() -> std::fs::OpenOptions {
 /// files, so the expected case is unaffected and the caller can reject anything
 /// else after `fstat`. Use this instead of pre-stat'ing the path: an lstat only
 /// narrows the race, it does not close it.
-pub(crate) fn nofollow_nonblock_options() -> std::fs::OpenOptions {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "single blessed construction site"
-    )]
-    let mut options = std::fs::OpenOptions::new();
-    options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-    options
+pub(crate) fn nofollow_nonblock_options() -> NoFollowOptions {
+    NoFollowOptions::new(nix::libc::O_NONBLOCK)
 }
 
 /// Open a cache file for reading on the calling thread, for a cache hit.
@@ -70,12 +120,6 @@ pub(crate) fn open_cached_file_inline(path: &Path) -> std::io::Result<tokio::fs:
         .read(true)
         .open(path)
         .map(tokio::fs::File::from_std)
-}
-
-/// [`nofollow_options`] over [`tokio::fs::OpenOptions`], with the same
-/// `custom_flags` caveat.
-pub(crate) fn tokio_nofollow_options() -> tokio::fs::OpenOptions {
-    nofollow_options().into()
 }
 
 /// Whether a failed syscall on a cache path failed because something other
@@ -365,13 +409,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tokio_nofollow_options_refuses_a_symlink_with_eloop() {
+    async fn async_nofollow_options_refuse_a_symlink_with_eloop() {
         let dir = tempfile::tempdir().expect("tempdir");
         let link = planted_symlink(dir.path());
 
-        let err = tokio_nofollow_options()
+        let err = nofollow_options()
             .read(true)
-            .open(&link)
+            .open_async(&link)
             .await
             .expect_err("O_NOFOLLOW must refuse a symlink at the final component");
         assert_eq!(
@@ -528,15 +572,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("fifo");
         nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
-        // Through the blessed constructor, so `disallowed_methods` stays
-        // clean; `custom_flags` overwrites, so O_NOFOLLOW is re-ORed in.
         // O_RDWR|O_NONBLOCK is the one FIFO open that never blocks on a
         // missing peer.
-        let file = tokio_nofollow_options()
+        let file = nofollow_nonblock_options()
             .read(true)
             .write(true)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-            .open(&path)
+            .open_async(&path)
             .await
             .expect("open fifo");
         let before = metrics::CACHE_NON_REGULAR.get();
