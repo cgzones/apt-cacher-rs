@@ -2868,7 +2868,6 @@ async fn pre_process_client_request(
 
         let (requested_host, requested_port) = match preflight_target(
             req.uri(),
-            req.version() == http::Version::HTTP_11,
             || req.headers().get(HOST).map(HeaderValue::as_bytes),
             &client,
             &acls,

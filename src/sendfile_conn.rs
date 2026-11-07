@@ -1076,7 +1076,6 @@ async fn try_sendfile_request(
 
     let (requested_host, requested_port) = match preflight_target(
         &uri,
-        *conn_version == ConnectionVersion::Http11,
         || {
             req.headers
                 .iter()

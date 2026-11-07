@@ -2,14 +2,14 @@
 //! hyper backend in `hyper_conn.rs` and the sendfile backend in
 //! `sendfile_conn.rs`.
 //!
-//! The pre-flight ([`preflight_method`] + [`preflight_target`]) is the
-//! backend-independent part of "is this a request we serve at all": method
-//! gate, URI scheme and target-form gates, the HTTP/1.1 `Host` requirement,
-//! the proxy-client ACL (for `CONNECT` and absolute-form `GET` alike), the
-//! web-interface ACL and `Host` name gate, and the port sanity check.  Both functions are pure over their
-//! parameters (no `global_config()`); the backends feed them the
-//! already-parsed request line and map the shared [`RejectReason`] onto their
-//! response type.  The host allowlist stays in
+//! The pre-flight ([`preflight_headers`], [`preflight_method`] and
+//! [`preflight_target`]) is the backend-independent part of "is this a
+//! request we serve at all": framing and HTTP/1.1 `Host` requirements, method
+//! gate, URI scheme and target-form gates, the proxy-client ACL (for
+//! `CONNECT` and absolute-form `GET` alike), the web-interface ACL and `Host`
+//! name gate, and the port sanity check. These gates take explicit parameters
+//! (no `global_config()`); the backends feed them the parsed headers and
+//! request line and map refusals onto their response type. The host allowlist stays in
 //! `permitted_host_cache::authorize_cache_access`, which the backends call on
 //! the returned [`RequestTarget::Proxy`] host.
 //!
@@ -41,7 +41,7 @@
 use std::{cell::LazyCell, num::NonZero};
 
 use http::{StatusCode, uri::Uri};
-use tracing::{debug, trace};
+use tracing::trace;
 
 use crate::{
     build_info::APP_VIA_PSEUDONYM,
@@ -84,8 +84,6 @@ pub(crate) enum RejectReason {
     /// Absolute-form `GET` with a scheme other than `http` (HTTPS goes
     /// through `CONNECT`).
     UnsupportedScheme,
-    /// HTTP/1.1 origin-form request without a `Host` header (RFC 9112 §3.2).
-    MissingHost,
     /// Origin-form (web-interface) request from a client outside
     /// `allowed_webif_clients`.
     UnauthorizedWebUi,
@@ -136,7 +134,6 @@ impl RejectReason {
             | Self::UnknownMethod
             | Self::UnauthorizedClient
             | Self::UnsupportedScheme
-            | Self::MissingHost
             | Self::UnauthorizedWebUi
             | Self::MisdirectedWebUi
             | Self::InvalidPort
@@ -158,7 +155,6 @@ impl RejectReason {
                 (StatusCode::FORBIDDEN, "Unauthorized client")
             }
             Self::UnsupportedScheme => (StatusCode::BAD_REQUEST, "Unsupported URI scheme"),
-            Self::MissingHost => (StatusCode::BAD_REQUEST, "Missing Host header"),
             Self::MisdirectedWebUi => (StatusCode::MISDIRECTED_REQUEST, "Misdirected request"),
             Self::InvalidPort => (StatusCode::BAD_REQUEST, "Invalid port"),
             Self::InvalidTarget => (StatusCode::BAD_REQUEST, "Invalid request target"),
@@ -380,10 +376,11 @@ pub(crate) enum RequestTarget<'a> {
 }
 
 /// Target gate shared by both backends for a `GET`: scheme check, the
-/// absolute-path requirement, the HTTP/1.1 `Host` requirement, web-interface
-/// ACL and `Host` name gate for origin-form requests, and the proxy-client
-/// ACL and then the port sanity check for absolute-form ones (a refused
-/// client gets its 403 whatever port it named).
+/// absolute-path requirement, web-interface ACL and `Host` name gate for
+/// origin-form requests, and the proxy-client ACL and then the port sanity
+/// check for absolute-form ones (a refused client gets its 403 whatever port
+/// it named). [`preflight_headers`] has already checked protocol framing,
+/// including the HTTP/1.1 `Host` requirement.
 ///
 /// `host_header` yields the raw value of the request's `Host` header, if
 /// any.  It is only consulted for origin-form requests, so the sendfile
@@ -391,7 +388,6 @@ pub(crate) enum RequestTarget<'a> {
 /// bumps metrics for every rejection.
 pub(crate) fn preflight_target<'a, 'h>(
     uri: &'a Uri,
-    is_http11: bool,
     host_header: impl FnOnce() -> Option<&'h [u8]>,
     client: &ClientInfo,
     acls: &ClientAcls<'_>,
@@ -417,14 +413,7 @@ pub(crate) fn preflight_target<'a, 'h>(
     }
 
     let Some(authority) = uri.authority() else {
-        // RFC 9112 §3.2: A server MUST respond with a 400 (Bad Request) status
-        // code to any HTTP/1.1 request message that lacks a Host header field.
-        // HTTP/1.0 did not require Host, so only enforce for 1.1.
         let host = host_header();
-        if is_http11 && host.is_none() {
-            debug!("Missing Host header from HTTP/1.1 request from client {client}");
-            return Err(RejectReason::MissingHost);
-        }
 
         // No authority means it's a direct request to the local web interface.
         if !client_permitted(acls.webif_clients, client) {
@@ -968,34 +957,29 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(
-            preflight_target(&uri, true, || LOCALHOST, &local_client(), &OPEN_ACLS).unwrap_err(),
+            preflight_target(&uri, || LOCALHOST, &local_client(), &OPEN_ACLS).unwrap_err(),
             RejectReason::UnsupportedScheme
         );
     }
 
     #[test]
-    fn preflight_target_origin_form_requires_host_on_http11_only() {
-        let uri: Uri = "/".parse().unwrap();
+    fn preflight_headers_require_host_on_http11_only() {
         assert_eq!(
-            preflight_target(&uri, true, || None, &local_client(), &OPEN_ACLS).unwrap_err(),
-            RejectReason::MissingHost
+            preflight_headers(true, std::iter::empty()),
+            Err("Missing Host header")
         );
-        assert!(matches!(
-            preflight_target(&uri, true, || LOCALHOST, &local_client(), &OPEN_ACLS),
-            Ok(RequestTarget::WebUi)
-        ));
-        assert!(matches!(
-            preflight_target(&uri, false, || None, &local_client(), &OPEN_ACLS),
-            Ok(RequestTarget::WebUi)
-        ));
+        assert_eq!(
+            preflight_headers(true, [("Host", b"localhost".as_slice())].into_iter()),
+            Ok(())
+        );
+        assert_eq!(preflight_headers(false, std::iter::empty()), Ok(()));
     }
 
     #[test]
     fn preflight_target_origin_form_enforces_webif_acl() {
         let uri: Uri = "/".parse().unwrap();
         assert_eq!(
-            preflight_target(&uri, true, || LOCALHOST, &local_client(), &OTHER_HOST_ACLS)
-                .unwrap_err(),
+            preflight_target(&uri, || LOCALHOST, &local_client(), &OTHER_HOST_ACLS).unwrap_err(),
             RejectReason::UnauthorizedWebUi
         );
         // The proxy-client ACL is not consulted for the web interface once a
@@ -1006,7 +990,7 @@ mod tests {
             webif_hosts: &WebifHosts::NONE,
         };
         assert!(matches!(
-            preflight_target(&uri, true, || LOCALHOST, &local_client(), &webif_only),
+            preflight_target(&uri, || LOCALHOST, &local_client(), &webif_only),
             Ok(RequestTarget::WebUi)
         ));
     }
@@ -1017,23 +1001,24 @@ mod tests {
     #[test]
     fn preflight_target_origin_form_refuses_unrecognized_host() {
         let uri: Uri = "/logs".parse().unwrap();
-        for is_http11 in [true, false] {
-            assert_eq!(
-                preflight_target(
-                    &uri,
-                    is_http11,
-                    || Some(b"rebind.attacker.example:3142".as_slice()),
-                    &local_client(),
-                    &OPEN_ACLS
-                )
-                .unwrap_err(),
-                RejectReason::MisdirectedWebUi
-            );
-        }
+        assert_eq!(
+            preflight_target(
+                &uri,
+                || Some(b"rebind.attacker.example:3142".as_slice()),
+                &local_client(),
+                &OPEN_ACLS
+            )
+            .unwrap_err(),
+            RejectReason::MisdirectedWebUi
+        );
+        // HTTP/1.0 can pass the header gate without a Host field.
+        assert!(matches!(
+            preflight_target(&uri, || None, &local_client(), &OPEN_ACLS),
+            Ok(RequestTarget::WebUi)
+        ));
         assert!(matches!(
             preflight_target(
                 &uri,
-                true,
                 || Some(b"127.0.0.1:3142".as_slice()),
                 &local_client(),
                 &OPEN_ACLS
@@ -1044,7 +1029,6 @@ mod tests {
         assert_eq!(
             preflight_target(
                 &uri,
-                true,
                 || Some(b"attacker.example".as_slice()),
                 &local_client(),
                 &OTHER_HOST_ACLS
@@ -1059,7 +1043,6 @@ mod tests {
         assert!(matches!(
             preflight_target(
                 &uri,
-                true,
                 || Some(b"attacker.example".as_slice()),
                 &local_client(),
                 &OPEN_ACLS
@@ -1091,16 +1074,14 @@ mod tests {
         let uri: Uri = "http://deb.example.com/debian/dists/sid/Release"
             .parse()
             .unwrap();
-        let (host, port) =
-            expect_proxy(&preflight_target(&uri, true, || None, &client, &OPEN_ACLS));
+        let (host, port) = expect_proxy(&preflight_target(&uri, || None, &client, &OPEN_ACLS));
         assert_eq!(host, "deb.example.com");
         assert_eq!(port, None);
 
         let uri: Uri = "http://deb.example.com:8080/debian/dists/sid/Release"
             .parse()
             .unwrap();
-        let (host, port) =
-            expect_proxy(&preflight_target(&uri, true, || None, &client, &OPEN_ACLS));
+        let (host, port) = expect_proxy(&preflight_target(&uri, || None, &client, &OPEN_ACLS));
         assert_eq!(host, "deb.example.com");
         assert_eq!(port, NonZero::new(8080));
 
@@ -1116,34 +1097,33 @@ mod tests {
             ),
         ] {
             let uri: Uri = target.parse().unwrap();
-            let (host, port) =
-                expect_proxy(&preflight_target(&uri, true, || None, &client, &OPEN_ACLS));
+            let (host, port) = expect_proxy(&preflight_target(&uri, || None, &client, &OPEN_ACLS));
             assert_eq!(host, expected_host, "{target}");
             assert_eq!(port, None, "{target}");
         }
         let uri: Uri = "http://deb.example.com:443/debian/dists/sid/Release"
             .parse()
             .unwrap();
-        let (_, port) = expect_proxy(&preflight_target(&uri, true, || None, &client, &OPEN_ACLS));
+        let (_, port) = expect_proxy(&preflight_target(&uri, || None, &client, &OPEN_ACLS));
         assert_eq!(port, NonZero::new(443), "only the http default folds");
 
         let uri: Uri = "http://deb.example.com:8080/debian/dists/sid/Release"
             .parse()
             .unwrap();
 
-        // Absolute-form requests need no Host header even on HTTP/1.1, and
-        // the web-interface ACL does not apply to them; the proxy-client
-        // ACL does.
+        // The target gate does not inspect Host on absolute-form requests;
+        // the header gate has already enforced its presence for HTTP/1.1.
+        // The proxy-client ACL applies here, not the web-interface ACL.
         let proxy_only = ClientAcls {
             proxy_clients: OPEN_ACLS.proxy_clients,
             ..OTHER_HOST_ACLS
         };
         assert!(matches!(
-            preflight_target(&uri, true, || None, &client, &proxy_only),
+            preflight_target(&uri, || None, &client, &proxy_only),
             Ok(RequestTarget::Proxy { .. })
         ));
         assert_eq!(
-            preflight_target(&uri, true, || None, &client, &OTHER_HOST_ACLS).unwrap_err(),
+            preflight_target(&uri, || None, &client, &OTHER_HOST_ACLS).unwrap_err(),
             RejectReason::UnauthorizedClient
         );
     }
@@ -1158,8 +1138,7 @@ mod tests {
                 .parse()
                 .expect("authority syntax");
             assert_eq!(
-                preflight_target(&uri, true, || None, &local_client(), &OTHER_HOST_ACLS)
-                    .unwrap_err(),
+                preflight_target(&uri, || None, &local_client(), &OTHER_HOST_ACLS).unwrap_err(),
                 RejectReason::UnauthorizedClient,
                 "{uri}"
             );
@@ -1179,8 +1158,7 @@ mod tests {
         ] {
             let uri: Uri = target.parse().unwrap();
             assert_eq!(
-                preflight_target(&uri, true, || LOCALHOST, &local_client(), &OPEN_ACLS)
-                    .unwrap_err(),
+                preflight_target(&uri, || LOCALHOST, &local_client(), &OPEN_ACLS).unwrap_err(),
                 RejectReason::InvalidTarget,
                 "{target}"
             );
@@ -1188,7 +1166,7 @@ mod tests {
         // An absolute-form target without a path still names the root.
         let uri: Uri = "http://deb.example.com".parse().unwrap();
         assert!(matches!(
-            preflight_target(&uri, true, || None, &local_client(), &OPEN_ACLS),
+            preflight_target(&uri, || None, &local_client(), &OPEN_ACLS),
             Ok(RequestTarget::Proxy { .. })
         ));
     }
@@ -1201,7 +1179,7 @@ mod tests {
                     .parse()
                     .expect("authority syntax");
                 assert_eq!(
-                    preflight_target(&uri, true, || None, &local_client(), &OPEN_ACLS).unwrap_err(),
+                    preflight_target(&uri, || None, &local_client(), &OPEN_ACLS).unwrap_err(),
                     RejectReason::InvalidPort,
                     "{uri}"
                 );
@@ -1230,10 +1208,6 @@ mod tests {
         assert_eq!(
             RejectReason::UnsupportedScheme.response_parts(),
             (StatusCode::BAD_REQUEST, "Unsupported URI scheme")
-        );
-        assert_eq!(
-            RejectReason::MissingHost.response_parts(),
-            (StatusCode::BAD_REQUEST, "Missing Host header")
         );
         assert_eq!(
             RejectReason::MisdirectedWebUi.response_parts(),
