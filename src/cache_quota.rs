@@ -1854,7 +1854,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admission_samples_the_cache_filesystem() {
+    async fn admission_refreshes_only_for_normal_downloads() {
         let dir = tempfile::tempdir().expect("tempdir");
         // More free space than any filesystem has.
         let quota = CacheQuota::with_disk_headroom(
@@ -1865,6 +1865,17 @@ mod tests {
                 NonZero::new(u64::MAX / 2).expect("non-zero"),
             )),
         );
+        let cleanup = quota
+            .acquire(&ClientInfo::new_cleanup(), exact(1), 0, None, "Packages.xz")
+            .await
+            .expect("cleanup bypasses the floor");
+        assert!(
+            quota.inner.accounting.lock().disk.is_none(),
+            "cleanup does not sample free space"
+        );
+        assert_eq!(quota.current_size(), b(1), "cleanup stays accounted");
+        drop(cleanup);
+
         assert!(
             quota
                 .acquire(&local_client(), exact(1), 0, None, "tiny")
