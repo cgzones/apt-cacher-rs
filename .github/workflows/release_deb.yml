@@ -15,12 +15,28 @@ jobs:
 
     name: Generate Debian Package
     runs-on: ubuntu-latest
+    # Build on the oldest supported release: cargo-deb derives the package's
+    # library dependencies (`$auto`) from the build system.  Built on the
+    # runner's Ubuntu, the package depends on the t64-renamed `libssl3t64`,
+    # which Debian 12 lacks, and may pick up newer glibc symbol versions.
+    # Built here it depends on `libssl3`, which the t64 releases provide.
+    container: docker.io/library/debian:bookworm
+
+    defaults:
+      run:
+        shell: bash
 
     env:
       RUSTFLAGS: "-D warnings"
       SQLX_OFFLINE: true
 
     steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git libssl-dev lintian pkg-config
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -64,8 +80,6 @@ jobs:
 
       - name: Run lintian
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends lintian
           lintian --display-experimental --info --display-info --pedantic \
                   --tag-display-limit 0 --color auto target/debian/*.deb
 
@@ -77,8 +91,44 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  release:
+  # Install the package on every supported release and start the binary:
+  # dpkg resolves the dependencies and the dynamic loader the symbol
+  # versions, which lintian checks neither of.
+  install-test:
     needs: build-deb
+    permissions: {}
+
+    name: Install on ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    container: docker.io/library/${{ matrix.image }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - debian:bookworm
+          - debian:trixie
+          - ubuntu:noble
+
+    steps:
+      - name: Download package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: debian-package
+          path: dist
+
+      - name: Install package
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y ./dist/*.deb
+
+      - name: Run binary
+        run: apt-cacher-rs --version
+
+  release:
+    needs: install-test
     permissions:
       contents: write
 
