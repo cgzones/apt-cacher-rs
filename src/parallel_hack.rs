@@ -104,8 +104,6 @@ pub(crate) fn log_nudge(conn_details: &ConnectionDetails, config: &Config, prefi
 
 #[cfg(test)]
 mod tests {
-    use http::StatusCode;
-
     use super::*;
     use crate::nonzero;
 
@@ -295,33 +293,5 @@ mod tests {
                 "curr_downloads must not be called at or below the size threshold"
             );
         }
-    }
-
-    #[test]
-    fn nudge_head_carries_the_configured_status_and_retry_after() {
-        let mut config = enabled_config();
-        config.experimental_parallel_hack_statuscode = StatusCode::SERVICE_UNAVAILABLE;
-        config.experimental_parallel_hack_retryafter = 17;
-        let head = nudge_head(&config);
-        #[cfg(feature = "hyper")]
-        {
-            let response = head.into_hyper(());
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(response.headers()["retry-after"], "17");
-            assert_eq!(response.headers()["content-length"], "20");
-            assert!(!response.headers().contains_key("server"));
-        }
-        #[cfg(not(feature = "hyper"))]
-        {
-            let rendered = head.render(
-                crate::http_helpers::ConnectionVersion::Http11,
-                crate::http_helpers::ConnectionAction::KeepAlive,
-            );
-            assert!(rendered.starts_with("HTTP/1.1 503"));
-            assert!(rendered.contains("Retry-After: 17\r\n"));
-            assert!(rendered.contains("Content-Length: 20\r\n"));
-            assert!(!rendered.contains("Server:"));
-        }
-        assert_eq!(NUDGE_BODY.len(), 20, "the pinned body length");
     }
 }

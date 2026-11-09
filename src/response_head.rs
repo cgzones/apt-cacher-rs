@@ -532,18 +532,44 @@ impl ResponseHead<'_> {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::parallel_hack::NUDGE_BODY;
+    use crate::parallel_hack::{NUDGE_BODY, nudge_head};
     use crate::{
         http_etag::ETag, http_last_modified::LastModified, xattr_helpers::XattrValue as _,
     };
 
     /// A config with the parallel-download hack on its defaults (`429`,
-    /// `Retry-After: 5`), for the two nudge-head renderer tests.
+    /// `Retry-After: 5`), for the nudge-head renderer tests.
     #[cfg(any(feature = "hyper", feature = "sendfile"))]
     fn nudge_config() -> Config {
         let mut config = Config::default();
         config.experimental_parallel_hack_enabled = true;
         config
+    }
+
+    #[cfg(any(feature = "hyper", feature = "sendfile"))]
+    #[test]
+    fn nudge_head_carries_the_configured_status_and_retry_after() {
+        let mut config = nudge_config();
+        config.experimental_parallel_hack_statuscode = StatusCode::SERVICE_UNAVAILABLE;
+        config.experimental_parallel_hack_retryafter = 17;
+        let head = nudge_head(&config);
+        #[cfg(feature = "hyper")]
+        {
+            let response = head.into_hyper(());
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()["retry-after"], "17");
+            assert_eq!(response.headers()["content-length"], "20");
+            assert!(!response.headers().contains_key("server"));
+        }
+        #[cfg(not(feature = "hyper"))]
+        {
+            let rendered = head.render(ConnectionVersion::Http11, ConnectionAction::KeepAlive);
+            assert!(rendered.starts_with("HTTP/1.1 503"));
+            assert!(rendered.contains("Retry-After: 17\r\n"));
+            assert!(rendered.contains("Content-Length: 20\r\n"));
+            assert!(!rendered.contains("Server:"));
+        }
+        assert_eq!(NUDGE_BODY.len(), 20, "the pinned body length");
     }
 
     #[cfg(feature = "hyper")]
@@ -698,8 +724,8 @@ mod tests {
         /// body's size hint.
         #[test]
         fn parallel_hack_nudge_head_is_pinned() {
-            let response = crate::parallel_hack::nudge_head(&nudge_config())
-                .into_hyper(crate::proxy_body::full_body(NUDGE_BODY));
+            let response =
+                nudge_head(&nudge_config()).into_hyper(crate::proxy_body::full_body(NUDGE_BODY));
             let headers = response.headers();
             assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
             assert_eq!(headers.get(RETRY_AFTER).unwrap(), "5");
@@ -874,7 +900,7 @@ mod tests {
         /// the sendfile/splice backends write these plus the inline body.
         #[test]
         fn parallel_hack_nudge_head_is_pinned() {
-            let wire = render(&crate::parallel_hack::nudge_head(&nudge_config()));
+            let wire = render(&nudge_head(&nudge_config()));
             assert!(
                 wire.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
                 "{wire}"
