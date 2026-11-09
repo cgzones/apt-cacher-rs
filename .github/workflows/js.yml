@@ -31,10 +31,21 @@ jobs:
           done
 
       # The browser runs the files as one script, joined in the order
-      # src/web/assets.rs lists them: check that bundle too.
+      # src/web/assets.rs lists them: check that bundle too.  The extraction
+      # must find every file: if it stops matching assets.rs, node would
+      # happily accept an empty or truncated bundle.
       - name: node --check (bundle)
+        shell: bash
         run: |
-          sed -n '/static SCRIPT/,/^);/p' src/web/assets.rs \
-            | grep -o 'assets/js/[a-z]*\.js' \
-            | sed 's|^|src/web/|' | xargs cat > "$RUNNER_TEMP/app.js"
+          mapfile -t files < <(
+            sed -n '/static SCRIPT/,/^);/p' src/web/assets.rs \
+              | grep -o 'assets/js/[a-z]*\.js' \
+              | sed 's|^|src/web/|'
+          )
+          all=(src/web/assets/js/*.js)
+          if [ "${#files[@]}" -ne "${#all[@]}" ]; then
+            echo "::error::bundle lists ${#files[@]} of ${#all[@]} files in src/web/assets/js" >&2
+            exit 1
+          fi
+          cat -- "${files[@]}" > "$RUNNER_TEMP/app.js"
           node --check "$RUNNER_TEMP/app.js"
