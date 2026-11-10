@@ -46,7 +46,8 @@ use crate::rate_checker::RateChecker;
 use crate::sendfile_conn::write_all_to_stream_rated;
 use crate::transfer_error::{ClientError, DeliveryFailure, UpstreamError};
 use crate::upstream_head::{
-    BodyFraming, RejectReason, UpstreamHead, resolve_body_framing, well_formed_etag,
+    BodyFraming, RejectReason, UpstreamHead, is_followed_redirect, resolve_body_framing,
+    well_formed_etag,
 };
 use crate::{
     build_info::{APP_USER_AGENT, APP_VIA},
@@ -453,17 +454,9 @@ impl UpstreamResponse {
         Ok(())
     }
 
-    /// A 3xx the drive follows (301/302/307/308) when the `Location` target
-    /// is allowed; the other redirects (303, 304 as a status, 300) are
-    /// relayed as-is.
+    /// A 3xx the drive follows when the `Location` target is allowed.
     pub(super) fn is_redirect(&self) -> bool {
-        matches!(
-            self.status_code,
-            StatusCode::MOVED_PERMANENTLY
-                | StatusCode::FOUND
-                | StatusCode::TEMPORARY_REDIRECT
-                | StatusCode::PERMANENT_REDIRECT
-        )
+        is_followed_redirect(self.status_code)
     }
 
     /// The body's fixed length, only when the response is length-delimited

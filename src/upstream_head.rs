@@ -104,6 +104,19 @@ pub(crate) struct UpstreamHead<'a> {
     pub(crate) etag: Option<&'a str>,
 }
 
+/// The redirects a fetch follows (301/302/307/308) when the `Location` target
+/// is allowed; any other 3xx (303, 300, a stray 304) is relayed as-is.
+#[must_use]
+pub(crate) const fn is_followed_redirect(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    )
+}
+
 /// The `ETag` value an [`UpstreamHead`] constructor may carry: the one
 /// filter both backends' constructors apply, so a malformed tag is absent to
 /// the table in either -- splice discards it before planning, hyper only

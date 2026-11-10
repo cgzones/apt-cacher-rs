@@ -99,7 +99,8 @@ use crate::{
     transfer_error::{CacheError, DeliveryFailure, DownloadFailure, InternalError, UpstreamError},
     upstream_head::{
         BodyFraming, ContentLength, DownloadPlan, FetchMode, RejectGates, RelayedHeaders,
-        ResumeGates, UpstreamHead, plan_download, plan_fresh_download, resolve_body_framing,
+        ResumeGates, UpstreamHead, is_followed_redirect, plan_download, plan_fresh_download,
+        resolve_body_framing,
     },
     upstream_retry::{self, RetryStop},
     uri_authority, verify_throttle,
@@ -1680,7 +1681,9 @@ async fn download_file(
     send_db_command(cmd).await;
 }
 
-/// Parse a redirect response's `Location` into a URI.
+/// The `Location` of a redirect this proxy follows
+/// ([`is_followed_redirect`]), parsed into a URI; `None` for any other
+/// response.
 ///
 /// The other reasons a redirect is not followed (relative target, unsupported
 /// scheme, host not permitted) are named by [`redirect_permitted`]; a
@@ -1688,12 +1691,15 @@ async fn download_file(
 /// leave nothing but a bare "failed with code 302" further down. `source` and
 /// `what` only name the mirror and resource for the log line.
 #[must_use]
-fn parse_redirect_location<B>(
+fn followed_redirect_location<B>(
     response: &Response<B>,
     source: &(impl fmt::Display + ?Sized),
     what: &str,
 ) -> Option<Uri> {
     let status = response.status();
+    if !is_followed_redirect(status) {
+        return None;
+    }
     let Some(location) = response.headers().get(LOCATION) else {
         warn_once_or_debug!(
             "Upstream mirror {source} answered {status} for {what} without a Location header; forwarding the response to the client"
@@ -2062,14 +2068,8 @@ async fn serve_new_file_worker(
 
     trace!("Forwarded response: {fwd_response:?}");
 
-    if matches!(
-        fwd_response.status(),
-        StatusCode::MOVED_PERMANENTLY
-            | StatusCode::FOUND
-            | StatusCode::TEMPORARY_REDIRECT
-            | StatusCode::PERMANENT_REDIRECT
-    ) && let Some(moved_uri) =
-        parse_redirect_location(&fwd_response, &conn_details.mirror, &conn_details.debname)
+    if let Some(moved_uri) =
+        followed_redirect_location(&fwd_response, &conn_details.mirror, &conn_details.debname)
     {
         debug!("Requested URI: {}, Moved URI: {moved_uri:?}", req.uri());
 
@@ -2951,12 +2951,12 @@ async fn pre_process_client_request(
 
     trace!("Forwarded request: {fwd_request:?}");
 
-    let fwd_request_sent = PreciseInstant::now();
+    let mut fwd_request_sent = PreciseInstant::now();
     // The returned parts serve the origin extraction and the rare
     // redirect-follow below — no up-front HeaderMap clone per request.
     // A passthrough records no time to first byte (`mirror_perf`).
     let UpstreamExchange {
-        response: fwd_response,
+        response: mut fwd_response,
         request_parts: mut parts,
         ..
     } = match request_with_retry(&appstate.https_client, fwd_request, Traffic::Proxied).await {
@@ -2981,13 +2981,7 @@ async fn pre_process_client_request(
         send_db_command(cmd).await;
     }
 
-    if matches!(
-        fwd_response.status(),
-        StatusCode::MOVED_PERMANENTLY
-            | StatusCode::FOUND
-            | StatusCode::TEMPORARY_REDIRECT
-            | StatusCode::PERMANENT_REDIRECT
-    ) && let Some(moved_uri) = parse_redirect_location(
+    if let Some(moved_uri) = followed_redirect_location(
         &fwd_response,
         &requested_host.format_authority(requested_port),
         parts.uri.path(),
@@ -3005,8 +2999,8 @@ async fn pre_process_client_request(
 
             trace!("Redirected request: {redirected_request:?}");
 
-            let redirected_request_sent = PreciseInstant::now();
-            let redirected_response = match request_with_retry(
+            fwd_request_sent = PreciseInstant::now();
+            fwd_response = match request_with_retry(
                 &appstate.https_client,
                 redirected_request,
                 Traffic::Proxied,
@@ -3017,19 +3011,7 @@ async fn pre_process_client_request(
                 Err(err) => return upstream_error_response(err),
             };
 
-            trace!("Redirected response: {redirected_response:?}");
-
-            return passthrough_response(
-                redirected_response,
-                Subject::Passthrough {
-                    host: requested_host.format_authority(requested_port).into_owned(),
-                    path: request_path,
-                    client,
-                    request_received_at: passthrough_request_received_at,
-                    request_sent: redirected_request_sent,
-                    relay_slot,
-                },
-            );
+            trace!("Redirected response: {fwd_response:?}");
         }
     }
 
@@ -3606,7 +3588,7 @@ mod tests {
                     .body(())
                     .expect("redirect response");
                 assert!(
-                    super::parse_redirect_location(&response, "mirror.example", "package.deb")
+                    super::followed_redirect_location(&response, "mirror.example", "package.deb")
                         .is_none(),
                     "{target}"
                 );
@@ -3618,7 +3600,7 @@ mod tests {
             .header(http::header::LOCATION, "http://[0:0::1]:00080/package.deb")
             .body(())
             .expect("redirect response");
-        let target = super::parse_redirect_location(&response, "mirror.example", "package.deb")
+        let target = super::followed_redirect_location(&response, "mirror.example", "package.deb")
             .expect("valid redirect port");
         assert_eq!(host_header_from_uri(&target), "[::1]");
     }
