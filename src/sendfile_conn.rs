@@ -1285,7 +1285,7 @@ async fn try_sendfile_request(
         let outcome = splice_proxy(
             conn,
             &conn_details,
-            uri.path_and_query().map_or(uri_path, |pq| pq.as_str()),
+            path_and_query,
             appstate,
             RangeRequestHeaders::extract(req.headers),
         )

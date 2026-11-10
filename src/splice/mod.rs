@@ -64,7 +64,7 @@ use crate::cache_layout::{CachedFlavor, ConnectionDetails, FetchRole};
 use crate::cache_quota::QuotaExceeded;
 use crate::error::ErrorReport;
 use crate::fs_open::{
-    nofollow_nonblock_options, regular_file_metadata_typed, touch_volatile_mtime_with,
+    open_cached_file_inline, regular_file_metadata_typed, touch_volatile_mtime_with,
 };
 use crate::guards::{Consequence, DownloadBarrier, InitBarrier};
 use crate::http_helpers::{ClientConn, ConnectionAction, WritePhase, write_all_to_stream};
@@ -675,7 +675,7 @@ struct StaleCopy {
 /// with 304 Not Modified if the content hasn't changed. Returns the headers
 /// and the open cached copy; `None` for a permanent file and for a volatile
 /// file that is not in the cache yet.
-async fn read_volatile_validators(
+fn read_volatile_validators(
     conn_details: &ConnectionDetails,
 ) -> Result<Option<(VolatileCondHeaders, StaleCopy)>, DownloadFailure> {
     if conn_details.cached_flavor() != CachedFlavor::Volatile {
@@ -683,11 +683,9 @@ async fn read_volatile_validators(
     }
     let cache_path = conn_details.cache_file_path();
 
-    let file = match nofollow_nonblock_options()
-        .read(true)
-        .open_async(&cache_path)
-        .await
-    {
+    // On the worker, like the lookup that just resolved this path: the
+    // dentry is hot, and a blocking-pool round trip costs more than the open.
+    let file = match open_cached_file_inline(&cache_path) {
         Ok(f) => f,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => {
@@ -1326,7 +1324,7 @@ pub(crate) async fn splice_proxy(
     let (mut ibarrier, (resume, exchange, plan, prev_file_size)) = ibarrier
         .run(async |barrier| {
             let mut resume = open_partial_resume(barrier, conn_details).await?;
-            let (volatile_cond, stale) = read_volatile_validators(conn_details).await?.unzip();
+            let (volatile_cond, stale) = read_volatile_validators(conn_details)?.unzip();
             // The size a download's commit frees by replacing the stale copy,
             // read before the planner takes the copy.
             let prev_file_size = stale.as_ref().map_or(0, |copy| copy.metadata.len());
