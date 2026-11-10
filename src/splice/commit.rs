@@ -458,13 +458,7 @@ impl Committed {
         // The wire body of this transfer, a resumed prefix excluded, as
         // hyper's `download_file` records it. Paced to the client until a
         // demotion, so a lower bound while one is attached.
-        if !conn_details.client.is_cleanup_synthetic() {
-            mirror_perf::record_throughput(
-                &conn_details.mirror,
-                bytes.upstream,
-                rates.body_window(),
-            );
-        }
+        mirror_perf::record_throughput(&conn_details, bytes.upstream, rates.body_window());
         log_splice_completion(&conn_details, conn_label, rates, bytes, &client);
 
         if let CompletionClient::Served(Served { bytes: _, partial }) = client {

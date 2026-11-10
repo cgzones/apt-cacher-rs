@@ -1386,9 +1386,7 @@ pub(crate) async fn splice_proxy(
     // measured (hyper records it at the same point).
     if plan.is_answered() {
         conn_details.record_origin();
-        if !conn_details.client.is_cleanup_synthetic() {
-            mirror_perf::record_ttfb(&conn_details.mirror, head_timing);
-        }
+        mirror_perf::record_ttfb(conn_details, head_timing);
     }
 
     let (total_content_length, body_content_length, resume_offset) = match plan {

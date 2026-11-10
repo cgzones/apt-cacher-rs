@@ -181,8 +181,9 @@ impl CapClock {
     }
 }
 
-/// The coarse monotonic clock every [`CapClock`] span is measured with.
-fn now_ticks() -> u64 {
+/// The coarse monotonic clock every [`CapClock`] span and `mirror_perf`
+/// sample is stamped with.
+pub(crate) fn now_ticks() -> u64 {
     coarsetime::Instant::now().as_ticks()
 }
 

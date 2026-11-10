@@ -39,9 +39,12 @@ use std::time::Duration;
 
 use hashbrown::HashMap;
 
+#[cfg(feature = "splice")]
+use crate::deb_mirror::Mirror;
 use crate::{
-    deb_mirror::Mirror,
+    cache_layout::ConnectionDetails,
     mem_usage::Footprint,
+    metrics::now_ticks,
     mirror_registry::{MAX_MIRRORS, MirrorRegistry, Twin},
     precise_instant::PreciseInstant,
 };
@@ -127,16 +130,16 @@ impl Twin for MirrorPerf {
 
 static PERF: MirrorRegistry<MirrorPerf> = MirrorRegistry::new(MAX_MIRRORS);
 
-fn now_ticks() -> u64 {
-    coarsetime::Instant::now().as_ticks()
-}
-
-/// Record the time to first byte of an answered fetch from `mirror`
-/// (canonical); see the module doc for which fetches count.
-pub(crate) fn record_ttfb(mirror: &Mirror, timing: HeadTiming) {
+/// Record the time to first byte of the answered fetch `details` describes,
+/// under its canonical mirror; see the module doc for which fetches count.
+/// Cleanup's synthetic fetches record nothing.
+pub(crate) fn record_ttfb(details: &ConnectionDetails, timing: HeadTiming) {
+    if details.client.is_cleanup_synthetic() {
+        return;
+    }
     let ttfb = timing.ttfb();
     let at = now_ticks();
-    PERF.update(mirror, |perf| perf.record_ttfb(ttfb, at));
+    PERF.update(&details.mirror, |perf| perf.record_ttfb(ttfb, at));
 }
 
 /// Bytes per second of `wire_bytes` over `window`, `None` below
@@ -150,13 +153,17 @@ fn throughput(wire_bytes: u64, window: Duration) -> Option<u64> {
     Some(u64::try_from(rate).unwrap_or(u64::MAX))
 }
 
-/// Record the throughput of a committed download from `mirror`
-/// (canonical): `wire_bytes` of body received over `window`, from the
-/// parsed head to the last body byte. Small downloads record nothing.
-pub(crate) fn record_throughput(mirror: &Mirror, wire_bytes: u64, window: Duration) {
+/// Record the throughput of the committed download `details` describes,
+/// under its canonical mirror: `wire_bytes` of body received over `window`,
+/// from the parsed head to the last body byte. Small downloads and
+/// cleanup's synthetic fetches record nothing.
+pub(crate) fn record_throughput(details: &ConnectionDetails, wire_bytes: u64, window: Duration) {
+    if details.client.is_cleanup_synthetic() {
+        return;
+    }
     if let Some(rate) = throughput(wire_bytes, window) {
         let at = now_ticks();
-        PERF.update(mirror, |perf| perf.record_rate(rate, at));
+        PERF.update(&details.mirror, |perf| perf.record_rate(rate, at));
     }
 }
 

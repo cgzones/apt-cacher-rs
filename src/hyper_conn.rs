@@ -1612,13 +1612,7 @@ async fn download_file(
     }
     // The body bytes of this transfer, a resumed prefix excluded; splice's
     // commit tail records the same.
-    if !conn_details.client.is_cleanup_synthetic() {
-        mirror_perf::record_throughput(
-            &conn_details.mirror,
-            bytes,
-            t_upstream_done.duration_since(head_at),
-        );
-    }
+    mirror_perf::record_throughput(conn_details, bytes, t_upstream_done.duration_since(head_at));
 
     let elapsed = start.elapsed();
     let in_time = conn_details.request_received_at.elapsed();
@@ -2118,14 +2112,7 @@ async fn serve_new_file_worker(
         partial.fetch_mode(conn_details.cached_flavor(), cached),
         config.max_object_size,
     ) {
-        Ok(plan) => {
-            // Answered by the upstream (fresh body or a 304): this is the
-            // point the request's Origin row is earned.
-            if plan.is_answered() {
-                conn_details.record_origin();
-            }
-            plan
-        }
+        Ok(plan) => plan,
         Err(anomaly) => {
             static GATES: ResumeGates = ResumeGates::new();
             GATES.log(
@@ -2173,10 +2160,12 @@ async fn serve_new_file_worker(
         }
     };
     revalidation.responded(head.status);
-    // The final exchange answered with a body or a 304: its time to first
-    // byte is the mirror's (splice records it at the same point).
-    if plan.is_answered() && !conn_details.client.is_cleanup_synthetic() {
-        mirror_perf::record_ttfb(&conn_details.mirror, head_timing);
+    // The final exchange answered with a body or a 304: this is the point
+    // the request's Origin row is earned, and its time to first byte is the
+    // mirror's (splice records both at the same point).
+    if plan.is_answered() {
+        conn_details.record_origin();
+        mirror_perf::record_ttfb(conn_details, head_timing);
     }
 
     // Validate before dispatch so a 304 update follows the same rules as a fresh body.
