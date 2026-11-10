@@ -948,17 +948,11 @@ fn passthrough_response(
 
 #[must_use]
 #[expect(
-    clippy::unused_async,
-    reason = "regular_file_metadata went synchronous; the sole caller awaits \
-              this in an async match arm alongside other async branches, so \
-              staying async keeps the call site uniform"
-)]
-#[expect(
     clippy::too_many_arguments,
     reason = "the fields of one Serveable::InProgress plus the request context; \
               a carrier struct would only rename them"
 )]
-async fn serve_unfinished_file(
+fn serve_unfinished_file(
     conn_details: ConnectionDetails,
     mut file: tokio::fs::File,
     file_path: PathBuf,
@@ -1122,7 +1116,6 @@ async fn serve_cached_file(
         conn_details.debname, conn_details.mirror, aliased, conn_details.client
     );
 
-    // TODO: use become: https://github.com/rust-lang/rust/issues/112788
     serve_cached_file_buf(
         conn_details,
         file,
@@ -1134,11 +1127,6 @@ async fn serve_cached_file(
     .await
 }
 
-#[expect(
-    clippy::inline_always,
-    reason = "function has only 1 caller and is a tail call"
-)]
-#[inline(always)]
 async fn serve_cached_file_buf(
     conn_details: ConnectionDetails,
     mut file: tokio::fs::File,
@@ -1255,19 +1243,16 @@ async fn serve_joined(
             content_length,
             rx,
             meta,
-        }) => {
-            serve_unfinished_file(
-                conn_details,
-                file,
-                path,
-                status,
-                content_length,
-                rx,
-                &meta,
-                role,
-            )
-            .await
-        }
+        }) => serve_unfinished_file(
+            conn_details,
+            file,
+            path,
+            status,
+            content_length,
+            rx,
+            &meta,
+            role,
+        ),
         Ok(Serveable::Complete { file, path, meta }) => {
             drop(status);
             // A caller-supplied snapshot (the stale-volatile revalidation

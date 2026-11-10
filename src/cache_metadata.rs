@@ -1100,7 +1100,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_xattrs_do_not_require_a_blocking_runtime() {
         let (_dir, file, path) = fixture_file().await;
-        xattr_helpers::set_xattr_supported(false);
+        xattr_helpers::disable_xattr_support();
         let meta =
             UpstreamMetadata::from_upstream(Some("\"abc\""), Some("Thu, 01 Jan 1970 00:00:00 GMT"));
         write_upstream_metadata(&file, &path, &meta, Some(12), TargetFile::Resumed);

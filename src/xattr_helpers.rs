@@ -141,8 +141,8 @@ pub(crate) trait XattrValue: Sized {
 /// stick.
 static XATTR_SUPPORTED: AtomicBool = AtomicBool::new(true);
 
-pub(crate) fn set_xattr_supported(supported: bool) {
-    XATTR_SUPPORTED.store(supported, Ordering::Relaxed);
+pub(crate) fn disable_xattr_support() {
+    XATTR_SUPPORTED.store(false, Ordering::Relaxed);
 }
 
 pub(crate) fn xattr_supported() -> bool {

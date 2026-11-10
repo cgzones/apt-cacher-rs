@@ -19,7 +19,7 @@ use xattr::FileExt as _;
 
 use crate::{
     cache_paths::CachePaths, error::ErrorReport, fs_open::nofollow_options, global_config,
-    xattr_helpers::set_xattr_supported,
+    xattr_helpers::disable_xattr_support,
 };
 
 /// Failure while preparing the cache directory at startup.
@@ -208,7 +208,7 @@ fn prepare_cache_dir(cache_path: &Path) -> Result<Flock<std::fs::File>, SetupErr
                     "Failed to verify extended attribute support on `{}` (got {val:?}, expected `probe`); disabling ETag/Last-Modified revalidation and cleanup checksum memoization",
                     xattr_probe_path.display()
                 );
-                set_xattr_supported(false);
+                disable_xattr_support();
             }
             Err(err) => {
                 warn!(
@@ -216,7 +216,7 @@ fn prepare_cache_dir(cache_path: &Path) -> Result<Flock<std::fs::File>, SetupErr
                     cache_path.display(),
                     ErrorReport(&err)
                 );
-                set_xattr_supported(false);
+                disable_xattr_support();
             }
         }
     }

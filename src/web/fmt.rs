@@ -872,20 +872,6 @@ impl<T: Display> Display for OptOrUnlimited<T> {
     }
 }
 
-pub(super) struct YesNo(pub(super) bool);
-impl Display for YesNo {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(if self.0 { "Yes" } else { "No" })
-    }
-}
-
-pub(super) struct EnabledDisabled(pub(super) bool);
-impl Display for EnabledDisabled {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(if self.0 { "Enabled" } else { "Disabled" })
-    }
-}
-
 /// Render an optional rate-limit configuration as `<size>/s` or `"None"`.
 pub(super) struct MinRate(pub(super) Option<std::num::NonZero<usize>>);
 impl Display for MinRate {
@@ -1003,13 +989,7 @@ impl Display for DiskUsage {
                     HumanFmt::Size(q),
                     Pct::new(self.cache_size, q)
                 );
-                Display::fmt(
-                    &Colorize {
-                        inner: format_args!("{inner}"),
-                        class,
-                    },
-                    f,
-                )?;
+                Display::fmt(&Colorize { inner, class }, f)?;
                 Display::fmt(
                     &Meter {
                         value: self.cache_size,

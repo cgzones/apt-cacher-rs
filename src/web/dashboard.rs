@@ -46,9 +46,9 @@ use crate::{
 
 use super::{
     fmt::{
-        CacheHitRatio, Colorize, Count, DiskUsage, EnabledDisabled, FmtMTimeAge, Gauge, HtmlEscape,
-        MinRate, OptOrUnlimited, OptSize, Pct, RatioClass, RelTime, Saturation, Utc, Window, YesNo,
-        as_size, now_epoch, warn_if,
+        CacheHitRatio, Colorize, Count, DiskUsage, FmtMTimeAge, Gauge, HtmlEscape, MinRate,
+        OptOrUnlimited, OptSize, Pct, RatioClass, RelTime, Saturation, Utc, Window, as_size,
+        now_epoch, warn_if,
     },
     metrics_page::build_metrics_html,
     page::{
@@ -1016,7 +1016,11 @@ fn build_configuration_html(rd: &RuntimeDetails) -> String {
     t.row("HTTPS Upgrade Mode", https_mode);
     t.row(
         "HTTPS Tunnel",
-        EnabledDisabled(rd.config.https_tunnel_enabled),
+        if rd.config.https_tunnel_enabled {
+            "Enabled"
+        } else {
+            "Disabled"
+        },
     );
     t.row("Min Download Rate", MinRate(rd.config.min_download_rate));
     t.row(
@@ -1040,7 +1044,11 @@ fn build_configuration_html(rd: &RuntimeDetails) -> String {
     );
     t.row(
         "Reject pdiff Requests",
-        YesNo(rd.config.reject_pdiff_requests),
+        if rd.config.reject_pdiff_requests {
+            "Yes"
+        } else {
+            "No"
+        },
     );
     t.row("Usage Retention", Retention(rd.config.usage_retention_days));
     t.row(
