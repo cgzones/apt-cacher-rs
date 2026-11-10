@@ -972,19 +972,10 @@ pub(crate) fn classify_request<'a>(
                 let architecture = decode_validate(architecture, ValidateKind::Architecture)?;
                 let content = ByHashContent::of_directory(Some(&architecture));
 
-                // Only `binary-<arch>` is a real architecture; the metadata
-                // trees sharing its depth (`dep11`, `i18n`, `source`,
-                // Ubuntu's `cnf`) map to no origin.
-                let origin_fields = if is_binary_arch(&architecture) {
-                    Some(OriginFields {
-                        distribution: distribution.into_owned(),
-                        component: component.into_owned(),
-                        architecture: architecture.into_owned(),
-                    })
-                } else {
-                    None
-                };
-                (origin_fields, content)
+                (
+                    OriginFields::of_scope(distribution, component, architecture),
+                    content,
+                )
             } else {
                 let innermost = validate_directories(dirs)?;
                 (None, ByHashContent::of_directory(innermost.as_deref()))
@@ -1086,19 +1077,9 @@ pub(crate) fn classify_request<'a>(
 
             let debname = dists_debname(&distribution, &component, &architecture, &filename);
 
-            // Only `binary-<arch>` is a real architecture; the metadata
-            // trees sharing its depth map to no origin.
-            let origin_fields = if is_binary_arch(&architecture) {
-                // The debname is built, so the decoded fields can be moved
-                // into the record instead of re-formatted out of the `Cow`s.
-                Some(OriginFields {
-                    distribution: distribution.into_owned(),
-                    component: component.into_owned(),
-                    architecture: architecture.into_owned(),
-                })
-            } else {
-                None
-            };
+            // The debname is built, so the decoded fields can be moved into
+            // the record instead of re-formatted out of the `Cow`s.
+            let origin_fields = OriginFields::of_scope(distribution, component, architecture);
 
             Ok(RequestClass {
                 mirror_path: Arc::from(mirror_path),

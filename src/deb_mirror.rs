@@ -236,6 +236,24 @@ pub(crate) struct OriginFields {
     pub(crate) architecture: String,
 }
 
+impl OriginFields {
+    /// The origin a decoded `dists/<dist>/<comp>/<arch>/` scope names. Only
+    /// `binary-<arch>` is a real architecture ([`is_binary_arch`]); the
+    /// metadata trees sharing its depth (`dep11`, `i18n`, `source`, Ubuntu's
+    /// `cnf`) map to no origin.
+    pub(crate) fn of_scope(
+        distribution: Cow<'_, str>,
+        component: Cow<'_, str>,
+        architecture: Cow<'_, str>,
+    ) -> Option<Self> {
+        is_binary_arch(&architecture).then(|| Self {
+            distribution: distribution.into_owned(),
+            component: component.into_owned(),
+            architecture: architecture.into_owned(),
+        })
+    }
+}
+
 /// How much a request proved about the `dists/<d>/<c>/<a>/` scope it carried.
 ///
 /// A `by-hash` cache entry is keyed by `{mirror, digest}` with the scope
