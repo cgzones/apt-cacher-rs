@@ -817,8 +817,15 @@ fn build_cache_group(g: &mut Groups) {
     let all = HitsMisses::load(&metrics::CACHE_HITS, &metrics::CACHE_MISSES);
     let parts_exceed =
         packages.hits + byhash.hits > all.hits || packages.misses + byhash.misses > all.misses;
-    let refetched_uptodate = metrics::VOLATILE_REFETCHED_UPTODATE.get();
-    let refetched_outofdate = metrics::VOLATILE_REFETCHED_OUTOFDATE.get();
+    // A stale copy's revalidation that ended in a 304, or in a body-bearing
+    // head: the revalidation matrix' first two outcomes, whichever
+    // validators were sent.
+    let [refetched_uptodate, refetched_outofdate] = [0, 1].map(|outcome| {
+        metrics::VOLATILE_REVALIDATION
+            .iter()
+            .map(|sent| sent[outcome].get())
+            .sum::<u64>()
+    });
     let refetched = metrics::VOLATILE_REFETCHED.get();
     let volatile = HitsMisses {
         hits: metrics::VOLATILE_HIT.get(),

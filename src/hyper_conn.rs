@@ -1323,9 +1323,9 @@ async fn serve_volatile_file(
         Err(reason) => reason,
     };
 
-    // Lookup-site parent refetch bump; dominates the VOLATILE_REFETCHED_*
-    // subset bumps in `serve_new_file`. Cleanup-synthetic probes are
-    // operator bookkeeping, not user traffic, and count nothing.
+    // Lookup-site parent refetch bump; dominates the revalidation outcome
+    // `serve_new_file` records. Cleanup-synthetic probes are operator
+    // bookkeeping, not user traffic, and count nothing.
     let miss = CacheMiss::StaleVolatile {
         reason,
         file,
@@ -2103,26 +2103,14 @@ async fn serve_new_file_worker(
 
     let mut head = UpstreamHead::from_response(&fwd_response, body_framing);
 
-    if let Some((_, file_path)) = &cached {
-        // Only count "out of date" when upstream actually returned fresh
-        // content (mirrors the splice path's non-200/non-206 passthrough in
-        // `splice_proxy`); a 4xx/5xx revalidation is not a fresh body.
-        // Cleanup-synthetic probes bypass the parent counter (they bypass
-        // sendfile and never bump VOLATILE_REFETCHED in the default build),
-        // so counting them here would let the subset run ahead of the parent;
-        // the UPTODATE site below excludes them for the same reason.
-        if (head.status == StatusCode::OK || head.status == StatusCode::PARTIAL_CONTENT)
-            && !conn_details.client.is_cleanup_synthetic()
-        {
-            metrics::VOLATILE_REFETCHED_OUTOFDATE.increment();
-        }
-        if head.status != StatusCode::NOT_MODIFIED {
-            debug!(
-                "File `{}` did not revalidate (status={})",
-                file_path.display(),
-                head.status
-            );
-        }
+    if let Some((_, file_path)) = &cached
+        && head.status != StatusCode::NOT_MODIFIED
+    {
+        debug!(
+            "File `{}` did not revalidate (status={})",
+            file_path.display(),
+            head.status
+        );
     }
 
     let plan = match plan_download(
@@ -2224,9 +2212,6 @@ async fn serve_new_file_worker(
         DownloadPlan::NotModified((file, file_path)) => {
             note_cached_index_touch(conn_details, req.uri().path(), &file_path);
             note_release_revalidated(conn_details, req.uri().path());
-            if !conn_details.client.is_cleanup_synthetic() {
-                metrics::VOLATILE_REFETCHED_UPTODATE.increment();
-            }
             let updated = cache_metadata::revalidate(
                 conn_details.key(),
                 &file,

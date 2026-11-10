@@ -348,16 +348,11 @@ pub(crate) static VOLATILE_HIT: Counter = Counter::new();
 /// in-flight fetch (a late joiner, also in `LATE_JOINERS_TOTAL`) -- the
 /// volatile counterpart of `CACHE_MISSES`, which counts permanent files
 /// only. `VOLATILE_HIT + VOLATILE_REFETCHED` is every volatile lookup.
-/// `VOLATILE_REFETCHED_UPTODATE` and `VOLATILE_REFETCHED_OUTOFDATE` are
-/// subsets bumped by the fetching request only, covering the
-/// stale-but-present case; the volatile-not-found case and joiners bump
-/// neither sub-bucket, so their sum is less than or equal to
-/// `VOLATILE_REFETCHED`.
+/// The stale-but-present share that upstream answered 304, or with a fresh
+/// body, is `VOLATILE_REVALIDATION`'s first two outcomes: recorded by the
+/// fetching request only, so the volatile-not-found case and joiners count
+/// in neither and their sum is less than or equal to `VOLATILE_REFETCHED`.
 pub(crate) static VOLATILE_REFETCHED: Counter = Counter::new();
-/// Subset of `VOLATILE_REFETCHED`: stale-but-present, upstream returned 304.
-pub(crate) static VOLATILE_REFETCHED_UPTODATE: Counter = Counter::new();
-/// Subset of `VOLATILE_REFETCHED`: stale-but-present, upstream returned a fresh body.
-pub(crate) static VOLATILE_REFETCHED_OUTOFDATE: Counter = Counter::new();
 
 /// Volatile lookup misses, split at the lookup site (fresh = `VOLATILE_HIT`).
 pub(crate) static VOLATILE_ABSENT: Counter = Counter::new();

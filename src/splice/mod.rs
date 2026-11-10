@@ -176,10 +176,6 @@ async fn serve_volatile_304_via_sendfile(
     client_range: RangeRequestHeaders<'_>,
     mut ibarrier: InitBarrier,
 ) -> Result<SpliceProxyOutcome, SpliceProxyError> {
-    if !conn_details.client.is_cleanup_synthetic() {
-        metrics::VOLATILE_REFETCHED_UPTODATE.increment();
-    }
-
     let StaleCopy {
         file,
         path,
@@ -763,17 +759,6 @@ async fn plan_upstream_response(
         (exchange, None)
     };
     exchange.response.discard_invalid_validators(conn_details);
-
-    // Volatile stale-but-present revalidation that returned a fresh body
-    // (200 or 206): counterpart to the 304 / UPTODATE case in
-    // `serve_volatile_304_via_sendfile`. The volatile-not-found path leaves
-    // `stale` as None and is intentionally not split into UPTODATE/OUTOFDATE.
-    if stale.is_some()
-        && (exchange.response.status_code == 200 || exchange.response.status_code == 206)
-        && !conn_details.client.is_cleanup_synthetic()
-    {
-        metrics::VOLATILE_REFETCHED_OUTOFDATE.increment();
-    }
 
     match plan_download(
         &exchange.response.head(),
