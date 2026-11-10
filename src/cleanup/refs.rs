@@ -6,9 +6,7 @@ use hashbrown::{HashMap, HashSet};
 use tracing::{debug, warn};
 
 use crate::cache_layout::CacheLayout;
-use crate::cache_walk::{
-    AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker,
-};
+use crate::cache_walk::{AnomalyLevel, DirFailure, EntryKind, WalkContext, WalkOutcome, Walker};
 use crate::database::OriginEntry;
 use crate::error::ErrorReport;
 use crate::fs_open::count_cache_failure;
@@ -109,8 +107,7 @@ pub(super) async fn build_byhash_reference_set(
     layout: CacheLayout,
     expected_dists: &[&str],
 ) -> Option<ByHashReferenceSet> {
-    let mut walker =
-        Walker::new(release_dir, &RELEASE_WALK, OnMissing::Tolerate, ()).confined_to(cache_root);
+    let mut walker = Walker::below(cache_root, release_dir, &RELEASE_WALK, ());
 
     let mut set = ByHashReferenceSet {
         sha256: HashSet::new(),

@@ -7,7 +7,7 @@ use tracing::{debug, error, warn};
 
 use crate::cache_layout::{CacheEntryKeyRef, CacheLayout};
 use crate::cache_quota::accounted_size;
-use crate::cache_walk::{AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkContext, Walker};
+use crate::cache_walk::{AnomalyLevel, DirFailure, EntryKind, WalkContext, Walker};
 use crate::deb_mirror::{Mirror, is_deb_package};
 use crate::error::ErrorReport;
 use crate::humanfmt::HumanFmt;
@@ -371,8 +371,7 @@ pub(super) async fn sweep_aged_metadata(
 
     let mut result = UnitStats::default();
 
-    let mut walker =
-        Walker::new(dir, &METADATA_WALK, OnMissing::Tolerate, ()).confined_to(cache_root);
+    let mut walker = Walker::below(cache_root, dir, &METADATA_WALK, ());
 
     while let Some(mut entry) = walker.next().await {
         match entry.kind() {

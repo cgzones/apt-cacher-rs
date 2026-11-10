@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 use tracing::{debug, error};
 
 use crate::cache_quota::accounted_size;
-use crate::cache_walk::{AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkContext, Walker};
+use crate::cache_walk::{AnomalyLevel, DirFailure, EntryKind, WalkContext, Walker};
 use crate::error::ErrorReport;
 use crate::metrics;
 use crate::partial_claim::{FileId, Reap, reap_unclaimed};
@@ -103,8 +103,7 @@ pub(super) async fn cleanup_tmp_dir(
 
     let mut reaped = TmpReap::default();
 
-    let mut walker =
-        Walker::new(tmp_dir, &TMP_WALK, OnMissing::Tolerate, ()).confined_to(cache_root);
+    let mut walker = Walker::below(cache_root, tmp_dir, &TMP_WALK, ());
 
     while let Some(mut entry) = walker.next().await {
         let Some(mdata) = entry.metadata().await else {

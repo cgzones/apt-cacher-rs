@@ -12,9 +12,7 @@ use crate::{
     AppState,
     cache_layout::CacheLayout,
     cache_quota::accounted_size,
-    cache_walk::{
-        AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker,
-    },
+    cache_walk::{AnomalyLevel, DirFailure, EntryKind, WalkContext, WalkOutcome, Walker},
     config::Config,
     database::{MirrorEntry, OriginEntry},
     deb_mirror::{Mirror, MirrorKind, UriFormat as _},
@@ -613,8 +611,7 @@ async fn sweep_byhash_dir(
     let mut referenced_kept = 0u64;
     let mut io_failures = 0u64;
 
-    let mut walker =
-        Walker::new(byhash_path, &BYHASH_WALK, OnMissing::Tolerate, ()).confined_to(cache_root);
+    let mut walker = Walker::below(cache_root, byhash_path, &BYHASH_WALK, ());
 
     while let Some(entry) = walker.next().await {
         match entry.kind() {

@@ -4,9 +4,7 @@ use std::path::Path;
 use hashbrown::HashMap;
 use tracing::{debug, error, trace};
 
-use crate::cache_walk::{
-    AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker,
-};
+use crate::cache_walk::{AnomalyLevel, DirFailure, EntryKind, WalkContext, WalkOutcome, Walker};
 use crate::cleanup::engine::{CleanupUnitError, SpanClass};
 use crate::cleanup::model::{TreeSpec, Walk};
 use crate::deb_mirror::{
@@ -100,8 +98,7 @@ pub(super) async fn scan_candidates(
 ) -> Result<ScannedTree, CleanupUnitError> {
     let mut ret = HashMap::new();
     let mut io_failures = 0;
-    let mut walker =
-        Walker::new(&tree.root, &RECONCILE_WALK, OnMissing::Tolerate, ()).confined_to(cache_root);
+    let mut walker = Walker::below(cache_root, &tree.root, &RECONCILE_WALK, ());
 
     while let Some(mut entry) = walker.next().await {
         match entry.kind() {

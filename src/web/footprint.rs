@@ -48,7 +48,7 @@ use crate::{
     cache_layout::CacheLayout,
     cache_paths::{CachePaths, MirrorSite},
     cache_tree::{DirRole, Level, classify_dir, is_unexpected_file},
-    cache_walk::{AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkContext, Walker},
+    cache_walk::{AnomalyLevel, DirFailure, EntryKind, WalkContext, Walker},
     deb_mirror::MirrorKind,
 };
 
@@ -184,9 +184,9 @@ static DASHBOARD_WALK: WalkContext = WalkContext {
 pub(super) async fn walk_footprint(footprint: &Footprint) -> DirStats {
     let mut stats = DirStats::default();
     for root in &footprint.roots {
-        let mut walker = Walker::new(&root.path, &DASHBOARD_WALK, OnMissing::Tolerate, root.level)
-            .stat_files()
-            .confined_to(&footprint.host_dir);
+        let mut walker =
+            Walker::below(&footprint.host_dir, &root.path, &DASHBOARD_WALK, root.level)
+                .stat_files();
         while let Some(mut entry) = walker.next().await {
             match entry.kind() {
                 EntryKind::NonRegular => {}

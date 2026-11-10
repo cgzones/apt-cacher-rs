@@ -293,9 +293,19 @@ pub(crate) struct Walker<T> {
 }
 
 impl<T: Copy + Send> Walker<T> {
-    /// Prepare a walk of `root`; nothing is read until the first
-    /// [`Walker::next`].  `root_tag` is handed back on every entry of the
-    /// root directory itself.
+    /// Prepare a walk of `root`, a directory below the trusted `base` (the
+    /// cache root, a host directory) that may be absent
+    /// ([`OnMissing::Tolerate`]) and is refused when reached through anything
+    /// but directories ([`Walker::confined_to`]).  Every walk but the one of
+    /// the cache root itself starts here.
+    #[must_use]
+    pub(crate) fn below(base: &Path, root: &Path, ctx: &'static WalkContext, root_tag: T) -> Self {
+        Self::new(root, ctx, OnMissing::Tolerate, root_tag).confined_to(base)
+    }
+
+    /// Prepare a walk of `root`, the cache root itself; nothing is read
+    /// until the first [`Walker::next`].  `root_tag` is handed back on every
+    /// entry of the root directory itself.
     #[must_use]
     pub(crate) fn new(
         root: &Path,
@@ -345,7 +355,7 @@ impl<T: Copy + Send> Walker<T> {
     /// window before its `opendir` without closing it. `root` must lie below
     /// `base`, which the caller trusts (the cache root, a host directory).
     #[must_use]
-    pub(crate) fn confined_to(mut self, base: &Path) -> Self {
+    fn confined_to(mut self, base: &Path) -> Self {
         self.confined_to = Some(base.to_path_buf());
         self
     }
