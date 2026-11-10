@@ -84,16 +84,16 @@ pub(crate) fn is_expected_client_end(err: &std::io::Error) -> bool {
 /// transport failure as a timeout for the per-mirror health counts.
 #[must_use]
 pub(crate) fn is_io_timed_out_in_chain(err: &(dyn std::error::Error + 'static)) -> bool {
-    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
-    while let Some(e) = cur {
-        if let Some(io) = e.downcast_ref::<std::io::Error>()
-            && io.kind() == std::io::ErrorKind::TimedOut
-        {
-            return true;
-        }
-        cur = e.source();
-    }
-    false
+    chain(err)
+        .filter_map(|e| e.downcast_ref::<std::io::Error>())
+        .any(|io| io.kind() == std::io::ErrorKind::TimedOut)
+}
+
+/// `err` and every error below it in its `source()` chain, outermost first.
+pub(crate) fn chain<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+    std::iter::successors(Some(err), |e| e.source())
 }
 
 /// Whether `err`'s chain holds a TLS client's rejection of the upstream's

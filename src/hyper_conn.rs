@@ -66,8 +66,8 @@ use crate::{
     deb_mirror::{Origin, OriginSighting},
     delivery::{Mechanism, Role},
     error::{
-        ErrorReport, UpstreamFetchError, is_io_timed_out_in_chain, is_peer_disconnect,
-        is_tls_certificate_rejection,
+        ErrorReport, UpstreamFetchError, chain as error_chain, is_io_timed_out_in_chain,
+        is_peer_disconnect, is_tls_certificate_rejection,
     },
     fs_open::{
         CacheAccessFailure, count_cache_failure, hint_sequential_read, open_cached_file_inline,
@@ -264,14 +264,9 @@ impl RequestFailure {
 /// Whether hyper's HTTP parser refused the response head (malformed, or past
 /// its read buffer), as opposed to a transport that failed under it.
 fn is_head_parse_error(err: &hyper_util::client::legacy::Error) -> bool {
-    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
-    while let Some(e) = cur {
-        if let Some(hyper_err) = e.downcast_ref::<hyper::Error>() {
-            return hyper_err.is_parse();
-        }
-        cur = e.source();
-    }
-    false
+    error_chain(err)
+        .find_map(|e| e.downcast_ref::<hyper::Error>())
+        .is_some_and(hyper::Error::is_parse)
 }
 
 /// Whose exchange [`request_with_retry`] runs. Only a proxied request moves
@@ -3057,14 +3052,7 @@ fn host_header_from_uri(uri: &Uri) -> HeaderValue {
 fn accounted_body_failure<'a>(
     err: &'a (dyn std::error::Error + 'static),
 ) -> Option<&'a DeliveryFailure> {
-    let mut cause = err.source();
-    while let Some(error) = cause {
-        if let Some(failure) = error.downcast_ref::<DeliveryFailure>() {
-            return Some(failure);
-        }
-        cause = error.source();
-    }
-    None
+    error_chain(err).find_map(|e| e.downcast_ref::<DeliveryFailure>())
 }
 
 /// The request-head allowance in [`client_max_buf_size`], and its floor:
