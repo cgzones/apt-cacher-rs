@@ -1289,18 +1289,6 @@ async fn serve_joined(
     }
 }
 
-enum CacheFileStat {
-    Volatile {
-        file: tokio::fs::File,
-        file_path: PathBuf,
-        /// Existing on-disk size at the time `serve_volatile_file` opened the
-        /// file.  Plumbed through so `serve_new_file` does not have to fetch
-        /// the metadata a second time to size the quota reservation.
-        prev_size: u64,
-    },
-    New,
-}
-
 #[must_use]
 async fn serve_volatile_file(
     conn_details: ConnectionDetails,
@@ -1371,25 +1359,13 @@ async fn serve_cache_miss(
         return match appstate.active_downloads.register(conn_details.key()) {
             Admission::Originator(origination) => {
                 conn_details.count_fetch_role(FetchRole::Originator);
-                let cfstate = match miss {
-                    CacheMiss::NotFound => {
-                        trace!(
-                            "File {} not found, serving new version...",
-                            cache_path.display()
-                        );
-                        CacheFileStat::New
-                    }
-                    CacheMiss::StaleVolatile {
-                        file,
-                        size,
-                        reason: _,
-                    } => CacheFileStat::Volatile {
-                        file,
-                        file_path: cache_path,
-                        prev_size: size,
-                    },
-                };
-                serve_new_file(conn_details, origination, req, cfstate, appstate).await
+                if matches!(miss, CacheMiss::NotFound) {
+                    trace!(
+                        "File {} not found, serving new version...",
+                        cache_path.display()
+                    );
+                }
+                serve_new_file(conn_details, origination, req, miss, cache_path, appstate).await
             }
             Admission::LateJoiner { status } => {
                 conn_details.count_fetch_role(FetchRole::Joiner);
@@ -1814,7 +1790,8 @@ async fn serve_new_file(
     conn_details: ConnectionDetails,
     origination: Origination,
     req: Request<Empty<()>>,
-    cfstate: CacheFileStat,
+    miss: CacheMiss,
+    cache_path: PathBuf,
     appstate: AppState,
 ) -> Response<ProxyCacheBody> {
     let status = Arc::clone(&origination.status);
@@ -1826,7 +1803,16 @@ async fn serve_new_file(
     );
     match barrier
         .run_settled(async |barrier| {
-            serve_new_file_worker(&conn_details, barrier, status, &req, cfstate, &appstate).await
+            serve_new_file_worker(
+                &conn_details,
+                barrier,
+                status,
+                &req,
+                miss,
+                cache_path,
+                &appstate,
+            )
+            .await
         })
         .await
     {
@@ -1955,7 +1941,8 @@ async fn serve_new_file_worker(
     ibarrier: &mut InitBarrier,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     req: &Request<Empty<()>>,
-    cfstate: CacheFileStat,
+    miss: CacheMiss,
+    cache_path: PathBuf,
     appstate: &AppState,
 ) -> Result<(Settled, Response<ProxyCacheBody>), DownloadFailure> {
     // TODO: upstream constant
@@ -1963,13 +1950,15 @@ async fn serve_new_file_worker(
 
     let config = global_config();
 
-    let (warn_on_override, prev_file_size) = match &cfstate {
-        CacheFileStat::Volatile {
+    // A stale copy's size was read when it was opened, so the quota
+    // reservation needs no second metadata fetch.
+    let (warn_on_override, prev_file_size) = match &miss {
+        CacheMiss::StaleVolatile {
+            reason: _,
             file: _,
-            file_path: _,
-            prev_size,
-        } => (false, *prev_size),
-        CacheFileStat::New => (true, 0),
+            size,
+        } => (false, *size),
+        CacheMiss::NotFound => (true, 0),
     };
 
     for (name, value) in req.headers() {
@@ -2006,24 +1995,24 @@ async fn serve_new_file_worker(
         return Ok(decline_with_response(ibarrier, why).await);
     }
 
-    let prefetched_upstream_metadata = match &cfstate {
-        CacheFileStat::Volatile {
+    let prefetched_upstream_metadata = match &miss {
+        CacheMiss::StaleVolatile {
+            reason: _,
             file,
-            file_path,
-            prev_size: _,
+            size: _,
         } => {
             let key = conn_details.key();
 
-            Some(cache_metadata::store().resolve(&key, file, file_path))
+            Some(cache_metadata::store().resolve(&key, file, &cache_path))
         }
-        CacheFileStat::New => None,
+        CacheMiss::NotFound => None,
     };
     let revalidate = prefetched_upstream_metadata.as_deref();
 
     // Permanent files only; see `partial_file::PartialDownload` for the
     // open-once and keep-on-drop rules this relies on.
     let mut partial = if conn_details.cached_flavor() == CachedFlavor::Permanent
-        && matches!(cfstate, CacheFileStat::New)
+        && matches!(miss, CacheMiss::NotFound)
     {
         match partial_file::prepare_partial_resume(ibarrier, partial_file::ResumeLog::Unprefixed)
             .await
@@ -2101,15 +2090,15 @@ async fn serve_new_file_worker(
         }
     }
 
-    // `cfstate` was only needed by reference for the conditional headers of
+    // `miss` was only needed by reference for the conditional headers of
     // the requests above; a retry below is an unconditional fresh fetch.
-    let cached = match cfstate {
-        CacheFileStat::Volatile {
+    let cached = match miss {
+        CacheMiss::StaleVolatile {
+            reason: _,
             file,
-            file_path,
-            prev_size: _,
-        } => Some((file, file_path)),
-        CacheFileStat::New => None,
+            size: _,
+        } => Some((file, cache_path)),
+        CacheMiss::NotFound => None,
     };
 
     let mut head = UpstreamHead::from_response(&fwd_response, body_framing);
