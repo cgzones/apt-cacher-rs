@@ -40,7 +40,7 @@ use crate::hyper_conn::{HttpClient, Traffic, UpstreamExchange, request_with_retr
 #[cfg(feature = "sendfile")]
 use crate::sendfile_conn;
 use crate::{
-    AppState, DB_DRAIN_TIMEOUT, OUTPUT_LOG_REOPEN, RUNTIMEDETAILS,
+    AppState, DB_DRAIN_TIMEOUT, OUTPUT_LOG_REOPEN,
     active_downloads::ActiveDownloads,
     cache_paths::CachePaths,
     cleanup::{
@@ -58,6 +58,7 @@ use crate::{
     humanfmt::HumanFmt,
     metrics,
     request_dispatch::ClientAcls,
+    runtime_details,
     sqlite_error::SqlxErrorReport,
     task_cache_scan::{CacheScanError, task_cache_scan},
     warn_once_or_debug, warn_once_or_info,
@@ -76,7 +77,7 @@ use crate::{
 /// after an unexpected restart -- and the counters behind the dashboard die
 /// with the process.
 fn log_shutdown_summary(signal: &str, active_downloads: &ActiveDownloads) {
-    let rd = RUNTIMEDETAILS.get().expect("global set in main()");
+    let rd = runtime_details();
     let uptime = (time::OffsetDateTime::now_utc() - rd.start_time).unsigned_abs();
 
     let bytes_served = [
@@ -322,7 +323,7 @@ pub(crate) async fn main_loop(
                 let scanned = HumanFmt::Time(scan_start.elapsed().into());
                 let cache_size = totals.bytes;
                 let files = totals.files;
-                let rd = RUNTIMEDETAILS.get().expect("global set in main()");
+                let rd = runtime_details();
 
                 rd.cache_quota.record_startup_scan(cache_size);
 

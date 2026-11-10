@@ -323,49 +323,43 @@ static RUNTIMEDETAILS: OnceLock<RuntimeDetails> = OnceLock::new();
 static LOGSTORE: OnceLock<logstore::LogStore> = OnceLock::new();
 static OUTPUT_LOG_REOPEN: OnceLock<Arc<LogReopen>> = OnceLock::new();
 
+/// The process-wide state `main()` sets before anything reads it.
+#[must_use]
+#[inline]
+pub(crate) fn runtime_details() -> &'static RuntimeDetails {
+    RUNTIMEDETAILS
+        .get()
+        .expect("Global was initialized in main()")
+}
+
 #[must_use]
 #[inline]
 pub(crate) fn global_config() -> &'static config::Config {
-    &RUNTIMEDETAILS
-        .get()
-        .expect("Global was initialized in main()")
-        .config
+    &runtime_details().config
 }
 
 #[must_use]
 #[inline]
 pub(crate) fn global_cache_quota() -> &'static cache_quota::CacheQuota {
-    &RUNTIMEDETAILS
-        .get()
-        .expect("Global was initialized in main()")
-        .cache_quota
+    &runtime_details().cache_quota
 }
 
 #[must_use]
 #[inline]
 pub(crate) fn global_checksum_registry() -> &'static integrity::ChecksumRegistry {
-    &RUNTIMEDETAILS
-        .get()
-        .expect("Global was initialized in main()")
-        .checksum_registry
+    &runtime_details().checksum_registry
 }
 
 #[must_use]
 #[inline]
 pub(crate) fn global_webif_hosts() -> &'static web::host_gate::WebifHosts {
-    &RUNTIMEDETAILS
-        .get()
-        .expect("Global was initialized in main()")
-        .webif_hosts
+    &runtime_details().webif_hosts
 }
 
 #[must_use]
 #[inline]
 pub(crate) fn global_verify_throttle() -> &'static verify_throttle::VerifyThrottle {
-    &RUNTIMEDETAILS
-        .get()
-        .expect("Global was initialized in main()")
-        .verify_throttle
+    &runtime_details().verify_throttle
 }
 
 /// Why the native root CA store could not be assembled.

@@ -15,7 +15,7 @@ use coarsetime::Instant;
 use tracing::error;
 
 use crate::{
-    AppState, LOGSTORE, RUNTIMEDETAILS, RuntimeDetails,
+    AppState, LOGSTORE, RuntimeDetails,
     active_downloads::ActiveDownloads,
     build_info::{APP_VERSION, FEATURES_ONE_LINE},
     cache_metadata,
@@ -37,7 +37,7 @@ use crate::{
     mem_usage::{self, Footprint, ProcessMemory},
     metrics, mirror_health, mirror_indexes, mirror_perf,
     passthrough_limiter::active_relays,
-    permitted_host_cache, scheme_cache,
+    permitted_host_cache, runtime_details, scheme_cache,
     sqlite_error::SqlxErrorReport,
     swrite,
     uncacheables::UNCACHEABLES_MAX,
@@ -395,7 +395,7 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
 
     let uncacheable = build_uncacheable_table();
 
-    let rd = RUNTIMEDETAILS.get().expect("initialized in main()");
+    let rd = runtime_details();
     let database_size = match tokio::fs::metadata(&rd.config.database_path).await {
         Ok(data) => Some(data.len()),
         Err(err) => {
@@ -1238,12 +1238,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
     swrite!(body, "{}", Heading);
 
     if !data.seen_traffic {
-        let bind_port = RUNTIMEDETAILS
-            .get()
-            .expect("initialized in main()")
-            .config
-            .bind_port;
-        swrite!(body, "{}", SetupHint(bind_port));
+        swrite!(body, "{}", SetupHint(global_config().bind_port));
     }
 
     body.push_str(&data.hero_html);
