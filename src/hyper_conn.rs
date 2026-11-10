@@ -12,8 +12,8 @@
 //! pipeline stage each variant enters).
 
 use std::{
-    borrow::Cow, convert::Infallible, fmt, num::NonZero, os::unix::fs::MetadataExt as _,
-    path::Path, path::PathBuf, sync::Arc,
+    borrow::Cow, convert::Infallible, fmt, os::unix::fs::MetadataExt as _, path::Path,
+    path::PathBuf, sync::Arc,
 };
 
 use futures_util::StreamExt as _;
@@ -56,7 +56,7 @@ use crate::{
     channel_body::{ChannelBody, ChannelEvent},
     client_info::ClientInfo,
     client_trouble::{self, Trouble},
-    config::{ClientHost, Config},
+    config::Config,
     connect_tunnel::{
         ConnectReject, admit, connect_upstream, copy_bidirectional_idle, report_tunnel_outcome,
         validate_connect_target,
@@ -90,7 +90,7 @@ use crate::{
     rate_checker::RateChecker,
     rate_log,
     request_dispatch::{
-        ClientAcls, DispatchOutcome, PassthroughReason, RejectReason, RequestKind, RequestTarget,
+        ClientAcls, DispatchOutcome, PassthroughRequest, RejectReason, RequestKind, RequestTarget,
         dispatch_request, preflight_method, preflight_target, preflight_via,
     },
     response_head::{ResponseHead, retry_after_secs},
@@ -2765,21 +2765,6 @@ fn strip_request_body(client: ClientInfo, req: Request<Incoming>) -> Request<Emp
     Request::from_parts(parts, Empty::new())
 }
 
-/// A request the cache pipeline declined, on its way to the simple proxy.
-/// Carries what the forwarding tail needs, whichever verdict produced it:
-/// the sendfile backend's `HandoffPlan::Passthrough` or this backend's own
-/// [`dispatch_request`].
-#[derive(Debug)]
-pub(crate) struct PassthroughRequest {
-    pub(crate) reason: PassthroughReason,
-    pub(crate) requested_host: ClientHost,
-    /// The host the passthrough's `Origin` row is recorded under, resolved
-    /// by the dispatcher (`DispatchOutcome::Passthrough`).
-    pub(crate) canonical_host: ClientHost,
-    pub(crate) requested_port: Option<NonZero<u16>>,
-    pub(crate) request_received_at: PreciseInstant,
-}
-
 /// Entry point for every request hyper serves.  With a [`HandoffPlan`] the
 /// request was already pre-flighted and dispatched by the sendfile backend
 /// (which also bumped `REQUESTS_TOTAL` for it); without one this is the
@@ -2878,21 +2863,7 @@ async fn pre_process_client_request(
                 return process_cache_request(conn_details, req, appstate).await;
             }
             DispatchOutcome::Reject(reason) => return reject_response(reason),
-            DispatchOutcome::Passthrough {
-                reason,
-                requested_host,
-                canonical_host,
-                request_received_at,
-            } => (
-                req,
-                PassthroughRequest {
-                    reason,
-                    requested_host,
-                    canonical_host,
-                    requested_port,
-                    request_received_at,
-                },
-            ),
+            DispatchOutcome::Passthrough(passthrough) => (req, passthrough),
         }
     };
 

@@ -43,10 +43,10 @@ use tracing::{debug, error, info, trace};
 
 #[cfg(feature = "splice")]
 use crate::active_downloads::at_capacity_refusal;
-#[cfg(not(feature = "splice"))]
-use crate::hyper_conn::PassthroughRequest;
 #[cfg(feature = "hyper")]
 use crate::hyper_conn::{HandoffPlan, handle_hyper_connection, serve_handoff_request};
+#[cfg(feature = "splice")]
+use crate::request_dispatch::PassthroughRequest;
 #[cfg(feature = "splice")]
 use crate::splice::SpliceProxyError;
 #[cfg(feature = "splice")]
@@ -1117,12 +1117,13 @@ async fn try_sendfile_request(
             DispatchOutcome::Cache(conn_details) => conn_details,
             DispatchOutcome::Reject(reason) => return reject_result(reason, || conn_action),
             #[cfg(feature = "splice")]
-            DispatchOutcome::Passthrough {
+            DispatchOutcome::Passthrough(PassthroughRequest {
                 reason,
                 requested_host,
                 canonical_host,
+                requested_port,
                 request_received_at,
-            } => {
+            }) => {
                 use crate::{
                     passthrough_limiter,
                     splice::{UpstreamEndpoint, splice_simple_proxy},
@@ -1170,23 +1171,12 @@ async fn try_sendfile_request(
                 };
             }
             #[cfg(not(feature = "splice"))]
-            DispatchOutcome::Passthrough {
-                reason,
-                requested_host,
-                canonical_host,
-                request_received_at,
-            } => {
+            DispatchOutcome::Passthrough(passthrough) => {
                 // Without splice this backend has no uncached forwarder; hyper
                 // continues from the dispatch verdict.
                 return ZeroCopyResult::NotApplicable {
-                    reason: reason.label(),
-                    plan: HandoffPlan::Passthrough(PassthroughRequest {
-                        reason,
-                        requested_host,
-                        canonical_host,
-                        requested_port,
-                        request_received_at,
-                    }),
+                    reason: passthrough.reason.label(),
+                    plan: HandoffPlan::Passthrough(passthrough),
                     conn_action,
                 };
             }

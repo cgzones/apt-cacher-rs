@@ -536,24 +536,30 @@ pub(crate) enum DispatchOutcome {
     /// already done.
     Reject(RejectReason),
     /// Forward to upstream uncached.  Logging, metric bumping and
-    /// `record_uncacheable` done by [`dispatch_request`].  `requested_host`
-    /// lets backends build an upstream `Mirror` or emit per-request log lines
-    /// without re-deriving it.
-    Passthrough {
-        // Named in the "Proxying (without caching)" line by both backends
-        // and in sendfile's `NotApplicable` handoff.
-        reason: PassthroughReason,
-        requested_host: ClientHost,
-        /// The alias' main host, or `requested_host` when it names none: the
-        /// host a passthrough's `Origin` row is recorded under
-        /// (`Origin::from_path` in both relays), resolved here like a cached
-        /// request's `ConnectionDetails::mirror`.  The upstream is still
-        /// dialled at `requested_host`.
-        canonical_host: ClientHost,
-        // Consumed by both backends: `splice_simple_proxy` (`splice/simple_proxy.rs`,
-        // via the sendfile dispatch) and `PassthroughBody` (`hyper_conn.rs`).
-        request_received_at: PreciseInstant,
-    },
+    /// `record_uncacheable` done by [`dispatch_request`].
+    Passthrough(PassthroughRequest),
+}
+
+/// A request the cache pipeline declined, on its way to a simple proxy:
+/// what either forwarding tail needs, so no backend re-derives it and a
+/// sendfile handoff (`HandoffPlan::Passthrough`) carries it to hyper as is.
+#[derive(Debug)]
+pub(crate) struct PassthroughRequest {
+    /// Named in the "Proxying (without caching)" line by both backends and
+    /// in sendfile's `NotApplicable` handoff.
+    pub(crate) reason: PassthroughReason,
+    /// The host the client named, which the upstream is dialled at.
+    pub(crate) requested_host: ClientHost,
+    /// The alias' main host, or `requested_host` when it names none: the
+    /// host a passthrough's `Origin` row is recorded under
+    /// (`Origin::from_path` in both relays), resolved here like a cached
+    /// request's `ConnectionDetails::mirror`.
+    pub(crate) canonical_host: ClientHost,
+    pub(crate) requested_port: Option<NonZero<u16>>,
+    /// Consumed by both relays' completion lines: `splice_simple_proxy`
+    /// (`splice/simple_proxy.rs`, via the sendfile dispatch) and hyper's
+    /// `Subject::Passthrough`.
+    pub(crate) request_received_at: PreciseInstant,
 }
 
 /// Split a request target's path-and-query at its first `?`, which RFC 3986
@@ -590,16 +596,10 @@ pub(crate) fn dispatch_request(
         flat_blocklist::is_blocked,
         request_received_at,
     );
-    if let DispatchOutcome::Passthrough {
-        requested_host,
-        reason: _,
-        canonical_host: _,
-        request_received_at: _,
-    } = &decision
-    {
+    if let DispatchOutcome::Passthrough(passthrough) = &decision {
         // Exactly-once: dispatch runs once per request, including a handoff.
         record_uncacheable(
-            requested_host,
+            &passthrough.requested_host,
             requested_port,
             split_query(path_and_query).0,
         );
@@ -795,12 +795,13 @@ fn decide_request(
 
     // `record_uncacheable` happens in the wrapper (`dispatch_request`)
     // so unit tests do not need the global uncacheables store.
-    DispatchOutcome::Passthrough {
+    DispatchOutcome::Passthrough(PassthroughRequest {
         reason: passthrough_reason,
         canonical_host: canonical_host(),
         requested_host,
+        requested_port,
         request_received_at,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1358,19 +1359,20 @@ mod tests {
             assert!(
                 matches!(
                     decision,
-                    DispatchOutcome::Passthrough {
+                    DispatchOutcome::Passthrough(PassthroughRequest {
                         reason: PassthroughReason::QueryString,
                         ..
-                    }
+                    })
                 ),
                 "expected a QueryString passthrough, got {decision:?}"
             );
-            let hosts = if let DispatchOutcome::Passthrough {
+            let hosts = if let DispatchOutcome::Passthrough(PassthroughRequest {
                 reason: _,
                 requested_host,
                 canonical_host,
+                requested_port: _,
                 request_received_at: _,
-            } = decision
+            }) = decision
             {
                 Some((requested_host, canonical_host))
             } else {
@@ -1388,10 +1390,10 @@ mod tests {
         assert!(
             matches!(
                 decision,
-                DispatchOutcome::Passthrough {
+                DispatchOutcome::Passthrough(PassthroughRequest {
                     reason: PassthroughReason::Unrecognized,
                     ..
-                }
+                })
             ),
             "expected Unrecognized passthrough, got {decision:?}"
         );
@@ -1417,10 +1419,10 @@ mod tests {
             assert!(
                 matches!(
                     decision,
-                    DispatchOutcome::Passthrough {
+                    DispatchOutcome::Passthrough(PassthroughRequest {
                         reason: PassthroughReason::QueryString,
                         ..
-                    }
+                    })
                 ),
                 "{target}: expected QueryString passthrough, got {decision:?}"
             );
@@ -1431,10 +1433,10 @@ mod tests {
         assert!(
             matches!(
                 decision,
-                DispatchOutcome::Passthrough {
+                DispatchOutcome::Passthrough(PassthroughRequest {
                     reason: PassthroughReason::Unrecognized,
                     ..
-                }
+                })
             ),
             "expected Unrecognized passthrough, got {decision:?}"
         );
@@ -1446,10 +1448,10 @@ mod tests {
         assert!(
             matches!(
                 decision,
-                DispatchOutcome::Passthrough {
+                DispatchOutcome::Passthrough(PassthroughRequest {
                     reason: PassthroughReason::JoinedFieldUnderscore,
                     ..
-                }
+                })
             ),
             "expected JoinedFieldUnderscore passthrough, got {decision:?}"
         );
@@ -1461,10 +1463,10 @@ mod tests {
         assert!(
             matches!(
                 decision,
-                DispatchOutcome::Passthrough {
+                DispatchOutcome::Passthrough(PassthroughRequest {
                     reason: PassthroughReason::PackagesOutsideArchitecture,
                     ..
-                }
+                })
             ),
             "expected PackagesOutsideArchitecture passthrough, got {decision:?}"
         );
@@ -1491,10 +1493,10 @@ mod tests {
             assert!(
                 matches!(
                     decision,
-                    DispatchOutcome::Passthrough {
+                    DispatchOutcome::Passthrough(PassthroughRequest {
                         reason: PassthroughReason::NameTooLong,
                         ..
-                    }
+                    })
                 ),
                 "{path}: expected NameTooLong passthrough, got {decision:?}"
             );
@@ -1512,10 +1514,10 @@ mod tests {
         assert!(
             matches!(
                 decision,
-                DispatchOutcome::Passthrough {
+                DispatchOutcome::Passthrough(PassthroughRequest {
                     reason: PassthroughReason::NonDebPool,
                     ..
-                }
+                })
             ),
             "expected NonDebPool passthrough, got {decision:?}"
         );
@@ -1534,10 +1536,10 @@ mod tests {
             assert!(
                 matches!(
                     decision,
-                    DispatchOutcome::Passthrough {
+                    DispatchOutcome::Passthrough(PassthroughRequest {
                         reason: PassthroughReason::FlatAnchoredMirror,
                         ..
-                    }
+                    })
                 ),
                 "{path}: expected FlatAnchoredMirror passthrough, got {decision:?}"
             );
@@ -1564,10 +1566,10 @@ mod tests {
         assert!(
             matches!(
                 decision,
-                DispatchOutcome::Passthrough {
+                DispatchOutcome::Passthrough(PassthroughRequest {
                     reason: PassthroughReason::FlatBlocked,
                     ..
-                }
+                })
             ),
             "expected FlatBlocked passthrough, got {decision:?}"
         );
@@ -1609,10 +1611,10 @@ mod tests {
         assert!(
             matches!(
                 decision,
-                DispatchOutcome::Passthrough {
+                DispatchOutcome::Passthrough(PassthroughRequest {
                     reason: PassthroughReason::Unrecognized,
                     ..
-                }
+                })
             ),
             "expected Unrecognized passthrough, got {decision:?}"
         );
