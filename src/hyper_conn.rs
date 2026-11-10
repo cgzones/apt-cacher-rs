@@ -58,8 +58,7 @@ use crate::{
     client_trouble::{self, Trouble},
     config::Config,
     connect_tunnel::{
-        ConnectReject, admit, connect_upstream, copy_bidirectional_idle, report_tunnel_outcome,
-        validate_connect_target,
+        ConnectReject, authorize, connect_upstream, copy_bidirectional_idle, report_tunnel_outcome,
     },
     content_type::{content_type_for_cached_file, warn_on_content_type_mismatch},
     database_task::{DatabaseCommand, DbCmdTransfer, TransferKind, send_db_command},
@@ -2564,13 +2563,8 @@ async fn connect_response(
     // Every refusal below closes the connection, as sendfile's
     // `handle_connect` does: a refused client gets no keep-alive connection
     // to probe further targets on.
-    let target = match validate_connect_target(config, &client, req.uri()) {
-        Ok(target) => target,
-        Err(ConnectReject { status, msg }) => return quick_response_closing(status, msg),
-    };
-
-    let tunnel_guard = match admit(config, &client) {
-        Ok(guard) => guard,
+    let (target, tunnel_guard) = match authorize(config, &client, req.uri()) {
+        Ok(authorized) => authorized,
         Err(ConnectReject { status, msg }) => return quick_response_closing(status, msg),
     };
 

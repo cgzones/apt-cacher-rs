@@ -67,8 +67,8 @@ use crate::{
     client_counter,
     client_info::ClientInfo,
     connect_tunnel::{
-        ConnectReject, TunnelTarget, admit, connect_upstream, copy_bidirectional_idle,
-        report_tunnel_outcome, validate_connect_target,
+        ConnectReject, TunnelTarget, authorize, connect_upstream, copy_bidirectional_idle,
+        report_tunnel_outcome,
     },
     content_type::content_type_for_cached_file,
     database_task::{DatabaseCommand, send_db_command},
@@ -823,19 +823,8 @@ fn handle_connect(client: ClientInfo, target: &str) -> ZeroCopyResult {
         }
     };
 
-    let target = match validate_connect_target(config, &client, &uri) {
-        Ok(target) => target,
-        Err(ConnectReject { status, msg }) => {
-            return ZeroCopyResult::Rejection {
-                status,
-                conn_action: ConnectionAction::Close,
-                msg,
-            };
-        }
-    };
-
-    let tunnel_guard = match admit(config, &client) {
-        Ok(guard) => guard,
+    let (target, tunnel_guard) = match authorize(config, &client, &uri) {
+        Ok(authorized) => authorized,
         Err(ConnectReject { status, msg }) => {
             return ZeroCopyResult::Rejection {
                 status,

@@ -120,8 +120,20 @@ pub(crate) struct TunnelPermit {
     _slot: Option<PerIpPermit>,
 }
 
+/// Authorize a CONNECT request for both backends: its target against tunnel
+/// policy, then the client's tunnel slot, so a refused target takes no slot.
+/// Either refusal has already logged its line and bumped its metric.
+pub(crate) fn authorize(
+    config: &Config,
+    client: &ClientInfo,
+    uri: &Uri,
+) -> Result<(TunnelTarget, TunnelPermit), ConnectReject> {
+    let target = validate_connect_target(config, client, uri)?;
+    Ok((target, admit(config, client)?))
+}
+
 /// Acquire the configured per-client tunnel slot, recording any refusal.
-pub(crate) fn admit(config: &Config, client: &ClientInfo) -> Result<TunnelPermit, ConnectReject> {
+fn admit(config: &Config, client: &ClientInfo) -> Result<TunnelPermit, ConnectReject> {
     let slot = if let Some(max) = config.https_tunnel_max_connections_per_client {
         let Some(guard) =
             TUNNEL_CONNECTIONS.try_acquire(client.ip(), max, config.client_ipv6_prefix_len)
@@ -193,7 +205,7 @@ pub(crate) async fn connect_upstream(
 /// On success returns the parsed [`TunnelTarget`]. On rejection returns a
 /// [`ConnectReject`] and has already emitted the matching log line and bumped
 /// the relevant metric, so both backends behave identically.
-pub(crate) fn validate_connect_target(
+fn validate_connect_target(
     config: &Config,
     client: &ClientInfo,
     uri: &Uri,
