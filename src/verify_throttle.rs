@@ -20,9 +20,11 @@
 use coarsetime::{Duration, Instant};
 use hashbrown::HashMap;
 
-use crate::cache_layout::{CacheEntryKey, CacheEntryKeyRef};
+use crate::active_downloads::Declined;
+use crate::cache_layout::{CacheEntryKey, CacheEntryKeyRef, ConnectionDetails};
+use crate::humanfmt::HumanFmt;
 use crate::mem_usage::Footprint;
-use crate::warn_once;
+use crate::{global_verify_throttle, metrics, warn_once, warn_once_or_info};
 
 /// Soft cap on the entry count. Every entry requires an actual upstream
 /// download that failed verification, so realistic workloads stay tiny;
@@ -43,6 +45,29 @@ struct ThrottleEntry {
 pub(crate) struct Throttled {
     pub(crate) remaining: std::time::Duration,
     pub(crate) failures: u32,
+}
+
+/// The answer every gate gives a request for a throttled resource: the
+/// rejection line (`lead` is the gate's own opening, with its subsystem
+/// prefix), the metric and the `503` to decline with. Cleanup's probes bypass
+/// the throttle: they run once per 24h cycle and a 503 would hard-fail the
+/// index-fetch cascade; their commit outcome still records/clears the state.
+pub(crate) fn refusal(conn_details: &ConnectionDetails, lead: &str) -> Option<Declined> {
+    if conn_details.client.is_cleanup_synthetic() {
+        return None;
+    }
+    let Throttled {
+        remaining,
+        failures,
+    } = global_verify_throttle().check(conn_details.key())?;
+    warn_once_or_info!(
+        "{lead} request for {} from client {} since it recently failed checksum verification ({failures} consecutive failures), retry in {}",
+        conn_details.debname,
+        conn_details.client,
+        HumanFmt::Time(remaining)
+    );
+    metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.increment();
+    Some(Declined::VerifyThrottled { remaining })
 }
 
 #[derive(Debug)]

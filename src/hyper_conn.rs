@@ -73,7 +73,7 @@ use crate::{
         CacheAccessFailure, count_cache_failure, hint_sequential_read, open_cached_file_inline,
         regular_file_metadata, touch_volatile_mtime,
     },
-    global_cache_quota, global_config, global_verify_throttle, global_webif_hosts,
+    global_cache_quota, global_config, global_webif_hosts,
     guards::{Consequence, DownloadBarrier, InitBarrier, Settled},
     humanfmt::HumanFmt,
     hyper_transport::{TransportConnector, is_transport_error},
@@ -102,7 +102,7 @@ use crate::{
         ResumeGates, UpstreamHead, plan_download, plan_fresh_download, resolve_body_framing,
     },
     upstream_retry::{self, RetryStop},
-    uri_authority,
+    uri_authority, verify_throttle,
     volatile_metrics::Revalidation,
     warn_once_or_debug, warn_once_or_info, warn_once_or_info_logged,
     web::serve_web_interface,
@@ -2001,23 +2001,7 @@ async fn serve_new_file_worker(
 
     let mut req_uri = Cow::Borrowed(req.uri());
 
-    // Cleanup probes bypass the throttle: they run once per 24h cycle and a
-    // 503 would hard-fail the index-fetch cascade; their commit outcome
-    // still records/clears throttle state.
-    if !conn_details.client.is_cleanup_synthetic()
-        && let Some(throttled) = global_verify_throttle().check(conn_details.key())
-    {
-        warn_once_or_info!(
-            "Rejecting request for {} from client {} since it recently failed checksum verification ({} consecutive failures), retry in {}",
-            conn_details.debname,
-            conn_details.client,
-            throttled.failures,
-            HumanFmt::Time(throttled.remaining)
-        );
-        metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.increment();
-        let why = Declined::VerifyThrottled {
-            remaining: throttled.remaining,
-        };
+    if let Some(why) = verify_throttle::refusal(conn_details, "Rejecting") {
         return Ok(decline_with_response(ibarrier, why).await);
     }
 

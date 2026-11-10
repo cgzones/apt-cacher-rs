@@ -47,7 +47,7 @@ use crate::mem_usage::{ARC_HEADER, Footprint};
 use crate::passthrough_limiter;
 use crate::transfer_error::{DeliveryFailure, DownloadFailure, InternalError};
 use crate::upstream_head::{ContentLength, RejectReason};
-use crate::{global_config, global_verify_throttle, metrics, warn_once_or_info};
+use crate::{global_config, metrics, verify_throttle, warn_once_or_info};
 
 /// Why an originator ended its registry entry without downloading anything:
 /// it answered its client from the upstream's head or from its own policy.
@@ -556,21 +556,8 @@ pub(crate) async fn await_serveable(
 /// gets the answer it would get from the pre-upstream gate a moment later;
 /// cleanup's synthetic client is exempt there and stays exempt here.
 fn discarded_join(checksum_mismatch: bool, conn_details: &ConnectionDetails) -> JoinFailure {
-    if checksum_mismatch
-        && !conn_details.client.is_cleanup_synthetic()
-        && let Some(throttled) = global_verify_throttle().check(conn_details.key())
-    {
-        warn_once_or_info!(
-            "Rejecting request for {} from client {} since it recently failed checksum verification ({} consecutive failures), retry in {}",
-            conn_details.debname,
-            conn_details.client,
-            throttled.failures,
-            HumanFmt::Time(throttled.remaining)
-        );
-        metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.increment();
-        return JoinFailure::Declined(Declined::VerifyThrottled {
-            remaining: throttled.remaining,
-        });
+    if checksum_mismatch && let Some(why) = verify_throttle::refusal(conn_details, "Rejecting") {
+        return JoinFailure::Declined(why);
     }
     let failure = JoinFailure::Discarded;
     info!(

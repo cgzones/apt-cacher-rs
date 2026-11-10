@@ -94,7 +94,7 @@ use crate::{
     cache_metadata::{self, write_upstream_metadata},
     client_counter,
     content_type::{content_type_for_cached_file, warn_on_content_type_mismatch},
-    global_cache_quota, global_config, global_verify_throttle, metrics, mirror_perf, static_assert,
+    global_cache_quota, global_config, metrics, mirror_perf, static_assert, verify_throttle,
     warn_once_or_debug, warn_once_or_info, warn_once_or_info_logged,
 };
 
@@ -622,33 +622,14 @@ impl RateTimestamps {
 
 /// The pre-upstream verify-throttle gate: declines the download and answers
 /// `503 Recently failed checksum verification` (`Ok(true)`) while the file's
-/// recent checksum failures keep it throttled. Cleanup probes bypass the
-/// throttle: they run once per 24h cycle and a 503 would hard-fail the
-/// index-fetch cascade; their commit outcome still records/clears throttle
-/// state. (Only the
-/// hyper gate is reachable by cleanup today; kept here for parallel-path
-/// symmetry.)
+/// recent checksum failures keep it throttled ([`verify_throttle::refusal`]).
 async fn reject_if_verify_throttled(
     ibarrier: &mut InitBarrier,
     client: ClientConn<'_>,
     conn_details: &ConnectionDetails,
 ) -> Result<bool, SpliceProxyError> {
-    if conn_details.client.is_cleanup_synthetic() {
+    let Some(why) = verify_throttle::refusal(conn_details, "splice proxy: rejecting") else {
         return Ok(false);
-    }
-    let Some(throttled) = global_verify_throttle().check(conn_details.key()) else {
-        return Ok(false);
-    };
-    warn_once_or_info!(
-        "splice proxy: rejecting request for {} from client {} since it recently failed checksum verification ({} consecutive failures), retry in {}",
-        conn_details.debname,
-        conn_details.client,
-        throttled.failures,
-        HumanFmt::Time(throttled.remaining)
-    );
-    metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.increment();
-    let why = Declined::VerifyThrottled {
-        remaining: throttled.remaining,
     };
     client.decline(ibarrier, why, "verify-throttle 503").await?;
     Ok(true)
