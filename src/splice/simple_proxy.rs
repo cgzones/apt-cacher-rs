@@ -125,7 +125,7 @@ pub(crate) async fn splice_simple_proxy(
 
     // Account this passthrough under `ACTIVE_CLIENT_DOWNLOADS` for the
     // duration of the function (RAII drop on every return path). The hyper
-    // passthrough is counted via `ClientCountedBody`; the splice passthrough
+    // passthrough is counted via `AccountedBody`; the splice passthrough
     // serves bytes synchronously inside this frame and would otherwise be
     // invisible to the counter.
     let _client_count = client_counter::ClientDownload::new();

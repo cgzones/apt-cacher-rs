@@ -1355,8 +1355,8 @@ pub(crate) fn nested_mirror_relation(
 
 /// For a flat-pool mirror path containing a `/pool/` segment, split it into the
 /// structured archive root (everything before the first `/pool/`) and the
-/// `flat_lookup_prefix` (the in-archive sub-path with a trailing `/`) to strip
-/// from `dists/.../Packages` `Filename:` values during strict cleanup.
+/// lookup prefix (the in-archive sub-path with a trailing `/`) to strip from
+/// `dists/.../Packages` `Filename:` values during strict cleanup.
 ///
 /// `api/packages/85/debian/pool/php-zts/main`
 ///   -> ("api/packages/85/debian", "pool/php-zts/main/")

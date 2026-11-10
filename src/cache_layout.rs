@@ -815,9 +815,9 @@ impl RequestClass {
     }
 }
 
-/// Errors returned by [`classify_request`].  Each call site translates these
-/// into its own response shape (HTTP `quick_response` for the hyper path,
-/// `SendfileResult::Invalid` / `SendfileResult::NotApplicable` for sendfile).
+/// Errors returned by [`classify_request`].  `request_dispatch::decide_request`
+/// translates each into the verdict every backend acts on: a rejection or a
+/// passthrough reason.
 #[derive(Debug)]
 pub(crate) enum ClassifyError<'a> {
     /// URL-decoding the field value failed.
@@ -883,9 +883,9 @@ pub(crate) enum ClassifyError<'a> {
 ///
 /// On success, the caller wraps `RequestClass` into a `ConnectionDetails`
 /// and routes the request through `process_cache_request` (or the sendfile
-/// pipeline equivalent).  On failure, each backend translates the
-/// `ClassifyError` variant into its own error response — see the variant
-/// docs.
+/// pipeline equivalent).  On failure, `request_dispatch::decide_request`
+/// maps the `ClassifyError` variant to a rejection or a passthrough — see
+/// the variant docs.
 ///
 /// `client` is borrowed only for inclusion in trace logs; nothing about the
 /// classification depends on the caller's identity.

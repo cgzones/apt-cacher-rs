@@ -1712,14 +1712,10 @@ fn rate_check_tick(rc: &RateChecker) -> std::time::Duration {
 /// sample on its own; the `rc.add(0)` calls here only exist to drive
 /// `check_fail` on each tick.
 ///
-/// Implementation note: the previous version constructed two
-/// `tokio::time::Timeout` futures per call (outer `http_timeout` plus a
-/// fresh inner 1 s timer per loop iteration), allocating even on the
-/// fast path where `wait_once` returns instantly.  This version pins
-/// one outer `Sleep` and one re-armable inner `Sleep`, then drives them
-/// with `tokio::select!` — no per-iteration allocation.  Without a
-/// `RateChecker` the tick branch is disabled and never polled, so its
-/// timer is never registered.
+/// One outer `Sleep` (`http_timeout`) and one re-armable inner `Sleep` (the
+/// 1 s tick) are pinned once and driven with `tokio::select!`, so no loop
+/// iteration allocates a timer.  Without a `RateChecker` the tick branch is
+/// disabled and never polled, so its timer is never registered.
 async fn wait_socket_rated(
     socket: &TcpStream,
     op: SocketReadiness,

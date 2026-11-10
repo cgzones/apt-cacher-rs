@@ -215,9 +215,9 @@ pub(crate) async fn invalidate_aggregates() {
 }
 
 /// Walk each mirror's cache directory for the Mirrors table and probe the
-/// filesystem for free space. The DB half of what used to be one
-/// `build_mirror_section` now rides the memoized aggregate block; what is
-/// left is the FS work the dashboard footer reports as `disk`.
+/// filesystem for free space. The table's DB half rides the memoized
+/// aggregate block; this is the FS work the dashboard footer reports as
+/// `disk`.
 ///
 /// This is a free async fn rather than an inline `tokio::join!` branch so
 /// rustc can prove `Send` for the future without tripping over higher-rank
