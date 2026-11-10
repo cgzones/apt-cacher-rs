@@ -507,15 +507,12 @@ pub(super) async fn follow_redirect(
     let moved_path = moved_uri
         .path_and_query()
         .map_or("/", http::uri::PathAndQuery::as_str);
-    let moved_port_effective = moved_port.map_or_else(
-        || {
-            if moved_uri.scheme() == Some(&http::uri::Scheme::HTTPS) {
-                443
-            } else {
-                80
-            }
+    let moved_port_effective = endpoint_port(
+        UpstreamEndpoint {
+            host: &moved_domain,
+            port: moved_port,
         },
-        NonZero::get,
+        redirect_scheme == Scheme::Https,
     );
     // The endpoint that answered, not the request's mirror: on the
     // `discard_partial_and_retry` refetch this response came from an earlier
