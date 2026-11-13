@@ -2239,8 +2239,10 @@ fn read_release_sync(path: &Path) -> std::io::Result<(String, std::time::SystemT
         .modified()
         .expect("Platform should support modification timestamps via setup check");
     let limit = limits::MAX_RELEASE_SIZE.get();
-    // Sized from the fstat so the read takes one call plus the EOF probe; a
-    // file grown since is still bounded by the `take` below.
+    // Sized from the fstat so the buffer never regrows; a file grown since is
+    // still bounded by the `take` below. The read is three calls, not two:
+    // `Take` passes no size hint, so std starts with an 8 KiB read before it
+    // fills the rest and probes for EOF.
     let capacity = usize::try_from(metadata.len().min(limit)).unwrap_or(0);
     let mut buf = String::with_capacity(capacity);
     // One byte past the cap tells an over-cap file from one exactly at it.
