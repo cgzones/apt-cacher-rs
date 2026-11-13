@@ -12,6 +12,14 @@
 * cache package list files and prefetch them every 30min?
 * add option to import packages locally
 
+* cleanups deferred because they require Rust 1.100 (released 2026-11-12) as minimum compiler:
+  - `str::trim_prefix()` / `str::trim_suffix()` instead of `s.strip_prefix(..).unwrap_or(s)`
+    (*src/http_etag.rs*, *src/request_dispatch.rs*, *src/web/host_gate.rs*, *src/deb_mirror.rs*)
+  - the never type `!` instead of `std::convert::Infallible`
+    (the `Never` alias in *src/main.rs*, the error types in *src/hyper_conn.rs*, *src/web/response.rs* and *src/splice/commit.rs*)
+  - `std::mem::DropGuard` instead of the function-local guard structs
+    (`Stopped` in *src/main.rs*, `Refreshing` in *src/cache_quota.rs*)
+
 # Utils
 
 curl --fail -o /dev/null --proxy 127.0.0.1:3142 http://deb.debian.org/debian/pool/main/f/firefox-esr/firefox-esr_115.9.1esr-1_amd64.deb
