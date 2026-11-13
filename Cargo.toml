@@ -106,6 +106,12 @@ nix = { version = "0.31", features = ["poll"] }
 tempfile = "3.27"
 
 
+[lints.cargo]
+# hyper-rustls and hyper-tls are needed only when both hyper and a TLS feature
+# are enabled, which Cargo features cannot express; splice-only builds would
+# otherwise report them as unused.
+unused_dependencies = "allow"
+
 [lints.rust]
 elided_lifetimes_in_paths = "warn"
 let_underscore_drop = "warn"
