@@ -1,6 +1,6 @@
-apt-cacher-rs (0.9.0rc.1-1) unstable; urgency=medium
+apt-cacher-rs (0.9.0-1) unstable; urgency=medium
 
   * New upstream release.
   * See the upstream release notes for the full list of changes.
 
- -- Christian Göttsche <cgzones@googlemail.com>  Tue, 03 Nov 2026 20:00:00 +0100
+ -- Christian Göttsche <cgzones@googlemail.com>  Fri, 13 Nov 2026 12:06:00 +0100
