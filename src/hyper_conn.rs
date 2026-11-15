@@ -1944,8 +1944,8 @@ async fn serve_new_file_worker(
             // the cache key come from the request-target authority, and a
             // client-chosen `Host` would select another vhost on the same
             // server while the response is cached under the permitted one.
-            &USER_AGENT | &RANGE | &IF_RANGE | &ACCEPT | &IF_MODIFIED_SINCE | &CACHE_CONTROL
-            | &CONNECTION | &HOST => (),
+            &USER_AGENT | &RANGE | &IF_RANGE | &ACCEPT | &IF_MODIFIED_SINCE | &IF_NONE_MATCH
+            | &CACHE_CONTROL | &CONNECTION | &HOST => (),
             n if n == PROXY_CONNECTION => (),
 
             _ => {
