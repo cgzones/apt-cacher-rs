@@ -800,18 +800,36 @@ pub(crate) fn is_missing_ipv6(err: &std::io::Error) -> bool {
 /// Pause after a transient `accept(2)` failure before retrying.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-/// Whether an `accept(2)` error is a passing load condition worth retrying
-/// (descriptor or buffer exhaustion, a peer gone before accept) rather than
-/// a broken listener.
+/// Whether an `accept(2)` error is a passing condition worth retrying
+/// (descriptor or buffer exhaustion, a peer gone before accept, a network
+/// error pending on the new connection) rather than a broken listener.
 fn is_transient_accept_error(err: &std::io::Error) -> bool {
-    let Some(errno) = err.raw_os_error().map(nix::errno::Errno::from_raw) else {
-        return false;
-    };
-    errno == nix::errno::Errno::EMFILE
-        || errno == nix::errno::Errno::ENFILE
-        || errno == nix::errno::Errno::ENOBUFS
-        || errno == nix::errno::Errno::ENOMEM
-        || errno == nix::errno::Errno::ECONNABORTED
+    use nix::errno::Errno;
+
+    /// Load conditions, then the errors Linux hands out from `accept(2)`
+    /// when they were already pending on the connection being accepted:
+    /// accept(2) says to treat those like `EAGAIN` and retry. They concern
+    /// that one peer, so none may stop the daemon.
+    const TRANSIENT: [Errno; 14] = [
+        Errno::EMFILE,
+        Errno::ENFILE,
+        Errno::ENOBUFS,
+        Errno::ENOMEM,
+        Errno::ECONNABORTED,
+        Errno::EINTR,
+        Errno::ENETDOWN,
+        Errno::EPROTO,
+        Errno::ENOPROTOOPT,
+        Errno::EHOSTDOWN,
+        Errno::ENONET,
+        Errno::EHOSTUNREACH,
+        Errno::EOPNOTSUPP,
+        Errno::ENETUNREACH,
+    ];
+
+    err.raw_os_error()
+        .map(Errno::from_raw)
+        .is_some_and(|errno| TRANSIENT.contains(&errno))
 }
 
 #[cfg(test)]
@@ -826,6 +844,26 @@ mod accept_error_tests {
             nix::errno::Errno::ENOBUFS,
             nix::errno::Errno::ENOMEM,
             nix::errno::Errno::ECONNABORTED,
+        ] {
+            let err = std::io::Error::from_raw_os_error(errno as i32);
+            assert!(is_transient_accept_error(&err), "{errno}");
+        }
+    }
+
+    /// accept(2): an error already pending on the accepted connection is
+    /// reported by the call and concerns that one peer only.
+    #[test]
+    fn pending_network_errors_are_transient() {
+        for errno in [
+            nix::errno::Errno::EINTR,
+            nix::errno::Errno::ENETDOWN,
+            nix::errno::Errno::EPROTO,
+            nix::errno::Errno::ENOPROTOOPT,
+            nix::errno::Errno::EHOSTDOWN,
+            nix::errno::Errno::ENONET,
+            nix::errno::Errno::EHOSTUNREACH,
+            nix::errno::Errno::EOPNOTSUPP,
+            nix::errno::Errno::ENETUNREACH,
         ] {
             let err = std::io::Error::from_raw_os_error(errno as i32);
             assert!(is_transient_accept_error(&err), "{errno}");
