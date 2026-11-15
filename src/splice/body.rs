@@ -536,18 +536,13 @@ impl CacheWriter {
     /// transfer's own error.
     pub(super) async fn salvage(&mut self) {
         let landed = match std::mem::replace(&mut self.sink, CacheSink::Direct) {
+            CacheSink::Direct => Ok(()),
             CacheSink::Pipes(pipes) => {
                 pipes
                     .salvage_into(&self.core.file, &mut self.core.file_offset)
                     .await
             }
-            sink @ (CacheSink::Direct | CacheSink::Buffer(_)) => {
-                self.sink = sink;
-                match &mut self.sink {
-                    CacheSink::Buffer(batch) => land_buffer(&mut self.core, batch).await,
-                    CacheSink::Direct | CacheSink::Pipes(_) => Ok(()),
-                }
-            }
+            CacheSink::Buffer(mut batch) => land_buffer(&mut self.core, &mut batch).await,
         };
         if let Err(err) = landed {
             let _logged = Logged::cache_io_failure(format_args!(
