@@ -1464,12 +1464,8 @@ pub(crate) async fn verify_and_rename(
 
     // Post-commit, best-effort: ingest index files into the registry so future
     // downloads are verifiable. Detached so the client connection is never
-    // delayed by decompression/parsing. Skipped when verification is disabled:
-    // the registry it populates is read only by `verify_temp_file`, so parsing
-    // (and decompressing) every index file would be pure waste.
-    if verify_enabled {
-        schedule_ingest(&IndexFile::from(plan), IngestTrigger::Commit);
-    }
+    // delayed by decompression/parsing.
+    let _queued = schedule_ingest(&IndexFile::from(plan));
 
     Ok(())
 }
@@ -1583,40 +1579,39 @@ pub(crate) fn ingest_ledger_footprint() -> (Footprint, usize) {
     (INGEST_LEDGER.footprint(), INGEST_LEDGER_CAP)
 }
 
-/// Why an ingest is scheduled (only the counters differ).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum IngestTrigger {
-    Commit,
-    Touch,
-}
-
 /// Queue the ingest of `file` unless the ledger says its digests are
-/// already registered, it failed for good, or an ingest of it is running.
-fn schedule_ingest(file: &IndexFile<'_>, trigger: IngestTrigger) {
+/// already registered, it failed for good, or an ingest of it is running;
+/// whether one was queued.
+///
+/// Nothing is queued when verification is disabled: the registry an ingest
+/// populates is read only by `verify_temp_file`, so parsing (and
+/// decompressing) every index file would be pure waste.
+fn schedule_ingest(file: &IndexFile<'_>) -> bool {
+    if !global_config().verify_checksums {
+        return false;
+    }
     let Some(kind) = ingest_kind(file) else {
-        return;
+        return false;
     };
     let registry = global_checksum_registry();
     let (authority, mirror_path) = (file.mirror.format_authority(), file.mirror.path());
     let epoch = registry.scope_epoch(authority, mirror_path);
     let (claim, slot) = match admit(&INGEST_LEDGER, ingest_pool(&kind), file.path, epoch) {
-        Admission::Nothing => return,
+        Admission::Nothing => return false,
         Admission::Refused => {
             metrics::INGEST_SKIPPED_QUEUE_FULL.increment();
             warn_once_or_debug!(
                 "Skipping registry ingest of index `{}` for host {authority} mirror {mirror_path} (ingest queue full); retrying on its next request",
                 file.path.display(),
             );
-            return;
+            return false;
         }
         Admission::Admitted(claim, slot) => (claim, slot),
     };
-    if trigger == IngestTrigger::Touch {
-        metrics::INGEST_TOUCH_TRIGGERED.increment();
-    }
     let mirror = file.mirror.clone();
     let buffer_size = global_config().buffer_size;
     tokio::spawn(run_ingest_job(claim, slot, kind, mirror, buffer_size));
+    true
 }
 
 /// Answer a request for a cached index without a commit (a cache hit, a
@@ -1628,19 +1623,15 @@ pub(crate) fn note_cached_index_touch(
     raw_uri_path: &str,
     cache_path: &Path,
 ) {
-    if !global_config().verify_checksums {
-        return;
+    if schedule_ingest(&IndexFile {
+        resource_kind: conn_details.resource_kind,
+        debname: &conn_details.debname,
+        raw_uri_path,
+        mirror: &conn_details.mirror,
+        path: cache_path,
+    }) {
+        metrics::INGEST_TOUCH_TRIGGERED.increment();
     }
-    schedule_ingest(
-        &IndexFile {
-            resource_kind: conn_details.resource_kind,
-            debname: &conn_details.debname,
-            raw_uri_path,
-            mirror: &conn_details.mirror,
-            path: cache_path,
-        },
-        IngestTrigger::Touch,
-    );
 }
 
 /// The upstream answered a revalidation of a cached `Release`/`InRelease`
