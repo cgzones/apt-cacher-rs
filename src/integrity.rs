@@ -379,8 +379,12 @@ struct RegistryScopeRef<'a> {
     mirror_path: &'a str,
 }
 
-impl Equivalent<RegistryScope> for RegistryScopeRef<'_> {
-    fn equivalent(&self, key: &RegistryScope) -> bool {
+// Both maps key on `Arc<RegistryScope>` (the registry shares the allocation
+// with the eviction epochs), and `lookup` stays allocation-free through the
+// borrowed `RegistryScopeRef`. `Arc<T>: Hash` delegates to `T: Hash` in std,
+// and both derives hash `authority` then `mirror_path`, so the hashes agree.
+impl Equivalent<Arc<RegistryScope>> for RegistryScopeRef<'_> {
+    fn equivalent(&self, key: &Arc<RegistryScope>) -> bool {
         let &Self {
             authority,
             mirror_path,
@@ -388,20 +392,8 @@ impl Equivalent<RegistryScope> for RegistryScopeRef<'_> {
         let RegistryScope {
             authority: kauthority,
             mirror_path: kmpath,
-        } = key;
+        } = &**key;
         authority == kauthority && mirror_path == kmpath
-    }
-}
-
-// The outer map keys on `Arc<RegistryScope>` so the eviction-order deque
-// can share the same allocation. Forwarding `Equivalent` here lets `lookup`
-// keep using the borrowed `RegistryScopeRef` (no allocation on the hot
-// path). `Arc<T>: Hash` delegates to `T: Hash` in std, so the hash byte
-// sequence matches `RegistryScope`'s derived hash and `RegistryScopeRef`'s
-// manual impl.
-impl Equivalent<Arc<RegistryScope>> for RegistryScopeRef<'_> {
-    fn equivalent(&self, key: &Arc<RegistryScope>) -> bool {
-        <Self as Equivalent<RegistryScope>>::equivalent(self, key.as_ref())
     }
 }
 
