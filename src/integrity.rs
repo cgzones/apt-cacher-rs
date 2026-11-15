@@ -234,7 +234,21 @@ fn verify_temp_file(input: &VerifyInput<'_>) -> Result<(), CommitError> {
 
     if computed == expected.as_slice() {
         metrics::CHECKSUM_VERIFIED.increment();
-        stamp_verified(input.file, input.meta, input.temp_path, expected);
+        // Stamp the cleanup-verification marker, so the first cleanup cycle
+        // after this download does not re-read and re-hash the file cold from
+        // disk. Before the rename: `rename(2)` keeps the inode and the mtime,
+        // and the size is final, so the marker is valid for the destination
+        // path cleanup will read it from. Unlike `cleanup/verify.rs`, no
+        // post-hash identity recheck is needed -- the temp file is
+        // exclusively owned by this download, so the identity is the commit
+        // job's `fstat` (`meta`). Best-effort: an xattr failure only means
+        // the next cleanup cycle hashes the file.
+        verified_marker::stamp(
+            input.file,
+            input.temp_path,
+            FileIdentity::of(input.meta),
+            expected,
+        );
         Ok(())
     } else {
         metrics::CHECKSUM_MISMATCH.increment();
@@ -305,22 +319,6 @@ fn hash_file(
     reader.rewind()?;
     hint_sequential_read(file, size, path);
     index_parser::hash_open_file(algo, &mut reader, size)
-}
-
-/// Stamp the cleanup-verification marker on a temp file whose digest just
-/// matched, so the first cleanup cycle after this download does not re-read
-/// and re-hash it cold from disk.
-///
-/// Stamped before the rename: `rename(2)` keeps the inode and the mtime, and
-/// the size is final (the last write already landed), so the marker is valid
-/// for the destination path cleanup will read it from. Unlike
-/// `cleanup/verify.rs`, no post-hash identity recheck is needed — the temp
-/// file is exclusively owned by this download and no other writer can reach
-/// it, so the identity is the commit job's `fstat` (`meta`). Best-effort: an
-/// xattr failure only means the next cleanup cycle hashes the file, so it is
-/// not worth failing a commit.
-fn stamp_verified(file: &std::fs::File, meta: &Metadata, path: &Path, expected: &Digest) {
-    verified_marker::stamp(file, path, FileIdentity::of(meta), expected);
 }
 
 /// Rename paths and resource identity for `verify_and_rename`. Built in
