@@ -1168,35 +1168,27 @@ async fn forward_upstream_chunked_body(
     // decoded payload.
     let mut client_total: u64 = 0;
 
-    // Bootstrap: process bytes that arrived with the response headers.
-    if forward_chunked_buf(
-        &mut decoder,
-        body_prefix,
-        relay,
-        &mut payload,
-        client,
-        &mut client_rate_checker,
-        &mut client_total,
-        config.http_timeout,
-    )
-    .await?
-    {
-        return Ok(client_total);
-    }
-
-    let mut buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE);
+    // The bytes that arrived with the response headers go first.
+    let mut pending = body_prefix;
+    let mut buf = BytesMut::new();
     loop {
-        buf.clear();
-        let n = reader.read(upstream.read_buf(&mut buf)).await?;
-        if n == 0 {
-            return Err(DeliveryFailure::from(UpstreamError::protocol(
-                "upstream closed during chunked body transfer",
-            )));
-        }
+        let data = if pending.is_empty() {
+            buf.clear();
+            buf.reserve(TLS_READ_BUF_SIZE);
+            let n = reader.read(upstream.read_buf(&mut buf)).await?;
+            if n == 0 {
+                return Err(DeliveryFailure::from(UpstreamError::protocol(
+                    "upstream closed during chunked body transfer",
+                )));
+            }
+            &buf[..n]
+        } else {
+            std::mem::take(&mut pending)
+        };
 
         if forward_chunked_buf(
             &mut decoder,
-            &buf[..n],
+            data,
             relay,
             &mut payload,
             client,
