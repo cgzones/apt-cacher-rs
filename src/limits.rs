@@ -38,7 +38,10 @@ use crate::xz_stream::xz_decoder;
 pub(crate) const MAX_UPSTREAM_HEADER_SIZE: usize = 16 * 1024;
 
 /// Maximum number of header fields parsed from an upstream HTTP response.
-pub(crate) const MAX_UPSTREAM_HEADERS: usize = 32;
+/// hyper's own default, and the sendfile backend's cap on a request head:
+/// a mirror behind a CDN and an application server can exceed a few dozen
+/// fields, and a response over the cap is a 502 for every request.
+pub(crate) const MAX_UPSTREAM_HEADERS: usize = 100;
 
 /// Largest read buffer the hyper client grows per upstream connection, which
 /// also bounds the response head it accepts. hyper's default is ~400 KiB.

@@ -2055,6 +2055,15 @@ mod tests {
             "exactly MAX_UPSTREAM_HEADERS headers must parse"
         );
 
+        // A literal, not the constant: a mirror behind a CDN and an
+        // application server sends more than a few dozen fields, so
+        // lowering the cap below this must fail here.
+        let hundred = build(100);
+        assert!(
+            parse_upstream_response(&hundred, hundred.len(), PreciseInstant::now()).is_ok(),
+            "100 header fields must parse"
+        );
+
         let over_cap = build(MAX_UPSTREAM_HEADERS + 1);
         // `UpstreamResponse` is not `Debug`, so go through `Option`.
         let err = parse_upstream_response(&over_cap, over_cap.len(), PreciseInstant::now())
