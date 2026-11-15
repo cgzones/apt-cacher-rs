@@ -52,8 +52,6 @@ use crate::{
     cache_paths::MirrorSite,
     cache_quota::QuotaReservation,
     deb_mirror::Mirror,
-    error::ErrorReport,
-    fs_open::count_cache_failure,
     global_verify_throttle,
     humanfmt::HumanFmt,
     integrity::{self, CommitError, CommitFailure, RenamePlan},
@@ -758,9 +756,8 @@ impl RenameBarrier {
     /// (the file now lives at `dest_path`), on a checksum mismatch the file is
     /// unlinked (its bytes are known-bad, resuming them cannot succeed), on a
     /// transient verify/rename failure the guard's `OnDrop::Keep` keeps it for
-    /// resumption. Rename failures are logged here (with `CACHE_IO_FAILURE`,
-    /// or `CACHE_NON_REGULAR` for a directory at the destination);
-    /// mismatch and verify-IO failures are logged by `verify_and_rename`.
+    /// resumption. Every failure is counted and logged by
+    /// `verify_and_rename`.
     pub(crate) async fn commit(
         mut self,
         finished: integrity::FinishedCacheFile,
@@ -773,7 +770,6 @@ impl RenameBarrier {
                 .as_mut()
                 .expect("every sink consumes the instance");
             RenamePlan {
-                temp_path: temp_path.to_path_buf(),
                 dest_path,
                 resource_kind: data.resource_kind,
                 debname: data.lease.key.debname.clone(),
@@ -798,19 +794,6 @@ impl RenameBarrier {
         if let Err(CommitFailure { error: err, guard }) =
             integrity::verify_and_rename(&plan, finished, temp_path, reservation, lease).await
         {
-            if let CommitError::Rename(io_err) = &err {
-                // A directory planted at the destination fails the rename
-                // with `EISDIR`: a non-regular entry, not a failed syscall.
-                // The inode-mismatch and dead-job errors carry no errno and
-                // stay `CACHE_IO_FAILURE`.
-                count_cache_failure(io_err);
-                error!(
-                    "Failed to rename temp file `{}` to `{}`; leaving the download uncached:  {}",
-                    plan.temp_path.display(),
-                    plan.dest_path.display(),
-                    ErrorReport(io_err)
-                );
-            }
             // Retire the entry here, not in `Drop` (which runs only after
             // the `TempPath` guard is dropped and a blocking write lock
             // is won): a request arriving while the entry was still

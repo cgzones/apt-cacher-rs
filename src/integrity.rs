@@ -50,7 +50,7 @@ use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use tracing::{debug, error, warn};
 
 use crate::error::ErrorReport;
-use crate::fs_open::{hint_sequential_read, nofollow_nonblock_options};
+use crate::fs_open::{count_cache_failure, hint_sequential_read, nofollow_nonblock_options};
 use crate::ingest_ledger::{Claim, IngestLedger, Outcome};
 use crate::limits::{self, PackagesCompression};
 use crate::mem_usage::{ARC_HEADER, Footprint, buffer_bytes};
@@ -93,7 +93,7 @@ pub(crate) enum CommitError {
     /// `rename(2)` itself, or the `create_dir_all` it falls back to when the
     /// destination directory turns out to be missing — or the path no longer
     /// named the verified file, or the job died while renaming. Counted and
-    /// logged once, by the caller (`RenameBarrier::commit`), never here.
+    /// logged once, in [`verify_and_rename`]'s tail.
     #[error("rename failed")]
     Rename(#[source] std::io::Error),
 }
@@ -325,8 +325,6 @@ fn hash_file(
 /// the barrier chain carries since `InitBarrier::new` - no download backend
 /// assembles one.
 pub(crate) struct RenamePlan {
-    /// The finished `.partial` / temp file to verify and rename.
-    pub(crate) temp_path: PathBuf,
     /// The final cache path to rename into.
     pub(crate) dest_path: PathBuf,
     /// Precise resource kind, from `ConnectionDetails::resource_kind`.
@@ -1207,8 +1205,8 @@ fn registry_verify_kind(plan: &RenamePlan, key: &str) -> VerifyKind {
 /// `rename(2)` reports `ENOENT` for a missing *source* too, so a lost temp
 /// file costs one wasted `mkdir` before failing with the same errno it would
 /// have failed with anyway. A `create_dir_all` failure is returned as-is and
-/// surfaces through `CommitError::Rename` — the caller's "Failed to rename
-/// temp file `…` to `…`" ERROR (`guards.rs`) carries its errno, which names
+/// surfaces through `CommitError::Rename` — [`verify_and_rename`]'s "Failed to
+/// rename temp file `…` to `…`" ERROR carries its errno, which names
 /// the real cause; no separate error variant.
 fn rename_into_cache(temp_path: &Path, dest_path: &Path) -> std::io::Result<()> {
     match std::fs::rename(temp_path, dest_path) {
@@ -1331,8 +1329,8 @@ pub(crate) struct CommitFailure {
 /// after the job was spawned still verifies and lands the file (or rejects
 /// it) -- it never leaves a verified download behind as a `.partial`. What
 /// such a cancellation skips is only the async tail: the checksum-mismatch
-/// warn and the post-commit ingest scheduling (the ledger invalidation that
-/// makes a later touch re-ingest runs in the job).
+/// warn, the rename-failure report and the post-commit ingest scheduling (the
+/// ledger invalidation that makes a later touch re-ingest runs in the job).
 ///
 /// The job owns the registry lease: cancelling the commit cannot permit a
 /// retry to modify the file while it is read, or to replace the partial before
@@ -1348,17 +1346,20 @@ pub(crate) async fn verify_and_rename(
     lease: Arc<DownloadWriteLease>,
 ) -> Result<(), CommitFailure> {
     let verify_enabled = global_config().verify_checksums;
+    let RenamePlan {
+        mirror, debname, ..
+    } = plan;
 
     // Build the verification kind. Layer-B/C registry lookups happen here -
     // synchronously, before spawn_blocking - so the pure decision stays
     // global-free. Skipped entirely when verification is disabled.
     let kind = match digest_source(
         plan.resource_kind,
-        &plan.debname,
+        debname,
         &plan.raw_uri_path,
         verify_enabled,
     ) {
-        DigestSource::InUrl(algo) => byhash_verify_kind(algo, &plan.debname),
+        DigestSource::InUrl(algo) => byhash_verify_kind(algo, debname),
         DigestSource::Registry(key) => registry_verify_kind(plan, &key),
         DigestSource::Absent => VerifyKind::Unverifiable,
     };
@@ -1371,6 +1372,8 @@ pub(crate) async fn verify_and_rename(
     // No blocking hop: the file is idle, so this only waits out an in-flight
     // operation that cannot exist.
     let file = file.into_std().await;
+    // For the rename-failure line of a job that died with the guard.
+    let temp_path = guard.to_path_buf();
 
     // Set just before the rename, so a job that dies is attributed to the
     // step it died in: the two keep their distinct messages and variants.
@@ -1433,47 +1436,53 @@ pub(crate) async fn verify_and_rename(
         }
     };
 
-    match lease.spawn_blocking(job).await {
-        Ok(Ok(())) => {}
-        Ok(Err((error, guard))) => {
-            if matches!(error, CommitError::ChecksumMismatch) {
-                warn!(
-                    "Checksum mismatch for {} from host {} mirror {}; discarding the download, not caching",
-                    plan.debname,
-                    plan.mirror.host(),
-                    plan.mirror.path(),
-                );
-            }
-            return Err(CommitFailure {
-                error,
-                guard: Some(guard),
-            });
+    let (error, guard) = match lease.spawn_blocking(job).await {
+        Ok(Ok(())) => {
+            // Post-commit, best-effort: ingest index files into the registry
+            // so future downloads are verifiable. Detached so the client
+            // connection is never delayed by decompression/parsing.
+            let _queued = schedule_ingest(&IndexFile::from(plan));
+            return Ok(());
+        }
+        Ok(Err((error, guard))) => (error, Some(guard)),
+        Err(join_err) if renaming.load(Ordering::Relaxed) => {
+            (CommitError::Rename(std::io::Error::other(join_err)), None)
         }
         Err(join_err) => {
-            let error = if renaming.load(Ordering::Relaxed) {
-                // Counted and logged by the caller, like every other
-                // `CommitError::Rename` (`RenameBarrier::commit`).
-                CommitError::Rename(std::io::Error::other(join_err))
-            } else {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to run the verification task for {} from host {}; discarding the download, not caching:  {}",
-                    plan.debname,
-                    plan.mirror.host(),
-                    ErrorReport(&join_err),
-                );
-                CommitError::VerifyIo(std::io::Error::other(join_err))
-            };
-            return Err(CommitFailure { error, guard: None });
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "Failed to run the verification task for {} from host {}; discarding the download, not caching:  {}",
+                debname,
+                mirror.host(),
+                ErrorReport(&join_err),
+            );
+            (CommitError::VerifyIo(std::io::Error::other(join_err)), None)
         }
+    };
+    match &error {
+        CommitError::ChecksumMismatch => warn!(
+            "Checksum mismatch for {} from host {} mirror {}; discarding the download, not caching",
+            debname,
+            mirror.host(),
+            mirror.path(),
+        ),
+        CommitError::Rename(io_err) => {
+            // A directory planted at the destination fails the rename with
+            // `EISDIR`: a non-regular entry, not a failed syscall. The
+            // inode-mismatch and dead-job errors carry no errno and stay
+            // `CACHE_IO_FAILURE`.
+            count_cache_failure(io_err);
+            error!(
+                "Failed to rename temp file `{}` to `{}`; leaving the download uncached:  {}",
+                temp_path.display(),
+                plan.dest_path.display(),
+                ErrorReport(io_err)
+            );
+        }
+        // Counted and logged where it arose.
+        CommitError::VerifyIo(_) => {}
     }
-
-    // Post-commit, best-effort: ingest index files into the registry so future
-    // downloads are verifiable. Detached so the client connection is never
-    // delayed by decompression/parsing.
-    let _queued = schedule_ingest(&IndexFile::from(plan));
-
-    Ok(())
+    Err(CommitFailure { error, guard })
 }
 
 /// How many `Packages` ingests decode at once. A commit or a touch schedules
@@ -1779,7 +1788,6 @@ struct IndexFile<'a> {
 impl<'a> From<&'a RenamePlan> for IndexFile<'a> {
     fn from(plan: &'a RenamePlan) -> Self {
         let RenamePlan {
-            temp_path: _,
             dest_path,
             resource_kind,
             debname,
