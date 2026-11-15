@@ -32,22 +32,17 @@ use crate::cache_layout::ConnectionDetails;
 use crate::guards::{Consequence, InitBarrier};
 use crate::partial_file;
 use crate::precise_instant::PreciseInstant;
-use crate::rate_checker::RateChecker;
-use crate::sendfile_conn::write_all_to_stream_rated_counted;
 use crate::tcp_cork_guard::CorkGuard;
 use crate::transfer_error::{DeliveryFailure, EndsDelivery, ReportedDelivery};
 use crate::upstream_head::BodyFraming;
-use crate::{
-    client_counter, global_config, limits::VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, metrics,
-    warn_once,
-};
+use crate::{client_counter, limits::VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, metrics, warn_once};
 
 use super::commit::{CompletionBytes, CompletionClient, Served};
 use super::http::UpstreamResponse;
 use super::upstream::{ConnLabel, ResponseBody};
 use super::{
     ClientConn, HeadValidators, RateTimestamps, SpliceProxyError, SpliceProxyOutcome,
-    prepare_cache_target, write_splice_response_headers,
+    prepare_cache_target, write_client_bytes, write_splice_response_headers,
 };
 
 /// Handle the full lifecycle for volatile files whose upstream response has no
@@ -304,19 +299,7 @@ async fn write_buffered_response(
 
     #[expect(clippy::cast_possible_truncation, reason = "body capped at 1 MiB")]
     let body_slice = &body[range_plan.content_start() as usize..range_plan.content_end() as usize];
-    let config = global_config();
-    let mut volatile_rc = RateChecker::from_config(config);
-    let before = rates.client_bytes_sent;
-    let delivered = write_all_to_stream_rated_counted(
-        client.stream,
-        body_slice,
-        &mut volatile_rc,
-        config.http_timeout,
-        &mut rates.client_bytes_sent,
-    )
-    .await;
-    metrics::BYTES_SERVED_SPLICE.increment_by(rates.client_bytes_sent - before);
-    delivered
-        .map_err(|err| conclude_write(conn_details, BODY_PHASE, DeliveryFailure::from(err)))?;
-    Ok(())
+    write_client_bytes(client.stream, body_slice, rates)
+        .await
+        .map_err(|err| conclude_write(conn_details, BODY_PHASE, DeliveryFailure::from(err)))
 }

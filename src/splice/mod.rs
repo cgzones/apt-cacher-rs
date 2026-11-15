@@ -82,8 +82,8 @@ use crate::sendfile_conn::{
 };
 use crate::tcp_cork_guard::CorkGuard;
 use crate::transfer_error::{
-    CacheError, DeliveryEnd, DeliveryFailure, DownloadFailure, EndsDelivery, HeaderWriteFailure,
-    ReportedDownloadFailure, ReportedUpstream, UpstreamError,
+    CacheError, ClientError, DeliveryEnd, DeliveryFailure, DownloadFailure, EndsDelivery,
+    HeaderWriteFailure, ReportedDownloadFailure, ReportedUpstream, UpstreamError,
 };
 use crate::upstream_head::{
     ContentLength, DownloadPlan, RejectReason, ResumeGates, plan_download, plan_fresh_download,
@@ -316,6 +316,29 @@ async fn write_splice_response_headers(
 /// Everything a download writes into: the open temp/partial file with its
 /// path guard, the final cache path, and the barrier the download reports
 /// progress on. Built by [`prepare_cache_target`], consumed by
+/// Write body bytes held in memory to the client, counting what the socket
+/// accepted into `rates.client_bytes_sent` and `BYTES_SERVED_SPLICE` even
+/// when the write then fails.
+async fn write_client_bytes(
+    stream: &TcpStream,
+    bytes: &[u8],
+    rates: &mut RateTimestamps,
+) -> Result<(), ClientError> {
+    let config = global_config();
+    let mut rate_checker = RateChecker::from_config(config);
+    let before = rates.client_bytes_sent;
+    let delivered = write_all_to_stream_rated_counted(
+        stream,
+        bytes,
+        &mut rate_checker,
+        config.http_timeout,
+        &mut rates.client_bytes_sent,
+    )
+    .await;
+    metrics::BYTES_SERVED_SPLICE.increment_by(rates.client_bytes_sent - before);
+    delivered
+}
+
 /// `CacheTarget::begin_rename` (in [`commit`]), which turns it into the
 /// [`commit::CommitTail`].
 struct CacheTarget {
@@ -1135,19 +1158,7 @@ async fn write_body_prefix<'a>(
         // The loop's `BodyTransfer` binds its own once it starts; a body that
         // fits the prefix never reaches it.
         let _client_count = client_counter::ClientDownload::new();
-        let config = global_config();
-        let mut prefix_rc = RateChecker::from_config(config);
-        let before = rates.client_bytes_sent;
-        let delivered = write_all_to_stream_rated_counted(
-            client_stream,
-            client_slice,
-            &mut prefix_rc,
-            config.http_timeout,
-            &mut rates.client_bytes_sent,
-        )
-        .await;
-        metrics::BYTES_SERVED_SPLICE.increment_by(rates.client_bytes_sent - before);
-        if let Err(err) = delivered {
+        if let Err(err) = write_client_bytes(client_stream, client_slice, rates).await {
             let failure = DeliveryFailure::from(err);
             return Ok((
                 target,
