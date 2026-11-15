@@ -514,13 +514,6 @@ pub(crate) enum ResourceFile<'a> {
     },
 }
 
-/// Defensive cap on the normalised output size. A URI longer than this is
-/// already rejected upstream by the request-line size limit
-/// (8 KiB on the sendfile path, hyper's default header limits on the rustls
-/// path); this is belt-and-suspenders against any code path that could reach
-/// here without that bound.
-const MAX_NORMALIZED_PATH_LEN: usize = 16 * 1024;
-
 /// Collapse runs of consecutive ASCII forward-slashes in a URL path to a
 /// single `/`.
 ///
@@ -539,21 +532,9 @@ const MAX_NORMALIZED_PATH_LEN: usize = 16 * 1024;
 /// Non-ASCII codepoints are preserved verbatim; later percent-decoding
 /// and non-ASCII rejection in `decode_validate` / `is_unsafe_proxy_path`
 /// get the original byte sequence.
-///
-/// Inputs longer than [`MAX_NORMALIZED_PATH_LEN`] are returned verbatim as
-/// `Cow::Borrowed`.  Truncating the output would create a validator-bypass
-/// primitive: a trailing `..` segment that the cap silently elides would
-/// allow `is_unsafe_proxy_path` to score the input safe.  Passing the
-/// oversize input through unchanged lets the downstream parser reject it.
 #[must_use]
 pub(crate) fn normalize_uri_path(path: &str) -> Cow<'_, str> {
     if !needs_normalization(path) {
-        return Cow::Borrowed(path);
-    }
-    // Fast path bailed. Cap the allocation at MAX_NORMALIZED_PATH_LEN to
-    // bound work; over-cap inputs bail unchanged rather than risk
-    // truncating away a `..` traversal segment.
-    if path.len() > MAX_NORMALIZED_PATH_LEN {
         return Cow::Borrowed(path);
     }
 
@@ -3113,27 +3094,6 @@ mod tests {
     fn parse_request_path_rejects_traversal_after_normalize() {
         // Even with `//` collapsed, traversal segments still get caught.
         assert!(parse_request_path("debian/dists/../passwd").is_none());
-    }
-
-    #[test]
-    fn normalize_uri_path_oversized_bails_safely() {
-        // Build an input longer than MAX_NORMALIZED_PATH_LEN containing a `//`
-        // run - would normally take the slow path, but oversize triggers the
-        // bailout.
-        let huge = format!("/{}/", "a/".repeat(MAX_NORMALIZED_PATH_LEN));
-        let normalized = normalize_uri_path(&huge);
-        assert!(matches!(normalized, Cow::Borrowed(_)));
-        assert_eq!(normalized.as_ref(), huge.as_str());
-    }
-
-    #[test]
-    fn normalize_uri_path_at_cap_normalizes() {
-        let segment = "a".repeat(MAX_NORMALIZED_PATH_LEN - 2);
-        let at_cap = format!("//{segment}");
-        assert_eq!(at_cap.len(), MAX_NORMALIZED_PATH_LEN);
-        let normalized = normalize_uri_path(&at_cap);
-        assert!(matches!(normalized, Cow::Owned(_)));
-        assert_eq!(normalized, format!("/{segment}"));
     }
 
     #[test]

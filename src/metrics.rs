@@ -92,9 +92,7 @@ impl Signal {
 
 /// The coarse wall clock every [`Signal`] stamp is taken from.
 fn now_epoch_secs() -> u64 {
-    // Only a clock set to the epoch's first second could store the "never"
-    // sentinel; clamp so a bump always reads as a bump.
-    coarsetime::Clock::now_since_epoch().as_secs().max(1)
+    coarsetime::Clock::now_since_epoch().as_secs()
 }
 
 /// Cumulative time a limiter spent at its cap since process start: how long
@@ -157,7 +155,7 @@ impl CapClock {
         // Lost race: another admission started the span already.
         if self
             .since
-            .compare_exchange(0, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {}
     }

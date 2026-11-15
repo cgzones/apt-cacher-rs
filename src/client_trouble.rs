@@ -148,10 +148,11 @@ impl HeavyHitters {
             self.entries.push(entry);
             return;
         }
-        let Some(lightest) = self.entries.iter_mut().min_by_key(|e| e.total()) else {
-            // A zero-capacity table tracks nothing.
-            return;
-        };
+        let lightest = self
+            .entries
+            .iter_mut()
+            .min_by_key(|e| e.total())
+            .expect("the table is full and its capacity is never 0");
         let mut entry = ClientTrouble::new(ip, lightest.total());
         entry.bump(trouble);
         *lightest = entry;
