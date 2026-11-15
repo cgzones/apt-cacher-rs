@@ -154,7 +154,10 @@ impl ClientConn<'_> {
     }
 }
 
-/// Maximum bytes to forward for volatile responses (no Content-Length / chunked non-cacheable).
+/// Cap on a relayed (uncached) body whose length the upstream did not
+/// announce -- chunked or close-delimited -- for both the passthrough relay
+/// of a non-cacheable response and the simple proxy. A length-delimited body
+/// is bounded by its `Content-Length` instead.
 const VOLATILE_BODY_MAX: usize = 1024 * 1024;
 
 /// Serve a cached volatile file after an upstream `304 Not Modified`: refresh
@@ -313,9 +316,6 @@ async fn write_splice_response_headers(
     Ok(t_client_first)
 }
 
-/// Everything a download writes into: the open temp/partial file with its
-/// path guard, the final cache path, and the barrier the download reports
-/// progress on. Built by [`prepare_cache_target`], consumed by
 /// Write body bytes held in memory to the client, counting what the socket
 /// accepted into `rates.client_bytes_sent` and `BYTES_SERVED_SPLICE` even
 /// when the write then fails.
@@ -339,6 +339,9 @@ async fn write_client_bytes(
     delivered
 }
 
+/// Everything a download writes into: the open temp/partial file with its
+/// path guard, the final cache path, and the barrier the download reports
+/// progress on. Built by [`prepare_cache_target`], consumed by
 /// `CacheTarget::begin_rename` (in [`commit`]), which turns it into the
 /// [`commit::CommitTail`].
 struct CacheTarget {
