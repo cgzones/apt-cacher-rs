@@ -55,7 +55,7 @@ use crate::sendfile_conn::{
 };
 use crate::{
     Never, active_downloads::ActiveDownloadStatus, client_counter, client_info::ClientInfo,
-    global_config, metrics, static_assert, sticky, warn_once_or_debug, warn_once_or_info,
+    global_config, metrics, static_assert, sticky, warn_once_or_info,
 };
 
 use super::upstream::UpstreamConn;
@@ -147,14 +147,6 @@ fn create_pipe() -> std::io::Result<(pipe::Sender, pipe::Receiver)> {
             warn_once_or_info!(
                 "splice proxy: failed to increase the pipe buffer size; continuing with the default size:  {}",
                 ErrorReport(&errno)
-            );
-        }
-    } else if cfg!(debug_assertions) {
-        let receiver_buf_size = fcntl(receiver.as_fd(), FcntlArg::F_GETPIPE_SZ)?;
-
-        if receiver_buf_size != PIPE_BUFFER_SIZE {
-            warn_once_or_debug!(
-                "splice proxy: pipe buffer size mismatch: sender={PIPE_BUFFER_SIZE}, receiver={receiver_buf_size}; continuing with the mismatched sizes"
             );
         }
     }
@@ -1542,11 +1534,6 @@ async fn pwrite_buf_to_file(
                 written += n;
                 offset +=
                     i64::try_from(n).expect("pwrite(2) does not write more than i64::MAX bytes");
-            }
-            // EAGAIN/EWOULDBLOCK: see module-level static_assert.
-            Err(nix::errno::Errno::EAGAIN) => {
-                // yield to avoid busy loop
-                tokio::task::yield_now().await;
             }
             Err(nix::errno::Errno::EINTR) => {}
             Err(errno) => {

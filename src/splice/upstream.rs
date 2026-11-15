@@ -354,32 +354,23 @@ pub(crate) async fn pool_reaper() {
     }
 }
 
-/// Return a connection to the pool for reuse.
-///
-/// Expires only this key's entries (at most [`UPSTREAM_POOL_MAX_IDLE_PER_HOST`]);
-/// [`pool_reaper`] handles other keys. Drop removed sockets outside the lock.
+/// Return a connection to the pool for reuse. Idle entries expire at
+/// checkout and in [`pool_reaper`]; an evicted socket drops outside the lock.
 fn pool_return(host: &ClientHost, port: u16, conn: UpstreamConn) {
     let is_tls = conn.is_tls();
     let mut map = upstream_pool().lock();
-    let now = coarsetime::Instant::now();
     let conns = map.entry((host.clone(), port, is_tls)).or_default();
-    let mut expired: Vec<_> = conns
-        .extract_if(.., |entry| {
-            now.duration_since(entry.idle_since) >= POOL_IDLE_TIMEOUT
-        })
-        .collect();
-
-    if conns.len() >= UPSTREAM_POOL_MAX_IDLE_PER_HOST {
+    let evicted = (conns.len() >= UPSTREAM_POOL_MAX_IDLE_PER_HOST).then(|| {
         debug!("splice proxy: evicting oldest pooled connection for {host}:{port} (pool full)");
         metrics::POOL_RETURN_EVICTED.increment();
-        expired.push(conns.remove(0));
-    }
+        conns.remove(0)
+    });
     conns.push(PooledConn {
         conn,
-        idle_since: now,
+        idle_since: coarsetime::Instant::now(),
     });
     drop(map);
-    drop(expired);
+    drop(evicted);
     debug!("splice proxy: returned connection to pool for {host}:{port} (tls={is_tls})");
 }
 
@@ -801,26 +792,6 @@ async fn tcp_connect(host: &ClientHost, port: u16) -> std::io::Result<TcpStream>
                     ErrorReport(&err)
                 );
             }
-
-            #[cfg(debug_assertions)]
-            {
-                use nix::sys::socket::{
-                    getsockopt,
-                    sockopt::{RcvBuf, ReceiveTimeout, SendTimeout, SndBuf},
-                };
-
-                let send_buf_size = getsockopt(&tcp, SndBuf);
-                let recv_buf_size = getsockopt(&tcp, RcvBuf);
-                let send_timeout = getsockopt(&tcp, SendTimeout);
-                let recv_timeout = getsockopt(&tcp, ReceiveTimeout);
-                debug!(
-                    "Connected to {host}:{port}: \
-                    snd_buf_size={send_buf_size:?}, \
-                    rcv_buf_size={recv_buf_size:?}, \
-                    send_timeout={send_timeout:?}, \
-                    recv_timeout={recv_timeout:?}"
-                );
-            }
         })
 }
 
@@ -1173,38 +1144,6 @@ mod tests {
                 "checkout closes the expired connection"
             );
         }
-    }
-
-    /// Returning to a key expires its old sockets without waiting for the
-    /// periodic sweep.
-    #[tokio::test]
-    async fn pool_return_reaps_idle_entries_of_same_host() {
-        use tokio::io::AsyncReadExt as _;
-
-        let (stale, mut stale_peer) = connected_tcp_pair().await;
-        let (fresh, _fresh_peer) = connected_tcp_pair().await;
-        let stale_host = test_host("pool-reap-stale.invalid");
-        let fresh_host = stale_host.clone();
-
-        upstream_pool().lock().insert(
-            (stale_host.clone(), 80, false),
-            vec![PooledConn {
-                conn: UpstreamConn::Tcp(stale),
-                idle_since: coarsetime::Instant::now()
-                    - (POOL_IDLE_TIMEOUT + coarsetime::Duration::from_secs(1)),
-            }],
-        );
-
-        pool_return(&fresh_host, 80, UpstreamConn::Tcp(fresh));
-
-        let count = upstream_pool()
-            .lock()
-            .get(&(fresh_host, 80, false))
-            .unwrap()
-            .len();
-        assert_eq!(count, 1);
-        let mut byte = [0u8; 1];
-        assert_eq!(stale_peer.read(&mut byte).await.unwrap(), 0);
     }
 
     /// The periodic reaper sweeps every key, so a host that sees no more
