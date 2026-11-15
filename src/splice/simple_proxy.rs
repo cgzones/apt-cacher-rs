@@ -20,6 +20,7 @@ use crate::humanfmt::HumanFmt;
 use crate::limits::MAX_UPSTREAM_HEADERS;
 use crate::precise_instant::PreciseInstant;
 use crate::rate_log;
+use crate::request_dispatch::split_query;
 use crate::{
     build_info::APP_VIA, client_counter, client_info::ClientInfo, metrics, warn_once_or_info,
     warn_once_or_info_logged,
@@ -119,9 +120,7 @@ pub(crate) async fn splice_simple_proxy(
     // Strip the query so cache identity (registry keys, Origin rows) stays
     // path-only; the query still rides on the upstream GET line via
     // `upstream_path`. Matches the hyper backend.
-    let original_uri_path = upstream_path
-        .split_once('?')
-        .map_or(upstream_path, |(path, _)| path);
+    let original_uri_path = split_query(upstream_path).0;
 
     // Account this passthrough under `ACTIVE_CLIENT_DOWNLOADS` for the
     // duration of the function (RAII drop on every return path). The hyper

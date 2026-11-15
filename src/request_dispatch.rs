@@ -564,7 +564,7 @@ pub(crate) struct PassthroughRequest {
 
 /// Split a request target's path-and-query at its first `?`, which RFC 3986
 /// reserves as the query delimiter (a literal `?` in the path is `%3F`).
-fn split_query(path_and_query: &str) -> (&str, Option<&str>) {
+pub(crate) fn split_query(path_and_query: &str) -> (&str, Option<&str>) {
     match path_and_query.split_once('?') {
         Some((path, query)) => (path, Some(query)),
         None => (path_and_query, None),
