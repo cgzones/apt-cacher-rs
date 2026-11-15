@@ -46,12 +46,8 @@ impl KeyMapper<'_> {
     }
 }
 
-/// Per-call context for [`reduce_file_list`]: needed to invalidate
-/// per-file `cache_metadata` entries and to attribute checksum-mismatch
-/// removals back to the per-mirror `CleanupDone` totals.
 pub(super) struct ReduceContext<'a> {
-    /// Tree root the candidate keys are relative to; a matched key is rejoined
-    /// onto it to reach the cached file.
+    /// Tree root the candidate keys are relative to.
     pub(super) root: &'a Path,
     pub(super) mirror: &'a Mirror,
     pub(super) layout: CacheLayout,
@@ -59,19 +55,12 @@ pub(super) struct ReduceContext<'a> {
     /// straight into it, so deletions performed before a mid-cascade group
     /// failure are never lost.
     pub(super) tally: &'a mut UnitStats,
-    /// Derives the lookup key from a `Filename:` relpath.
     pub(super) keymap: KeyMapper<'a>,
 }
 
 /// Process one stanza: if its `Filename:` value resolves to a candidate
-/// cached file, verify the file content and either retain it (match), warn-
-/// and-retain it (no usable hash advertised, transient error, or concurrent
-/// rename race), or warn-and-evict it (genuine digest mismatch).
-///
-/// The `Filename:` field is a full relative path from the repo root.  For
-/// structured archives the on-disk cache flattens that to the basename, so
-/// the lookup key is the basename portion.  For flat archives the URL path
-/// is the on-disk path verbatim, so the lookup key is the relpath itself.
+/// cached file, verify the file content and retain it unless the digest
+/// genuinely mismatches.
 async fn process_stanza(
     stanza: &Stanza,
     file_list: &mut HashMap<OsString, SpanClass>,
@@ -85,8 +74,6 @@ async fn process_stanza(
         return;
     };
 
-    // Every path below drops the entry from the reference set, so take it out
-    // once rather than looking it up again per exit.
     if file_list.remove(OsStr::new(lookup_key)).is_none() {
         return;
     }
@@ -99,8 +86,7 @@ async fn process_stanza(
 
     // No pre-verify stat: `verify_cache_file` opens the file `O_NOFOLLOW |
     // O_NONBLOCK` and `fstat`s the descriptor it actually hashed, so it detects
-    // a concurrent type swap without a second syscall (and without the
-    // lstat-then-open race an extra stat would only narrow).
+    // a concurrent type swap itself.
     match verify_cache_file(path.clone(), expected.clone()).await {
         Verdict::Match => {}
         Verdict::NonRegular => {
@@ -162,10 +148,7 @@ async fn process_stanza(
 
 /// Why a fetched `Packages` index could not be reduced against the candidate
 /// set.  Carries the cause only: the resolver receiving it decides the
-/// consequence (bail the mirror, continue with the next index source, fall
-/// back to age-based retention) and logs the one line, with this rendered
-/// through `ErrorReport` after it.  `filename` is the fetched index's
-/// [`FetchedPackages::name`], which identifies the origin's index.
+/// consequence and logs it.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ReduceError {
     /// A gzip/xz index of zero bytes is malformed (both formats need at least
@@ -190,16 +173,13 @@ pub(super) enum ReduceError {
 }
 
 /// Stream a (possibly compressed) Debian `Packages` file stanza by stanza,
-/// reducing the candidate `file_list` by basename and verifying matched
-/// cache files against the stanza's `SHA256:`/`SHA512:` digest.
+/// reducing the candidate `file_list` and verifying matched cache files
+/// against the stanza's `SHA256:`/`SHA512:` digest.
 ///
-/// Cleanup is conservative about an index it cannot read in full: an unreadable
-/// or malformed file bails the mirror this cycle rather than reconciling against
-/// a partial reference set (which would grace-sweep still-referenced debs). That
-/// is the deliberate difference from `integrity::ingest_packages_file`, which
-/// shares the decode ladder via [`packages_reader`] and the stanza loop via
-/// [`StanzaStream`] but degrades to a less-populated registry instead.  The
-/// `Err` is the cause alone; the resolver logs it with its consequence.
+/// An unreadable or malformed index is an `Err` rather than a partial
+/// reduction: reconciling against a partial reference set would grace-sweep
+/// still-referenced debs. (`integrity::ingest_packages_file` deliberately
+/// degrades instead.)
 pub(super) async fn reduce_file_list(
     index: FetchedPackages,
     file_list: &mut HashMap<OsString, SpanClass>,
@@ -222,15 +202,9 @@ pub(super) async fn reduce_file_list(
 
     let Some(compressed_size) = NonZero::new(len) else {
         return match compression {
-            // A raw Packages file with zero stanzas is legal (e.g.
-            // a freshly-created component with no published debs); the
-            // read loop would hit EOF immediately and treat
-            // file_list as the empty reference set, which is the
-            // correct cleanup behaviour. Avoid turning that into a
-            // mirror-cleanup failure.
+            // A raw Packages file with zero stanzas is legal (e.g. a
+            // freshly-created component with no published debs).
             PackagesCompression::Raw => Ok(()),
-            // For compressed formats an empty file is malformed:
-            // both gzip and xz require at least a header.
             PackagesCompression::Gz | PackagesCompression::Xz => {
                 Err(ReduceError::ZeroSizeCompressed { filename })
             }
@@ -254,7 +228,6 @@ pub(super) async fn reduce_file_list(
         match stanzas.next().await {
             Ok(Some(stanza)) => {
                 process_stanza(stanza, file_list, ctx).await;
-                // Every candidate is referenced: nothing left to reduce.
                 if file_list.is_empty() {
                     return Ok(());
                 }
@@ -280,8 +253,6 @@ mod tests {
         test_support::{gzip, structured_mirror},
     };
 
-    /// A test fixture as the fetch would hand it over: the whole file,
-    /// sized by a stat.
     async fn fetched(
         compression: PackagesCompression,
         file: tokio::fs::File,
@@ -296,8 +267,6 @@ mod tests {
         }
     }
 
-    /// A candidate map for the reduce tests: every entry is `Deb`-class and
-    /// keyed by its path relative to the `ReduceContext` root.
     fn cands(keys: &[&str]) -> HashMap<OsString, SpanClass> {
         keys.iter()
             .map(|k| (OsString::from(*k), SpanClass::Deb))
@@ -306,17 +275,14 @@ mod tests {
 
     #[test]
     fn key_mapper_maps_each_layout() {
-        // Structured: basename of the relpath.
         assert_eq!(
             KeyMapper::Basename.map("pool/main/a/abc/abc_1.0_amd64.deb"),
             Some("abc_1.0_amd64.deb"),
         );
-        // Flat co-located: relpath verbatim.
         assert_eq!(
             KeyMapper::Relpath.map("amd64/twilio-cli_5.0.0_amd64.deb"),
             Some("amd64/twilio-cli_5.0.0_amd64.deb"),
         );
-        // Flat walk-up: strip the prefix, drop siblings outside it.
         let km = KeyMapper::RelpathUnderPrefix { prefix: "amd64/" };
         assert_eq!(km.map("amd64/pkg.deb"), Some("pkg.deb"));
         assert_eq!(km.map("arm64/sibling.deb"), None);
@@ -324,12 +290,8 @@ mod tests {
 
     #[tokio::test]
     async fn process_stanza_flat_prefix_strips_in_subtree_and_drops_siblings() {
-        // Regression guard for the walk-up flat-cleanup case: when a flat
-        // mirror at `apt/amd64` reuses a Packages index fetched at the
-        // ancestor `apt/`, `Filename:` values are relative to `apt/`. The
-        // process_stanza prefix logic must (a) ignore sibling-subtree
-        // entries (`arm64/*`), and (b) strip the `amd64/` prefix to find
-        // the basename-keyed entry inside our subtree.
+        // A flat mirror at `apt/amd64` reusing a Packages index fetched at
+        // the ancestor `apt/`: `Filename:` values are relative to `apt/`.
         use std::num::NonZero;
 
         let mut file_list = cands(&["pkg.deb", "other.deb"]);
@@ -342,8 +304,6 @@ mod tests {
         );
         let mut tally = UnitStats::default();
 
-        // Sibling subtree: `arm64/sibling.deb` does not start with the
-        // `amd64/` prefix — must be a no-op on file_list.
         {
             let mut ctx = ReduceContext {
                 root: Path::new("/tmp/cache"),
@@ -360,8 +320,7 @@ mod tests {
         assert!(file_list.contains_key(OsStr::new("pkg.deb")));
         assert!(file_list.contains_key(OsStr::new("other.deb")));
 
-        // In-subtree: `amd64/pkg.deb` strips to `pkg.deb`; with no SHA
-        // advertised, the stanza warn-retains and removes the lookup key.
+        // With no SHA advertised, the stanza retains the file unverified.
         {
             let mut ctx = ReduceContext {
                 root: Path::new("/tmp/cache"),
@@ -390,10 +349,9 @@ mod tests {
         let deb_body: &[u8] = b"payload";
         let deb_hash: [u8; 32] = Sha256::digest(deb_body).into();
 
-        // Build a stanza whose `Provides:` field is far longer than the
-        // per-line cap (mirroring the real `experimental_main` layout where
-        // packages like `librust-ruma` carry ~19 KiB Provides lists) — the
-        // parser must skip the line and still extract Filename+SHA256.
+        // A `Provides:` field far longer than the per-line cap (real
+        // `experimental_main` packages like `librust-ruma` carry ~19 KiB
+        // Provides lists).
         let mut raw = Vec::new();
         raw.extend_from_slice(b"Package: dummy\n");
         raw.extend_from_slice(b"Filename: pool/d/dummy/dummy_1.0_amd64.deb\n");
@@ -409,10 +367,6 @@ mod tests {
         tokio::fs::write(&path, &raw).await.expect("write fixture");
         let file = tokio::fs::File::open(&path).await.expect("open fixture");
 
-        // `dummy_1.0_amd64.deb` is the structured-lookup-key (basename) of
-        // the Filename: above; reaching `StanzaStream::complete` with the stanza
-        // intact removes the entry from the candidate list, proving the
-        // parser kept its place through the oversize line.
         tokio::fs::write(dir.path().join("dummy_1.0_amd64.deb"), deb_body)
             .await
             .expect("write deb");
@@ -475,8 +429,7 @@ mod tests {
         }
     }
 
-    /// How a test hands the reduce its index: hyper's buffered file, or the
-    /// bridge's bytes.
+    /// Hyper's buffered file, or the bridge's bytes.
     #[derive(Debug, Clone, Copy)]
     enum Via {
         File,
@@ -530,9 +483,6 @@ mod tests {
         (result, file_list)
     }
 
-    /// The decode ladder is one for both inputs: every format reduces the
-    /// same candidates whether the index arrives as a file or as bytes,
-    /// verifying the referenced deb and keeping it on disk.
     #[tokio::test]
     async fn reduce_file_list_decodes_files_and_bytes_alike() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -567,9 +517,9 @@ mod tests {
         }
     }
 
-    /// Once every candidate is referenced the reduce stops reading: a
-    /// malformed tail past that point (a `Filename:` that is not UTF-8) is
-    /// never decoded, while it still fails a reduce that has candidates left.
+    /// The malformed tail (a `Filename:` that is not UTF-8) is never decoded
+    /// once every candidate is referenced, while it still fails a reduce that
+    /// has candidates left.
     #[tokio::test]
     async fn reduce_file_list_stops_reading_once_every_candidate_is_referenced() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -596,10 +546,8 @@ mod tests {
         }
     }
 
-    /// Only the fields the reduce reads must be UTF-8: a Latin-1
-    /// `Description:` in a third-party index reduces like any other, while
-    /// a `Filename:` that is not UTF-8 still bails the mirror rather than
-    /// reconcile against the references read before it.
+    /// A Latin-1 `Description:` in a third-party index reduces like any
+    /// other, while a `Filename:` that is not UTF-8 still bails the mirror.
     #[tokio::test]
     async fn reduce_file_list_reads_only_tracked_fields_as_utf8() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -636,9 +584,6 @@ mod tests {
         }
     }
 
-    /// The guards the file path has hold for in-memory bytes: an empty
-    /// compressed index, a malformed or bomb-sized stream, and an index past
-    /// its compressed cap all fail, an empty raw index is no stanzas.
     #[tokio::test]
     async fn reduce_file_list_guards_files_and_bytes_alike() {
         let root = Path::new("/nonexistent");

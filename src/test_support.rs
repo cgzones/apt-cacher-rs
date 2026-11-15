@@ -10,7 +10,6 @@ use crate::{
     precise_instant::PreciseInstant,
 };
 
-/// A structured mirror on the default port.
 pub(crate) fn structured_mirror(host: &str, path: &str) -> Mirror {
     Mirror::new(
         ClientHost::new(host).expect("valid host"),
@@ -20,13 +19,10 @@ pub(crate) fn structured_mirror(host: &str, path: &str) -> Mirror {
     )
 }
 
-/// A loopback client, for code paths that only log or classify it.
 pub(crate) fn local_client() -> ClientInfo {
     ClientInfo::new(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
 }
 
-/// A minimal request context for the log/bookkeeping sites that only read
-/// `debname`, `mirror` and `client` off it.
 pub(crate) fn connection_details(debname: &str) -> ConnectionDetails {
     let mirror = structured_mirror("fixture.test", "/debian");
     ConnectionDetails {
@@ -104,7 +100,6 @@ pub(crate) fn pause_blocking_pool(
     resume
 }
 
-/// Encode and finalize a gzip fixture using the default compression level.
 pub(crate) async fn gzip(raw: &[u8]) -> Vec<u8> {
     use async_compression::tokio::write::GzipEncoder;
     use tokio::io::AsyncWriteExt as _;
@@ -115,7 +110,7 @@ pub(crate) async fn gzip(raw: &[u8]) -> Vec<u8> {
     encoder.into_inner()
 }
 
-/// A connected loopback TCP pair, returned as (connecting socket, accepted socket).
+/// Returns (connecting socket, accepted socket).
 #[cfg(feature = "splice")]
 pub(crate) async fn connected_tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

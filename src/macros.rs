@@ -15,7 +15,6 @@ macro_rules! nonzero {
     };
 }
 
-/// Compile-time assertion macro.
 #[macro_export]
 macro_rules! static_assert {
     ($cond:expr) => {

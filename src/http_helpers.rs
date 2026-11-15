@@ -12,7 +12,6 @@ use crate::{
     response_head::{ResponseHead, WireBody, retry_after_secs},
 };
 
-/// Represents the action to take after sending a response.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ConnectionAction {
     Close,
@@ -28,15 +27,13 @@ impl std::fmt::Display for ConnectionAction {
     }
 }
 
-/// Represents the version of the HTTP protocol used in a connection.
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub(crate) enum ConnectionVersion {
     Http10,
     Http11,
 }
 
-/// Distinguishes header-only writes from body-payload writes for timeout
-/// metric attribution in [`write_all_to_stream`].
+/// Which timeout counter a [`write_all_to_stream`] deadline bumps.
 #[derive(Copy, Clone)]
 pub(crate) enum WritePhase {
     Header,
@@ -55,30 +52,22 @@ impl std::fmt::Display for ConnectionVersion {
 /// Find the end of the HTTP request header block, returning the index just
 /// past the terminating empty line.
 ///
-/// Recognizes both the canonical `CRLF` line terminator and a lone `LF`
-/// (RFC 9112 §2.2 permits a recipient to treat a bare LF as a line
-/// terminator). This matches `httparse`'s lenient parsing, so the index
-/// returned here agrees with the byte count `httparse` consumes for the same
-/// request — keeping the sendfile read/advance boundary in lockstep with the
-/// parser (and with the hyper backend, which parses via the same `httparse`).
-/// A CRLF-only scan desyncs on a bare-LF-terminated pipelined request,
-/// advancing past the *following* request and dropping it.
+/// Recognizes both `CRLF` and a lone `LF` (RFC 9112 §2.2) as line
+/// terminator, like `httparse`, so the index agrees with the byte count
+/// `httparse` consumes for the same request. A CRLF-only scan desyncs on a
+/// bare-LF-terminated pipelined request, advancing past the *following*
+/// request and dropping it.
 ///
 /// The lockstep holds only for a `buf` that starts with the request line:
-/// httparse skips empty lines *before* the request line (RFC 9112 §2.2),
-/// while this scan takes a leading `LF LF` for the end of the header block.
-/// A request reader strips them first with [`leading_empty_lines`];
-/// advancing by this index over a buffer still carrying them would leave the
-/// request in the buffer to be parsed, and answered, once more per pair.
+/// httparse skips empty lines *before* the request line, while this scan
+/// takes a leading `LF LF` for the end of the header block. A request reader
+/// strips them first with [`leading_empty_lines`], or the request would be
+/// parsed, and answered, once more per pair.
 #[must_use]
 #[inline]
 pub(crate) fn find_header_end(buf: &[u8]) -> Option<usize> {
-    // The header block ends at the first empty line. Every header line ends in
-    // LF (optionally preceded by CR), so an empty line begins right after some
-    // LF: either LF LF (bare-LF empty line) or LF CR LF. Do NOT simplify this
-    // to a `\r\n\r\n` search: httparse accepts bare LF, and a CRLF-only scan
-    // desyncs the sendfile keep-alive request boundary against the parser,
-    // dropping the next pipelined request.
+    // An empty line begins right after some LF: either LF LF or LF CR LF.
+    // Do NOT simplify this to a `\r\n\r\n` search (see the doc).
     for i in memchr::memchr_iter(b'\n', buf) {
         match buf.get(i + 1) {
             Some(b'\n') => return Some(i + 2),
@@ -89,8 +78,7 @@ pub(crate) fn find_header_end(buf: &[u8]) -> Option<usize> {
     None
 }
 
-/// Where a head still being read stands against its byte cap, from
-/// [`capped_header_end`].
+/// Where a head still being read stands against its byte cap.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HeadEnd {
     /// The head ends at this index, within the cap; what follows is body or a
@@ -138,7 +126,6 @@ pub(crate) fn leading_empty_lines(buf: &[u8]) -> usize {
     }
 }
 
-/// Find a header value by name (case-insensitive).
 #[must_use]
 pub(crate) fn find_header<'a>(
     headers: &[httparse::Header<'a>],
@@ -152,10 +139,7 @@ pub(crate) fn find_header<'a>(
         .and_then(|h| std::str::from_utf8(h.value).ok())
 }
 
-/// Renders `Name: value\r\n` when `value` is `Some`, or nothing when `None`,
-/// writing straight into the formatter.  Lets a response template keep an
-/// optional header inline (`{opt_header}`) without a throwaway per-header
-/// `String` allocation on the hot serve path.
+/// Renders `Name: value\r\n` when `value` is `Some`, or nothing when `None`.
 pub(crate) struct OptHeader<T: std::fmt::Display>(pub(crate) &'static str, pub(crate) Option<T>);
 
 impl<T: std::fmt::Display> std::fmt::Display for OptHeader<T> {
@@ -170,9 +154,6 @@ impl<T: std::fmt::Display> std::fmt::Display for OptHeader<T> {
 
 /// The client side of a raw-socket exchange: the socket plus the protocol
 /// version and keep-alive decision every response head is rendered with.
-/// `Copy`, so the serve paths of the sendfile and splice backends take it by
-/// value instead of repeating the stream/version/action triple in their
-/// signatures.
 #[derive(Clone, Copy)]
 pub(crate) struct ClientConn<'a> {
     pub(crate) stream: &'a TcpStream,
@@ -194,9 +175,6 @@ impl<'a> ClientConn<'a> {
         }
     }
 
-    /// Write a 304 Not Modified response.
-    ///
-    /// Times out after the configured HTTP timeout.
     pub(crate) async fn write_304(
         self,
         last_modified_str: &crate::http_last_modified::LastModified,
@@ -208,20 +186,11 @@ impl<'a> ClientConn<'a> {
             .await
     }
 
-    /// Write a 416 Range Not Satisfiable response.
-    ///
-    /// Times out after the configured HTTP timeout.
     pub(crate) async fn write_416(self, file_size: u64) -> std::io::Result<()> {
-        // `Content-Length: 0` frames the empty body for keep-alive; hyper emits
-        // the same automatically for its empty body, so the constructor leaves it
-        // to the renderer that needs it.
         let head = ResponseHead::range_not_satisfiable(file_size);
         head.write_to(self, WireBody::None).await
     }
 
-    /// Write an error response.
-    ///
-    /// Times out after the configured HTTP timeout.
     pub(crate) async fn write_invalid(
         self,
         status: StatusCode,
@@ -234,13 +203,8 @@ impl<'a> ClientConn<'a> {
     }
 
     /// Write the head of a cache-hit file response whose body follows via
-    /// `sendfile(2)`, from the two objects that describe it: the plan
-    /// [`CacheInfo::plan`] returned and the cached representation's validators.
-    ///
-    /// Uses `send(MSG_MORE)` so the kernel coalesces the head with the first
-    /// `sendfile(2)` body bytes; the splice paths keep their `CorkGuard` instead
-    /// (see `write_splice_response_headers`). Times out after the configured HTTP
-    /// timeout.
+    /// `sendfile(2)`. Uses `send(MSG_MORE)` so the kernel coalesces the head
+    /// with the first body bytes.
     pub(crate) async fn write_response_headers(
         self,
         params: &ServeParams,
@@ -253,7 +217,6 @@ impl<'a> ClientConn<'a> {
     }
 }
 
-/// The head [`ClientConn::write_response_headers`] writes.
 pub(crate) fn cached_file_head<'a>(
     params: &'a ServeParams,
     content_type: &'static str,
@@ -272,10 +235,7 @@ enum WriteMode {
     MsgMore,
 }
 
-/// Write every byte of `data`, handling partial writes, `EAGAIN`/`EINTR` and
-/// the configured HTTP timeout.  The one loop behind
-/// [`write_all_to_stream`] and [`write_all_to_stream_msg_more`]: they differ
-/// only in the syscall and the timeout counter.
+/// Write every byte of `data` within the configured HTTP timeout.
 async fn write_all(stream: &TcpStream, mut data: &[u8], mode: WriteMode) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
 
@@ -348,8 +308,8 @@ async fn write_all(stream: &TcpStream, mut data: &[u8], mode: WriteMode) -> std:
 
 /// Like [`write_all_to_stream`] with `WritePhase::Header`, but issues the
 /// bytes via `send(2)` with `MSG_MORE`: the kernel holds the trailing
-/// partial segment until the body written right after completes it — the
-/// same header+body coalescing `TCP_CORK` gave, without the per-response
+/// partial segment until the body written right after completes it. That is
+/// the header+body coalescing of `TCP_CORK` without the per-response
 /// setsockopt on/off pair.
 ///
 /// Only correct when body bytes follow immediately on the same socket and
@@ -362,12 +322,8 @@ pub(crate) async fn write_all_to_stream_msg_more(
     write_all(stream, data, WriteMode::MsgMore).await
 }
 
-/// Write all bytes to the TCP stream, handling partial writes.
-///
-/// `phase` selects which timeout counter to bump if the configured HTTP
-/// timeout fires (`HTTP_TIMEOUT_CLIENT_HEADER_WRITE` for headers, control
-/// frames, and small fixed responses; `HTTP_TIMEOUT_CLIENT_BODY` for
-/// response-body bytes).
+/// Write all of `data` within the configured HTTP timeout; `phase` selects
+/// the timeout counter bumped if it fires.
 pub(crate) async fn write_all_to_stream(
     stream: &TcpStream,
     data: &[u8],
@@ -468,10 +424,6 @@ mod tests {
         assert_eq!(leading_empty_lines(b" \r\nGET /"), 0);
     }
 
-    /// The read/advance boundary must stay in lockstep with the byte count
-    /// httparse consumes, including the empty lines httparse skips before
-    /// the request line: advancing by a leading `LF LF` instead would leave
-    /// the request in the buffer to be parsed and answered again.
     #[test]
     fn header_end_after_leading_empty_lines_matches_httparse() {
         for raw in [

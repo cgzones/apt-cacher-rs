@@ -2,15 +2,6 @@
 //! permanent file with a configurable `429` plus `Retry-After` while the
 //! proxy keeps downloading, so apt moves on to its next item and late-joins
 //! the still-running download on its retry.
-//!
-//! Backend-neutral on purpose. The gate ([`should_nudge`]), the response head
-//! ([`nudge_head`]) and the opening debug line ([`log_nudge`]) are pure
-//! functions of the config, so `hyper_conn.rs::serve_new_file` and
-//! `splice/mod.rs::splice_proxy` share one decision, one head and one
-//! wording instead of two drifting copies. What differs is only who keeps
-//! downloading afterwards: hyper's `download_file` is a detached task
-//! already, while splice hands the whole download to
-//! `splice/detached.rs::DetachedDownload`.
 
 use std::num::NonZero;
 
@@ -33,12 +24,10 @@ pub(crate) const NUDGE_BODY: &str = "Download in progress";
 ///
 /// Volatile resources are never nudged: apt needs the index in hand to decide
 /// what to fetch next, so a retry buys nothing. `curr_downloads` includes the
-/// caller's own registry entry -- both backends have already originated by
-/// the time they ask -- and drives the probability, which decays linearly by
-/// `experimental_parallel_hack_factor` per download already in flight and
-/// reaches certainty for the first one. It is taken lazily and called at most
-/// once, after the enabled, flavor and size checks have passed, so an
-/// ineligible request never pays for a registry read.
+/// caller's own registry entry and drives the probability, which decays
+/// linearly by `experimental_parallel_hack_factor` per download already in
+/// flight and is certainty for the first one. It is called at most once,
+/// after the enabled, flavor and size checks have passed.
 #[must_use]
 pub(crate) fn should_nudge(
     config: &Config,
@@ -74,9 +63,6 @@ pub(crate) fn should_nudge(
     fastrand::f64() < p
 }
 
-/// The head of the nudge response: the configured status code, the configured
-/// `Retry-After` and the [`NUDGE_BODY`] length.
-///
 /// Uses the success header policy: the nudge answers on the origin's
 /// behalf and must not advertise `Server:` (see the `response_head` contract).
 #[must_use]
@@ -88,10 +74,8 @@ pub(crate) fn nudge_head(config: &Config) -> ResponseHead<'static> {
     )
 }
 
-/// The debug line both backends emit right before writing the nudge.
-///
-/// `prefix` disambiguates the parallel splice/sendfile paths:
-/// hyper passes `""`, splice passes `"splice proxy: "`.
+/// `prefix` names the backend: hyper passes `""`, splice passes
+/// `"splice proxy: "`.
 pub(crate) fn log_nudge(conn_details: &ConnectionDetails, config: &Config, prefix: &'static str) {
     debug!(
         "{prefix}Trying parallel download hack for client {} and file {} with code {} and retry after value {}",
@@ -107,8 +91,6 @@ mod tests {
     use super::*;
     use crate::nonzero;
 
-    /// A config with the hack enabled and both size/parallel limits set to
-    /// values the callers below pass deliberately.
     fn enabled_config() -> Config {
         let mut config = Config::default();
         config.experimental_parallel_hack_enabled = true;

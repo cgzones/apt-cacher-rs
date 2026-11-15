@@ -3,12 +3,11 @@
 //! [`TempPath`] guard that decides what happens to either on drop.
 //!
 //! One download runs `InitBarrier` (`guards.rs`) -> [`prepare_partial_resume`]
-//! (open or reserve the `.partial`) -> [`PartialDownload::into_target`]
-//! ([`create_partial_file`] / [`tokio_tempfile`], one funnel for every
-//! backend) -> `RenameBarrier::commit` (`guards.rs`), which consumes
-//! the [`TempPath`] on the atomic rename. The `.partial` lives in the `tmp/`
-//! sibling of the rename target ([`CachePaths::partial_file`]) so that rename
-//! never crosses a filesystem.
+//! (open or reserve the `.partial`) -> [`PartialDownload::into_target`] ->
+//! `RenameBarrier::commit` (`guards.rs`), which consumes the [`TempPath`] on
+//! the atomic rename. The `.partial` lives in the `tmp/` sibling of the
+//! rename target ([`CachePaths::partial_file`]) so that rename never crosses
+//! a filesystem.
 //!
 //! [`prepare_partial_resume`] claims the `.partial` path before it touches it
 //! (`partial_claim`), and every guard over a kept partial carries that claim,
@@ -51,15 +50,11 @@ use crate::{
 /// - `Resumable`: permanent cache flavor with an existing valid partial whose file handle
 ///   has been held open since the size/ETag check (avoiding TOCTOU); caller resumes from
 ///   `file`'s current offset. `stored` holds the validators the first attempt persisted
-///   on the partial (its `ETag` is always set: it is what made the partial resumable),
-///   read through the same descriptor; see [`Self::resumed_validators`].
+///   on the partial (its `ETag` is always set: it is what made the partial resumable).
 ///
-/// The `Resumable` handle is opened once, up front, so size and mtime come
-/// from the same descriptor the download then writes through — there is no
-/// window between the check and the open for the file to be replaced in.
 /// Both guards are `OnDrop::Keep`: a partial survives a transient failure
 /// (upstream 5xx, a fallback to another backend) and is picked up by the next
-/// attempt. Discarding one is always explicit — [`Self::discard_resume`] for
+/// attempt. Discarding one is always explicit: [`Self::discard_resume`] for
 /// a stale partial (a 200 answering an unsupported `Range`, a 416, an invalid
 /// `Content-Range`), `TempPath::remove_blocking` for known-bad bytes.
 pub(crate) enum PartialDownload {
@@ -93,10 +88,7 @@ impl PartialDownload {
     }
 
     /// The validators the partial's first attempt stored, while the download
-    /// still resumes it: `Some` only for `Resumable`, which a resume anomaly
-    /// has already downgraded (see [`Self::discard_resume`]) by the time the
-    /// upstream's answer is a usable `206`. Both backends hand this to
-    /// [`UpstreamMetadata::inherit_resumed`].
+    /// still resumes it, for [`UpstreamMetadata::inherit_resumed`].
     pub(crate) fn resumed_validators(&self) -> Option<&UpstreamMetadata> {
         match self {
             Self::Resumable(ResumablePartial { stored, .. }) => Some(stored),
@@ -153,11 +145,9 @@ impl PartialDownload {
         self.resume_state().map(|state| state.if_range().as_ref())
     }
 
-    /// The partial a quota reservation for this download accounts (see
-    /// `cache_quota`'s module doc): `None` for a volatile scratch file, which
-    /// is never kept; a `Resumable` partial's `resume_offset` bytes are
-    /// adopted from the kept partial. It shares the guard's claim on the
-    /// path, which the reservation's drop still measures.
+    /// The partial a quota reservation for this download accounts: `None`
+    /// for a scratch file, which is never kept. It shares the guard's claim
+    /// on the path, which the reservation's drop still measures.
     pub(crate) fn reserved_partial(&self) -> Option<ReservedPartial> {
         match self {
             Self::Scratch => None,
@@ -168,11 +158,8 @@ impl PartialDownload {
         }
     }
 
-    /// What [`Self::into_target`] hands back, for
-    /// `cache_metadata::write_upstream_metadata`: only a resumed partial
-    /// can carry xattrs of an earlier attempt; a `Fresh` partial is created
-    /// with `O_EXCL` ([`create_partial_file`]) and a volatile temp file
-    /// likewise ([`tokio_tempfile`]).
+    /// Only a resumed partial can carry xattrs of an earlier attempt; a
+    /// `Fresh` partial and a scratch file are created with `O_EXCL`.
     pub(crate) fn target_file(&self) -> TargetFile {
         match self {
             Self::Resumable(_) => TargetFile::Resumed,
@@ -181,13 +168,11 @@ impl PartialDownload {
     }
 
     /// Open or create the file the body is written into, taking over the path
-    /// guard. The one place the `Resumable`/`Fresh`/`Scratch` sequence lives,
-    /// so both fetching backends agree on the resume check, the modes and the
-    /// operation names; the caller's download runner reports the failure.
+    /// guard; the caller reports the failure.
     ///
     /// A `Resumable` whose length disagrees with `resume_offset` is a
-    /// consistency failure, not a syscall failure: it builds a
-    /// [`CacheError::invalid`] and leaves `CACHE_IO_FAILURE` alone.
+    /// consistency failure, not a syscall failure: it leaves
+    /// `CACHE_IO_FAILURE` alone.
     pub(crate) async fn into_target(
         self,
         filename: &Path,
@@ -237,17 +222,11 @@ impl PartialDownload {
 ///
 /// `speaker` renders the start of every emitted log line: see [`ResumeLog`].
 ///
-/// The path is claimed first (see `partial_claim`): the returned guard holds
-/// the claim, so cleanup does not reap a partial this download may still use.
-/// A path another download still claims -- the tail of an earlier download
-/// of the same file, whose registry entry was retired before its partial
-/// guard or reservation dropped -- is not waited for: the download goes to a
-/// scratch file like a volatile one, never touching the partial.
+/// The path is claimed first (see `partial_claim`). A path another download
+/// still claims is not waited for: the download goes to a scratch file like
+/// a volatile one, never touching the partial.
 ///
-/// Returns `Ok` for the resumable, fresh and scratch outcomes; the caller
-/// distinguishes via `partial`/`offset`.  The `Err` cases are the two ways the
-/// partial file could not be opened, see [`PartialOpenFailure`]; the partial
-/// path is left untouched on the filesystem either way.
+/// On `Err` the partial path is left untouched on the filesystem.
 pub(crate) async fn prepare_partial_resume(
     ibarrier: &InitBarrier,
     speaker: ResumeLog,
@@ -293,10 +272,7 @@ impl ResumeLog {
     }
 }
 
-/// [`prepare_partial_resume`] for an already-derived partial `path` and the
-/// quota a removal of it releases bytes from: the pure half, kept free of
-/// the global lookups so the lifecycle is unit-testable against a temporary
-/// directory.
+/// [`prepare_partial_resume`] free of the global lookups, for unit tests.
 async fn prepare_partial_resume_at(
     path: PathBuf,
     quota: Option<CacheQuota>,
@@ -315,10 +291,8 @@ async fn prepare_partial_resume_at(
     };
     match open_partial_file(claim, quota).await {
         Ok((file, size, guard)) if size > 0 => {
-            // One blocking section for the three attributes, as
-            // `cache_metadata::write_upstream_metadata` batches its writes;
-            // the other two are read only behind a strong `ETag`. Without
-            // xattr support every read is `None` without a syscall.
+            // One blocking section for the three attributes; the other two
+            // are read only behind a strong `ETag`.
             let read = || {
                 let xfile = &xattr_helpers::XattrFile(&file);
                 let if_range =
@@ -339,9 +313,6 @@ async fn prepare_partial_resume_at(
                     last_modified,
                 };
                 let expected_total = expected_total.map(|xattr_helpers::ExpectedSize(size)| size);
-                // The total is only known when the partial carries the
-                // expected-size xattr; narrate its absence instead of
-                // placeholdering it.
                 if let Some(total) = expected_total {
                     info!(
                         "{} partial download ({} out of {}) for {debname} from mirror {mirror}, will attempt resume",
@@ -375,9 +346,6 @@ async fn prepare_partial_resume_at(
             }
         }
         Ok((_file, _size, guard)) => Ok(PartialDownload::Fresh(guard)),
-        // Absence is the overwhelmingly common case and not a failure: start
-        // a fresh download on the guard rather than making both backends
-        // undo an `Err` identically.
         Err(PartialOpenError::NotFound(guard)) => Ok(PartialDownload::Fresh(guard)),
         // Recoverable without touching the other names: unlinking ours
         // removes one link, and the fresh download starts on a new inode.
@@ -396,30 +364,23 @@ async fn prepare_partial_resume_at(
     }
 }
 
-/// Why `open_partial_file` did not hand back a resumable file. Internal:
-/// `NotFound` and `HardLinked` never leave this module, since
-/// [`prepare_partial_resume`] turns both into a fresh download.
+/// Why `open_partial_file` did not hand back a resumable file.
 #[derive(Debug)]
 enum PartialOpenError {
-    /// No partial file at the path: the normal fresh-download case, not
-    /// logged and not counted.
+    /// The normal fresh-download case, not logged and not counted.
     NotFound(TempPath),
     /// A regular file whose link count is `nlink`, not one: resuming would
-    /// write an inode other names share. Unlinking the path drops only this
-    /// name, so the caller discards it and downloads afresh.
+    /// write an inode other names share.
     HardLinked { nlink: u64, guard: TempPath },
-    /// Any other open/stat/seek failure. The operation counts cache failures;
-    /// the guarded download owner retains and reports the cause.
+    /// Any other open/stat/seek failure, already counted.
     Failed {
         failure: CacheError,
         guard: TempPath,
     },
 }
 
-/// [`prepare_partial_resume`] could not open the deterministic partial path,
-/// retaining its cache source for the guarded download runner. Hands back the
-/// `TempPath` guard
-/// (`OnDrop::Keep`, so dropping it touches nothing on disk).
+/// [`prepare_partial_resume`] could not open the deterministic partial path.
+/// The guard is `OnDrop::Keep`, so dropping it touches nothing on disk.
 #[derive(Debug)]
 pub(crate) struct PartialOpenFailure {
     pub(crate) failure: CacheError,
@@ -439,23 +400,16 @@ enum OnDrop {
 }
 
 /// A guard over a temporary file path.
-///
-/// The two shapes are minted by [`TempPath::keeping`] and
-/// [`TempPath::scratch`]; which one a path is depends on whether anything can
-/// find it again, so the choice belongs to the constructor rather than to a
-/// flag a caller sets.
 pub(crate) struct TempPath {
     path: Option<PathBuf>,
     on_drop: OnDrop,
-    /// The quota a kept `.partial` is accounted in (see `cache_quota`'s
-    /// module doc): an explicit removal releases its bytes there. `None` for
-    /// a scratch file, which is never accounted, and in unit tests.
+    /// The quota a kept `.partial` is accounted in: an explicit removal
+    /// releases its bytes there. `None` for a scratch file, which is never
+    /// accounted, and in unit tests.
     quota: Option<CacheQuota>,
 }
 
 impl TempPath {
-    /// Guard the claimed deterministic `.partial` path: `Drop` leaves the
-    /// file for a later resume and releases the claim.
     fn keeping(claim: PartialClaim, quota: Option<CacheQuota>) -> Self {
         Self {
             path: Some(claim.path().to_path_buf()),
@@ -464,8 +418,6 @@ impl TempPath {
         }
     }
 
-    /// Guard a randomly-named scratch file: `Drop` unlinks it, since nothing
-    /// else knows the name.
     fn scratch(path: PathBuf) -> Self {
         Self {
             path: Some(path),
@@ -483,7 +435,6 @@ impl TempPath {
         }
     }
 
-    /// Defuse the temporary path guard, returning the underlying `PathBuf`.
     pub(crate) fn defuse(mut self) -> PathBuf {
         std::mem::take(&mut self.path).expect("path has not been taken yet")
     }
@@ -532,7 +483,6 @@ fn unlink_and_release(path: &Path, quota: Option<&CacheQuota>) -> std::io::Resul
     Ok(())
 }
 
-/// [`unlink_and_release`] for an explicit removal, logging a failure.
 fn remove_and_release(path: &Path, quota: Option<&CacheQuota>) {
     if let Err(err) = unlink_and_release(path, quota) {
         // NotFound is still a WARN here: the path is supposed to exist for the
@@ -680,19 +630,14 @@ pub(crate) async fn tokio_tempfile(
     }
 }
 
-/// Build the deterministic on-disk path for a download's `.partial` temp
-/// file under `paths`: [`CachePaths::partial_file`] for the download's layout and site,
-/// i.e. the `tmp/` sibling of the eventual rename target
+/// The `tmp/` sibling of the eventual rename target
 /// (`{anchor}/tmp/{debname}.partial`), so the atomic `rename(2)` after the
 /// download finishes stays within the same filesystem.
 ///
 /// The site comes from [`InitBarrier::site`], which resolves the alias'
 /// main host exactly like `ConnectionDetails::site` does for the rename
 /// target; using the same host on both sides is what keeps the sibling
-/// guarantee.  Disambiguation between flat-pool `.deb`s sharing a basename
-/// across different sub-directories (`apt/amd64/foo.deb` vs
-/// `apt/arm64/foo.deb`) is implicit in the site's mirror path, which equals
-/// the URL-dir verbatim under the host-anchored flat layout.
+/// guarantee.
 fn partial_path_for_barrier(paths: CachePaths<'_>, ibarrier: &InitBarrier) -> PathBuf {
     let filename = format!("{debname}{PARTIAL_SUFFIX}", debname = ibarrier.debname());
     paths.partial_file(ibarrier.layout(), ibarrier.site(), Path::new(&filename))
@@ -704,9 +649,6 @@ fn partial_path_for_barrier(paths: CachePaths<'_>, ibarrier: &InitBarrier) -> Pa
 ///
 /// Uses `write(true)` + seek instead of `append(true)` so that splice(2) can use explicit
 /// file offsets (`O_APPEND` is incompatible with splice's offset parameter).
-///
-/// By opening the file and querying size from the same file handle, this avoids
-/// TOCTOU races between a separate `metadata()` check and a later `open()`.
 ///
 /// A file whose link count is not one is not resumed
 /// ([`PartialOpenError::HardLinked`]): writing its inode would also change
@@ -720,7 +662,6 @@ async fn open_partial_file(
 
     use tokio::io::AsyncSeekExt as _;
 
-    /// [`PartialOpenError`] before the guard is attached.
     enum FileOpsError {
         NotFound,
         HardLinked(u64),
@@ -734,9 +675,6 @@ async fn open_partial_file(
             .open_async(path)
             .await
             .map_err(|err| {
-                // NotFound is the normal "no partial file" case; the caller
-                // turns it into a fresh download.  Don't pollute the failure
-                // metric or logs with it.
                 if err.kind() == tokio::io::ErrorKind::NotFound {
                     FileOpsError::NotFound
                 } else {
@@ -762,7 +700,6 @@ async fn open_partial_file(
             return Err(FileOpsError::HardLinked(mdata.nlink()));
         }
 
-        // Seek to the end so subsequent writes append correctly.
         let size = file.seek(std::io::SeekFrom::End(0)).await.map_err(|err| {
             FileOpsError::Failed(CacheError::counted_io("seek partial file", path, err))
         })?;
@@ -779,15 +716,11 @@ async fn open_partial_file(
     }
 }
 
-/// Create a new file at the given deterministic partial path, returning the file and a
-/// `OnDrop::Keep` `TempPath` guard. A failure names the path whose syscall
-/// failed: the partial itself, or the parent directory it had to create.
-///
-/// A file already at the path (the empty partial a `Fresh` download reuses,
-/// e.g. one a splice `416` or an attempt that failed before its first byte
-/// left behind) is unlinked and replaced, not truncated: the download must
-/// start on a new inode, or it would inherit the old attempt's creation date
-/// -- which a synthesized `Last-Modified` reports -- and any xattrs it wrote.
+/// A file already at the path (e.g. the empty partial an attempt that failed
+/// before its first byte left behind) is unlinked and replaced, not
+/// truncated: the download must start on a new inode, or it would inherit
+/// the old attempt's creation date -- which a synthesized `Last-Modified`
+/// reports -- and any xattrs it wrote.
 async fn create_partial_file(
     guard: TempPath,
     mode: u32,
@@ -811,12 +744,10 @@ async fn create_partial_file(
         // Open first and create the parent only on `ENOENT`: with `O_CREAT`
         // set, a missing directory is the sole source of that errno here,
         // and the directory already exists for every download after the
-        // first into a given `tmp/`. `create_dir_all` is a blocking-pool
-        // round trip of its own, so the steady state now costs one hop
-        // rather than two.
-        // A leftover file costs the same extra hop: unlink it (a symlink
-        // planted there included -- `O_EXCL` does not follow it), releasing
-        // whatever it held from the quota, and create afresh.
+        // first into a given `tmp/`.
+        // A leftover file is unlinked (a symlink planted there included --
+        // `O_EXCL` does not follow it), releasing whatever it held from the
+        // quota.
         match open(path, mode).await {
             Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => {
                 if let Some(parent) = path.parent() {
@@ -905,7 +836,6 @@ mod tests {
         guard.expect("asserted above")
     }
 
-    /// Claim `path` as a download does before touching it.
     fn claim(path: &Path) -> PartialClaim {
         PartialClaim::acquire(path.to_path_buf()).expect("unclaimed partial")
     }
@@ -919,10 +849,6 @@ mod tests {
         );
     }
 
-    /// The claim `prepare_partial_resume` takes lives in the partial's guard
-    /// and in the quota reservation built from it, and ends with the later
-    /// of the two: until then no second download (and no cleanup reap) can
-    /// take the path.
     #[tokio::test]
     async fn the_claim_lasts_until_guard_and_reservation_are_gone() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -944,9 +870,6 @@ mod tests {
         assert!(PartialClaim::acquire(path).is_some(), "released");
     }
 
-    /// A path another download still claims (a double claim) is not a
-    /// panic: the download goes to a scratch file and leaves the partial,
-    /// and its resume state, untouched.
     #[tokio::test]
     async fn a_claimed_partial_degrades_the_download_to_a_scratch_file() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -969,9 +892,8 @@ mod tests {
         drop(held);
     }
 
-    /// A failed `lstat(2)` before the unlink leaves the partial's bytes
-    /// unreleased; that must be reported, not read as an empty file. A path
-    /// below a regular file fails with `ENOTDIR`, standing in for an `EIO`.
+    /// A path below a regular file fails with `ENOTDIR`, standing in for an
+    /// `EIO`.
     #[test]
     fn unlink_and_release_reports_a_failed_stat() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -992,8 +914,6 @@ mod tests {
         assert_eq!(metrics::CACHE_IO_FAILURE.get(), before);
     }
 
-    /// A resumed partial whose length disagrees with the resume offset is a
-    /// consistency failure, not a syscall failure: no `CACHE_IO_FAILURE`.
     #[tokio::test]
     async fn into_target_rejects_a_size_mismatch_without_counting_io() {
         use crate::xattr_helpers::XattrValue as _;
@@ -1081,8 +1001,6 @@ mod tests {
         .expect("no partial exists yet");
         assert_eq!(&*guard, path.as_path());
 
-        // create_partial_file creates the tmp/ parent and hands back a
-        // keep-on-drop guard.
         let (mut file, guard) = create_partial_file(guard, 0o640)
             .await
             .expect("create partial");
@@ -1093,7 +1011,6 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(path.is_file(), "a partial survives its guard");
 
-        // Reopening lands at the end of the existing bytes.
         let (file, size, guard) = open_partial_file(claim(&path), None)
             .await
             .expect("partial reopens");
@@ -1109,9 +1026,6 @@ mod tests {
         );
     }
 
-    /// A leftover file at the partial path is replaced by a new inode, not
-    /// truncated in place: the old one's creation date and xattrs must not
-    /// reach the new download.
     // The xattr read runs through `block_in_place`, which needs the
     // multi-thread runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1169,10 +1083,6 @@ mod tests {
         assert!(path.exists(), "the guard keeps the path untouched");
     }
 
-    /// A partial sharing its inode with another name (a hard-link backup
-    /// snapshot, a deduplication tool) is not resumed: writing it would
-    /// change the other name too. Its own name is unlinked and the download
-    /// starts afresh, leaving the other name's bytes intact.
     #[tokio::test]
     async fn prepare_partial_resume_discards_a_hardlinked_partial() {
         use std::os::unix::fs::MetadataExt as _;
@@ -1281,7 +1191,6 @@ mod tests {
             matches!(resume, PartialDownload::Resumable(_)),
             "a strong ETag makes the partial resumable"
         );
-        // Both stored validators ride along, for a `206` that omits them.
         assert_eq!(
             resume.resumed_validators(),
             Some(&UpstreamMetadata::from_upstream(
@@ -1336,9 +1245,6 @@ mod tests {
         assert_eq!(resume.if_range(), Some("\"strong\""));
     }
 
-    /// Every explicit unlink of a kept partial releases its bytes from the
-    /// quota it is accounted in: a discarded resume and a replaced leftover
-    /// alike.
     // The xattr read runs through `block_in_place`, which needs the
     // multi-thread runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

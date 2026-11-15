@@ -1,10 +1,10 @@
 //! Infallible formatted appends to a [`String`].
 
-/// Destination of [`swrite!`](crate::swrite), implemented for [`String`] only — so the macro
-/// cannot be aimed at a genuinely fallible [`std::fmt::Write`] sink, where
-/// discarding the `Result` would hide a real I/O error.
+/// Destination of [`swrite!`](crate::swrite), implemented for [`String`]
+/// only, so the macro cannot be aimed at a genuinely fallible
+/// [`std::fmt::Write`] sink, where discarding the `Result` would hide a real
+/// I/O error.
 pub(crate) trait StringWrite {
-    /// Append `args`, panicking on the unreachable formatting failure.
     fn swrite_fmt(&mut self, args: std::fmt::Arguments<'_>);
 }
 
@@ -18,7 +18,7 @@ impl StringWrite for String {
 ///
 /// `String`'s [`std::fmt::Write`] impl never fails, so the only way the
 /// underlying `write_fmt` can error is a `Display` impl returning `Err` — a
-/// bug, not a runtime condition. Callers need no `use std::fmt::Write` import.
+/// bug, not a runtime condition.
 #[macro_export]
 macro_rules! swrite {
     ($dst:expr, $($arg:tt)*) => {{

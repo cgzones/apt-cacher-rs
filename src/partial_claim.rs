@@ -1,20 +1,17 @@
 //! Ownership of the deterministic `.partial` paths, shared between the
 //! downloads that write them and cleanup's `tmp/` reap.
 //!
-//! A kept partial is accounted in the disk quota (`cache_quota`'s module doc)
-//! and its bytes are released exactly once: by cleanup's reap, through the
-//! reconcile's `removed`, when no download uses it; or by the download that
-//! takes it over, whose reservation adopts the bytes and keeps what the
-//! partial holds when it ends. Cleanup used to decide from its walk and
-//! unlink by path, so it could reap a partial a download had already opened:
-//! the download wrote into an unlinked inode and failed its rename, its
-//! reservation found nothing left to keep and released the adopted bytes, and
-//! the reap released them again. Both sides therefore meet on one
-//! process-wide set of claimed paths:
+//! A kept partial is accounted in the disk quota and its bytes must be
+//! released exactly once: by cleanup's reap when no download uses it, or by
+//! the download that takes it over (its reservation adopts the bytes).
+//! Cleanup used to decide from its walk and unlink by path, so it could reap
+//! a partial a download had already opened: the download wrote into an
+//! unlinked inode and failed its rename, its reservation found nothing left
+//! to keep and released the adopted bytes, and the reap released them again.
+//! Both sides therefore meet on one process-wide set of claimed paths:
 //!
-//! - A download claims its partial path ([`PartialClaim::acquire`], in
-//!   `partial_file::prepare_partial_resume`) before it first opens, stats or
-//!   creates it, fresh or resumed alike. The claim rides in both holders that
+//! - A download claims its partial path ([`PartialClaim::acquire`]) before it
+//!   first opens, stats or creates it. The claim rides in both holders that
 //!   may still touch the path -- the kept partial's `TempPath` guard and the
 //!   quota reservation's `ReservedPartial`, whose drop measures the file --
 //!   and the path is released when the later of the two is gone.
@@ -24,15 +21,11 @@
 //!   bytes of that `lstat`. A claim taken meanwhile waits for at most that
 //!   unlink.
 //!
-//! A partial is thus either reaped and released by cleanup, or used and
-//! released by its download, never both.
-//!
 //! The active-downloads registry serialises originators per cache entry, but
 //! it retires an entry before a failed or declined download has dropped its
 //! partial guard and reservation, so a new originator can still find the
 //! path claimed by the previous one's tail. It then downloads into a scratch
-//! file instead of resuming (`prepare_partial_resume`), which touches the
-//! partial not at all.
+//! file instead of resuming.
 
 use std::{
     fs::Metadata,
@@ -49,10 +42,8 @@ use hashbrown::HashSet;
 static CLAIMED: LazyLock<parking_lot::Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| parking_lot::Mutex::new(HashSet::new()));
 
-/// A download's ownership of its `.partial` path; see the module doc.
-///
-/// Cloning shares the one claim: the path is released when the last clone
-/// drops.
+/// A download's ownership of its `.partial` path. Cloning shares the one
+/// claim: the path is released when the last clone drops.
 #[derive(Clone)]
 pub(crate) struct PartialClaim(Arc<Claimed>);
 
@@ -61,9 +52,8 @@ struct Claimed {
 }
 
 impl PartialClaim {
-    /// Claim `path`, or `None` when another download still owns it.
-    ///
-    /// Blocks for at most one of cleanup's unlinks ([`reap_unclaimed`]).
+    /// `None` when another download still owns `path`. Blocks for at most
+    /// one of cleanup's unlinks ([`reap_unclaimed`]).
     #[must_use]
     pub(crate) fn acquire(path: PathBuf) -> Option<Self> {
         if !CLAIMED.lock().insert(path.clone()) {
@@ -72,7 +62,6 @@ impl PartialClaim {
         Some(Self(Arc::new(Claimed { path })))
     }
 
-    /// The claimed partial path.
     #[must_use]
     pub(crate) fn path(&self) -> &Path {
         &self.0.path
@@ -93,9 +82,8 @@ impl Drop for Claimed {
     }
 }
 
-/// Whether a download owns `path` now: the cache scan's test for an orphaned
-/// partial, one lookup under the claim-set lock. The answer can be stale by
-/// the time it is read; the scan only counts with it, never unlinks.
+/// The answer can be stale by the time it is read: only for counting, never
+/// for a decision to unlink.
 #[must_use]
 pub(crate) fn is_claimed(path: &Path) -> bool {
     CLAIMED.lock().contains(path)
@@ -122,21 +110,21 @@ impl FileId {
 /// What [`reap_unclaimed`] did with a partial the walk judged stale.
 #[derive(Debug)]
 pub(crate) enum Reap {
-    /// Unlinked; `len` is its length as the final `lstat(2)` read it.
-    Removed { len: u64 },
+    /// `len` is its length as the final `lstat(2)` read it.
+    Removed {
+        len: u64,
+    },
     /// A download owns it; left alone.
     Claimed,
     /// Gone, replaced by another file, or no longer stale since the walk;
     /// left alone.
     Changed,
-    /// The fresh `lstat(2)` failed; left alone.
     StatFailed(std::io::Error),
-    /// The `unlink(2)` failed.
     RemoveFailed(std::io::Error),
 }
 
 /// Unlink the stale partial at `path` unless a download claims it: the one
-/// way cleanup removes a partial (see the module doc).
+/// way cleanup removes a partial.
 ///
 /// Under the claim-set lock the path is `lstat`ed again and removed only if
 /// it is still the regular file `walked` identified and `still_stale`
@@ -174,7 +162,6 @@ pub(crate) fn reap_unclaimed(
 mod tests {
     use super::*;
 
-    /// A stale file planted at `name` under `dir`, and its identity.
     fn plant(dir: &tempfile::TempDir, name: &str) -> (PathBuf, FileId) {
         let path = dir.path().join(name);
         std::fs::write(&path, b"resume state").expect("write partial");
@@ -191,7 +178,6 @@ mod tests {
         assert!(matches!(reap_unclaimed(&path, id, |_| true), Reap::Claimed));
         assert!(path.exists(), "a download owns it");
 
-        // A clone keeps the claim alive; the last one releases it.
         let clone = claim.clone();
         drop(claim);
         assert!(matches!(reap_unclaimed(&path, id, |_| true), Reap::Claimed));
@@ -227,8 +213,6 @@ mod tests {
         assert!(PartialClaim::acquire(path).is_some(), "released on drop");
     }
 
-    /// The walk's verdict describes the inode it saw: a partial a download
-    /// recreated at the same path since is somebody else's file.
     #[test]
     fn a_replaced_file_is_not_reaped() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -1,12 +1,9 @@
-//! Shared CONNECT-tunnel target validation and relay used by every HTTP
-//! backend.
+//! CONNECT-tunnel target validation, admission and relay shared by every
+//! HTTP backend.
 //!
-//! Both the hyper and sendfile/splice backends call
-//! [`validate_connect_target`] so their tunnel policy (enable flag, authority
-//! bound, port ACL, mirror ACL) — and the metrics/log side effects — stay
-//! identical. The per-request proxy-client ACL is *not* handled here; both
-//! backends enforce `allowed_proxy_clients` for `CONNECT` in
-//! `request_dispatch::preflight_method` before reaching this validator.
+//! The per-request proxy-client ACL is *not* handled here; the backends
+//! enforce `allowed_proxy_clients` for `CONNECT` in
+//! `request_dispatch::preflight_method` before reaching this module.
 //!
 //! The mirror ACL is fail-closed like `allowed_mirrors`: an empty
 //! `https_tunnel_allowed_mirrors` permits no target.  A CONNECT relay is an
@@ -15,15 +12,9 @@
 //! empty `https_tunnel_allowed_ports` skips the port check entirely, because
 //! the host list has already bounded the reachable targets by then.
 //!
-//! [`admit`] also owns the tunnel counts: the per-source-IP cap
-//! (`https_tunnel_max_connections_per_client`, a `PerIpCounter`) and the
-//! unconditional active count and peak the dashboard shows, kept whether or
-//! not that cap is configured.
-//!
-//! Established tunnels relay through [`copy_bidirectional_idle`], which
-//! tears the tunnel down after `client_idle_timeout` without a byte in either
-//! direction — otherwise a parked CONNECT socket pins two fds and an upstream
-//! connection for as long as the peer likes.
+//! An established tunnel is torn down after `client_idle_timeout` without a
+//! byte in either direction: otherwise a parked CONNECT socket pins two fds
+//! and an upstream connection for as long as the peer likes.
 
 use core::num::NonZero;
 use std::{
@@ -70,7 +61,6 @@ pub(crate) fn busiest_client_tunnels() -> usize {
     TUNNEL_CONNECTIONS.busiest()
 }
 
-/// Current number of active HTTPS tunnel connections across all clients.
 #[must_use]
 pub(crate) fn active_tunnels() -> usize {
     ACTIVE_TUNNELS.get()
@@ -104,9 +94,8 @@ impl std::fmt::Display for TunnelTarget {
     }
 }
 
-/// A rejected CONNECT request: the status/body the backend should return to the
-/// client. All logging and metric bumping already happened inside
-/// [`validate_connect_target`], [`admit`] or [`connect_upstream`].
+/// A rejected CONNECT request: the status/body the backend should return to
+/// the client. The log line and the metric bump have already happened.
 pub(crate) struct ConnectReject {
     pub status: StatusCode,
     pub msg: &'static str,
@@ -120,9 +109,8 @@ pub(crate) struct TunnelPermit {
     _slot: Option<PerIpPermit>,
 }
 
-/// Authorize a CONNECT request for both backends: its target against tunnel
-/// policy, then the client's tunnel slot, so a refused target takes no slot.
-/// Either refusal has already logged its line and bumped its metric.
+/// Authorize a CONNECT request: its target against tunnel policy, then the
+/// client's tunnel slot, so a refused target takes no slot.
 pub(crate) fn authorize(
     config: &Config,
     client: &ClientInfo,
@@ -132,7 +120,6 @@ pub(crate) fn authorize(
     Ok((target, admit(config, client)?))
 }
 
-/// Acquire the configured per-client tunnel slot, recording any refusal.
 fn admit(config: &Config, client: &ClientInfo) -> Result<TunnelPermit, ConnectReject> {
     let slot = if let Some(max) = config.https_tunnel_max_connections_per_client {
         let Some(guard) =
@@ -158,8 +145,7 @@ fn admit(config: &Config, client: &ClientInfo) -> Result<TunnelPermit, ConnectRe
     })
 }
 
-/// Connect an admitted tunnel before either backend sends its 200 response.
-/// A failed dial is counted and logged once here; the backend writes the 502.
+/// A failed dial is counted and logged here; the backend writes the 502.
 pub(crate) async fn connect_upstream(
     config: &Config,
     client: &ClientInfo,
@@ -201,10 +187,6 @@ pub(crate) async fn connect_upstream(
 }
 
 /// Validate a CONNECT request's authority against tunnel policy.
-///
-/// On success returns the parsed [`TunnelTarget`]. On rejection returns a
-/// [`ConnectReject`] and has already emitted the matching log line and bumped
-/// the relevant metric, so both backends behave identically.
 fn validate_connect_target(
     config: &Config,
     client: &ClientInfo,
@@ -303,12 +285,10 @@ fn validate_connect_target(
     Ok(TunnelTarget { host, port })
 }
 
-/// Why [`copy_bidirectional_idle`] stopped relaying.
 #[derive(Debug)]
 enum TunnelCopyError {
     /// No byte crossed the tunnel in either direction for the idle timeout.
     Idle(Duration),
-    /// A read or write on either side failed.
     Io(std::io::Error),
 }
 
@@ -320,7 +300,6 @@ pub(crate) struct TunnelOutcome {
     /// Bytes read from the client for the upstream, plus any the backend
     /// forwarded itself before the relay started (see `run_connect_tunnel`).
     pub(crate) from_client: u64,
-    /// Bytes written to the client from the upstream.
     from_server: u64,
     end: Result<(), TunnelCopyError>,
 }
@@ -375,10 +354,8 @@ where
     }
 }
 
-/// Log the outcome of a finished tunnel relay and bump its metrics.  Shared
-/// by both backends so an idle close, a peer close and a transfer failure
-/// carry the same wording and counters everywhere; the bytes that crossed
-/// count whichever way the tunnel ended.
+/// Log the outcome of a finished tunnel relay and bump its metrics; the
+/// bytes that crossed count whichever way the tunnel ended.
 pub(crate) fn report_tunnel_outcome(
     outcome: &TunnelOutcome,
     client: &ClientInfo,
@@ -442,9 +419,7 @@ pub(crate) fn report_tunnel_outcome(
 }
 
 /// Coarse "last progress" stamp shared between the relay's client stream and
-/// the idle watchdog.  Millisecond ticks of `coarsetime::Instant` since the
-/// clock was created; an atomic so the hot `poll_read`/`poll_write` path
-/// takes no lock.
+/// the idle watchdog, in milliseconds since the clock was created.
 struct ActivityClock {
     base: coarsetime::Instant,
     last_millis: AtomicU64,
@@ -477,9 +452,7 @@ impl ActivityClock {
 struct IdleTracked<'a, S> {
     inner: S,
     activity: &'a ActivityClock,
-    /// Bytes read from the client (headed upstream).
     read: u64,
-    /// Bytes written to the client (from the upstream).
     written: u64,
 }
 
@@ -569,8 +542,6 @@ mod tests {
         validate_connect_target(config, &local_client(), &uri).map_err(|reject| reject.status)
     }
 
-    /// An IPv6 target arrives bracketed, matches the listed address in any
-    /// spelling, is dialled bare and logged in authority form.
     #[test]
     fn an_ipv6_target_matches_its_listed_address() {
         let config = tunnel_config(&["2001:db8::1", "deb.debian.org"]);

@@ -57,9 +57,7 @@ pub(crate) enum HostReject {
     Forbidden,
 }
 
-/// Caches the full validation + allow-list check result per raw host
-/// string.  On hit, [`permitted_host`] returns a cloned `ClientHost` without
-/// re-running `ClientHost::new` or scanning `allowed_mirrors`.
+/// Caches the validation + allow-list check result per raw host string.
 #[derive(Default)]
 struct PermittedHostCache {
     entries: parking_lot::RwLock<HashMap<Box<str>, Result<ClientHost, HostReject>>>,
@@ -87,8 +85,7 @@ static PERMITTED_HOST_CACHE: LazyLock<PermittedHostCache> =
     LazyLock::new(PermittedHostCache::default);
 
 /// Hosts cached and the heap they take: the table, each raw host text and
-/// each admitted host's canonical text. Walks the table, which the cap
-/// keeps small.
+/// each admitted host's canonical text.
 pub(crate) fn footprint() -> Footprint {
     let entries = PERMITTED_HOST_CACHE.entries.read();
     let text: usize = entries
@@ -118,14 +115,11 @@ pub(crate) fn footprint() -> Footprint {
 /// host it names. Nothing is logged or counted here: each caller words its
 /// own refusal.
 pub(crate) fn permitted_host(raw_host: &str) -> Result<ClientHost, HostReject> {
-    // Hot path: cache hit returns a cloned ClientHost without
-    // re-validating or rescanning allowed_mirrors.
     if let Some(cached) = PERMITTED_HOST_CACHE.lookup(raw_host) {
         return cached;
     }
 
-    // Miss: validate the host and check allowed_mirrors, then cache
-    // whatever the outcome was (success, malformed, or not-allowed).
+    // Every outcome is cached, rejections included.
     let result = match ClientHost::new(raw_host) {
         Ok(c) if is_host_allowed(&c) => Ok(c),
         Ok(_) => Err(HostReject::Forbidden),
@@ -259,9 +253,6 @@ mod tests {
         );
     }
 
-    /// The soft cap is enforced by clearing, and only a *new* key past the
-    /// cap trips it: re-recording a host already in the map must not throw
-    /// away the whole cache.
     #[test]
     fn entry_cap_clears_only_for_a_new_key() {
         let cache = PermittedHostCache::default();

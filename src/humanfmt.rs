@@ -1,33 +1,21 @@
 //! SI-decimal `Display` adapters for the byte counts, transfer rates and
 //! durations that appear in log lines and the web interface.
 //!
-//! Three shapes, one set of rules. Units are decimal (kB = 1000 B, not 1024),
-//! matching what apt and the mirrors report. A unit is promoted at
-//! `NEXT_UNIT` (999.5) rather than at 1000, so the zero-decimal rendering can
-//! never read `1000kB`. The decimal count shrinks as the mantissa grows: two
-//! digits below 10, one below 100, none above.
+//! Units are decimal (kB = 1000 B, not 1024), matching what apt and the
+//! mirrors report. A unit is promoted at 999.5 rather than at 1000, so the
+//! zero-decimal rendering can never read `1000kB`.
 //!
-//! [`HumanFmt::BinarySize`] is the one IEC exception, for configuration
-//! values that are powers of two by nature (buffer sizes): a 32 KiB buffer
-//! reads `32.0KiB`, not `32.8kB`. Same precision ladder, promotion at
-//! 1023.5 for the same reason.
-//!
-//! [`HumanFmt::Rate`] divides by its window and renders `???B/s` for a
-//! zero-length one - see `precise_instant` for why the std clock makes that
-//! nearly unreachable, and `docs/logging.md` for why it is the formatter's own
-//! output rather than the "unknown value" placeholder.
-//! [`HumanFmt::Time`] leaves the scaled-unit ladder at 600 s and switches to a
-//! `1d 2h 3m 4s` breakdown, omitting every zero component.
+//! [`HumanFmt::Rate`] renders `???B/s` for a zero-length window; see
+//! `docs/logging.md` for why that is the formatter's own output rather than
+//! the "unknown value" placeholder.
 
 #[must_use]
 pub(crate) enum HumanFmt {
     Size(u64),
-    /// IEC units (KiB = 1024 B) for values that are naturally powers of two.
+    /// IEC units (KiB = 1024 B) for values that are naturally powers of two
+    /// (buffer sizes).
     BinarySize(u64),
     Rate(u64, std::time::Duration),
-    /// An already-per-second rate. [`Self::Rate`] divides and delegates here,
-    /// so a configured `min_download_rate` on the dashboard and a measured
-    /// rate in the log share one unit ladder.
     RatePerSec(u64),
     Time(std::time::Duration),
 }
@@ -49,8 +37,7 @@ impl std::fmt::Display for HumanFmt {
         const NEXT_UNIT: f64 = 999.5;
         const RATE_UNITS: [&str; 5] = ["B/s", "kB/s", "MB/s", "GB/s", "TB/s"];
 
-        /// Promote just before the rounded mantissa would reach the base,
-        /// using the same sequential divisions for bytes and rates.
+        /// Promote just before the rounded mantissa would reach the base.
         fn write_scaled(
             f: &mut std::fmt::Formatter<'_>,
             mut value: f64,
@@ -145,9 +132,6 @@ mod tests {
 
     use crate::humanfmt::HumanFmt;
 
-    /// `Rate` over a one-second window and `RatePerSec` of the same number
-    /// must render identically - that equality is the reason the dashboard's
-    /// configured `min_download_rate` can share the log's unit ladder.
     #[test]
     fn rate_per_sec_matches_rate_over_one_second() {
         for bytes in [0_u64, 1, 999, 1000, 24_756, 1_500_000, 3_000_000_000] {
@@ -160,10 +144,8 @@ mod tests {
         assert_eq!(format!("{}", HumanFmt::RatePerSec(10_000)), "10.00kB/s");
     }
 
-    /// Below 1 kB/s the rate ladder keeps `precision()`'s decimals, where
-    /// [`HumanFmt::Size`] prints a bare integer. The dashboard's configured
-    /// `min_download_rate` renders through the ladder, so a rate that low
-    /// reads `5.00B/s` there and not `5B/s` -- deliberate, so a configured
+    /// Below 1 kB/s the rate ladder keeps its decimals, where
+    /// [`HumanFmt::Size`] prints a bare integer -- deliberate, so a configured
     /// rate and a measured one in the log are comparable digit for digit.
     #[test]
     fn sub_kilobyte_rates_keep_the_ladder_decimals() {
@@ -233,8 +215,6 @@ mod tests {
 
     #[test]
     fn rate_test() {
-        // Zero window is unmeasurable -> sentinel (essentially unreachable with
-        // the std::time::Instant ns clock, but guards against a 0/0 divide).
         assert_eq!(
             format!("{}", HumanFmt::Rate(0, Duration::from_millis(0))),
             "???B/s"
@@ -255,7 +235,6 @@ mod tests {
             format!("{}", HumanFmt::Rate(1000, Duration::from_secs(1))),
             "1.00kB/s"
         );
-        // Sub-millisecond host-local window stays finite.
         assert_eq!(
             format!("{}", HumanFmt::Rate(61_700, Duration::from_micros(50))),
             "1.23GB/s"

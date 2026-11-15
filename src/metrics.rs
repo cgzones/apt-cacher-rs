@@ -27,8 +27,6 @@ impl Counter {
     }
 
     pub(crate) fn increment(&self) {
-        // Wraparound on `u64::MAX` is acceptable: at one increment per
-        // nanosecond it would still take ~584 years to overflow.
         self.0.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -38,16 +36,9 @@ impl Counter {
     }
 }
 
-/// A bad-sign counter: a [`Counter`] that also remembers when it last moved.
-///
-/// Every counter the dashboard highlights once non-zero is one of these, so
-/// the page can say whether a lifetime count is history or is happening now
-/// ("last: 3 h ago") -- the highlight alone reads the same for a single
-/// failure at startup and a mirror failing every minute. The stamp is one
-/// wall-clock read (`coarsetime::Clock::now_since_epoch`) and one relaxed
-/// store per bump, cheap enough for any site: these counters sit on
-/// failure and refusal paths, never on a per-byte one. Request-granular
-/// counters that are no alarm stay plain [`Counter`]s.
+/// A bad-sign counter: a [`Counter`] that also remembers when it last moved,
+/// so the dashboard can tell a single old failure from an ongoing one. Meant
+/// for failure and refusal paths, never a per-byte one.
 #[derive(Debug)]
 pub(crate) struct Signal {
     count: AtomicU64,
@@ -76,11 +67,10 @@ impl Signal {
         self.count.load(Ordering::Acquire)
     }
 
-    /// Unix seconds of the latest bump, `None` before the first. Read after
-    /// [`Self::get`] and the two can disagree by one in-flight bump, which
-    /// only ever makes the stamp newer than the count it is shown with: the
-    /// count is released after the stamp and acquired before it is read, so
-    /// a count never shows without the stamp of its own bump.
+    /// Unix seconds of the latest bump, `None` before the first. Read it
+    /// after [`Self::get`]: the count is released after the stamp, so a
+    /// count never shows without the stamp of its own bump (the stamp may
+    /// be one in-flight bump newer).
     #[must_use]
     pub(crate) fn last(&self) -> Option<u64> {
         match self.last.load(Ordering::Relaxed) {
@@ -90,24 +80,17 @@ impl Signal {
     }
 }
 
-/// The coarse wall clock every [`Signal`] stamp is taken from.
 fn now_epoch_secs() -> u64 {
     coarsetime::Clock::now_since_epoch().as_secs()
 }
 
-/// Cumulative time a limiter spent at its cap since process start: how long
-/// requests were being refused or made to wait, which a refusal count alone
-/// cannot tell apart (a burst of refusals in one second vs. a cap that is
-/// hit all day).
+/// Cumulative time a limiter spent at its cap since process start, which a
+/// refusal count alone cannot show (one burst vs. a cap hit all day).
 ///
-/// The limiter calls [`Self::enter`] when an admission brings it to its cap
-/// and [`Self::leave`] when a release takes it below; both are idempotent,
-/// so a caller that cannot tell whether it was at the cap may call `leave`
-/// on every release. Each is a relaxed load in the common case (not at the
-/// cap, or already there), an RMW only on a transition. Where the limiter
-/// is not updated under a lock, a transition racing an opposite one can end
-/// or start a span one release late; the figure is for sizing a cap, not
-/// for billing.
+/// [`Self::enter`] and [`Self::leave`] are idempotent, so a caller that
+/// cannot tell whether it was at the cap may call `leave` on every release.
+/// Where the limiter is not updated under a lock, a transition racing an
+/// opposite one can end or start a span one release late.
 pub(crate) struct CapClock {
     /// Coarse monotonic ticks when the current span at the cap began; 0
     /// while below the cap.
@@ -139,7 +122,6 @@ impl CapClock {
         }
     }
 
-    /// Whether a span at the cap is running.
     #[must_use]
     pub(crate) fn is_at_cap(&self) -> bool {
         self.since.load(Ordering::Relaxed) != 0
@@ -179,8 +161,6 @@ impl CapClock {
     }
 }
 
-/// The coarse monotonic clock every [`CapClock`] span and `mirror_perf`
-/// sample is stamped with.
 pub(crate) fn now_ticks() -> u64 {
     coarsetime::Instant::now().as_ticks()
 }
@@ -208,17 +188,12 @@ impl Peak {
     }
 }
 
-/// A counter bumped by an arbitrary amount (`increment_by`). Most are byte
-/// counters; the cleanup and database tallies among them count what their
-/// name says (`CLEANUP_EVICTIONS` and `CLEANUP_BYHASH_UNREFERENCED` files,
-/// `DB_MIRROR_LAST_SEEN_FLUSHED` rows).
+/// A counter bumped by an arbitrary amount; most count bytes.
 ///
-/// Cache-line aligned for the hot ones, the per-chunk byte counters
-/// (`BYTES_SERVED_*`, `BYTES_DOWNLOADED_UPSTREAM`), hit from different
-/// worker threads at chunk granularity. Without the alignment, up to eight
-/// of them share one 64-byte line and every bump bounces it between cores.
-/// There are only 13 accumulators, so the padding is negligible;
-/// the ~125 request-granularity `Counter`s stay packed on purpose.
+/// Cache-line aligned for the per-chunk byte counters (`BYTES_SERVED_*`,
+/// `BYTES_DOWNLOADED_UPSTREAM`), hit from different worker threads: unaligned,
+/// up to eight share one 64-byte line and every bump bounces it between
+/// cores. The request-granularity `Counter`s stay packed on purpose.
 #[repr(align(64))]
 pub(crate) struct Accumulator(AtomicU64);
 
@@ -229,8 +204,6 @@ impl Accumulator {
     }
 
     pub(crate) fn increment_by(&self, value: u64) {
-        // Wraparound on `u64::MAX` is acceptable: at one byte per nanosecond
-        // it would still take ~584 years to overflow.
         self.0.fetch_add(value, Ordering::Relaxed);
     }
 
@@ -292,15 +265,14 @@ pub(crate) static ACCEPT_TRANSIENT_FAILURES: Signal = Signal::new();
 /// client aborting its handshake (ECONNABORTED) this is an outage.
 pub(crate) static ACCEPT_FD_EXHAUSTED: Signal = Signal::new();
 
-/// Upstream response class buckets (2xx/3xx/4xx/5xx/other).
 pub(crate) static UPSTREAM_STATUS_2XX: Counter = Counter::new();
 pub(crate) static UPSTREAM_STATUS_3XX: Counter = Counter::new();
 pub(crate) static UPSTREAM_STATUS_4XX: Counter = Counter::new();
 pub(crate) static UPSTREAM_STATUS_5XX: Signal = Signal::new();
 pub(crate) static UPSTREAM_STATUS_OTHER: Signal = Signal::new();
 
-/// Selected upstream status codes tracked individually
-/// (200/206/301/302/304/307/308). 206 is every resumed download's answer.
+/// Selected upstream status codes tracked individually. 206 is every resumed
+/// download's answer.
 pub(crate) static UPSTREAM_STATUS_200: Counter = Counter::new();
 pub(crate) static UPSTREAM_STATUS_206: Counter = Counter::new();
 pub(crate) static UPSTREAM_STATUS_301: Counter = Counter::new();
@@ -309,16 +281,14 @@ pub(crate) static UPSTREAM_STATUS_304: Counter = Counter::new();
 pub(crate) static UPSTREAM_STATUS_307: Counter = Counter::new();
 pub(crate) static UPSTREAM_STATUS_308: Counter = Counter::new();
 
-/// Client response class buckets (2xx/3xx/4xx/5xx/other).
 pub(crate) static CLIENT_STATUS_2XX: Counter = Counter::new();
 pub(crate) static CLIENT_STATUS_3XX: Counter = Counter::new();
 pub(crate) static CLIENT_STATUS_4XX: Counter = Counter::new();
 pub(crate) static CLIENT_STATUS_5XX: Signal = Signal::new();
 pub(crate) static CLIENT_STATUS_OTHER: Signal = Signal::new();
 
-/// Selected client status codes tracked individually (200/206/304/410/416
-/// and the 5xx codes this proxy commonly answers with itself). The rarer
-/// ones -- 501 (unknown method), 505 (HTTP version), 508 (proxy loop, also
+/// Selected client status codes tracked individually. The rarer 5xx ones --
+/// 501 (unknown method), 505 (HTTP version), 508 (proxy loop, also
 /// `PROXY_LOOP_REJECTED`) -- count only in `CLIENT_STATUS_5XX`.
 pub(crate) static CLIENT_STATUS_200: Counter = Counter::new();
 pub(crate) static CLIENT_STATUS_206: Counter = Counter::new();
@@ -734,56 +704,27 @@ pub(crate) static UPSTREAM_HYPER_BODY_ERR: Signal = Signal::new();
 /// which is specific to on-disk size accounting drift.
 pub(crate) static CACHE_IO_FAILURE: Signal = Signal::new();
 
-/// Cache entries observed to be non-regular non-directory files (FIFO,
-/// socket, device, symlink).  Bumped by serving paths (which then return
-/// 5xx), download paths (which abort the download) -- including an open the
-/// entry itself failed: a symlink `O_NOFOLLOW` refuses (`ELOOP`), a
-/// directory opened for writing (`EISDIR`), a socket (`ENXIO`), classified
-/// by `fs_open::count_cache_failure` -- and every directory
-/// walk (`cache_walk.rs`, on sight): the startup scan and the dashboard
-/// leave such an entry in place, cleanup unlinks it wherever it walks
-/// (pool / flat / `dists/` / by-hash / `tmp/`).
-/// A non-zero count indicates either a hostile filesystem or a
-/// misconfigured cache directory and is worth operator attention.
-/// Disjoint from `CACHE_IO_FAILURE`: a non-regular-file detection is
-/// reported here only.  If a subsequent removal attempt's syscall itself
-/// fails, that is reported separately under `CACHE_IO_FAILURE`.  Unexpected
-/// directories are tracked separately under `CACHE_DIRECTORY_UNEXPECTED`
-/// when detected on dedicated directory-classification paths; however a
-/// number of serving paths (`main.rs`, `sendfile_conn.rs`, `splice/`)
-/// and TOCTOU-safe sweep paths in the `cleanup/` submodule still bump
-/// `CACHE_NON_REGULAR` for directories encountered at file locations.
-/// Treat the counter as "any non-regular entry where a regular file was
-/// expected"; if you need the strict FIFO/socket/device/symlink slice,
-/// filter at the call site.
+/// Cache entries that are not regular files where one was expected: a FIFO,
+/// socket, device or symlink, and on the serving, download and cleanup-sweep
+/// paths also a directory at a file location. Serving paths answer 5xx,
+/// downloads abort, cleanup unlinks the entry; the startup scan and the
+/// dashboard leave it in place. Points to a hostile filesystem or a
+/// misconfigured cache directory. Disjoint from `CACHE_IO_FAILURE`: the
+/// detection is reported here only; if removing the entry then fails, that
+/// failure is reported separately under `CACHE_IO_FAILURE`.
 pub(crate) static CACHE_NON_REGULAR: Signal = Signal::new();
 
-/// Cache entries observed to be directories in places where the cache
-/// layout does not allow one (an unknown host dir at the cache root, a
-/// non-layout dir in a mirror dir, anything in a pool / by-hash leaf).
-/// Bumped through `cache_walk::Entry::report_unexpected` by the walk that
-/// knows the layout; cleanup leaves the directory in place and emits a
-/// warn — the cache layout has no recursive-remove semantics there and
-/// a directory typically indicates operator action (e.g. a `mv` into the
-/// cache tree).  The single exception is `tmp/`, where stray directories
-/// are recursively removed once aged; the bump there fires on every
-/// cycle the directory is seen, like everywhere else.  Distinct from
-/// `CACHE_NON_REGULAR` because the operator response differs: a stray
-/// directory is usually benign-but-wasteful; a stray FIFO/socket/symlink
-/// is a security-relevant tampering signal.
+/// Directories where the cache layout does not allow one (an unknown host
+/// dir at the cache root, a non-layout dir in a mirror dir, anything in a
+/// pool / by-hash leaf), counted on every walk that sees them. Left in place
+/// with a warning, as it usually is an operator artefact (a `mv` into the
+/// cache tree); only `tmp/` removes stray directories, once aged.
 pub(crate) static CACHE_DIRECTORY_UNEXPECTED: Signal = Signal::new();
 
-/// Cache entries observed to be regular files where the layout does not
-/// allow one: at the cache root (whose only legitimate children are
-/// alias-resolved host dirs), a non-deb file directly in a mirror dir,
-/// or a non-UTF-8-named file cleanup can never match against an index.
-/// Bumped through `cache_walk::Entry::report_unexpected`; the file is
-/// left in place with a warn — like a stray directory, this is typically
-/// an operator artefact (e.g. a hand-placed `.txt` note) rather than a
-/// tampering signal.
-/// Distinct from `CACHE_NON_REGULAR` (FIFO/socket/device/symlink, which
-/// are security-relevant) and `CACHE_DIRECTORY_UNEXPECTED` (the
-/// directory-shaped counterpart inside mirror subtrees).
+/// Regular files where the cache layout does not allow one: at the cache
+/// root, a non-deb file directly in a mirror dir, or a non-UTF-8-named file
+/// cleanup can never match against an index. Left in place with a warning,
+/// like a stray directory.
 pub(crate) static CACHE_UNEXPECTED_REGULAR: Signal = Signal::new();
 
 /// `.partial` files a download found with a link count other than one --
@@ -809,64 +750,34 @@ pub(crate) static BYTES_TUNNELED_CLIENT_TO_UPSTREAM: Accumulator = Accumulator::
 /// socket accepted), whichever way the tunnel ends.
 pub(crate) static BYTES_TUNNELED_UPSTREAM_TO_CLIENT: Accumulator = Accumulator::new();
 
-/// HTTP timeout firings: upstream read (response headers and body).
-///
-/// Splice path: bumped when the per-read deadline fires anywhere in the
-/// upstream read flow — `read_upstream_response_headers`, the body
-/// splice loops (TCP and userspace-TLS variants), the chunked / EOF / volatile
-/// buffered-download readers, the error-response forwarder, and
-/// `read_body_to_vec_until_eof` / `read_dechunk_body_to_vec`. The name
-/// is historical; coverage is "upstream read deadline fired," whether
-/// the bytes were headers or body. Hyper path: bumped when
-/// `hyper-timeout`'s read/write timeout surfaces as a hyper transport
-/// error during request/response header exchange or body streaming
-/// (detected by walking the error source chain for an
-/// `io::ErrorKind::TimedOut`).
+/// Upstream read deadline fired, whether the bytes awaited were response
+/// headers or body, in both backends (hyper: a `hyper-timeout` read/write
+/// timeout surfacing as a transport error).
 pub(crate) static HTTP_TIMEOUT_UPSTREAM_READ: Signal = Signal::new();
-/// HTTP timeout firings: upstream TCP/TLS handshake, counted per attempt
-/// (a request whose retries all time out counts each of them, and once in
-/// `UPSTREAM_CONNECT_FAILED`).
-///
-/// Splice path: bumped when `tcp_connect` or the TLS handshake exceeds
-/// the configured timeout. Hyper path: bumped when `hyper-timeout`'s
-/// connect timeout fires (detected by walking the connect error source
-/// chain for an `io::ErrorKind::TimedOut`). Also bumped when a CONNECT
-/// tunnel's upstream dial times out, in both backends.
+/// Upstream TCP connect or TLS handshake timed out, counted per attempt (a
+/// request whose retries all time out counts each of them, and once in
+/// `UPSTREAM_CONNECT_FAILED`). Includes a CONNECT tunnel's upstream dial.
 pub(crate) static HTTP_TIMEOUT_UPSTREAM_CONNECT: Signal = Signal::new();
-/// HTTP timeout firings: client failed to send request headers in time
-/// (slow-loris-shaped, or a stalled client between keep-alive requests).
+/// Client failed to send request headers in time (slow-loris-shaped, or a
+/// stalled client between keep-alive requests).
 ///
-/// Scope: only updated by the sendfile backend's `read_request_headers`.
-/// In `cfg(not(feature = "sendfile"))` builds (non-default) the hyper path's
-/// `header_read_timeout` is configured from `client_idle_timeout` and does
-/// fire on idle/slow-header clients, but it is not counted here -- it logs at
-/// debug level instead, so this counter stays at 0 on those builds; likewise a
-/// sendfile connection handed over to hyper for good (an HTTP/1.0 request, a
-/// request body) stops counting here.
+/// Scope: only the sendfile backend's `read_request_headers`. Hyper's
+/// `header_read_timeout` fires too but only logs at debug level, so this
+/// stays at 0 in `cfg(not(feature = "sendfile"))` builds and stops counting
+/// on a sendfile connection handed over to hyper for good (an HTTP/1.0
+/// request, a request body).
 pub(crate) static HTTP_TIMEOUT_CLIENT_HEADER: Counter = Counter::new();
-/// HTTP timeout firings: client failed to drain the response body within
-/// `http_timeout` (slow reader, dropped link). A client falling below
-/// `min_download_rate` is not a timeout: it counts only in
-/// `RATE_LIMIT_CLIENT`.
+/// Client failed to drain the response body within `http_timeout` (slow
+/// reader, dropped link). A client falling below `min_download_rate` is not
+/// a timeout: it counts only in `RATE_LIMIT_CLIENT`.
 ///
-/// Scope: response-body writes via `write_all_to_stream(.., WritePhase::Body)`,
-/// every rated-write helper (`write_all_to_stream_rated{,_counted}`,
-/// `wait_socket_rated`), the sendfile chunk loop, and a hyper-served
-/// connection or a CONNECT tunnel ended by `write_stall::WriteStallTimeout`
-/// (which cannot tell a stalled head write from a body write, so counts both
-/// here). The other
-/// header-write timeouts are tracked separately in
-/// `HTTP_TIMEOUT_CLIENT_HEADER_WRITE`.
+/// A hyper-served connection or a CONNECT tunnel ended by
+/// `write_stall::WriteStallTimeout` cannot tell a stalled head write from a
+/// body write, so counts both here.
 pub(crate) static HTTP_TIMEOUT_CLIENT_BODY: Signal = Signal::new();
-/// HTTP timeout firings: client failed to drain a response-header (or other
-/// small fixed control) write in time. Distinct from
-/// `HTTP_TIMEOUT_CLIENT_HEADER`, which counts request-header *reads* that
-/// stalled before any request was parsed.
-///
-/// Scope: client writes of response heads and small proxy-generated
-/// responses (304/416/error responses, the tunnel's `200`), through
-/// `write_all_to_stream(.., WritePhase::Header)` and
-/// `write_all_to_stream_msg_more`.
+/// Client failed to drain a response head or a small proxy-generated
+/// response (304/416/error responses, the tunnel's `200`) in time. Distinct
+/// from `HTTP_TIMEOUT_CLIENT_HEADER`, which counts request-header *reads*.
 pub(crate) static HTTP_TIMEOUT_CLIENT_HEADER_WRITE: Counter = Counter::new();
 
 /// `max_upstream_downloads` saturation episodes — debounced (latched at cap,
@@ -920,28 +831,19 @@ pub(crate) static LOGSTORE_EVICTIONS: Counter = Counter::new();
 pub(crate) static CACHE_QUOTA_UTIL_PEAK_BPS: Peak = Peak::new();
 
 /// HTTPS upgrade attempted on an HTTP request (Auto / uncached scheme).
-/// Every attempt resolves to exactly one of `HTTPS_UPGRADE_SUCCEEDED`,
-/// `HTTPS_UPGRADE_REVERTED`, or `HTTPS_UPGRADE_FAILED`, so the identity
-/// `ATTEMPTED == SUCCEEDED + REVERTED + FAILED` holds. Both the hyper and
-/// splice backends write these counters; the identity holds per-backend and
-/// in aggregate, though the mechanism differs (see each subset below).
+/// Every attempt resolves to exactly one of the three below, so
+/// `ATTEMPTED == SUCCEEDED + REVERTED + FAILED` holds per backend and in
+/// aggregate.
 pub(crate) static HTTPS_UPGRADE_ATTEMPTED: Counter = Counter::new();
-/// HTTPS upgrade succeeded. hyper: bumped on the first successful upstream
-/// response (any status) after the upgrade flag was set. The host's
-/// https scheme is also cached in this same code path when no entry
-/// exists yet, but the metric fires before the cache-write check, so a
-/// response with an unsupported scheme or a non-2xx status still
-/// counts as a success here. splice: bumped at connect/handshake success
-/// (before the response headers are read), so a later header-read failure
-/// is not re-counted as `HTTPS_UPGRADE_FAILED`.
+/// HTTPS upgrade succeeded. hyper: bumped on the first upstream response of
+/// any status after the upgrade. splice: bumped at connect/handshake
+/// success, so a later header-read failure is not re-counted as
+/// `HTTPS_UPGRADE_FAILED`.
 pub(crate) static HTTPS_UPGRADE_SUCCEEDED: Counter = Counter::new();
-/// HTTPS upgrade reverted: the upgrade was abandoned in favour of the
-/// original scheme (the request may still succeed via it; this counter only
-/// marks that the upgrade attempt was abandoned, not that the request as a
-/// whole failed). hyper: Auto-mode gave up after
-/// `HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS` connect failures and reverted.
-/// splice: the one-shot HTTPS-then-HTTP fallback in `connect_upstream`
-/// connected via HTTP for an Auto-mode upgrade attempt.
+/// HTTPS upgrade abandoned in favour of the original scheme; the request
+/// may still succeed via it. hyper: Auto-mode gave up after
+/// `HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS` connect failures. splice: the
+/// one-shot HTTPS-then-HTTP fallback connected via HTTP.
 pub(crate) static HTTPS_UPGRADE_REVERTED: Counter = Counter::new();
 /// HTTPS upgrade failed terminally: the upgrade attempt resolved to neither
 /// success nor revert. hyper: Always-mode exhausts the connect-retry budget
@@ -1142,10 +1044,8 @@ pub(crate) static LAST_CLEANUP_FAILURES: StateU64 = StateU64::new();
 /// list could not be read), so no cache file could be reclaimed.
 pub(crate) const CLEANUP_ABORTED: u64 = u64::MAX;
 
-/// Record a client response status code into the matching class counter plus the
-/// fine-grained bucket for statuses we track individually. The class is
-/// bumped first, so a reader that loads the codes before their class never
-/// sees the codes exceed it.
+/// The class is bumped first, so a reader that loads the codes before their
+/// class never sees the codes exceed it.
 pub(crate) fn record_client_status(status: StatusCode) {
     match status.as_u16() {
         200..=299 => CLIENT_STATUS_2XX.increment(),
@@ -1169,9 +1069,7 @@ pub(crate) fn record_client_status(status: StatusCode) {
     }
 }
 
-/// Record an upstream response status code. Tracks status-class buckets and
-/// the individually-tracked codes (200/206/301/302/304/307/308) independently
-/// from the client-side `record_client_status`, class first like it.
+/// Class first, like `record_client_status`.
 pub(crate) fn record_upstream_status(status: StatusCode) {
     match status.as_u16() {
         200..=299 => UPSTREAM_STATUS_2XX.increment(),
@@ -1204,7 +1102,6 @@ mod tests {
         let clock = CapClock::new();
         assert_eq!(clock.total_at(100), std::time::Duration::ZERO);
         clock.enter_at(1_000);
-        // Idempotent: a second admission at the cap keeps the span's start.
         clock.enter_at(5_000);
         assert!(clock.is_at_cap());
         clock.leave_at(9_000);
@@ -1212,14 +1109,13 @@ mod tests {
         assert!(!clock.is_at_cap());
         let first: std::time::Duration = coarsetime::Duration::from_ticks(8_000).into();
         assert_eq!(clock.total_at(20_000), first);
-        // A running span counts up to "now".
         clock.enter_at(30_000);
         let running: std::time::Duration = coarsetime::Duration::from_ticks(8_000 + 2_000).into();
         assert_eq!(clock.total_at(32_000), running);
     }
 
-    /// Each code a row is shown for lands in its row and its class; other
-    /// tests bump the same globals concurrently, so only growth is asserted.
+    /// Other tests bump the same globals concurrently, so only growth is
+    /// asserted.
     #[test]
     fn status_codes_land_in_their_row_and_class() {
         let (u206, u2xx) = (UPSTREAM_STATUS_206.get(), UPSTREAM_STATUS_2XX.get());

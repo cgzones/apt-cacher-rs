@@ -1,16 +1,11 @@
-//! Shared formatting for the per-request rate-logging segments.
-//!
-//! Every download/serve/passthrough success log builds the trailing
-//! parenthesised part of its message from these segments and nothing else,
-//! so the format stays identical across the hyper, sendfile and splice
-//! backends.
+//! The trailing parenthesised rate segments of the per-request
+//! download/serve/passthrough log lines, identical across the backends.
 
 use std::fmt;
 use std::time::Duration;
 
 use crate::humanfmt::HumanFmt;
 
-/// A rate-log segment formatted directly into the logger's output buffer.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Segment {
     kind: SegmentKind,
@@ -62,8 +57,7 @@ impl fmt::Display for Segment {
     }
 }
 
-/// `upstream <size> at <rate>` -- body bytes received from the upstream mirror
-/// over the upstream-rate window.
+/// `upstream <size> at <rate>`
 #[must_use]
 pub(crate) fn upstream_segment(bytes: u64, window: Duration) -> Segment {
     Segment {
@@ -73,8 +67,7 @@ pub(crate) fn upstream_segment(bytes: u64, window: Duration) -> Segment {
     }
 }
 
-/// `client <size> at <rate>` -- bytes delivered to the client over the
-/// client-rate window, for a fully-served response.
+/// `client <size> at <rate>`, for a fully-served response.
 #[must_use]
 pub(crate) fn client_segment(bytes: u64, window: Duration) -> Segment {
     Segment {
@@ -84,9 +77,8 @@ pub(crate) fn client_segment(bytes: u64, window: Duration) -> Segment {
     }
 }
 
-/// `client disconnected after <time> (<size>)` -- the client dropped before
-/// receiving the whole response; `bytes` is the best-effort count streamed
-/// toward it.
+/// `client disconnected after <time> (<size>)`; `bytes` is the best-effort
+/// count streamed toward the client.
 #[must_use]
 pub(crate) fn client_disconnect_segment(bytes: u64, elapsed: Duration) -> Segment {
     Segment {
@@ -96,7 +88,8 @@ pub(crate) fn client_disconnect_segment(bytes: u64, elapsed: Duration) -> Segmen
     }
 }
 
-/// A partial delivery without evidence that the client disconnected.
+/// `delivery stopped after <time> (<size>)`: a partial delivery without
+/// evidence that the client disconnected.
 #[must_use]
 pub(crate) fn client_abort_segment(bytes: u64, elapsed: Duration) -> Segment {
     Segment {

@@ -13,11 +13,8 @@ use crate::deb_mirror::{
 use crate::error::ErrorReport;
 use crate::metrics;
 
-/// Unlink a symlink / FIFO / socket / device the walker reported: cleanup
-/// removes non-regular entries wherever it walks (pool, flat tree, `dists/`,
-/// by-hash, `tmp/`).  The detection warn and `CACHE_NON_REGULAR` bump are
-/// the walker's; this owns the removal and its outcome lines.  Returns
-/// whether the entry is gone.
+/// Unlink a symlink / FIFO / socket / device the walker reported (the walker
+/// already warned and counted it).  Returns whether the entry is gone.
 pub(super) async fn remove_non_regular(path: &Path) -> bool {
     match tokio::fs::remove_file(path).await {
         Ok(()) => {
@@ -37,9 +34,8 @@ pub(super) async fn remove_non_regular(path: &Path) -> bool {
 }
 
 /// Recursively remove a stray directory from `tmp/` - the one place cleanup
-/// removes a directory rather than retaining it (see
-/// `metrics::CACHE_DIRECTORY_UNEXPECTED`).  The caller has already reported
-/// it through `Entry::report_unexpected`.  Returns whether the entry is gone.
+/// removes a directory rather than retaining it.  The caller has already
+/// reported it.  Returns whether the entry is gone.
 pub(super) async fn remove_stray_dir(path: &Path) -> bool {
     match tokio::fs::remove_dir_all(path).await {
         Ok(()) => {
@@ -66,31 +62,22 @@ static RECONCILE_WALK: WalkContext = WalkContext {
     anomalies: AnomalyLevel::Warn,
 };
 
-/// What [`scan_candidates`] found.
 pub(super) struct ScannedTree {
-    /// The deb candidates, keyed as the doc of [`scan_candidates`] says.
+    /// Keyed by the entry's path relative to the tree root.
     pub(super) candidates: HashMap<OsString, SpanClass>,
-    /// Entries left in place on a cache I/O failure, each logged where it
-    /// failed (see [`UnitStats::io_failures`]).
-    ///
-    /// [`UnitStats::io_failures`]: super::engine::UnitStats::io_failures
+    /// Entries left in place on a cache I/O failure, each already logged.
     pub(super) io_failures: u64,
 }
 
-/// Unified on-disk candidate scanner, driven by the unit's [`TreeSpec`].
+/// On-disk candidate scanner, driven by the unit's [`TreeSpec`].
 ///
-/// [`Walk::Shallow`] is the structured pool's shape: depth-1, basename keys,
-/// a deb-named directory is reported as unexpected.  [`Walk::Recursive`] is
-/// the flat tree's shape: relpath keys (forward-slash joined), `skip_subdirs`
-/// and nested-mirror boundaries are not entered.  Either way only
-/// `.deb`/`.udeb`/`.ddeb`-named regular files become candidates; every
-/// symlink / FIFO / socket / device met on the way is unlinked, and an
-/// unreadable directory abandons the unit (`Err`, logged by the walker) -
-/// reconciling against a partial candidate set would grace-sweep live debs.
+/// Only `.deb`/`.udeb`/`.ddeb`-named regular files become candidates; every
+/// non-regular entry met on the way is unlinked.  An unreadable directory
+/// abandons the unit (`Err`, logged by the walker): reconciling against a
+/// partial candidate set would grace-sweep live debs.
 ///
 /// Candidates are keyed by the entry's path *relative to `tree.root`*, which
-/// is what `sweep_candidates` rejoins to reach the file - so it must stay
-/// exactly that and never, say, a basename for a nested entry.
+/// is what `sweep_candidates` rejoins to reach the file.
 pub(super) async fn scan_candidates(
     cache_root: &Path,
     tree: &TreeSpec,
@@ -131,8 +118,6 @@ pub(super) async fn scan_candidates(
                             );
                             continue;
                         };
-                        // The by-hash subtree (handled by the by-hash
-                        // cleanup) and the tmp partial-download dir.
                         if skip_subdirs.contains(&name_str) {
                             continue;
                         }
@@ -142,14 +127,8 @@ pub(super) async fn scan_candidates(
                             continue;
                         }
 
-                        // Translate the on-disk position back to a
-                        // mirror-path equivalent (`<mirror_path>/<rel>`) so
-                        // it can be compared against the registered nested
-                        // mirror paths.  A hit delimits a boundary: the
-                        // nested mirror owns everything inside, so do not
-                        // descend.  Only UTF-8-named directories are ever
-                        // descended into, so the relative path is UTF-8 and
-                        // the lossy conversion is exact.
+                        // Only UTF-8-named directories are ever descended
+                        // into, so the lossy conversion is exact.
                         let rel_path = entry.rel_path();
                         let rel = rel_path.to_string_lossy();
                         let candidate = mirror_relative_path(mirror_path, &rel);

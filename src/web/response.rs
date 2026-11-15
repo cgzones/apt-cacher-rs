@@ -47,13 +47,10 @@ const HTML_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self';
      img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; \
      frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'";
 
-/// A response from the local web interface.
-///
-/// Carries enough information for the hyper backend to construct a
-/// `Response<ProxyCacheBody>` and for the sendfile backend to format the wire
-/// bytes by hand using `format!` (see `sendfile_conn::write_webui_response`).
-/// The two paths derive their headers from the same `WebResponse`, so clients
-/// see the same response regardless of which backend served the request.
+/// A response from the local web interface. The hyper backend
+/// (`into_hyper_response`) and the sendfile backend
+/// (`sendfile_conn::write_webui_response`) both derive their headers from
+/// it, so clients see the same response from either.
 pub(crate) struct WebResponse {
     pub(crate) status: StatusCode,
     pub(crate) body: bytes::Bytes,
@@ -72,7 +69,6 @@ enum WebResponseKind {
     /// Machine-readable healthcheck payload; `no-store` like Html, none of
     /// the document-oriented security headers.
     Json,
-    /// Plain-text error response.
     Error,
 }
 
@@ -143,9 +139,6 @@ impl WebResponse {
     }
 
     /// Per-kind headers beyond the common Server/Date/Connection/Content-* set.
-    /// The single owner of this table: the hyper path feeds it to the response
-    /// builder, the sendfile path formats it onto the wire
-    /// (`sendfile_conn::write_webui_response`), so the two cannot drift.
     pub(crate) fn extra_headers(&self) -> &'static [(&'static str, &'static str)] {
         match self.kind {
             WebResponseKind::Html => &[
@@ -194,7 +187,6 @@ impl WebResponse {
         }
     }
 
-    /// Render this response as a `Response<ProxyCacheBody>` for the hyper path.
     #[cfg(feature = "hyper")]
     pub(crate) fn into_hyper_response(self) -> Response<ProxyCacheBody> {
         let mut builder = Response::builder()

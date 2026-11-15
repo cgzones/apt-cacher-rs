@@ -1,26 +1,18 @@
 //! Buffered download path for volatile responses without `Content-Length`:
 //! [`handle_volatile_buffered_download`] reads the whole body into memory (up
 //! to 1 MiB), serves it to the client and caches it, bypassing splice(2).
-//! Shares the response-head, cache-target, commit and completion-log helpers
-//! with the drive in `mod.rs`.
 //!
-//! The body is buffered in memory here, so it lands in the temp file *before*
-//! the client is written to, and caching it never depends on the client write
-//! succeeding. The commit itself (`fsync`, verify + rename, the `Download`
-//! row) does not delay the response either: it is the same spawned
-//! `CommitTail` task the streaming drive uses, started with
+//! The body lands in the temp file *before* the client is written to, so
+//! caching it never depends on the client write succeeding. The commit
+//! (`fsync`, verify + rename, the `Download` row) does not delay the response
+//! either: it is the spawned `CommitTail` task, started with
 //! `CommitTail::spawn_before_serving` right before the response head goes
-//! out, so the client is served from memory while the commit runs. As with
-//! every spawned commit, a completed response does not prove the cache file
-//! exists yet. The upstream connection goes back to the pool the moment the
-//! body is read, and the download's `max_upstream_downloads` slot at
-//! `CacheTarget::begin_rename` on the connection task, both before the
-//! client write; the completion line and the `Delivery` row wait in the tail
-//! for the client's fate (`commit::ClientVerdict::send`).
-//!
-//! Buffered bodies use the same cache writer as the streaming path, moving
-//! the buffer into the write rather than copying it, with commit-time
-//! verification instead of an incremental digest.
+//! out. As with every spawned commit, a completed response does not prove
+//! the cache file exists yet. The upstream connection goes back to the pool
+//! the moment the body is read, and the download's `max_upstream_downloads`
+//! slot at `CacheTarget::begin_rename`, both before the client write; the
+//! completion line and the `Delivery` row wait in the tail for the client's
+//! fate (`commit::ClientVerdict::send`).
 
 use std::num::NonZero;
 
@@ -45,8 +37,7 @@ use super::{
 };
 
 /// Handle the full lifecycle for volatile files whose upstream response has no
-/// Content-Length.  The entire body is buffered into memory (up to 1 MiB),
-/// then served to the client and cached, bypassing splice(2).
+/// Content-Length; see the module doc.
 #[expect(
     clippy::too_many_arguments,
     reason = "lifecycle function threading full context"
@@ -67,10 +58,8 @@ pub(super) async fn handle_volatile_buffered_download(
         .try_into()
         .expect("constant fits"); // TODO: const conversion once stable
 
-    // Account this buffered serve under `ACTIVE_CLIENT_DOWNLOADS` for the
-    // duration of the function (RAII drop on every return path).  Mirrors
-    // the canonical `splice_proxy_body{,_tls}` holders; the buffered path
-    // bypasses those and would otherwise undercount.
+    // The buffered path bypasses the body loops that normally hold this, and
+    // would otherwise undercount `ACTIVE_CLIENT_DOWNLOADS`.
     let _client_count = client_counter::ClientDownload::new();
 
     // Buffer the entire body into memory: chunked or close-delimited, since
@@ -134,14 +123,8 @@ pub(super) async fn handle_volatile_buffered_download(
 
     let start = PreciseInstant::now();
 
-    // The whole body is already buffered in memory, so -- unlike the streaming
-    // path (`splice_proxy`) -- it lands in the temp file BEFORE the
-    // client is written to. Caching must not depend on the client write, so a
-    // late client-write failure never discards an already-downloaded body
-    // (late joiners and future requests keep it).
-
-    // Write the full body to the cache temp file (best-effort), moving the
-    // buffer into the write and back rather than copying it.
+    // The body lands in the temp file BEFORE the client is written to (see
+    // the module doc).
     // `Abandon`, not `CloseConnection`: the body is already in memory, so a
     // failed cache write loses only the download -- the client is served
     // below and the connection survives.
@@ -152,13 +135,11 @@ pub(super) async fn handle_volatile_buffered_download(
         super::write_buffered_body_to_cache(target, &mut body, Consequence::Abandon).await;
 
     // Commit on a task of its own, only if the body reached the temp file, and
-    // start it before serving: the client does not wait for the `fsync`,
-    // the verify + rename or the `Download` row. `begin_rename` stays here on
-    // the connection task, after draining writes, so the slot goes back before the client
-    // write. When the write failed, the target went with the failure: its
-    // barrier published the terminal aborted state (correct, since nothing is
-    // on disk for late joiners to serve) and gave the `max_upstream_downloads`
-    // slot back with the entry, so the client write below holds neither.
+    // start it before serving. `begin_rename` stays here on the connection
+    // task so the slot goes back before the client write. When the write
+    // failed, the target went with the failure: its barrier published the
+    // terminal aborted state (nothing is on disk for late joiners to serve)
+    // and gave the `max_upstream_downloads` slot back with the entry.
     let verdict = match cache_write {
         Ok(target) => target
             .begin_rename(
@@ -177,12 +158,10 @@ pub(super) async fn handle_volatile_buffered_download(
         Err(_reported) => None,
     };
 
-    // Serve the client from the in-memory body while the tail commits. A
-    // client write failure does not lose the downloaded body -- and a cached
-    // download reports its completion line either way, "Cached ..." for a
-    // client that did not get it all, the same as the streaming tail's
-    // `Aborted` arm. A failed commit logged its own cause in the tail and
-    // reports nothing; the connection is unaffected.
+    // A client write failure does not lose the downloaded body, and a cached
+    // download reports its completion line either way ("Cached ..." for a
+    // client that did not get it all). A failed commit logged its own cause
+    // in the tail and reports nothing; the connection is unaffected.
     let served = serve_buffered(
         client,
         conn_details,
@@ -217,9 +196,7 @@ pub(super) async fn handle_volatile_buffered_download(
     Ok(outcome)
 }
 
-/// Phase tag of the buffered path's head write.
 const HEAD_PHASE: &str = "volatile response headers";
-/// Phase tag of the buffered path's body write.
 const BODY_PHASE: &str = "volatile body";
 
 /// Write the response head and the range-filtered slice of the buffered body
@@ -263,8 +240,7 @@ async fn serve_buffered(
     written
 }
 
-/// The one sink for either client write of this path; the failure's type
-/// decides what it counts (a head counts nothing).
+/// The failure's type decides what it counts (a head counts nothing).
 fn conclude_write(
     conn_details: &ConnectionDetails,
     phase: &'static str,

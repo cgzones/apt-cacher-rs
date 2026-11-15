@@ -76,7 +76,6 @@ const ACR = (function () {
     return node;
   }
 
-  /* An HTML element with attributes and optional text content. */
   function el(tag, attrs, text) {
     const node = setAttrs(document.createElement(tag), attrs);
     if (text !== undefined && text !== null) {
@@ -135,10 +134,6 @@ const ACR = (function () {
     return node && node.closest ? node.closest("[data-section]") : null;
   }
 
-  /* Run `change`, which may grow or shrink blocks above the reader, and
-   * scroll so the first block on screen stays where it was. The page opts
-   * out of the browser's own scroll anchoring (style.css), which loses its
-   * anchor when the block holding it is replaced. */
   /* A block the reader can keep their place on: a server section, or a
    * script-built block marked data-anchor (the activity panel). */
   const ANCHORS = "body > [data-section], body > [data-anchor]";
@@ -156,6 +151,10 @@ const ACR = (function () {
     return null;
   }
 
+  /* Run `change`, which may grow or shrink blocks above the reader, and
+   * scroll so the first block on screen stays where it was. The page opts
+   * out of the browser's own scroll anchoring (style.css), which loses its
+   * anchor when the block holding it is replaced. */
   function keepScroll(change) {
     let anchor = null;
     for (const node of all(document, ANCHORS)) {
@@ -259,7 +258,6 @@ const ACR = (function () {
 
   const listeners = { state: [] };
 
-  /* Replace the page's query string and tell the features about it. */
   function setState(st) {
     const url = href(window.location.pathname, st) + window.location.hash;
     window.history.replaceState(window.history.state, "", url);

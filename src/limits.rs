@@ -1,18 +1,10 @@
 //! Process-wide defence-in-depth bounds shared across the hyper / splice /
 //! sendfile code paths, plus the small helpers that enforce them.
 //!
-//! This module hosts the cross-path limits that benefit from a single
-//! definition (upstream header size/count, `Packages` decompression caps,
-//! upstream metadata line length, CONNECT authority cap). It is *not* the
-//! sole audit point for every defensive limit — module-local constants
-//! still live next to their callers (for example `deb_mirror`'s
-//! mirror-path bounds, `sendfile_conn`'s request-header cap). The two
-//! *configurable* bounds (`max_object_size`, `client_idle_timeout`) live
-//! on [`crate::config::Config`] and are reached via `global_config()`;
-//! everything here is a compile-time constant or a pure helper. The three
-//! cache-policy constants the backends, cleanup and the database share
-//! (`RETENTION_TIME`, `VOLATILE_CACHE_MAX_AGE`,
-//! `VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER`) live here as well.
+//! Not the sole audit point for every defensive limit: module-local
+//! constants still live next to their callers, and the configurable bounds
+//! (`max_object_size`, `client_idle_timeout`) live on
+//! [`crate::config::Config`].
 
 use std::io;
 use std::num::NonZero;
@@ -54,25 +46,17 @@ pub(crate) const MAX_UPSTREAM_READ_BUFFER: usize = 128 * 1024;
 /// Absolute ceiling (bytes) on the decompressed output of a `Packages` file,
 /// and so on a raw one, which cleanup buffers whole (a memfd in hyper builds,
 /// a `Vec` in hyper-less ones) for up to ten mirrors at once. Debian's largest,
-/// `main/binary-amd64/Packages`, decompresses to well under 100 MiB; 256 MiB
-/// leaves room for bigger archives while bounding that buffering at a
-/// quarter of the former 1 GiB.
+/// `main/binary-amd64/Packages`, decompresses to well under 100 MiB.
 pub(crate) const MAX_DECOMPRESSED_PACKAGES_SIZE: NonZero<u64> = nonzero!(256 * 1024 * 1024);
 
 /// Ceiling (bytes) on a compressed (`.gz`/`.xz`) `Packages` file, checked
 /// before it is decoded or, by cleanup, buffered. Debian's largest,
-/// `main/binary-amd64/Packages.xz`, is ~10 MiB. Without it the
-/// decompressed caps alone admitted a compressed body as large as the
-/// decompressed ceiling, which cleanup holds in memory (a memfd in hyper
-/// builds, a `Vec` in hyper-less ones) for up to ten mirrors at once.
+/// `main/binary-amd64/Packages.xz`, is ~10 MiB.
 pub(crate) const MAX_COMPRESSED_PACKAGES_SIZE: NonZero<u64> = nonzero!(128 * 1024 * 1024);
 
 /// Maximum size (bytes) of a `Release` / `InRelease` file ingested into the
-/// checksum registry. Real Release files for Debian-scale archives are tens
-/// of KB; an 8 MiB cap leaves several orders of magnitude of headroom while
-/// bounding the memory ballooning surface from a hostile or buggy mirror
-/// (which could otherwise serve a multi-GB `Release` under `max_object_size`
-/// and force `read_to_string` to grow without bound).
+/// checksum registry, which is read into memory whole. Real Release files
+/// for Debian-scale archives are tens of KB.
 pub(crate) const MAX_RELEASE_SIZE: NonZero<u64> = nonzero!(8 * 1024 * 1024);
 
 /// Maximum decompressed-to-compressed ratio tolerated for a `Packages` file.
@@ -80,12 +64,9 @@ const MAX_DECOMPRESSION_RATIO: NonZero<u64> = nonzero!(100);
 
 /// Largest LZMA2 dictionary an `.xz` index may declare, 64 MiB (`xz -9`;
 /// Debian's archive tooling uses `-6`, 8 MiB).  The decoder's window grows
-/// with the decoded output up to the declared dictionary (lzma-rust2 0.21
-/// and earlier allocated it whole from the block header, letting a hostile
-/// ~200-byte `Packages.xz` commit up to 4 GiB), so without this cap one
-/// ingest could hold a window as large as
-/// [`MAX_DECOMPRESSED_PACKAGES_SIZE`]; with it, at most 64 MiB.  Enforced
-/// through `lzma_rust2::XzReader::new_mem_limit` in `xz_stream`.
+/// with the decoded output up to the declared dictionary, so without this
+/// cap one ingest could hold a window as large as
+/// [`MAX_DECOMPRESSED_PACKAGES_SIZE`].
 pub(crate) const MAX_XZ_DICT_SIZE: NonZero<u64> = nonzero!(64 * 1024 * 1024);
 
 /// Idle upstream connections kept per host, by the splice backend's own pool
@@ -97,10 +78,9 @@ pub(crate) const UPSTREAM_POOL_MAX_IDLE_PER_HOST: usize = 4;
 /// Maximum length (bytes) of a single line read from upstream metadata.
 pub(crate) const MAX_METADATA_LINE_LEN: usize = 8 * 1024;
 
-/// Defensive upper bound on the byte length of a CONNECT request's
-/// authority (`<host>:<port>`).  Real-world authorities are well below
-/// this: an FQDN is capped at 253 bytes by RFC 1035 and a `:port` suffix
-/// adds at most 6 bytes.
+/// Upper bound on the byte length of a CONNECT request's authority
+/// (`<host>:<port>`): an FQDN is capped at 253 bytes by RFC 1035 and a
+/// `:port` suffix adds at most 6 bytes.
 pub(crate) const MAX_AUTHORITY_LEN: usize = 259;
 
 pub(crate) const RETENTION_TIME: Duration = Duration::from_hours(8 * 7 * 24); /* 8 weeks */
@@ -110,9 +90,6 @@ pub(crate) const VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER: NonZero<u64> = nonzero!(
 /// Maximum age for volatile cache entries before they are treated as stale.
 pub(crate) const VOLATILE_CACHE_MAX_AGE: Duration = Duration::from_secs(30);
 
-/// Returns `true` if a declared upstream Content-Length of `declared` bytes is
-/// within the configured `max_object_size` cap. A `None` cap disables the
-/// check.
 #[must_use]
 pub(crate) fn content_length_within_cap(
     declared: u64,
@@ -126,8 +103,7 @@ pub(crate) fn content_length_within_cap(
 
 /// A reader adapter ([`AsyncRead`] and [`io::Read`]) that fails with
 /// [`io::ErrorKind::InvalidData`] once more than `limit` total bytes have been
-/// read from the inner reader. Bounds both ends of a `Packages` decode: the
-/// decompressed output and the compressed input.
+/// read from the inner reader.
 struct LimitedReader<R> {
     inner: R,
     limit: NonZero<u64>,
@@ -137,7 +113,6 @@ struct LimitedReader<R> {
 }
 
 impl<R> LimitedReader<R> {
-    /// Bounds the decompressed output of a `Packages` index.
     fn decompressed(inner: R, limit: NonZero<u64>) -> Self {
         Self {
             inner,
@@ -147,7 +122,6 @@ impl<R> LimitedReader<R> {
         }
     }
 
-    /// Bounds the compressed input of a `.gz`/`.xz` `Packages` index.
     fn compressed(inner: R, limit: NonZero<u64>) -> Self {
         Self {
             inner,
@@ -157,7 +131,6 @@ impl<R> LimitedReader<R> {
         }
     }
 
-    /// Adds `read` bytes to the count; an error once it passes the limit.
     fn account(&mut self, read: usize) -> io::Result<()> {
         self.count = self.count.saturating_add(read as u64);
         if self.count > self.limit.get() {
@@ -200,7 +173,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for LimitedReader<R> {
     }
 }
 
-/// Outcome of a single [`read_line_capped`] call.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum CappedLine<'a> {
     /// End of stream reached with no data read.
@@ -215,25 +187,16 @@ pub(crate) enum CappedLine<'a> {
     Skipped,
 }
 
-/// Read one line (through the next `\n`, inclusive) from `reader` into
-/// `line_buf` and hand it out as [`CappedLine::Line`], borrowed from that
-/// buffer: the line is copied once, out of the reader's buffer, and never
-/// again. A line longer than `max_len` bytes is drained from the reader and
-/// reported as [`CappedLine::Skipped`] — the absolute decompressed-size cap is
-/// enforced separately by [`LimitedReader`], so the per-line cap only exists
-/// to bound the in-memory line buffer. The bytes are not validated as UTF-8:
-/// a `Packages` file may carry another encoding in fields nobody reads (a
+/// A bounded replacement for [`tokio::io::AsyncBufReadExt::read_line`], which
+/// allocates without limit on a line with no newline terminator: a line
+/// longer than `max_len` bytes is drained from the reader and reported as
+/// [`CappedLine::Skipped`]. The bytes are not validated as UTF-8: a
+/// `Packages` file may carry another encoding in fields nobody reads (a
 /// Latin-1 `Description:`), so the caller decodes only the fields it uses.
 ///
-/// `line_buf` is a caller-owned scratch buffer whose capacity is reused across
-/// calls; the body of a real `Packages` file is millions of short lines, so
-/// allocating a fresh `Vec` per call would dominate cleanup-scan allocator
-/// traffic. The buffer is cleared on entry; its prior contents are not
-/// preserved.
-///
-/// A bounded replacement for [`tokio::io::AsyncBufReadExt::read_line`], which
-/// allocates without limit when an upstream metadata file contains a line with
-/// no newline terminator.
+/// `line_buf` is a caller-owned scratch buffer, cleared on entry, whose
+/// capacity is reused across calls: a real `Packages` file is millions of
+/// short lines.
 pub(crate) async fn read_line_capped<'a, R>(
     reader: &mut R,
     line_buf: &'a mut Vec<u8>,
@@ -282,11 +245,9 @@ where
 
 /// Compression of a `Packages` file.
 ///
-/// [`extension`](Self::extension) and [`from_filename`](Self::from_filename) are
-/// inverses of one table, so a new format is one edit here rather than two in
-/// separate modules: the cleanup fetch cascade builds URL/cache names from the
-/// former, the registry-ingest router classifies committed leaves with the
-/// latter.
+/// [`extension`](Self::extension) and [`from_filename`](Self::from_filename)
+/// are inverses of one table, so a new format is one edit here rather than
+/// two in separate modules.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PackagesCompression {
     Raw,
@@ -295,7 +256,6 @@ pub(crate) enum PackagesCompression {
 }
 
 impl PackagesCompression {
-    /// The filename suffix this compression carries.
     #[must_use]
     pub(crate) const fn extension(self) -> &'static str {
         match self {
@@ -305,8 +265,7 @@ impl PackagesCompression {
         }
     }
 
-    /// Derive from a filename leaf. `None` if the leaf does not look like a
-    /// `Packages` file at all.
+    /// `None` if the filename leaf is not a `Packages` file at all.
     #[must_use]
     pub(crate) fn from_filename(name: &str) -> Option<Self> {
         match name {
@@ -318,9 +277,8 @@ impl PackagesCompression {
     }
 }
 
-/// Largest `Packages` file in `compression` that is decoded or buffered: the
-/// file itself for raw bytes, so the decompressed ceiling, and
-/// [`MAX_COMPRESSED_PACKAGES_SIZE`] for a compressed one.
+/// Largest `Packages` file in `compression` that is decoded or buffered. A
+/// raw file is its own decompressed output.
 #[must_use]
 pub(crate) const fn packages_file_cap(compression: PackagesCompression) -> NonZero<u64> {
     match compression {
@@ -329,9 +287,6 @@ pub(crate) const fn packages_file_cap(compression: PackagesCompression) -> NonZe
     }
 }
 
-/// Refuse, with [`io::ErrorKind::InvalidData`], a `Packages` file of `size`
-/// bytes above [`packages_file_cap`], before a byte of it is decoded. Both
-/// decode sites call it on the size they stat.
 pub(crate) fn check_packages_file_size(
     compression: PackagesCompression,
     size: u64,
@@ -351,11 +306,7 @@ pub(crate) fn check_packages_file_size(
 }
 
 /// The effective decompressed-output ceiling for a `Packages` file of
-/// `compressed_size` bytes: the smaller of [`MAX_DECOMPRESSED_PACKAGES_SIZE`]
-/// and the size multiplied by [`MAX_DECOMPRESSION_RATIO`].
-///
-/// `None` — an empty file — yields the absolute cap: with no compressed
-/// size to anchor it, the ratio bound has nothing to say.
+/// `compressed_size` bytes. `None` - an empty file - yields the absolute cap.
 #[must_use]
 pub(crate) fn decompressed_limit(compressed_size: Option<NonZero<u64>>) -> NonZero<u64> {
     match compressed_size {
@@ -381,7 +332,6 @@ pub(crate) enum PackagesInput {
     Bytes(Vec<u8>),
 }
 
-/// [`PackagesInput`] as one [`AsyncRead`] for the raw and gzip ladders.
 enum InputReader {
     File(tokio::fs::File),
     Bytes(io::Cursor<Vec<u8>>),
@@ -422,25 +372,12 @@ impl AsyncRead for InputReader {
 /// Wrap a `Packages` index in its decompression layer with the
 /// decompression-bomb guard applied, ready for [`read_line_capped`].
 ///
-/// `limit` bounds the *decompressed* byte count (see [`decompressed_limit`]), so
-/// that [`LimitedReader`] sits above the decoder. A second one below the
-/// decoder holds a `.gz`/`.xz` input to [`packages_file_cap`] as it is read:
-/// the callers check the size they stat first, and this layer holds the bytes
-/// actually read to the same bound, since a decoder does work per input byte
-/// that yields no output (xz's empty blocks), which no output cap sees. The gzip layer
-/// is fed from its own [`BufReader`](tokio::io::BufReader) because it benefits
-/// from amortising reads of its compressed input; raw bytes need no such inner
-/// buffer, and the xz decoder reads the input on its own blocking thread, in
-/// 64 KiB chunks (see `xz_stream`): a file as a `std::fs::File` (so it waits
-/// for any in-flight operation on it before taking it over), in-memory bytes
-/// through a `Cursor`.
-///
-/// Shared by cleanup's candidate reduce (`cleanup::packages`) and checksum
-/// registry ingest (`integrity`) — the two differ in how they *derive* the
-/// compression and what they do when the file is unreadable, never in how the
-/// bytes are decoded or bounded. The returned reader is boxed: one allocation on
-/// a path that then streams the whole index through it, in exchange for the
-/// three branches having one home.
+/// `limit` bounds the *decompressed* byte count (see [`decompressed_limit`]).
+/// A second [`LimitedReader`] below the decoder holds a `.gz`/`.xz` input to
+/// [`packages_file_cap`] as it is read: the callers check the size they stat
+/// first, and this layer holds the bytes actually read to the same bound,
+/// since a decoder does work per input byte that yields no output (xz's
+/// empty blocks), which no output cap sees.
 pub(crate) async fn packages_reader(
     input: PackagesInput,
     compression: PackagesCompression,
@@ -495,8 +432,7 @@ async fn wrap_packages(
 }
 
 /// Consume bytes from `reader` up to and including the next `\n`, or until
-/// EOF. Used to skip the tail of an over-length line after the in-memory
-/// accumulator has been abandoned.
+/// EOF.
 async fn drain_to_newline<R>(reader: &mut R) -> io::Result<()>
 where
     R: AsyncBufRead + Unpin + ?Sized,
@@ -587,7 +523,6 @@ mod tests {
                 .expect_err("a compressed index past the cap must be refused");
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         }
-        // A raw index is its own decompressed output, capped at 256 MiB.
         let cap = MAX_DECOMPRESSED_PACKAGES_SIZE.get();
         assert_eq!(cap, 256 * 1024 * 1024);
         check_packages_file_size(PackagesCompression::Raw, cap).expect("at the cap");
@@ -627,7 +562,6 @@ mod tests {
         }
     }
 
-    /// Decodes `encoded` through [`wrap_packages`] with `input_cap`.
     async fn decode_capped(
         encoded: &[u8],
         compression: PackagesCompression,
@@ -654,8 +588,6 @@ mod tests {
         reader.read_to_end(&mut out).await.map(|_| out)
     }
 
-    /// Both decoders read their input through the compressed cap: an index
-    /// one byte over it fails, one exactly at it decodes.
     #[tokio::test]
     async fn compressed_input_is_held_to_the_cap() {
         let gz = crate::test_support::gzip(b"hello world\n").await;
@@ -706,8 +638,6 @@ mod tests {
 
     #[tokio::test]
     async fn limited_reader_undoes_the_fill_on_overrun() {
-        // tokio's `read_to_end` asserts that an `Err` reports zero bytes
-        // read, so the overrun must roll the fill back.
         let data = [7u8; 150];
         let mut reader = LimitedReader::decompressed(&data[..], nonzero!(100));
         let mut storage = [0u8; 150];
@@ -795,8 +725,6 @@ mod tests {
 
     #[tokio::test]
     async fn read_line_capped_reuses_line_buf_across_calls() {
-        // Both lines fit in the caller's allocation. Each read must retain
-        // that storage and capacity for the next call.
         let input = b"first\nsecond\n";
         let mut reader = tokio::io::BufReader::new(&input[..]);
         let mut line_buf = Vec::<u8>::with_capacity(64);
@@ -827,7 +755,6 @@ mod tests {
         assert!(content_length_within_cap(0, cap));
         assert!(content_length_within_cap(100, cap));
         assert!(!content_length_within_cap(101, cap));
-        // `None` disables the cap entirely.
         assert!(content_length_within_cap(u64::MAX, None));
     }
 }

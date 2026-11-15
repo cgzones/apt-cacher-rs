@@ -1,45 +1,24 @@
 //! Process-local cache for cached-file metadata (`ETag`, Last-Modified).
 //!
-//! Motivated by a profiling finding (May 2026, local samply baseline):
-//! every cache-hit conditional-request path
-//! issues two `fgetxattr(2)` syscalls (one for the `ETag` xattr, one for
-//! Last-Modified), and the rustix bounds-check inside the xattr crate
-//! showed up at ~0.5 % of worker samples plus drove `block_in_place` and
-//! `spawn_blocking_inner` mutex traffic. Caching the parsed values per
-//! `(mirror, debname, layout)` lets repeat hits skip the syscalls entirely.
+//! Caching the parsed values per `(mirror, debname, layout)` lets repeat
+//! cache hits skip the two `fgetxattr(2)` syscalls and their
+//! `block_in_place` section.
 //!
 //! # Source-of-truth split
 //!
 //! - **In-flight downloads** carry their etag/last-modified on
 //!   [`crate::active_downloads::ActiveDownloadStatus::Download`] and on `Finished { meta:
 //!   Some(_) }`; late-joiners read those directly. `Finished { meta:
-//!   None }` (volatile-304 in `InitBarrier::finished`, error fallback
-//!   in `RenameBarrier::commit`) falls through to
-//!   [`CacheMetadataStore::resolve`].
+//!   None }` falls through to [`CacheMetadataStore::resolve`].
 //! - **Post-flight (rename complete, active-downloads entry removed)** is
-//!   what this cache covers. The transition from in-flight to post-flight
-//!   happens inside `RenameBarrier::commit`, which calls
-//!   [`CacheMetadataStore::set`] (via `cache_metadata::store().set(...)`)
-//!   *before* removing the active-downloads entry — so a worker that
-//!   misses the entry always finds the cache populated.
+//!   what this cache covers. `RenameBarrier::commit` calls
+//!   [`CacheMetadataStore::set`] *before* removing the active-downloads
+//!   entry, so a worker that misses the entry always finds the cache
+//!   populated.
 //!
 //! The xattrs on the cached file remain the persistent source of truth.
 //! This cache is empty at boot; the first read for each file falls back
-//! to the xattr helpers and inserts the result. xattr writes still happen
-//! on the download path (every backend calls [`write_upstream_metadata`]
-//! on the same [`UpstreamMetadata`] it later publishes) so the values
-//! survive process restarts. A resumed download's metadata first inherits
-//! each validator its `206` omitted from the partial
-//! ([`UpstreamMetadata::inherit_resumed`]); on a resumed partial a
-//! validator it still lacks is *removed* there, not left alone: the partial
-//! still carries its first attempt's xattrs, and a stale one would
-//! otherwise be what a restart reads back for a file whose download
-//! published `None`. Every other download writes to a file it just created
-//! ([`TargetFile::New`]), which has nothing to remove.
-//! Volatile 304 revalidation also writes xattrs: [`revalidate`] merges the
-//! supplied validators with the selected stored representation, persists
-//! that snapshot, then publishes it through [`CacheMetadataStore::set`]
-//! before the refreshed entry is released to waiting readers.
+//! to the xattr helpers and inserts the result.
 //!
 //! # Publication invariant
 //!
@@ -53,27 +32,18 @@
 //! re-acquires the write lock to insert.  A concurrent `set` can publish
 //! in between, and then wins: resolve's insert re-checks the entry under
 //! the write lock and returns the published `Arc`, dropping what it read.
-//! That read is stale by construction whenever it started before the
-//! publish (a volatile revalidation rewrites the xattrs of the very file a
-//! hit is resolving; a commit renames a new file over the one it opened),
-//! and under the lock nothing tells such a read from a caller that skipped
-//! its xattr write, so the mismatch is not asserted or logged.  The
-//! invariant is what keeps the published value and the file in step, not
-//! something resolve can check.
+//! Such a read is stale by construction and cannot be told from a caller
+//! that skipped its xattr write, so the mismatch is not asserted or logged.
 //!
 //! # Negative caching and transient errors
 //!
 //! Successfully observing absent xattrs (no value, FS doesn't support
 //! xattrs, or a malformed value was scrubbed) inserts a `(None, None)`
-//! entry — subsequent hits skip the syscalls.  Transient I/O failures
-//! (e.g. `EIO`) are deliberately NOT cached: a one-time syscall failure
-//! would otherwise pin the negative entry until process restart and
-//! silently disable conditional-request handling.  When *either* xattr
-//! read errors, `resolve` returns a best-effort `Arc` for the current
-//! request that contains whichever fields succeeded (so an `EIO` on the
-//! `ETag` xattr while Last-Modified read cleanly yields
-//! `(None, Some(...))`, and vice versa) but does not insert; the next
-//! reader retries both syscalls.
+//! entry.  Transient I/O failures (e.g. `EIO`) are deliberately NOT cached:
+//! a one-time syscall failure would otherwise pin the negative entry until
+//! process restart and silently disable conditional-request handling.  When
+//! *either* xattr read errors, `resolve` returns a best-effort `Arc` with
+//! whichever fields succeeded but does not insert.
 
 use std::{
     path::Path,
@@ -95,13 +65,6 @@ use crate::{
 /// Upstream-supplied metadata for a single cached file.  Used both as the
 /// in-flight value carried on [`crate::active_downloads::ActiveDownloadStatus::Download`] and
 /// as the post-flight cache entry.
-///
-/// `last_modified` stores both the raw header string (for `Last-Modified`
-/// response headers) and its parsed [`HttpDate`](crate::http_range::HttpDate)
-/// (for If-Modified-Since comparison) so consumers don't re-parse on every hit.
-///
-/// The strings are `Arc<str>` so per-serve [`crate::cache_conditional::CacheInfo`]
-/// construction is a refcount bump instead of a String clone.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UpstreamMetadata {
     pub(crate) etag: Option<ETag>,
@@ -109,7 +72,7 @@ pub(crate) struct UpstreamMetadata {
 }
 
 impl UpstreamMetadata {
-    /// Build from raw upstream header strings, retaining only valid validators.
+    /// Retains only valid validators.
     #[must_use]
     pub(crate) fn from_upstream(etag: Option<&str>, last_modified: Option<&str>) -> Self {
         Self {
@@ -120,24 +83,19 @@ impl UpstreamMetadata {
 
     /// Fill in, for a download that resumes a partial, each validator the
     /// upstream's `206` omitted from `resumed` -- the values the partial's
-    /// first attempt stored ([`crate::partial_file::PartialDownload::resumed_validators`];
-    /// `None` for any other download, which leaves `self` as it is).
+    /// first attempt stored (`None` for any other download).
     ///
     /// A resume is only ever requested with the stored strong `ETag` as
     /// `If-Range`, so a `206` is the upstream's statement that the
-    /// representation is unchanged (RFC 9110 §13.1.5): the first attempt's
-    /// validators still describe it, and RFC 9110 §15.3.7 does not require a
-    /// `206` to repeat `Last-Modified`. Without this, a `206` lacking one
-    /// would publish a synthesized `Last-Modified` in place of the real one,
-    /// and one lacking the `ETag` would leave the file unresumable after a
-    /// second interruption. A value the `206` does carry wins. The stored
-    /// `Last-Modified` is not inherited next to a *different* `ETag` the
-    /// `206` names: that response does not vouch for the stored
-    /// representation, so the date would be paired with a tag it never
-    /// belonged to. That branch is defense in depth, not a production path:
-    /// `upstream_head::plan_download` already turns such a `206` into
-    /// `ResumeAnomaly::ETagMismatch`, which discards the partial before any
-    /// metadata is built.
+    /// representation is unchanged (RFC 9110 §13.1.5), and RFC 9110 §15.3.7
+    /// does not require a `206` to repeat `Last-Modified`. Without this, a
+    /// `206` lacking one would publish a synthesized `Last-Modified` in
+    /// place of the real one, and one lacking the `ETag` would leave the
+    /// file unresumable after a second interruption. A value the `206` does
+    /// carry wins. The stored `Last-Modified` is not inherited next to a
+    /// *different* `ETag` the `206` names; that branch is defense in depth:
+    /// `upstream_head::plan_download` already discards the partial on such
+    /// a `206`.
     #[must_use]
     pub(crate) fn inherit_resumed(self, resumed: Option<&Self>) -> Self {
         let Some(Self {
@@ -185,8 +143,7 @@ pub(crate) fn revalidate(
 }
 
 /// Where [`write_upstream_metadata`] writes: what decides whether a
-/// validator the metadata lacks can be left alone. From
-/// `partial_file::PartialDownload::target_file`.
+/// validator the metadata lacks can be left alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TargetFile {
     /// Created for this download (`O_EXCL`: a `Fresh` partial or a volatile
@@ -196,19 +153,16 @@ pub(crate) enum TargetFile {
     Resumed,
 }
 
-/// Persist a download's upstream metadata on its cache file: the `ETag` and
-/// `Last-Modified` validators from `meta`, plus the expected total size when
-/// the upstream announced one (so a resume can detect an upstream change).
-/// Written early, on the partial/temp file, so the values survive an
-/// interrupted download for resume; every backend calls this on the very
-/// [`UpstreamMetadata`] it hands the download barrier, which is what keeps
-/// the publication invariant (module docs) trivially true -- including for
-/// a validator `meta` lacks on a [`TargetFile::Resumed`] partial, whose
-/// attribute is removed in case the earlier attempt left one behind (an
-/// absent one is success). A [`TargetFile::New`] file skips those removals:
-/// they could only ever answer `ENODATA`.
+/// Persist a download's upstream metadata on its cache file: the validators
+/// from `meta`, plus the expected total size when the upstream announced one
+/// (so a resume can detect an upstream change). Written early, on the
+/// partial/temp file, so the values survive an interrupted download for
+/// resume.
 ///
-/// The metadata owns validated values, which are written without reparsing.
+/// To keep the publication invariant (module docs), a validator `meta` lacks
+/// is removed from a [`TargetFile::Resumed`] partial: a stale one left by
+/// the earlier attempt would otherwise be what a restart reads back for a
+/// file whose download published `None`.
 pub(crate) fn write_upstream_metadata(
     file: &tokio::fs::File,
     display_path: &Path,
@@ -223,9 +177,7 @@ pub(crate) fn write_upstream_metadata(
         etag,
         last_modified,
     } = meta;
-    // One blocking section for all three attributes: writing them through
-    // the `tokio::fs::File` target would demote the worker once per
-    // attribute, and every fresh download writes up to three.
+    // One blocking section for all three attributes.
     tokio::task::block_in_place(|| {
         let file = &xattr_helpers::XattrFile(file);
         match etag {
@@ -267,15 +219,13 @@ pub(crate) enum InvalidValidator<'a> {
 impl InvalidValidator<'_> {
     /// What the upstream sent, for the backends' warn line: rendered after
     /// the backend's own subject ("upstream mirror X"), so it starts
-    /// lowercase, and before its "for `<file>`; discarding it". The once-gates
-    /// are the backend's own ([`ValidatorGates`]).
+    /// lowercase.
     #[must_use]
     pub(crate) const fn detail(&self) -> InvalidValidatorDetail<'_> {
         InvalidValidatorDetail(self)
     }
 }
 
-/// [`InvalidValidator::detail`]'s renderer.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InvalidValidatorDetail<'a>(&'a InvalidValidator<'a>);
 
@@ -316,8 +266,6 @@ impl ValidatorGates {
         }
     }
 
-    /// This table's gate for `invalid`, for
-    /// [`log_once::warn_once_or_info_gated`](crate::log_once::warn_once_or_info_gated).
     #[must_use]
     pub(crate) const fn for_validator(
         &'static self,
@@ -331,16 +279,14 @@ impl ValidatorGates {
     }
 }
 
-/// Longest upstream validator value [`check_upstream_validators`] inspects:
-/// [`MAX_ETAG_LEN`], which an IMF-fixdate `Last-Modified` (29 bytes) is far
-/// below as well.
+/// Longest upstream validator value [`check_upstream_validators`] inspects;
+/// an IMF-fixdate `Last-Modified` (29 bytes) is far below it as well.
 const MAX_VALIDATOR_LEN: usize = MAX_ETAG_LEN;
 
 /// Validate the raw upstream `ETag`/`Last-Modified` header values once per
 /// upstream response, before either reaches a client response header, an
 /// `If-Range` comparison or an xattr.  Malformed values come back as `None`.
 ///
-/// Both backends route through here so the accepted set is identical;
 /// `on_invalid` receives each discarded value so the caller emits its
 /// backend's warn line.
 ///
@@ -392,13 +338,11 @@ pub(crate) struct CacheMetadataStore {
     inner: parking_lot::RwLock<Inner>,
 }
 
-/// The map and the mirrors its keys share.
 struct Inner {
     map: HashMap<StoredKey, Arc<UpstreamMetadata>>,
     /// One copy of each mirror that at least one entry names, so a cache
     /// holding tens of thousands of files from a handful of mirrors stores
-    /// each mirror's host and path once rather than per entry.  An entry's
-    /// removal drops the copy its mirror no longer needs.
+    /// each mirror's host and path once rather than per entry.
     mirrors: HashSet<Arc<Mirror>>,
 }
 
@@ -443,8 +387,7 @@ impl Inner {
         }
     }
 
-    /// Insert an entry for a key the map does not hold, sharing its mirror
-    /// with the entries that already name it.
+    /// For a key the map does not hold.
     fn insert(&mut self, key: &CacheEntryKeyRef<'_>, meta: Arc<UpstreamMetadata>) {
         let &CacheEntryKeyRef {
             mirror,
@@ -480,18 +423,16 @@ impl Inner {
 /// Soft cap on cached entries, bounding memory for caches holding very
 /// many distinct files (entries are a few hundred bytes each).  Values are
 /// lazily re-loadable from the on-disk xattrs, so overflow simply clears
-/// the map (no LRU) and subsequent serves re-populate it — same
-/// best-effort approach as `verify_throttle` and `permitted_host_cache`.
+/// the map (no LRU) and subsequent serves re-populate it.
 ///
 /// Seven eighths of 2^16: the most a hashbrown table of 2^16 buckets
 /// holds, so the table never doubles for a last eighth of entries and sits
 /// half empty at the cap.
 pub(crate) const CACHE_METADATA_MAX_ENTRIES: usize = 7 * (1 << 16) / 8;
 
-/// The clear is silent otherwise: serves go back to two `fgetxattr(2)`
-/// round-trips through `block_in_place` -- the cost this cache exists to
-/// remove -- and on a cache larger than the cap that repeats indefinitely.
-/// The dashboard only ever shows the post-clear count, which looks idle.
+/// Logged because on a cache larger than the cap the clear repeats
+/// indefinitely, and the dashboard only ever shows the post-clear count,
+/// which looks idle.
 fn log_metadata_cache_cleared() {
     warn_once_or_info!(
         "Cache metadata store reached {CACHE_METADATA_MAX_ENTRIES} entries; clearing it (xattr reads resume until it refills)"
@@ -500,9 +441,7 @@ fn log_metadata_cache_cleared() {
 
 impl std::fmt::Debug for CacheMetadataStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Avoid dumping the entire map (could be large and mostly noise)
-        // and avoid acquiring the lock so this is safe to call from any
-        // context — e.g. `Result::expect(...)` at startup.
+        // Neither dumps the map nor takes the lock.
         f.debug_struct("CacheMetadataStore").finish_non_exhaustive()
     }
 }
@@ -519,16 +458,9 @@ impl CacheMetadataStore {
     }
 
     /// Look up the cached metadata for a key; on miss, read xattrs from
-    /// the supplied file and populate the entry.  The caller must already
-    /// have an open `tokio::fs::File` for the cached path so the xattr
-    /// lookups address the same inode the caller is serving from.
-    ///
-    /// The hot-path lookup is zero-clone — readers pass a
-    /// [`CacheEntryKeyRef`] that borrows the caller's `Mirror` and
-    /// `debname`, and we only materialise an owned [`StoredKey`] on the
-    /// cold cache-miss insert.  The `block_in_place` round-trip happens
-    /// only on miss; subsequent hits return an [`Arc`] clone with no
-    /// syscalls.
+    /// the supplied file and populate the entry.  `file` must be the one
+    /// the caller is serving from, so the xattr lookups address the same
+    /// inode.
     pub(crate) fn resolve(
         &self,
         key: &CacheEntryKeyRef<'_>,
@@ -539,14 +471,11 @@ impl CacheMetadataStore {
             return Arc::clone(entry);
         }
 
-        // Cold path: fetch from xattrs.  One blocking section for both
-        // attributes — reading them through the `tokio::fs::File` target
-        // would demote the worker once per attribute, the same reason
-        // `write_upstream_metadata` batches its three writes.  Batching puts
-        // the section *above* `try_read`'s own support check, so repeat that
-        // check here: on a cache filesystem without xattrs the closure has
-        // nothing to do, and entering it would cost a worker->blocking
-        // transition (and a multi-thread runtime) per cold resolve.
+        // One blocking section for both attributes.  The support check is
+        // repeated here, above `try_read`'s own: on a cache filesystem
+        // without xattrs, entering the section would cost a
+        // worker->blocking transition (and a multi-thread runtime) per cold
+        // resolve.
         let (etag_res, last_modified_res) = if xattr_helpers::xattr_supported() {
             tokio::task::block_in_place(|| {
                 let file = &xattr_helpers::XattrFile(file);
@@ -559,9 +488,7 @@ impl CacheMetadataStore {
             (Ok(None), Ok(None))
         };
 
-        // If either read errors, surface a best-effort `Arc` containing
-        // whichever fields succeeded for this request but do not insert —
-        // see the "Negative caching and transient errors" module docs.
+        // A transient error is not negative-cached (module docs).
         let (etag, last_modified) = match (etag_res, last_modified_res) {
             (Ok(etag), Ok(last_modified)) => (etag, last_modified),
             (etag_res, last_modified_res) => {
@@ -577,10 +504,8 @@ impl CacheMetadataStore {
             last_modified,
         });
 
-        // Re-check under the write lock: a concurrent `set` may have
-        // published while we were reading xattrs, and what we read is then
-        // older than it (see the module docs on why that is not a mismatch
-        // worth reporting).
+        // A concurrent `set` may have published while we were reading
+        // xattrs, and what we read is then older than it.
         let mut inner = self.inner.write();
         if let Some(published) = inner.map.get(key) {
             return Arc::clone(published);
@@ -590,12 +515,6 @@ impl CacheMetadataStore {
         meta
     }
 
-    /// Replace the entry for `key` with `meta`.  Used by the rename
-    /// barrier transition to publish post-flight metadata before clearing
-    /// the active-downloads entry, and by volatile 304 [`revalidate`] to
-    /// publish merged validators after writing them to the cached file's
-    /// xattrs and before releasing the refreshed entry to waiting readers.
-    ///
     /// **Publication invariant:** callers must have already persisted
     /// matching xattrs to the cached file before invoking this, so that
     /// a restart, which reads the file, serves what this published (see
@@ -610,25 +529,22 @@ impl CacheMetadataStore {
         }
     }
 
-    /// Drop any cached entry for `key`.  Called from cleanup file
-    /// removal and (in principle) from any other context where the on-
-    /// disk file is going away.
+    /// Drop any cached entry for `key`, the only way back to the file as
+    /// source of truth: a published entry shadows the xattrs until it is
+    /// dropped. Every site that replaces or removes a cached file without
+    /// calling [`Self::set`] must call this.
     pub(crate) fn invalidate(&self, key: &CacheEntryKeyRef<'_>) {
         self.inner.write().remove(key);
     }
 
-    /// Number of currently cached entries (the dashboard reads
-    /// [`Self::footprint`]).
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.read().map.len()
     }
 
-    /// Entries and the heap they take: the table, each key's name, each
-    /// value and its validator strings, and the shared mirrors. Walks the
-    /// table under the read lock, which blocks no reader and holds writers
-    /// (a commit, a cleanup unlink) for the few hundred microseconds a full
-    /// table takes.
+    /// Walks the table under the read lock, which holds writers (a commit,
+    /// a cleanup unlink) for the few hundred microseconds a full table
+    /// takes.
     pub(crate) fn footprint(&self) -> Footprint {
         let inner = self.inner.read();
         let entries: usize = inner
@@ -660,11 +576,8 @@ impl CacheMetadataStore {
     }
 }
 
-/// The singleton store, built empty on first use: it takes no runtime
-/// configuration, so there is no startup step to order or forget.
 static STORE: LazyLock<CacheMetadataStore> = LazyLock::new(CacheMetadataStore::new);
 
-/// Global handle to the singleton [`CacheMetadataStore`].
 #[must_use]
 pub(crate) fn store() -> &'static CacheMetadataStore {
     &STORE
@@ -730,8 +643,6 @@ mod tests {
         assert!(first.last_modified.is_some());
         assert_eq!(store.len(), 1);
 
-        // Mutate the file's xattr to confirm the second resolve returns the
-        // cached value, not a fresh disk read.
         write_etag(&file, &path, "\"xyz\"");
         let second = store.resolve(&key.as_ref(), &file, &path);
         assert_eq!(second.etag.as_deref(), Some("\"abc\""));
@@ -762,10 +673,6 @@ mod tests {
         );
     }
 
-    /// A resumed partial carries the xattrs of its first attempt; when the
-    /// resuming response no longer sends a validator, the published metadata
-    /// is `None` and the file must agree (publication invariant), or a
-    /// restart resurrects the first attempt's value.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn write_upstream_metadata_removes_validators_the_download_lacks() {
         let (_dir, file, path) = fixture_file().await;
@@ -792,9 +699,7 @@ mod tests {
         );
     }
 
-    /// A file the download just created has no xattrs to remove, so the
-    /// removals are skipped: a value planted anyway survives, which is how
-    /// the skip shows.
+    /// A value planted anyway survives, which is how the skip shows.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn write_upstream_metadata_skips_removals_on_a_new_file() {
         let (_dir, file, path) = fixture_file().await;
@@ -820,8 +725,6 @@ mod tests {
         UpstreamMetadata::from_upstream(Some(STORED_ETAG), Some(STORED_LM))
     }
 
-    /// A `206` answering the stored `ETag` as `If-Range` proves the first
-    /// attempt's validators still hold: the ones it omits are inherited.
     #[test]
     fn inherit_resumed_fills_what_the_206_omits() {
         let stored = stored_validators();
@@ -843,10 +746,6 @@ mod tests {
         );
     }
 
-    /// A `206` naming a different `ETag` does not vouch for the stored
-    /// representation: its own tag stands and the stored date is not paired
-    /// with it. Defense in depth: the planner already refuses such a `206`
-    /// as `ResumeAnomaly::ETagMismatch`, so no production path gets here.
     #[test]
     fn inherit_resumed_keeps_the_stored_date_off_a_different_etag() {
         let stored = stored_validators();
@@ -854,8 +753,6 @@ mod tests {
         assert_eq!(other.clone().inherit_resumed(Some(&stored)), other);
     }
 
-    /// Anything but a resumed download publishes the upstream's values as
-    /// they are.
     #[test]
     fn inherit_resumed_without_a_resumed_partial_is_identity() {
         let upstream = UpstreamMetadata::from_upstream(None, Some(STORED_LM));
@@ -888,9 +785,6 @@ mod tests {
         assert_eq!(entry.etag.as_deref(), Some("\"new\""));
     }
 
-    /// `layout` is part of the key precisely so a flat-pool and a
-    /// structured-pool file of the same name under the same mirror do not
-    /// share one entry (see `CacheEntryKey`'s docs).
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn entries_of_the_same_debname_do_not_collide_across_layouts() {
         let store = CacheMetadataStore::new();
@@ -937,8 +831,7 @@ mod tests {
     }
 
     /// The `Equivalent` bridge: a borrowed key must hash and compare to the
-    /// stored key its own cold path materialised, or every hot-path lookup
-    /// would miss and re-read the xattrs.
+    /// stored key, or every hot-path lookup would miss.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn a_borrowed_key_finds_the_entry_it_populated() {
         let store = CacheMetadataStore::new();
@@ -963,8 +856,6 @@ mod tests {
         assert_eq!(store.len(), 1);
     }
 
-    /// Entries of one mirror share a single copy of it, which the last of
-    /// them to go takes along; a cap clear drops every copy.
     #[test]
     fn entries_share_their_mirror_until_the_last_one_goes() {
         let store = CacheMetadataStore::new();
@@ -1049,10 +940,6 @@ mod tests {
         assert_eq!(store.len(), 0);
     }
 
-    /// Invalidation is the only way back to the file as source of truth: a
-    /// published entry shadows the xattrs until it is dropped, which is what
-    /// every site that replaces a cached file without calling
-    /// [`CacheMetadataStore::set`] has to rely on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn invalidate_makes_resolve_re_read_the_xattrs() {
         let store = CacheMetadataStore::new();
@@ -1090,7 +977,6 @@ mod tests {
         let entry = store.resolve(&key.as_ref(), &file, &path);
         assert!(entry.etag.is_none());
         assert!(entry.last_modified.is_none());
-        // Second call still hits the cache.
         assert_eq!(store.len(), 1);
         let again = store.resolve(&key.as_ref(), &file, &path);
         assert!(Arc::ptr_eq(&entry, &again), "the negative entry is reused");
@@ -1191,9 +1077,7 @@ mod tests {
 
     #[test]
     fn check_upstream_validators_discards_oversized_values_by_length() {
-        // Well-formed apart from their length: an upstream head may carry
-        // ~400 KiB through the hyper client, and a kept value is retained
-        // per cached file.
+        // Well-formed apart from their length.
         let etag = format!("\"{}\"", "a".repeat(MAX_VALIDATOR_LEN - 1));
         let lm = format!(
             "Thu, 01 Jan 1970 00:00:00 GMT{}",

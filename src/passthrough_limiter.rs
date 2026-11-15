@@ -1,8 +1,5 @@
 //! The concurrency cap on uncached passthrough relays
-//! (`max_passthrough_relays`), shared by every backend that relays one: the
-//! hyper simple proxy, `splice_simple_proxy`, and a cache fetch whose
-//! upstream answer (a non-200 the planner passes through) is relayed
-//! uncached.
+//! (`max_passthrough_relays`).
 //!
 //! A cache-fetch relay starts as a download: the upstream request is made
 //! before the answer is known to be a passthrough, under the
@@ -12,34 +9,24 @@
 //! `decline`, so a refusal is what joiners are told (`Declined::RelayRefused`).
 //! The refused upstream answer is dropped undrained.
 //!
-//! Passthroughs are not downloads, so `max_upstream_downloads` never saw
-//! them, yet each one holds an upstream connection and its buffers (up to
-//! 256 KiB over TLS in splice) for as long as the client keeps reading. The
-//! cap is global, not per source IP: the per-IP accept cap already bounds a
-//! single client, this one bounds the upstream side as a whole.
-//!
-//! Composed like the per-IP caps: the counter owns admission, the RAII
-//! release and the peak gauge; [`admit`] adds the refusal metric and the one
-//! log line both backends emit, and each backend renders the 503 with
-//! [`REFUSAL_BODY`].
+//! Passthroughs are not downloads, so `max_upstream_downloads` does not
+//! bound them, yet each one holds an upstream connection and its buffers for
+//! as long as the client keeps reading. The cap is global, not per source
+//! IP: the per-IP accept cap already bounds a single client, this one bounds
+//! the upstream side as a whole.
 
 use std::num::NonZero;
 
 use crate::{client_info::ClientInfo, metrics, warn_once_or_info};
 
-/// Body of the 503 a refused passthrough is answered with (the proxy-side
-/// overload convention: a 503 with a specific body).
+/// Body of the 503 a refused passthrough is answered with.
 pub(crate) const REFUSAL_BODY: &str = "Too many concurrent passthrough requests";
 
-/// The relays held across all clients, and the clock of the time they sat
-/// at the cap.
-///
-/// The count and the clock move under one lock, as in `PerIpCounter`: with
-/// the count an atomic and the clock updated beside it, an admission
-/// landing between a release's decrement and its `leave` saw the span still
-/// running (its `enter` a no-op), and the `leave` then stopped the span with
-/// the cap full again -- under-counting the time at cap for as long as that
-/// relay ran.
+/// The count and the clock move under one lock: with the count an atomic
+/// and the clock updated beside it, an admission landing between a
+/// release's decrement and its `leave` would see the span still running
+/// (its `enter` a no-op), and the `leave` would then stop the span with the
+/// cap full again.
 struct RelayCounter {
     held: parking_lot::Mutex<usize>,
     cap_clock: &'static metrics::CapClock,
@@ -54,10 +41,9 @@ impl RelayCounter {
         }
     }
 
-    /// Admit one more relay while fewer than `max` are held (`None`: no
-    /// cap), or return `None` at the cap. Counts and updates the peak gauge
-    /// either way, so the dashboard reflects real activity on an uncapped
-    /// deployment too.
+    /// `None` at the cap. Counts and updates the peak gauge without a cap
+    /// too, so the dashboard reflects real activity on an uncapped
+    /// deployment.
     fn try_acquire(&'static self, max: Option<NonZero<usize>>) -> Option<RelaySlot> {
         let mut held = self.held.lock();
         if max.is_some_and(|max| *held >= max.get()) {
@@ -82,15 +68,13 @@ impl RelayCounter {
 
 static RELAYS: RelayCounter = RelayCounter::new(&metrics::PASSTHROUGH_CAP_CLOCK);
 
-/// Current number of active passthrough relays.
 #[must_use]
 pub(crate) fn active_relays() -> usize {
     RELAYS.active()
 }
 
 /// One admitted passthrough relay; released on drop. Hold it for as long as
-/// the relay can move bytes: across `splice_simple_proxy`, inside the hyper
-/// response body.
+/// the relay can move bytes.
 pub(crate) struct RelaySlot {
     counter: &'static RelayCounter,
 }
@@ -106,21 +90,19 @@ impl Drop for RelaySlot {
     fn drop(&mut self) {
         let mut held = self.counter.held.lock();
         *held -= 1;
-        // A release from the cap takes the relays below it; a no-op when no
-        // span runs. Under the lock, so no admission can refill the cap
-        // between the decrement and the clock.
+        // Under the lock, so no admission can refill the cap between the
+        // decrement and the clock.
         self.counter.cap_clock.leave();
         drop(held);
     }
 }
 
-/// [`RelayCounter::try_acquire`] on the process-wide relay count.
 fn try_acquire(max: Option<NonZero<usize>>) -> Option<RelaySlot> {
     RELAYS.try_acquire(max)
 }
 
-/// [`try_acquire`] against `max_passthrough_relays`, counting and logging a
-/// refusal. The caller answers a `None` with 503 [`REFUSAL_BODY`].
+/// Counts and logs a refusal; the caller answers a `None` with 503
+/// [`REFUSAL_BODY`].
 #[must_use]
 pub(crate) fn admit(
     max: Option<NonZero<usize>>,
@@ -143,9 +125,8 @@ mod tests {
     use super::*;
     use crate::test_support::local_client;
 
-    // `ACTIVE_RELAYS` is process-wide and other tests (or this module's own,
-    // in parallel) may hold slots, so the cap is expressed relative to the
-    // count seen at the start and the assertions stay on this test's slots.
+    // `RELAYS` is process-wide and other tests may hold slots, so the cap is
+    // expressed relative to the count seen at the start.
     #[test]
     fn slots_are_capped_and_released_on_drop() {
         let base = active_relays();
@@ -165,8 +146,6 @@ mod tests {
         drop(third);
     }
 
-    /// The clock runs exactly while the relays sit at the cap, whatever the
-    /// order of admissions and releases.
     #[test]
     fn the_cap_clock_runs_exactly_while_the_relays_are_at_the_cap() {
         static CLOCK: metrics::CapClock = metrics::CapClock::new();

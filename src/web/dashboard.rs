@@ -1,8 +1,5 @@
-//! The dashboard page (`/`): gathers every section concurrently into
-//! [`DashboardData`] and assembles the page from it. The details sections
-//! (Daemon Status, Configuration, Maintenance, Cache Statistics) are built
-//! here; the row tables come from [`super::tables`] and the Metrics section
-//! from [`super::metrics_page`].
+//! The dashboard page (`/`): gathers every section into [`DashboardData`]
+//! and assembles the page from it.
 
 use std::{
     fmt::{self, Display, Formatter},
@@ -78,9 +75,7 @@ struct DashboardData {
     top_packages_by_count: Section,
     top_packages_by_size: Section,
     daemon_status_html: String,
-    /// One gauge per limiter; see [`build_capacity_html`].
     capacity_html: String,
-    /// The process's memory and each store's share; see [`build_memory_html`].
     memory_html: String,
     configuration_html: String,
     maintenance_html: String,
@@ -95,14 +90,10 @@ struct DashboardData {
     /// A failed mirror query counts as traffic: see `gather_dashboard_data`.
     seen_traffic: bool,
     generation_start: Instant,
-    /// Wall-clock time spent on the parallel DB-query block (mirrors,
-    /// origins, clients, top packages, bandwidth) — excluding the FS work
-    /// tracked separately in `fs_elapsed`.
+    /// Wall-clock time spent on the aggregate DB-query block.
     db_elapsed: std::time::Duration,
-    /// Wall-clock time the mirror-section branch spent on FS work after
-    /// the initial `get_mirrors_with_stats` query: the per-mirror directory
-    /// walks, the (small) `DIR_STATS_CACHE` prune and the `statvfs` probe.
-    /// Subtracted from the total parallel time to produce `db_elapsed`.
+    /// Wall-clock time spent on the per-mirror directory walks and the
+    /// `statvfs` probe.
     fs_elapsed: std::time::Duration,
 }
 
@@ -144,13 +135,10 @@ static AGGREGATE_CACHE: tokio::sync::Mutex<Option<(Instant, Arc<DashboardAggrega
 /// serve a stale page.
 const AGGREGATES_TTL: coarsetime::Duration = coarsetime::Duration::from_secs(5);
 
-/// Serve the memoized aggregates, refreshing them when older than
-/// [`AGGREGATES_TTL`].
-///
-/// The slot is populated only when every query succeeded. `sqlx::Error` is
-/// not `Clone`, so a failure could not be stored anyway, and returning the
-/// raw per-query results on a partial failure keeps today's behaviour: each
-/// section renders its own error notice and the next load retries at once.
+/// The slot is populated only when every query succeeded (`sqlx::Error` is
+/// not `Clone`). A partial failure returns the raw per-query results, so
+/// each section renders its own error notice and the next load retries at
+/// once.
 async fn cached_aggregates(
     database: &Database,
     now_epoch: i64,
@@ -165,8 +153,6 @@ async fn cached_aggregates(
     let day_cutoff = now_epoch.saturating_sub(24 * 60 * 60);
     let week_cutoff = now_epoch.saturating_sub(7 * 24 * 60 * 60);
 
-    // The five queries run concurrently on this one task; the lock is held
-    // across them so concurrent loads queue behind this single flight.
     let results = tokio::join!(
         database.get_mirrors_with_stats(),
         database.get_origins(),
@@ -203,21 +189,15 @@ async fn cached_aggregates(
     }
 }
 
-/// Drop the memoized aggregates so the next dashboard load re-queries.
-///
-/// Called by the cleanup task: cleanup is the only thing that *removes* rows
-/// (orphan mirror rows, stale origins, expired usage logs), and an operator
-/// who has just run a cleanup reloads the page precisely to see it took
-/// effect. Row *insertions* need no invalidation — a count a few seconds
-/// behind is what [`AGGREGATES_TTL`] already accepts.
+/// For the cleanup task, the only thing that *removes* rows: an operator who
+/// has just run a cleanup reloads the page to see it took effect. Row
+/// *insertions* need no invalidation: a count a few seconds behind is what
+/// [`AGGREGATES_TTL`] already accepts.
 pub(crate) async fn invalidate_aggregates() {
     *AGGREGATE_CACHE.lock().await = None;
 }
 
-/// Walk each mirror's cache directory for the Mirrors table and probe the
-/// filesystem for free space. The table's DB half rides the memoized
-/// aggregate block; this is the FS work the dashboard footer reports as
-/// `disk`.
+/// The FS work the dashboard footer reports as `disk`.
 ///
 /// This is a free async fn rather than an inline `tokio::join!` branch so
 /// rustc can prove `Send` for the future without tripping over higher-rank
@@ -237,7 +217,6 @@ async fn build_mirror_fs_section(
     (section, aggregate, free_disk_bytes)
 }
 
-/// The dashboard's own `statvfs(3)` slot (see [`probe_filesystem_space`]).
 static DISK_FREE_PROBE: ProbeSlot = ProbeSlot::new();
 
 /// The last free-space figure and when it was taken. The lock is held across
@@ -247,7 +226,6 @@ static DISK_FREE_PROBE: ProbeSlot = ProbeSlot::new();
 static DISK_FREE_MEMO: tokio::sync::Mutex<Option<(Instant, Option<u64>)>> =
     tokio::sync::Mutex::const_new(None);
 
-/// How long a free-space figure is reused.
 const DISK_FREE_TTL: coarsetime::Duration = coarsetime::Duration::from_secs(1);
 
 /// Free bytes on the cache filesystem for the footer, `None` (shown as
@@ -306,11 +284,8 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
     let now = Utc::now();
     let now_epoch = now.inner().unix_timestamp();
 
-    // The whole aggregate block, memoized: one pass over the usage tables
-    // per `AGGREGATES_TTL` no matter how many loads arrive. Timed directly
-    // rather than derived by subtracting the FS work, so the footer's `db`
-    // figure is exact — and reads ~0 on a memo hit, which is accurate: this
-    // render did no database work.
+    // The footer's `db` figure reads ~0 on a memo hit, which is accurate:
+    // this render did no database work.
     let db_start = Instant::now();
     let aggregates = cached_aggregates(&appstate.database, now_epoch).await;
     let db_elapsed: std::time::Duration = db_start.elapsed().into();
@@ -368,22 +343,11 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
     let mirror_rows = mirrors.unwrap_or_default();
     let seen_traffic = mirrors.is_err() || !mirror_rows.is_empty();
 
-    // The FS half of the Mirrors section: the per-mirror directory walks and
-    // the `statvfs` probe, reported as `disk` in the footer.
-    //
     // This runs *after* the aggregate block rather than beside it, because
-    // the mirror rows it walks come from that block. The walk used to start
-    // as soon as `get_mirrors_with_stats` resolved and overlap the remaining
-    // queries, so a load missing both memos (the 5s one here, the 60s
-    // `DIR_STATS_TTL_SECS` in the walk -- a 30s auto-refresh misses this one
-    // every time and that one every other time) now pays `db + disk` where
-    // it used to pay roughly the larger of the two. The penalty is bounded
-    // by the aggregate block's own duration, and folding the duplicate scans
-    // away cut that from 726ms to 201ms on a ~400k-row `deliveries` table:
-    // below a ~525ms cold walk the sequential path is still the faster of
-    // the two, and above it the gap asymptotes to ~200ms of a multi-second
-    // load. Restoring the overlap costs a second memo slot for the mirror
-    // query alone; measure a large cache before paying for it.
+    // the mirror rows it walks come from that block: a load missing both
+    // memos pays `db + disk`. Overlapping the walk with the other queries
+    // costs a second memo slot for the mirror query alone; measure a large
+    // cache before paying for it.
     let fs_start = Instant::now();
     let (mirror_table, aggregate_dir_stats, free_disk_bytes) =
         build_mirror_fs_section(mirror_rows, &snapshots, now_epoch).await;
@@ -470,10 +434,8 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
 /// A duration in milliseconds, fixed unit and fixed precision.
 ///
 /// The footer's three figures are read against each other, so they have to
-/// share a unit: `HumanFmt::Time` picks one per value and mixes "30.0ms"
-/// with "412us" on one line. Rounding to whole milliseconds first shares the
-/// unit but renders every sub-millisecond figure as "0ns", which is how the
-/// disk timing read on an idle daemon.
+/// share a unit: `HumanFmt::Time` picks one per value, and rounding to whole
+/// milliseconds first renders every sub-millisecond figure as "0ns".
 struct Millis(std::time::Duration);
 
 impl Display for Millis {
@@ -504,9 +466,7 @@ impl Display for SavedShare {
 }
 
 /// The one thing the daemon exists to do, at the top of the page: bytes in
-/// from upstream, bytes out to clients, and the difference it kept. That
-/// difference was previously the third cell of the fourth card, in the same
-/// weight as the buffer size.
+/// from upstream, bytes out to clients, and the difference it kept.
 fn build_hero_html(mirrors: &[MirrorStatEntry], cache_size: u64, quota: Option<u64>) -> String {
     let downloaded_raw: i64 = mirrors.iter().map(|m| m.total_download_size).sum();
     let delivered_raw: i64 = mirrors.iter().map(|m| m.total_delivery_size).sum();
@@ -787,7 +747,6 @@ fn build_memory_html(
     html
 }
 
-/// A configured `usize` cap as the `u64` every gauge renders.
 fn cap_of(cap: Option<std::num::NonZero<usize>>) -> Option<u64> {
     cap.map(|cap| cap.get() as u64)
 }
@@ -970,7 +929,6 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
     html
 }
 
-/// A retention window in days, or `"forever"` when it is unlimited.
 struct Retention(Option<std::num::NonZero<u64>>);
 
 impl Display for Retention {
@@ -1328,8 +1286,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
     }
 
     // Reference and diagnostics last: read once at setup, or when something
-    // is wrong. Configuration in particular used to sit second, above the
-    // figures anyone actually opens this page for.
+    // is wrong.
     for (title, key, html) in [
         (
             "Cache Statistics",
@@ -1392,8 +1349,6 @@ pub(super) async fn serve_dashboard(appstate: &AppState, options: QueryOptions) 
 
 #[cfg(test)]
 mod tests {
-    /// Concurrent dashboard loads share one free-space probe and read its
-    /// figure; within the memo window no probe runs at all.
     #[tokio::test(start_paused = true)]
     async fn concurrent_loads_share_one_free_space_probe() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1421,8 +1376,6 @@ mod tests {
         assert_eq!(probes.load(Ordering::SeqCst), 1);
     }
 
-    /// A probe that outran its deadline, or found the previous one still
-    /// blocked, leaves the figure unknown rather than failing the page.
     #[tokio::test]
     async fn an_unmeasured_free_space_is_unknown() {
         static TIMED_OUT: tokio::sync::Mutex<Option<(Instant, Option<u64>)>> =

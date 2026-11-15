@@ -1,14 +1,6 @@
 //! The `cleanup_verified` xattr marker: the memo that says "this exact file
 //! (inode, size, mtime) already matched this expected digest", so a cleanup
 //! cycle can skip re-hashing it.
-//!
-//! The marker has two writers — `integrity.rs` stamps it at commit, on the
-//! temp file it just hashed and is about to rename, and `cleanup/verify.rs`
-//! stamps it after its own verification — and one reader,
-//! `cleanup/verify.rs`. It lives here so the `(identity, algo, digest)`
-//! contract has a single owner: both writers build the identity through
-//! [`FileIdentity::of`], so a field added there reaches every stamp and every
-//! comparison rather than silently diverging.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -40,7 +32,6 @@ pub(crate) struct FileIdentity {
 }
 
 impl FileIdentity {
-    /// The identity of the file `meta` was taken from.
     #[must_use]
     pub(crate) fn of(meta: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt as _;
@@ -70,34 +61,30 @@ impl FileIdentity {
     }
 }
 
-/// What a stored marker was bound to.
 #[derive(Debug, PartialEq, Eq)]
 enum MarkerIdentity {
-    /// Stamped by this version: the full [`FileIdentity`].
     Bound(FileIdentity),
     /// Stamped by a version that bound only `(ino, size)`, so it cannot
     /// vouch for the content (an in-place same-size rewrite keeps both).
     /// Parsed rather than rejected because a rejected value is scrubbed with
     /// a "malformed" WARN, which this is not; it never matches, so the file
     /// is re-hashed once and re-stamped in the current form.
-    Legacy { ino: u64, size: u64 },
+    Legacy {
+        ino: u64,
+        size: u64,
+    },
 }
 
 /// Xattr recording a successful cleanup digest verification, persisted as
 /// `user.apt_cacher_rs.cleanup_verified` =
 /// `"{ino}:{size}:{mtime_secs}.{mtime_nanos}:{algo}:{digest-hex}"`.
 ///
-/// A later cycle skips re-hashing when the [`FileIdentity`], algorithm and
-/// expected digest all still match — the daily full-cache re-read otherwise
-/// scales with total cache size instead of churn. Binding the expected
-/// digest means an index update that changes the expected content
-/// invalidates the marker automatically; binding the identity means a
-/// re-download (a fresh inode) or an in-place rewrite (a new mtime)
-/// invalidates it too.
+/// Binding the expected digest means an index update that changes the
+/// expected content invalidates the marker.
 ///
 /// A by-hash download verified with SHA-512 leaves a SHA-512 marker while
 /// cleanup compares against the registry's SHA-256 expectation, so that file
-/// is re-hashed once — a missed optimisation, not a correctness gap.
+/// is re-hashed once: a missed optimisation, not a correctness gap.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CleanupMarker {
     identity: MarkerIdentity,
@@ -112,8 +99,6 @@ impl CleanupMarker {
         }
     }
 
-    /// Whether the marker was stamped for exactly this file identity and
-    /// expected digest. A legacy marker never matches.
     fn matches(&self, identity: FileIdentity, expected: &Digest) -> bool {
         let Self {
             identity: stamped,
@@ -127,7 +112,6 @@ impl CleanupMarker {
     }
 }
 
-/// Parse `"{sec}.{nsec}"`; `nsec` must be a valid nanosecond count.
 fn parse_mtime(raw: &str) -> Option<(i64, i64)> {
     let (sec, nsec) = raw.split_once('.')?;
     let sec = sec.parse().ok()?;
@@ -138,8 +122,6 @@ fn parse_mtime(raw: &str) -> Option<(i64, i64)> {
 impl XattrValue for CleanupMarker {
     const KEY: &'static str = "user.apt_cacher_rs.cleanup_verified";
     const LABEL: &'static str = "cleanup verification marker";
-    // Without any log a per-file stamp failure is indistinguishable from
-    // working memoization, and every cycle silently re-hashes the whole cache.
     const WRITE_FAILURE_CONSEQUENCE: &'static str =
         "digest verification is not memoized and every cleanup cycle re-hashes this file";
 
@@ -190,10 +172,9 @@ impl XattrValue for CleanupMarker {
     }
 }
 
-/// Whether `file` carries a verified marker matching `identity` and the
-/// expected digest. Any read failure or mismatch counts as "not verified"
-/// (the caller re-hashes and re-stamps); a malformed marker is scrubbed by
-/// the xattr layer.
+/// Any read failure or mismatch counts as "not verified" (the caller
+/// re-hashes and re-stamps); a malformed marker is scrubbed by the xattr
+/// layer.
 pub(crate) fn has_valid_marker(
     file: &std::fs::File,
     path: &Path,
@@ -204,9 +185,8 @@ pub(crate) fn has_valid_marker(
         .is_some_and(|marker| marker.matches(identity, expected))
 }
 
-/// Stamp the verified marker after a successful digest match. Best-effort:
-/// a failure (logged once by the xattr layer, e.g. a filesystem without
-/// xattr support) just means the next cycle re-hashes.
+/// Best-effort: a failure (logged once by the xattr layer, e.g. a filesystem
+/// without xattr support) just means the next cycle re-hashes.
 pub(crate) fn stamp(file: &std::fs::File, path: &Path, identity: FileIdentity, expected: &Digest) {
     xattr_helpers::write(file, path, &CleanupMarker::new(identity, expected.clone()));
 }
@@ -281,8 +261,6 @@ mod tests {
         assert!(CleanupMarker::parse(&format!("42:1234:1.-1:SHA256:{hex}")).is_none());
     }
 
-    /// A same-size rewrite in place keeps inode and size; only the mtime
-    /// tells it apart, so the marker must not match it.
     #[test]
     fn cleanup_marker_rejects_an_mtime_only_change() {
         let digest = [0x5au8; 32];
@@ -308,7 +286,6 @@ mod tests {
         }
     }
 
-    /// Pre-epoch mtimes are representable and round-trip.
     #[test]
     fn cleanup_marker_round_trips_a_negative_mtime() {
         let digest = [0x01u8; 32];
@@ -358,8 +335,6 @@ mod tests {
         assert_scrubs_malformed_and_round_trips(b"42:1234:1.0:SHA256:nothex", &marker);
     }
 
-    /// The legacy form survives a real xattr read: present, not scrubbed,
-    /// nothing logged -- and still not valid.
     #[test]
     fn legacy_marker_is_kept_on_disk_but_not_valid() {
         use crate::test_support::levels_during;

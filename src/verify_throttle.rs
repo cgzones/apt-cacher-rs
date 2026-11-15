@@ -12,10 +12,6 @@
 //! `Mirror` is the alias-resolved canonical mirror
 //! (`request_dispatch::decide_request`), so every alias of a mirror shares
 //! one throttle entry.
-//!
-//! Time is tracked on `coarsetime` (the crate-preferred clock); its ~1ms
-//! resolution is irrelevant for second-scale backoff windows. The public
-//! API speaks `std::time::Duration` (config input, log output).
 
 use coarsetime::{Duration, Instant};
 use hashbrown::HashMap;
@@ -33,25 +29,22 @@ pub(crate) const MAX_THROTTLE_ENTRIES: usize = 256;
 
 #[derive(Clone, Copy, Debug)]
 struct ThrottleEntry {
-    /// Consecutive verification failures for this resource (>= 1).
+    /// Consecutive failures, always >= 1.
     failures: u32,
-    /// When the current backoff window ends.
+    /// End of the current backoff window.
     until: Instant,
 }
 
-/// Snapshot returned by [`VerifyThrottle::check`] for a throttled resource;
-/// carries the context the rejection log line needs.
 #[derive(Debug)]
 pub(crate) struct Throttled {
     pub(crate) remaining: std::time::Duration,
     pub(crate) failures: u32,
 }
 
-/// The answer every gate gives a request for a throttled resource: the
-/// rejection line (`lead` is the gate's own opening, with its subsystem
-/// prefix), the metric and the `503` to decline with. Cleanup's probes bypass
-/// the throttle: they run once per 24h cycle and a 503 would hard-fail the
-/// index-fetch cascade; their commit outcome still records/clears the state.
+/// Logs, counts and builds the `503` for a throttled resource; `lead` opens
+/// the log line. Cleanup's probes bypass the throttle: they run once per 24h
+/// cycle and a 503 would hard-fail the index-fetch cascade; their commit
+/// outcome still records/clears the state.
 pub(crate) fn refusal(conn_details: &ConnectionDetails, lead: &str) -> Option<Declined> {
     if conn_details.client.is_cleanup_synthetic() {
         return None;
@@ -74,9 +67,7 @@ pub(crate) fn refusal(conn_details: &ConnectionDetails, lead: &str) -> Option<De
 pub(crate) struct VerifyThrottle {
     map: parking_lot::RwLock<HashMap<CacheEntryKey, ThrottleEntry>>,
     /// Window after the first failure. `None` (a configured zero) disables
-    /// the whole feature; modelling it as an absent window rather than a
-    /// zero one makes a zero-length backoff -- an entry that is inserted but
-    /// never throttles anything -- unrepresentable.
+    /// the whole feature.
     base: Option<Duration>,
     /// Upper bound on the window. Doubles as the streak-reset TTL: a
     /// failure arriving more than `cap` after the previous window ended
@@ -95,8 +86,6 @@ impl VerifyThrottle {
         }
     }
 
-    /// Entries and the heap they take: the table and each key's mirror and
-    /// name. Walks the table, which the cap keeps small.
     pub(crate) fn footprint(&self) -> Footprint {
         let map = self.map.read();
         let keys: usize = map
@@ -109,16 +98,13 @@ impl VerifyThrottle {
         }
     }
 
-    /// Whether the resource is inside its backoff window.
     #[must_use]
     pub(crate) fn check(&self, key: CacheEntryKeyRef<'_>) -> Option<Throttled> {
         self.check_at(key, Instant::now())
     }
 
     fn check_at(&self, key: CacheEntryKeyRef<'_>, now: Instant) -> Option<Throttled> {
-        // A disabled throttle never records, so the map stays empty and the
-        // lookup below would miss anyway; this short-circuit keeps the
-        // per-request gate free of a lock acquisition and a hash.
+        // Disabled: keep the per-request gate free of a lock and a hash.
         self.base?;
         let ThrottleEntry { failures, until } = self.map.read().get(&key).copied()?;
         (now < until).then(|| Throttled {
@@ -127,9 +113,8 @@ impl VerifyThrottle {
         })
     }
 
-    /// Record a checksum-verification failure and arm/extend the backoff
-    /// window. Returns the new `(window, consecutive_failures)` for the
-    /// caller's log line, or `None` when the throttle is disabled.
+    /// Returns the new `(window, consecutive_failures)`, or `None` when the
+    /// throttle is disabled.
     pub(crate) fn record_failure(
         &self,
         key: CacheEntryKeyRef<'_>,
@@ -160,10 +145,8 @@ impl VerifyThrottle {
             let cap = self.cap;
             map.retain(|_, entry| now <= entry.until + cap);
             if map.len() >= MAX_THROTTLE_ENTRIES {
-                // Clearing drops live backoff windows, so every throttled
-                // resource becomes re-downloadable at once and the proxy
-                // resumes fetching content it knows fails verification --
-                // exactly the mass-corruption case the throttle exists for.
+                // Clearing drops live backoff windows, so the proxy resumes
+                // fetching content it knows fails verification: worth a WARN.
                 warn_once!(
                     "Verification throttle reached {MAX_THROTTLE_ENTRIES} entries; clearing all backoff windows"
                 );
@@ -185,8 +168,6 @@ impl VerifyThrottle {
         Some((window.into(), failures))
     }
 
-    /// Clear the entry after a successful commit -- the resource verified,
-    /// so any earlier failures are stale.
     pub(crate) fn record_success(&self, key: CacheEntryKeyRef<'_>) {
         if self.map.read().is_empty() {
             return;
@@ -194,8 +175,8 @@ impl VerifyThrottle {
         self.map.write().remove(&key);
     }
 
-    /// Number of resources currently inside a backoff window (dashboard
-    /// gauge; expired-but-not-yet-purged streak entries are excluded).
+    /// Resources inside a backoff window; expired-but-not-yet-purged streak
+    /// entries are excluded.
     #[must_use]
     pub(crate) fn active_len(&self) -> usize {
         self.active_len_at(Instant::now())
@@ -276,8 +257,6 @@ mod tests {
 
     #[test]
     fn consecutive_failures_double_up_to_cap() {
-        // base 30s doubling per failure, clamped at the 3600s cap: the
-        // eighth failure would be 3840s and lands on the cap instead.
         const EXPECTED: [(u64, u32); 10] = [
             (30, 1),
             (60, 2),

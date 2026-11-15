@@ -1,6 +1,4 @@
-//! Log-level policy helpers: the per-call-site once-gates for flood control
-//! (the `*_once` macros, the gate they share and the [`Logged`] proof token),
-//! plus [`info_or_warn!`](crate::info_or_warn), which carries no gate at all.
+//! Log-level policy helpers: once-gates for flood control.
 //!
 //! Each `*_once` macro plants its own `static` gate, so "once" means once per
 //! call site, not once per process. A [`KeyedGate`] is the exception: one
@@ -12,8 +10,7 @@ use tracing::error;
 
 use crate::{metrics, transfer_error::Severity};
 
-/// The gate every `*_once` macro and gated helper below is built on: `true`
-/// exactly once per `fired`, `false` on every later call.
+/// `true` exactly once per `fired`, `false` on every later call.
 ///
 /// The relaxed load before the CAS keeps the steady state read-only — an
 /// unconditional `compare_exchange` is an RMW on a shared static cache line
@@ -47,9 +44,8 @@ impl KeyedGate {
         }
     }
 
-    /// `true` on `key`'s first use while fewer than `cap` keys have fired.
-    /// Only failure paths consult it, so a linear scan over at most `cap`
-    /// keys under the lock costs nothing that matters.
+    /// Only failure paths consult it, so a linear scan under the lock is
+    /// fine.
     fn first_fire(&self, key: &str) -> bool {
         let mut fired = self.fired.lock();
         if fired.len() >= self.cap || fired.iter().any(|seen| **seen == *key) {
@@ -63,15 +59,9 @@ impl KeyedGate {
 /// Emit one message at INFO when `$expected` holds and at WARN otherwise.
 ///
 /// For the delivery split `docs/logging.md` mandates: a client that hung up
-/// or stalled (`error::is_expected_client_end`) is an expected end to a
-/// transfer and logs at INFO, while any other I/O failure is the operator's
-/// business. Not gated — these lines are
-/// the per-request narrative, which `docs/logging.md`'s flood-control section
-/// exempts.
-///
-/// Exists so the message is written once: the hand-written form repeats the
-/// whole format string in both arms, where a rewording can silently reach
-/// only one of them.
+/// or stalled is an expected end to a transfer and logs at INFO, while any
+/// other I/O failure is the operator's business. Not gated: these lines are
+/// the per-request narrative, which the flood-control policy exempts.
 #[macro_export]
 macro_rules! info_or_warn {
     ($expected:expr, $($arg:tt)*) => {{
@@ -87,9 +77,7 @@ macro_rules! info_or_warn {
 ///
 /// Expands to an explicit `tracing` call per `transfer_error::Severity` arm
 /// rather than `event!(level, …)` so each level keeps its own call-site
-/// metadata (and its static level filter). An exported macro cannot link that
-/// crate-private type, so it is named in plain text. Not gated -- like
-/// [`info_or_warn!`](crate::info_or_warn) these are per-request narrative lines.
+/// metadata (and its static level filter). Not gated.
 #[macro_export]
 macro_rules! log_at {
     ($severity:expr, $($arg:tt)*) => {{
@@ -162,8 +150,7 @@ macro_rules! info_once {
 }
 
 /// [`warn_once_or_info!`] that returns the [`Logged`] proof for
-/// an error variant whose policy is "logged at the throw site". Same per-site
-/// once-gate; the level split lives in `warn_once_or_info_gated`.
+/// an error variant whose policy is "logged at the throw site".
 #[macro_export]
 macro_rules! warn_once_or_info_logged {
     ($($t:tt)*) => {{
@@ -190,24 +177,16 @@ pub(crate) fn warn_once_or_info_gated(
 
 /// Proof that a failure was logged, carrying the value it was logged for.
 ///
-/// A failure is logged once, at the site that decides the outcome. Some sites
-/// must be that site because the context that makes the line actionable --
-/// the on-disk path, the upstream authority and attempt count -- exists only
-/// there; the error variant they return then carries this token instead of
-/// (or next to) the error, and the outer arm receiving it maps silently. The
-/// field is private and every constructor logs: the [`Logged`] helpers below
-/// write the line, and [`Logged::with`] attaches the value to that proof, so a
-/// `Reported<T>` cannot exist without its log line, and a reviewer reading one
-/// at a throw site knows which helper wrote it.
-///
-/// Terminal failures reach it through their `conclude` methods
-/// (`transfer_error`), which count the cause before logging it; that is the
-/// only way to count one.
+/// A failure is logged once, at the site that decides the outcome. Where the
+/// context that makes the line actionable (the on-disk path, the upstream
+/// authority and attempt count) exists only at the throw site, the error
+/// variant it returns carries this token, and the outer arm receiving it maps
+/// silently. The field is private and every constructor logs, so a
+/// `Reported<T>` cannot exist without its log line.
 ///
 /// The helpers log from this module, so the `target` recorded for the line
-/// (visible only in the web interface's log store, which prints targets) is
-/// `log_once`, not the throw site's module. The console/file sinks print no
-/// target.
+/// (visible only in the web interface's log store) is `log_once`, not the
+/// throw site's module.
 #[derive(Clone, Debug)]
 #[must_use = "a reported failure proves its line was written; hand it on"]
 pub(crate) struct Reported<T>(T);
@@ -228,37 +207,31 @@ impl Logged {
         Reported(value)
     }
 
-    /// Log the line at `severity` and prove it.
     pub(crate) fn at(severity: Severity, args: std::fmt::Arguments<'_>) -> Self {
         crate::log_at!(severity, "{args}");
         Self(())
     }
 
-    /// `debug!` the line and prove it: a terminal failure whose outcome the
-    /// caller reports itself (cleanup's decision log).
+    /// For a terminal failure whose outcome the caller reports itself
+    /// (cleanup's decision log).
     #[cfg(all(feature = "splice", not(feature = "hyper")))]
     pub(crate) fn debug(args: std::fmt::Arguments<'_>) -> Self {
         tracing::debug!("{args}");
         Self(())
     }
 
-    /// `error!` the line and prove it.
     pub(crate) fn error(args: std::fmt::Arguments<'_>) -> Self {
         error!("{args}");
         Self(())
     }
 
-    /// A cached-file syscall failed: bump `CACHE_IO_FAILURE` and `error!`
-    /// the line.
+    /// A cached-file syscall failed.
     pub(crate) fn cache_io_failure(args: std::fmt::Arguments<'_>) -> Self {
         metrics::CACHE_IO_FAILURE.increment();
         Self::error(args)
     }
 
-    /// WARN on `fired`'s first use, INFO after. The body of
-    /// [`crate::warn_once_or_info_logged!`], where `fired` is that call site's
-    /// own once-gate, so per-site flood control is unchanged from
-    /// [`crate::warn_once_or_info!`].
+    /// WARN on `fired`'s first use, INFO after.
     pub(crate) fn warn_once_or_info(
         fired: &'static std::sync::atomic::AtomicBool,
         args: std::fmt::Arguments<'_>,
@@ -342,8 +315,6 @@ mod tests {
 
     #[test]
     fn once_macros_gate_per_call_site() {
-        // Two expansions plant two gates: the second site still warns after
-        // the first has fired, and each site only warns once.
         let levels = levels_during(|| {
             for _ in 0..3 {
                 warn_once!("site one");
@@ -359,7 +330,6 @@ mod tests {
     fn warn_once_or_debug_gated_warns_once_per_handed_in_gate() {
         static A: AtomicBool = AtomicBool::new(false);
         static B: AtomicBool = AtomicBool::new(false);
-        // One call site, two facts: each gate warns once, then demotes.
         let levels = levels_during(|| {
             for gate in [&A, &A, &B, &B] {
                 crate::warn_once_or_debug_gated!(gate, "one site");

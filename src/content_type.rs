@@ -4,7 +4,7 @@
 use crate::{deb_mirror, warn_once_or_info};
 
 /// Whether an upstream `Content-Type` is acceptable for a file whose name
-/// implies `expected` (as [`content_type_for_cached_file`] derives it).
+/// implies `expected`.
 ///
 /// Comparison ignores parameters and is case-insensitive. Three historical
 /// spellings Debian mirrors still emit count as equal rather than as a
@@ -40,8 +40,6 @@ fn content_type_matches(upstream: &str, expected: &str) -> bool {
     upstream.eq_ignore_ascii_case(accepted_alias)
 }
 
-/// Warn (once) if the upstream `Content-Type` is not one
-/// [`content_type_matches`] accepts for the cached file's name.
 pub(crate) fn warn_on_content_type_mismatch(
     upstream: Option<&str>,
     mirror: &deb_mirror::Mirror,
@@ -59,8 +57,6 @@ pub(crate) fn warn_on_content_type_mismatch(
     );
 }
 
-/// Derive the `Content-Type` for a cached file from its debname: the deb
-/// predicate first, then the manifest basenames, then the extension.
 #[must_use]
 pub(crate) fn content_type_for_cached_file(filename: &str) -> &'static str {
     if deb_mirror::is_deb_package(filename) {

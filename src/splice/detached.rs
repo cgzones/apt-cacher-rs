@@ -2,28 +2,15 @@
 //!
 //! `splice_proxy`'s nudge gate answers the client with a `429` plus
 //! `Retry-After` (see `crate::parallel_hack`) and hands everything the
-//! download still needs -- the upstream connection, the cache target with its
-//! registry entry and quota reservation, the body geometry -- to a
-//! [`DetachedDownload`], which finishes it on its own task. The client's retry
-//! late-joins through `ActiveDownloads::attach` on the same keep-alive
-//! connection, exactly like any other concurrent request for an in-flight
-//! download.
+//! download still needs to a [`DetachedDownload`], which finishes it on its
+//! own task. The client's retry late-joins through `ActiveDownloads::attach`
+//! like any other concurrent request for an in-flight download.
 //!
-//! `DetachedDownload::run` mirrors the tail of `splice_proxy` from the body-prefix
-//! step on, minus every client write: the body loops run in
-//! `ClientStatus::Absent` (see `super::body`), and a failure is attributed by
-//! the same guarded runner as an attached download. No connection is needed
-//! to retain or report the cause.
-//!
-//! The very end is not a mirror but the same code: `CacheTarget::begin_rename`
-//! ends the download, and the commit and the completion line are
-//! `super::commit::CommitTail`, which `splice_proxy` spawns onto a
-//! fresh task and this module -- already off the connection -- simply awaits
-//! in place.
-//!
-//! Feature coverage falls out of the ownership: the task holds whichever
-//! `UpstreamConn` variant the exchange produced, so hyper-less builds are
-//! covered without a second code path.
+//! `DetachedDownload::run` mirrors the tail of `splice_proxy` from the
+//! body-prefix step on, minus every client write: the body loops run in
+//! `ClientStatus::Absent` (see `super::body`), and the commit and the
+//! completion line are the same `super::commit::CommitTail`, awaited in
+//! place since this task is already off the connection.
 
 use bytes::BytesMut;
 
@@ -44,17 +31,13 @@ use crate::cache_conditional::ServeParams;
 /// `splice_proxy` had in hand at the gate, owned rather than borrowed,
 /// so it can outlive the connection task.
 pub(super) struct DetachedDownload {
-    /// Owned upstream connection.
     pub(super) upstream: ResponseBody,
     /// The head-read buffer; the body prefix is `header_buf[header_end..]`.
     pub(super) header_buf: BytesMut,
     pub(super) header_end: usize,
-    /// The partial file, its path guard, the destination and the download
-    /// barrier (registry entry plus quota reservation).
     pub(super) target: CacheTarget,
     pub(super) conn_details: ConnectionDetails,
     pub(super) conn_label: ConnLabel,
-    /// The body geometry the completion line and the `Download` row report.
     pub(super) bytes: CompletionBytes,
     pub(super) splice_count: u64,
     /// Start of the upstream-rate window: when the upstream request went out.
@@ -69,9 +52,8 @@ pub(super) struct DetachedDownload {
 const NO_CLIENT_RANGE: ServeParams = ServeParams::full(0);
 
 impl DetachedDownload {
-    /// Fire-and-forget, like the hyper backend's `download_file` spawn: the
-    /// connection task returns to its next request while this one finishes
-    /// the download.
+    /// Fire-and-forget: the connection task returns to its next request
+    /// while this one finishes the download.
     pub(super) fn spawn(self) {
         tokio::task::spawn(self.run());
     }
@@ -142,11 +124,9 @@ impl DetachedDownload {
 
         upstream.complete();
 
-        // The same tail `splice_proxy` spawns, run in place: this task
-        // *is* the off-connection context that one has to create. A commit
-        // failure already logged its cause and dropped the barrier; nothing is
-        // cached, so no DB rows and no completion line. Upstream side only:
-        // no client was ever served, so there is no `SERVED_*` /
+        // A commit failure already logged its cause and dropped the barrier;
+        // nothing is cached, so no DB rows and no completion line. Upstream
+        // side only: no client was ever served, so there is no `SERVED_*` /
         // `BYTES_SERVED_SPLICE` bump and no `Delivery` row.
         if let Ok(tail) = target
             .begin_rename(conn_details, conn_label, bytes, start)

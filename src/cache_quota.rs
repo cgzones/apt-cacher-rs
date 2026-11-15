@@ -1,37 +1,26 @@
 //! Disk-quota accounting for the cache directory.
 //!
 //! Every size is counted as [`accounted_size`]: the length rounded up to
-//! whole [`QUOTA_BLOCK_SIZE`] (4 KiB) blocks, 0 for an empty file. Counting
-//! apparent lengths let millions of tiny index and by-hash files occupy far
-//! more disk than the quota saw. The rounding applies to every input -- a
-//! reservation's `Content-Length`, the replaced file, an adopted, kept or
-//! removed partial, the finalised size -- and to every file the cache scan
-//! and cleanup count, so the reconcile compares like with like; all figures
-//! below are in these units.
+//! whole [`QUOTA_BLOCK_SIZE`] (4 KiB) blocks, 0 for an empty file, since
+//! millions of tiny index and by-hash files occupy far more disk than their
+//! apparent lengths. The rounding applies to every input and to every file
+//! the cache scan and cleanup count, so the reconcile compares like with
+//! like; all figures below are in these units.
 //!
-//! One mutex guards every number the quota decision depends on, so a check,
-//! its reservation, a finalisation and the cleanup reconcile can never
-//! interleave inconsistently:
+//! One mutex guards every number the quota decision depends on:
 //!
 //! - `size`: the accounted cache size. Files below the mirror directories --
 //!   the `.partial` files in their `tmp/` subdirectories included -- plus the
 //!   reservation of every download in flight. Kept partials are disk usage a
-//!   failing upstream can grow at will (a partial survives its download for a
-//!   later resume), so they count like cached files: a reservation that
-//!   resumes a partial *adopts* its bytes (they move from the kept partial
-//!   into the reservation), a download that ends without a commit hands back
-//!   what its partial then holds (only the unwritten remainder is reverted),
-//!   and every removal of a partial releases its bytes exactly once --
-//!   cleanup's `tmp/` reap through the reconcile's `removed`, every other
-//!   unlink (a discarded resume, a checksum mismatch, a replaced leftover)
-//!   through [`CacheQuota::release_removed_partial`]. A download claims its
-//!   partial's path before touching it and holds the claim until both its
-//!   partial guard and its [`ReservedPartial`] are gone; cleanup reaps only
+//!   failing upstream can grow at will, so they count like cached files: a
+//!   reservation that resumes a partial *adopts* its bytes, a download that
+//!   ends without a commit hands back what its partial then holds, and every
+//!   removal of a partial releases its bytes exactly once -- cleanup's
+//!   `tmp/` reap through the reconcile's `removed`, every other unlink
+//!   through [`CacheQuota::release_removed_partial`]. Cleanup reaps only
 //!   unclaimed partials (`partial_claim`), so a partial is released by the
 //!   reap or by the reservation that adopted it, never by both. The random
-//!   scratch files of volatile downloads live in the cache root's `.apt-cacher-rs.tmp/`,
-//!   are unlinked with their download and purged at startup, and are never
-//!   counted.
+//!   scratch files of volatile downloads are never counted.
 //! - `inflight_reserved` / `inflight_replaced`: what the live reservations
 //!   added to and subtracted from `size` (`replaced` includes the adopted
 //!   partials). The reconcile adds their net to the scanned on-disk total
@@ -52,20 +41,16 @@
 //!   its directory was repaired away, under-counting the cache until the
 //!   next cleanup.
 //!
-//! A [`QuotaReservation`] is minted through [`CacheQuota::acquire`],
-//! is required to build a download barrier (`guards.rs`), is finalised inside the rename step
-//! (`integrity::verify_and_rename`, in the same blocking closure as the
-//! `rename(2)`, so a cancelled commit future cannot land the file and revert
-//! the reservation), and reverts itself on drop -- keeping the bytes its
-//! [`ReservedPartial`] then holds.
+//! A [`QuotaReservation`] is finalised inside the rename step, in the same
+//! blocking closure as the `rename(2)`, so a cancelled commit future cannot
+//! land the file and revert the reservation. It reverts itself on drop --
+//! keeping the bytes its [`ReservedPartial`] then holds.
 //!
 //! The same admission also keeps `min_disk_free` free on the cache
 //! filesystem ([`DiskHeadroom`], with or without a `disk_quota`): the quota
 //! bounds what this daemon accounts, but the filesystem is what runs out,
-//! and it may be shared or already fuller than the cache. The decision reads
-//! a `statvfs(3)` sample at most [`DISK_SAMPLE_TTL`] old (older only while
-//! the one outstanding probe hangs, see
-//! [`CacheQuota::refresh_disk_headroom`]), minus the full
+//! and it may be shared or already fuller than the cache. The decision reads a `statvfs(3)` sample at most [`DISK_SAMPLE_TTL`] old
+//! (older only while the one outstanding probe hangs), minus the full
 //! [`InflightShare::disk`] of every reservation still live (`inflight_disk`) or
 //! ended since the sample was taken (`retired_disk`): a download from a slow
 //! mirror writes for minutes, so a sample taken while it runs shows only
@@ -96,7 +81,6 @@ use crate::{
     warn_once_or_info,
 };
 
-/// Represents a quota violation.
 #[derive(Debug)]
 pub(crate) struct QuotaExceeded;
 
@@ -108,10 +92,9 @@ pub(crate) const QUOTA_BLOCK_SIZE: u64 = 4096;
 /// [`QUOTA_BLOCK_SIZE`] blocks, saturating. An empty file counts 0: it holds
 /// no data block, and inodes are not what the quota measures.
 ///
-/// Every length reaching the quota goes through this -- reservations,
-/// finalisation, a replaced file, a kept or removed partial -- and so does
-/// every file the cache scan and cleanup count, or the reconcile would
-/// "repair" the difference between the two sums.
+/// Every length reaching the quota goes through this, and so does every file
+/// the cache scan and cleanup count, or the reconcile would "repair" the
+/// difference between the two sums.
 #[must_use]
 pub(crate) const fn accounted_size(len: u64) -> u64 {
     len.div_ceil(QUOTA_BLOCK_SIZE)
@@ -154,15 +137,13 @@ impl ReservedPartial {
 
 /// The size of the partial at `path` to account: 0 when there is none (or
 /// it is not a regular file, which the scan does not count either). A
-/// failed `lstat(2)` is reported (`CACHE_IO_FAILURE`) and also taken as 0,
-/// leaving the discrepancy to the next cleanup reconcile.
+/// failed `lstat(2)` is reported and also taken as 0, leaving the
+/// discrepancy to the next cleanup reconcile.
 ///
-/// For [`QuotaReservation`]'s `Drop` (the bytes a kept partial holds) and a
-/// download's own partial unlink (`partial_file`, the bytes it releases);
-/// the caller's claim on the path is held, so cleanup cannot have reaped
-/// it. A direct `lstat(2)` rather than `block_in_place`: `Drop` also fires
-/// on current-thread runtimes and inside blocking closures, and the file is
-/// one its own download has just written, so the inode is cached.
+/// The caller must hold the claim on the path, so cleanup cannot have
+/// reaped it. A direct `lstat(2)` rather than `block_in_place`: `Drop` also
+/// fires on current-thread runtimes and inside blocking closures, and the
+/// file is one its own download has just written, so the inode is cached.
 pub(crate) fn partial_len(path: &Path) -> u64 {
     match std::fs::symlink_metadata(path) {
         Ok(mdata) if mdata.file_type().is_file() => mdata.len(),
@@ -233,10 +214,9 @@ impl Accounting {
         )
     }
 
-    /// Net of the live reservations (`reserved - replaced`); what the
-    /// reservations currently contribute to `size` on top of the on-disk
-    /// files. Signed as `(add, sub)` because a shrinking overwrite
-    /// contributes a negative net.
+    /// Net of the live reservations (`reserved - replaced`), signed as
+    /// `(add, sub)` because a shrinking overwrite contributes a negative
+    /// net.
     const fn inflight_net(&self) -> (u64, u64) {
         if self.inflight_reserved >= self.inflight_replaced {
             (self.inflight_reserved - self.inflight_replaced, 0)
@@ -271,7 +251,6 @@ impl Accounting {
         }
     }
 
-    /// Add a reservation's contribution to the in-flight tallies.
     const fn admit(&mut self, share: InflightShare) {
         let InflightShare {
             reserved,
@@ -285,7 +264,6 @@ impl Accounting {
         self.inflight_disk = self.inflight_disk.saturating_add(disk);
     }
 
-    /// Remove a reservation's contribution from the in-flight tallies.
     const fn retire(&mut self, share: InflightShare) {
         let InflightShare {
             reserved,
@@ -355,8 +333,6 @@ const DISK_SAMPLE_TTL: coarsetime::Duration = coarsetime::Duration::from_secs(1)
 /// request. The probe itself runs on until the syscall returns.
 const DISK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Whether `needed` more bytes on a filesystem with `free` bytes available
-/// still leave `min_free` of them free.
 const fn headroom_allows(free: u64, needed: u64, min_free: u64) -> bool {
     free >= min_free.saturating_add(needed)
 }
@@ -387,27 +363,19 @@ pub(crate) struct Reconciled {
     /// Bytes the in-flight downloads may still write into their partials,
     /// which the scan counted at an unknown fill level.
     pub(crate) inflight_unwritten: u64,
-    /// Accounted size after the reconcile.
     pub(crate) corrected: u64,
     /// `|corrected - stored|`; 0 when no repair was needed.
     pub(crate) difference: u64,
 }
 
-/// The accounted cache size that reserving `reserved` bytes in place of
-/// `prev_file_size` existing bytes would produce:
-/// `current - prev_file_size + reserved`, saturating.
+/// `prev_file_size` is subtracted *before* `reserved` is added, so a
+/// smaller-replacement download may proceed while the cache is over quota:
+/// rejecting it would prevent self-heal via volatile re-fetches.
 ///
-/// Accounting for `prev_file_size` *before* adding `reserved` lets a
-/// smaller-replacement download proceed while the cache is over quota -- the
-/// net size decreases by `prev_file_size - reserved`, so rejecting it would
-/// prevent self-heal via volatile re-fetches. Saturation on the add yields
-/// `u64::MAX` only when the sum would overflow, which then rejects via
-/// `> quota`.
-///
-/// This is the single definition of the formula: the admission check
-/// ([`CacheQuota::quota_exceeded_by`]) and [`CacheQuota::reserve_locked`] (which applies
-/// it to `size`) call it, so an admitted check can never disagree with the
-/// reservation it admits.
+/// The single definition of the formula: the admission check
+/// ([`CacheQuota::quota_exceeded_by`]) and [`CacheQuota::reserve_locked`]
+/// both call it, so an admitted check cannot disagree with the reservation
+/// it admits.
 const fn projected_size(current: u64, prev_file_size: u64, reserved: NonZero<u64>) -> u64 {
     current
         .saturating_sub(prev_file_size)
@@ -415,21 +383,15 @@ const fn projected_size(current: u64, prev_file_size: u64, reserved: NonZero<u64
 }
 
 /// One reservation's contribution to each in-flight tally of [`Accounting`].
-/// Minting and ending a reservation derive it through the same
-/// [`InflightShare::of`], so [`Accounting::admit`] adds exactly what
-/// [`Accounting::retire`] later takes back.
 #[derive(Clone, Copy, Debug)]
 struct InflightShare {
-    /// The accounted reservation (`inflight_reserved`).
     reserved: NonZero<u64>,
-    /// What it replaces: the previous cache file plus the partial it adopts
-    /// (`inflight_replaced`).
+    /// What it replaces: the previous cache file plus the partial it adopts.
     replaced: u64,
-    /// What it may still write into its partial; 0 without one
-    /// (`inflight_unwritten`).
+    /// What it may still write into its partial; 0 without one.
     unwritten: u64,
     /// The disk space it may still consume: all of it, except the bytes its
-    /// adopted partial already holds (`inflight_disk`, then `retired_disk`).
+    /// adopted partial already holds.
     disk: u64,
 }
 
@@ -447,19 +409,12 @@ impl InflightShare {
 }
 
 impl CacheQuota {
-    /// A `CacheQuota` with the given initial size and quota configuration and
-    /// no `min_disk_free` floor; the daemon builds its one quota with
-    /// [`Self::with_disk_headroom`].
     #[cfg(test)]
     #[must_use]
     pub(crate) fn new(initial: u64, quota_config: Option<NonZero<u64>>) -> Self {
         Self::with_disk_headroom(initial, quota_config, None)
     }
 
-    /// A `CacheQuota` with the given initial size and quota configuration
-    /// that also keeps `headroom`'s `min_disk_free` on the
-    /// cache filesystem: [`Self::try_acquire`] refuses a download that would
-    /// dig into it.
     #[must_use]
     pub(crate) fn with_disk_headroom(
         initial: u64,
@@ -479,8 +434,7 @@ impl CacheQuota {
     }
 
     /// Store a free-space sample of the cache filesystem (`None`: the probe
-    /// failed). The startup scan seeds one; [`Self::refresh_disk_headroom`]
-    /// keeps it fresh.
+    /// failed).
     pub(crate) fn record_disk_free(&self, free: Option<u64>) {
         let mut mg = self.inner.accounting.lock();
         let retired_at = mg.retired_disk;
@@ -493,12 +447,10 @@ impl CacheQuota {
 
     /// Take a new free-space sample for the `min_disk_free` admission check
     /// when the current one is older than [`DISK_SAMPLE_TTL`].
-    /// [`Self::acquire`] awaits it before the synchronous admission check.
     ///
     /// Single flight: a request arriving while a probe is outstanding goes
-    /// on with the current sample, which still charges every download in
-    /// flight or ended since it was taken. A failed probe stores a sample
-    /// that admits.
+    /// on with the current sample. A failed probe stores a sample that
+    /// admits.
     ///
     /// The probe runs in a task of its own that stores its sample and only
     /// then clears the single-flight flag; the requester waits for it at
@@ -515,8 +467,7 @@ impl CacheQuota {
     }
 
     /// [`Self::refresh_disk_headroom`] with the requester's wait and the
-    /// probe (the free bytes of the filesystem holding the given directory)
-    /// injected.
+    /// probe injected.
     async fn refresh_disk_headroom_with<F, Fut>(&self, timeout: std::time::Duration, probe: F)
     where
         F: FnOnce(PathBuf) -> Fut,
@@ -584,10 +535,8 @@ impl CacheQuota {
     }
 
     /// Admit a download and reserve its space in one operation.
-    /// Normal requests refresh the free-space sample before checking the
-    /// limits; cleanup's synthetic index fetches bypass both limits so a
-    /// full cache can still fetch the reference set needed to shrink it.
-    /// These choices stay here rather than in each backend's quota gate.
+    /// Cleanup's synthetic index fetches bypass both limits so a full cache
+    /// can still fetch the reference set needed to shrink it.
     pub(crate) async fn acquire(
         &self,
         client: &ClientInfo,
@@ -618,11 +567,9 @@ impl CacheQuota {
     ///
     /// With a [`DiskHeadroom`], the download is also refused when the bytes
     /// it may still write (all but the adopted prefix) would leave less than
-    /// `min_disk_free` on the cache filesystem, judged from the latest
-    /// sample minus what every download in flight, or ended since the
-    /// sample, may write ([`Self::refresh_disk_headroom`]).
-    /// Both refusals are the same [`QuotaExceeded`]: the client sees one
-    /// "Disk quota reached" 503 either way.
+    /// `min_disk_free` on the cache filesystem. Both refusals are the same
+    /// [`QuotaExceeded`]: the client sees one "Disk quota reached" 503
+    /// either way.
     fn try_acquire(
         &self,
         content_length: ContentLength,
@@ -639,8 +586,7 @@ impl CacheQuota {
         if let Some(quota) = self.quota_exceeded_by(&mg, share) {
             drop(mg);
             // A cache sitting at its quota rejects on *every* cacheable
-            // miss until cleanup runs, so only the first rejection is a
-            // warning -- the rest stay visible at info.
+            // miss until cleanup runs, so only the first is a warning.
             warn_once_or_info!(
                 "Disk quota reached while reserving space for {debname} (cache size {}, reserving {}, quota {}); rejecting the download with 503",
                 HumanFmt::Size(curr),
@@ -653,8 +599,6 @@ impl CacheQuota {
 
         if let Some((free, min_free)) = self.headroom_short_for(&mg, share) {
             drop(mg);
-            // Like the quota: a nearly full disk rejects every cacheable
-            // miss until space is freed.
             warn_once_or_info!(
                 "Low disk space while reserving space for {debname} ({} free on the cache filesystem, needing {}, min_disk_free {}); rejecting the download with 503",
                 HumanFmt::Size(free),
@@ -710,27 +654,22 @@ impl CacheQuota {
         self.reserve_locked(mg, share, prev_file_size, partial, debname)
     }
 
-    /// The `disk_quota` admitting `share` would exceed ([`projected_size`]),
-    /// if any. Shared by both admission paths, which differ only in what they
-    /// do about it.
+    /// The `disk_quota` admitting `share` would exceed, if any.
     fn quota_exceeded_by(&self, mg: &Accounting, share: InflightShare) -> Option<u64> {
         let quota = self.inner.quota_config?.get();
         (projected_size(mg.size, share.replaced, share.reserved) > quota).then_some(quota)
     }
 
     /// `(free, min_disk_free)` when admitting `share` would dig into the
-    /// [`DiskHeadroom`] floor, judged from the latest free-space sample
-    /// ([`Accounting::disk_free_now`]). Shared like
-    /// [`Self::quota_exceeded_by`].
+    /// [`DiskHeadroom`] floor.
     fn headroom_short_for(&self, mg: &Accounting, share: InflightShare) -> Option<(u64, u64)> {
         let min_free = self.inner.headroom.as_ref()?.min_free.get();
         let free = mg.disk_free_now()?;
         (!headroom_allows(free, share.disk, min_free)).then_some((free, min_free))
     }
 
-    /// Apply a reservation to the accounting and mint its token. Takes the
-    /// held guard so the caller's check and this update are one critical
-    /// section.
+    /// Takes the held guard so the caller's check and this update are one
+    /// critical section.
     fn reserve_locked(
         &self,
         mut mg: parking_lot::MutexGuard<'_, Accounting>,
@@ -746,7 +685,7 @@ impl CacheQuota {
         );
 
         // Reconcile catches any residual drift from `replaced > curr`
-        // caller bugs and emits `Repaired cache size discrepancy`.
+        // caller bugs.
         mg.size = projected_size(mg.size, share.replaced, share.reserved);
         mg.admit(share);
         let new_size = mg.size;
@@ -778,13 +717,12 @@ impl CacheQuota {
         mg.record_change(len, 0);
     }
 
-    /// Return the current cache size.
     #[must_use]
     pub(crate) fn current_size(&self) -> u64 {
         self.inner.accounting.lock().size
     }
 
-    /// Configured quota limit, if any. `None` means unlimited.
+    /// `None` means unlimited.
     #[must_use]
     pub(crate) fn quota_limit(&self) -> Option<NonZero<u64>> {
         self.inner.quota_config
@@ -792,20 +730,14 @@ impl CacheQuota {
 
     /// Update `CACHE_QUOTA_UTIL_PEAK_BPS` with the current utilization
     /// (in basis points: hundredths of a percent). No-op when no quota is
-    /// configured, since utilization is not well defined.
-    ///
-    /// `current` is taken as a parameter so callers that already hold (or
-    /// just released) the accounting lock do not have to re-acquire it.
+    /// configured.
     pub(crate) fn sample_utilization_peak_with(&self, current: u64) {
         let Some(quota) = self.inner.quota_config else {
             return;
         };
-        // bps = current * 10000 / quota, computed in u128 to avoid overflow;
-        // `quota` is NonZero so no div-by-zero. Not clamped at 100 %: the
-        // cache can run over its quota (reservations settle after the
-        // gate, cleanup trails), and the dashboard shows the current
-        // utilization unclamped beside this peak -- "105%, peak 100%" read
-        // as a contradiction.
+        // Not clamped at 100 %: the cache can run over its quota, and the
+        // dashboard shows the current utilization unclamped beside this
+        // peak -- "105%, peak 100%" would read as a contradiction.
         let bps = u128::from(current).saturating_mul(10_000) / std::num::NonZeroU128::from(quota);
         let bps = u64::try_from(bps).unwrap_or(u64::MAX);
         metrics::CACHE_QUOTA_UTIL_PEAK_BPS.update(bps);
@@ -897,8 +829,6 @@ impl CacheQuota {
             metrics::RECONCILE_BYTES_REPAIRED.increment_by(difference);
         }
         drop(mg);
-        // An upward reconcile may push past the prior utilisation peak; downward
-        // reconciles cannot, so skip the sample to avoid pointless work.
         if corrected > stored {
             self.sample_utilization_peak_with(corrected);
         }
@@ -926,9 +856,8 @@ impl std::fmt::Debug for CacheQuota {
 #[must_use]
 pub(crate) struct QuotaReservation {
     quota: CacheQuota,
-    /// The accounted reservation.
+    // Both are accounted sizes.
     reserved: NonZero<u64>,
-    /// The accounted size of the cache file the download replaces.
     prev_file_size: u64,
     /// The partial the download writes into; `None` for a volatile scratch
     /// file. What it holds when the reservation ends unfinalised stays
@@ -939,10 +868,9 @@ pub(crate) struct QuotaReservation {
 }
 
 impl QuotaReservation {
-    /// What this reservation added to the in-flight tallies: re-derived from
-    /// the same inputs, through the same [`InflightShare::of`], as at mint
-    /// time (none of them changes while the reservation lives). Not stored,
-    /// which would widen every download barrier's failure type.
+    /// Re-derived from the same inputs as at mint time (none of them changes
+    /// while the reservation lives). Not stored, which would widen every
+    /// download barrier's failure type.
     fn share(&self) -> InflightShare {
         InflightShare::of(self.reserved, self.prev_file_size, self.partial.as_deref())
     }
@@ -950,12 +878,8 @@ impl QuotaReservation {
     /// Finalize the reservation after the download landed in the cache.
     ///
     /// Adjusts the accounted size so the net change from acquire + finalize
-    /// equals `bytes_received - prev_file_size`. For `ContentLength::Exact`
-    /// with an honest upstream this is a no-op. For `ContentLength::Unknown`
-    /// (or an upstream that under-delivered), the unused reservation is
-    /// reclaimed. For an upstream that over-delivered (sent more bytes than
-    /// announced via `Content-Length`), the extra is added so the accounted
-    /// size tracks the actual on-disk size.
+    /// equals `bytes_received - prev_file_size`, whether the upstream
+    /// under- or over-delivered against the reservation.
     ///
     /// Call it right after the `rename(2)` that made the file visible, in
     /// the same non-cancellable step: it also records the commit's on-disk
@@ -1015,7 +939,6 @@ impl Drop for QuotaReservation {
         let partial = self.partial.as_deref();
         let adopted = partial.map_or(0, |p| p.adopted);
         let kept = partial.map_or(0, |p| accounted_size(partial_len(p.claim.path())));
-        // `reserved` out, `prev_file_size` and the kept partial back in.
         let restored = prev.saturating_add(kept);
         // Both trace lines below start with "Reverting quota reservation",
         // which `kept_partial_counts_against_the_disk_quota` waits on to know
@@ -1066,7 +989,6 @@ mod tests {
         n * QUOTA_BLOCK_SIZE
     }
 
-    /// `v` blocks.
     fn nz(v: u64) -> NonZero<u64> {
         NonZero::new(b(v)).expect("non-zero test value")
     }
@@ -1076,8 +998,6 @@ mod tests {
         ContentLength::Exact(nz(v))
     }
 
-    /// An over-quota cache records its true utilization as the peak, so the
-    /// dashboard cannot show "105%, peak 100%".
     #[test]
     fn the_utilization_peak_is_not_clamped_at_the_quota() {
         let quota = CacheQuota::new(0, Some(NonZero::new(100).expect("non-zero")));
@@ -1094,9 +1014,6 @@ mod tests {
         assert_eq!(accounted_size(u64::MAX), u64::MAX, "saturates");
     }
 
-    /// Many tiny files take far more disk than their lengths add up to: each
-    /// is charged a whole block, in the reservation, at finalisation, on
-    /// replacement and when its partial is kept or removed alike.
     #[test]
     fn every_quota_input_is_rounded_to_whole_blocks() {
         let quota = CacheQuota::new(0, Some(nz(2)));
@@ -1187,9 +1104,6 @@ mod tests {
 
     #[test]
     fn reconcile_window_ignores_an_abandoned_reservation() {
-        // A download that never commits must widen no reconcile interval:
-        // only `finalize` records an on-disk delta, so a scan taken after the
-        // abort sees the truth and the accounted size needs no repair.
         let quota = CacheQuota::new(b(50), Some(nz(1000)));
         let window = quota.begin_reconcile_window();
         let reservation = quota
@@ -1217,7 +1131,6 @@ mod tests {
     fn cleanup_index_fetch_is_admitted_over_quota() {
         let quota = CacheQuota::new(b(100), Some(nz(100)));
         let reservation = quota.acquire_for_cleanup(exact(10), b(4), None, "Packages.xz");
-        // Accounted like any other reservation: 100 - 4 + 10.
         assert_eq!(quota.current_size(), b(106));
         reservation.finalize(b(10));
         assert_eq!(quota.current_size(), b(106));
@@ -1329,7 +1242,7 @@ mod tests {
         assert_eq!(quota.current_size(), b(123));
     }
 
-    /// A partial path in a fresh temporary directory; nothing on disk yet.
+    /// Nothing is on disk at the returned path yet.
     fn partial_path() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("x_1.0_amd64.deb.partial");
@@ -1348,17 +1261,11 @@ mod tests {
             .expect("set partial length");
     }
 
-    /// The partial at `path`, claimed as its download would, adopting
-    /// `adopted` bytes.
     fn reserved(path: &Path, adopted: u64) -> ReservedPartial {
         let claim = PartialClaim::acquire(path.to_path_buf()).expect("unclaimed partial");
         ReservedPartial::new(claim, adopted)
     }
 
-    /// Cleanup trying to reap a partial a resume has adopted leaves it to
-    /// the reservation: the bytes are released once, when the reservation
-    /// ends, and a reap after that counts nothing twice. Reaping it under the
-    /// download released them from both sides.
     #[test]
     fn a_partial_adopted_by_a_resume_is_released_once() {
         use crate::partial_claim::{FileId, Reap, reap_unclaimed};
@@ -1402,8 +1309,6 @@ mod tests {
         assert_eq!(r.difference, b(0), "nothing to repair");
     }
 
-    /// Cleanup removing more than the quota accounted is accounting drift,
-    /// counted like `Accounting::subtract`'s underflow, then repaired.
     #[test]
     fn reconcile_counts_a_removal_underflow_as_corruption() {
         let quota = CacheQuota::new(b(50), Some(nz(1000)));
@@ -1621,8 +1526,6 @@ mod tests {
         drop(first);
     }
 
-    /// A download that ends between two samples wrote bytes the older sample
-    /// cannot show: it stays charged until the next sample.
     #[test]
     fn low_disk_space_charges_a_download_ended_since_the_sample() {
         let quota = headroom_quota(100, Some(1000));
@@ -1705,11 +1608,6 @@ mod tests {
         );
     }
 
-    /// A `statvfs(3)` hung on a stuck filesystem outlives the request that
-    /// started it. Later misses must neither start another probe, which
-    /// would strand one more blocking thread every few seconds, nor wait for
-    /// one: they go on with the previous sample until the hung probe
-    /// returns, and its sample then lands.
     #[tokio::test(start_paused = true)]
     async fn a_hung_disk_probe_is_never_doubled() {
         let quota = CacheQuota::with_disk_headroom(

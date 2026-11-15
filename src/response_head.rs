@@ -1,13 +1,10 @@
 //! Backend-neutral description of a proxy-generated response head.
 //!
-//! Every response the proxy *originates* (cache hit, conditional 304/416,
-//! rejection or error page, upstream-relay failure, throttle 503, CONNECT
-//! tunnel establishment) is described by a [`ResponseHead`] and rendered by
-//! exactly one of two functions: `ResponseHead::into_hyper` for the hyper
-//! backend and `ResponseHead::write_to` for the raw-socket sendfile/splice
-//! backends.  Responses *relayed* from upstream (passthrough, streamed
-//! downloads carrying the origin's headers) are not built here; those paths
-//! only append `Via:` to the origin's header set.
+//! Every response the proxy *originates* is described by a [`ResponseHead`]
+//! and rendered by `ResponseHead::into_hyper` (hyper backend) or
+//! `ResponseHead::write_to` (raw-socket backends).  Responses *relayed* from
+//! upstream are not built here; those paths only append `Via:` to the
+//! origin's header set.
 //!
 //! # Contract
 //!
@@ -38,10 +35,9 @@
 //! [`ResponseHead::cached`]), [`ResponseHead::not_modified`] and
 //! [`ResponseHead::range_not_satisfiable`].
 //!
-//! A new proxy-generated response must be built from a [`ResponseHead`] —
+//! A new proxy-generated response must be built from a [`ResponseHead`],
 //! not from a hand-written `Response::builder()` chain or `format!`
-//! template — so the `Via`/`Server` invariant stays enforced by these two
-//! renderers rather than by grep.
+//! template, so the renderers keep enforcing the contract.
 //!
 //! [RFC 9110 §7.6.3]: https://www.rfc-editor.org/rfc/rfc9110#section-7.6.3
 //! [RFC 9110 §15.5.6]: https://www.rfc-editor.org/rfc/rfc9110#section-15.5.6
@@ -52,8 +48,6 @@ use http::StatusCode;
 use crate::http_helpers::{ClientConn, ConnectionAction, ConnectionVersion};
 use crate::{cache_conditional::CacheInfo, http_etag::ETag, http_last_modified::LastModified};
 
-/// Whether a response advertises the proxy as its origin.
-///
 /// Selects the `Server:` and `Connection:` policy in the renderers; see the
 /// module documentation for the contract.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -104,8 +98,6 @@ impl std::fmt::Display for RangeHeader {
 /// Content type of every proxy-generated error body.
 const TEXT_PLAIN_UTF8: &str = "text/plain; charset=utf-8";
 
-/// A proxy-generated response head, independent of the serving backend.
-///
 /// Constructors own status and framing together. Private fields prevent
 /// callers from changing a representation's status or range independently.
 #[derive(Clone, Debug)]
@@ -118,7 +110,6 @@ pub(crate) struct ResponseHead<'a> {
     /// it only when set, so bodiless heads must set `Some(0)` explicitly.
     content_length: Option<u64>,
     content_type: Option<&'static str>,
-    /// Emit `Accept-Ranges: bytes`.
     accept_ranges: bool,
     last_modified: Option<&'a LastModified>,
     etag: Option<&'a ETag>,
@@ -129,7 +120,6 @@ pub(crate) struct ResponseHead<'a> {
 }
 
 impl<'a> ResponseHead<'a> {
-    /// A head with only the status and kind set; every optional header off.
     #[must_use]
     const fn bare(status: StatusCode, kind: ResponseKind) -> Self {
         Self {
@@ -178,20 +168,16 @@ impl<'a> ResponseHead<'a> {
         }
     }
 
-    /// The `200 Connection Established` head answering a `CONNECT`.
     #[must_use]
     pub(crate) const fn tunnel_established() -> Self {
         Self::bare(StatusCode::OK, ResponseKind::TunnelEstablished)
     }
 
-    /// The `304 Not Modified` head answering a satisfied conditional request.
-    ///
     /// Carries the cached representation's validators and nothing else. No
     /// `Content-Length`: RFC 9110 section 8.6 permits one on a 304 only when
     /// it equals the 200 representation's length, which `0` never does. No
-    /// `Accept-Ranges` either — it is advertised on the
-    /// representation-bearing responses only. Both backends answer a 304
-    /// with this head, so the shape cannot drift between them.
+    /// `Accept-Ranges` either: it is advertised on the
+    /// representation-bearing responses only.
     #[must_use]
     pub(crate) fn not_modified(
         last_modified: &'a LastModified,
@@ -209,11 +195,8 @@ impl<'a> ResponseHead<'a> {
     /// The `200`/`206` head of a cacheable file whose body follows: its
     /// type, framing and validators, and `Accept-Ranges`.
     ///
-    /// `content_length` is `None` only for a joiner of a download of unknown
-    /// length (hyper frames that body itself); `content_range` is set for a
-    /// `206`. Every backend answers with this head, so its shape cannot drift
-    /// between them: splice's streamed download directly, every cache hit
-    /// and joiner through [`Self::cached`].
+    /// The length is `None` only for a joiner of a download of unknown
+    /// length (hyper frames that body itself).
     #[must_use]
     pub(crate) fn representation(
         representation: Representation,
@@ -243,8 +226,7 @@ impl<'a> ResponseHead<'a> {
     }
 
     /// [`Self::representation`] with the validators and age of a cached
-    /// file: the head of every cache-hit and joiner serve of the hyper and
-    /// sendfile backends.
+    /// file.
     #[must_use]
     pub(crate) fn cached(
         representation: Representation,
@@ -260,9 +242,6 @@ impl<'a> ResponseHead<'a> {
         )
     }
 
-    /// The `416 Range Not Satisfiable` head for a request no byte of the
-    /// representation satisfies.
-    ///
     /// An error head with an explicitly empty body, including its length
     /// so the raw-socket response can keep the connection alive.
     #[must_use]
@@ -274,7 +253,6 @@ impl<'a> ResponseHead<'a> {
         }
     }
 
-    /// Whether the renderers emit `Server:`.
     #[must_use]
     const fn emits_server(&self) -> bool {
         match self.kind {
@@ -283,7 +261,6 @@ impl<'a> ResponseHead<'a> {
         }
     }
 
-    /// Whether the renderers emit `Connection:`.
     #[must_use]
     const fn emits_connection(&self) -> bool {
         match self.kind {
@@ -292,7 +269,6 @@ impl<'a> ResponseHead<'a> {
         }
     }
 
-    /// Whether the renderers emit `Allow: GET`.
     #[must_use]
     fn emits_allow(&self) -> bool {
         self.status == StatusCode::METHOD_NOT_ALLOWED
@@ -430,8 +406,6 @@ pub(crate) enum WireBody<'a> {
 
 #[cfg(feature = "sendfile")]
 impl ResponseHead<'_> {
-    /// Render the status line and header block as wire bytes, terminated by
-    /// the empty line.
     #[must_use]
     fn render(&self, conn_version: ConnectionVersion, conn_action: ConnectionAction) -> String {
         use crate::{
@@ -454,9 +428,8 @@ impl ResponseHead<'_> {
             retry_after,
         } = self;
 
-        // A cache-hit 200 carrying every optional validator renders to
-        // ~300 bytes and a 206 adds a ~50-byte `Content-Range`; 512 holds
-        // either (and an inline error body) without a regrow.
+        // Holds a cache-hit 206 with every optional validator (~350 bytes)
+        // or an inline error body without a regrow.
         let mut out = String::with_capacity(512);
         match kind {
             ResponseKind::TunnelEstablished => {
@@ -489,11 +462,8 @@ impl ResponseHead<'_> {
         out
     }
 
-    /// Write the head (and an inline body, if any) to the raw client stream,
-    /// rendered for `client`'s protocol version and keep-alive decision.
-    ///
-    /// Records the client status metric; times out after the configured
-    /// HTTP timeout.
+    /// Write the head (and an inline body, if any) to the raw client stream
+    /// and record the client status metric.
     pub(crate) async fn write_to(
         &self,
         client: ClientConn<'_>,
@@ -537,8 +507,7 @@ mod tests {
         http_etag::ETag, http_last_modified::LastModified, xattr_helpers::XattrValue as _,
     };
 
-    /// A config with the parallel-download hack on its defaults (`429`,
-    /// `Retry-After: 5`), for the nudge-head renderer tests.
+    /// The parallel-download hack on its defaults (`429`, `Retry-After: 5`).
     #[cfg(any(feature = "hyper", feature = "sendfile"))]
     fn nudge_config() -> Config {
         let mut config = Config::default();
@@ -661,9 +630,6 @@ mod tests {
             assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "42");
         }
 
-        /// The `416` head `hyper_conn.rs`'s `ServePlan::NotSatisfiable` arm
-        /// builds: an `Error` head naming the current representation length,
-        /// with `Content-Length` left to the empty body.
         #[test]
         fn unsatisfied_range_carries_content_range() {
             let response = render(ResponseHead::range_not_satisfiable(1234));
@@ -675,13 +641,6 @@ mod tests {
             assert_eq!(headers.get(CONTENT_LENGTH).unwrap(), "0");
         }
 
-        /// The `304` head `hyper_conn.rs`'s `ServePlan::NotModified` arm
-        /// builds: validators and `Age` only.  No `Content-Length` (RFC 9110
-        /// §8.6 permits one only when it equals the `200` representation's
-        /// length), no `Accept-Ranges`, and no `Server:` — a 304 answers on
-        /// the origin's behalf.  `http_helpers::ClientConn::write_304` must
-        /// stay header-for-header identical; see the `wire` twin of this
-        /// test.
         #[test]
         fn not_modified_head_carries_validators_only() {
             let response = render(ResponseHead::not_modified(
@@ -717,11 +676,8 @@ mod tests {
             assert!(!headers.contains_key(CONNECTION));
         }
 
-        /// The parallel-hack nudge, which both backends render from the one
-        /// head in `parallel_hack::nudge_head`: a keep-alive `Success` head,
-        /// so no `Server:`, and exactly one `Content-Length` -- the head sets
-        /// it explicitly, so hyper must not derive a second one from the
-        /// body's size hint.
+        /// Exactly one `Content-Length`: the head sets it explicitly, so
+        /// hyper must not derive a second one from the body's size hint.
         #[test]
         fn parallel_hack_nudge_head_is_pinned() {
             let response =
@@ -844,9 +800,6 @@ mod tests {
             assert!(header_lines(&wire).contains(&"Retry-After: 42"), "{wire}");
         }
 
-        /// `http_helpers::ClientConn::write_416` builds exactly this head: the
-        /// hyper `416` plus the explicit `Content-Length: 0` that frames the
-        /// empty body on a keep-alive raw socket.
         #[test]
         fn unsatisfied_range_carries_content_range() {
             let wire = render(&ResponseHead::range_not_satisfiable(1234));
@@ -864,8 +817,6 @@ mod tests {
             assert!(!has_header(&lines, "Content-Type"), "{wire}");
         }
 
-        /// `http_helpers::ClientConn::write_304` builds exactly this head; it
-        /// must stay header-for-header the hyper backend's 304.
         #[test]
         fn not_modified_head_carries_validators_only() {
             let wire = render(&ResponseHead::not_modified(
@@ -893,8 +844,6 @@ mod tests {
             assert!(!has_header(&lines, "Server"), "{wire}");
         }
 
-        /// The wire bytes of the parallel-hack nudge head, pinned in full:
-        /// the sendfile/splice backends write these plus the inline body.
         #[test]
         fn parallel_hack_nudge_head_is_pinned() {
             let wire = render(&nudge_head(&nudge_config()));

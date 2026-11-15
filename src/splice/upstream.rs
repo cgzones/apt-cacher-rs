@@ -1,13 +1,8 @@
 //! Upstream connection plumbing for the splice proxy: the [`UpstreamConn`]
-//! enum (plain TCP, userspace TLS) with its [`ConnLabel`] log rendering, the per-host idle pool behind [`ResponseBody`]
-//! the TCP/TLS connect helpers
-//! ([`connect_upstream`], [`tcp_connect`], `tls_connect`) and the
+//! enum (plain TCP, userspace TLS), the per-host idle pool behind
+//! [`ResponseBody`], the TCP/TLS connect helpers and the
 //! [`ConnectError`]/[`Transience`] classification consumed by the retry
-//! loop in `acquire`. Also hosts the process-wide `TLS_CLIENT_CONFIG` that
-//! `main.rs` initialises.
-//!
-//! Consumers: `acquire` (connect, pool checkout, labels), `http` and `body`
-//! (read/write through the connection).
+//! loop in `acquire`.
 
 #[cfg(feature = "tls_rustls")]
 use std::sync::Arc;
@@ -42,13 +37,11 @@ use crate::{
 #[cfg(feature = "tls_rustls")]
 pub(crate) static TLS_CLIENT_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
 
-/// How long an idle pooled connection is kept before eviction.
 const POOL_IDLE_TIMEOUT: coarsetime::Duration = coarsetime::Duration::from_secs(90);
 
 /// Buffer size for TLS upstream reads by the `super::http` head scanners and
-/// buffered-body collectors; 256 KiB costs one allocation per read site. The
-/// userspace-TLS body loop (`super::body::splice_proxy_body_tls`) reads into
-/// its cache batch instead, which is sized by the batch policy.
+/// buffered-body collectors. The userspace-TLS body loop reads into its cache
+/// batch instead.
 pub(super) const TLS_READ_BUF_SIZE: usize = 256 * 1024;
 
 #[cfg_attr(
@@ -83,8 +76,7 @@ impl std::fmt::Display for ConnLabel {
     }
 }
 
-/// Userspace-TLS upstream stream of the selected TLS backend. The one `cfg`
-/// pair here keeps every `UpstreamConn::Tls` match arm backend-agnostic.
+/// Userspace-TLS upstream stream of the selected TLS backend.
 #[cfg(feature = "tls_rustls")]
 type TlsStream = tokio_rustls::client::TlsStream<TcpStream>;
 
@@ -136,16 +128,11 @@ impl AsyncWrite for UpstreamConn {
 }
 
 impl UpstreamConn {
-    /// Whether the connection is encrypted: decides the upstream port, the
-    /// pool key and the log label. Derived from the variant on demand, never
-    /// cached, so it cannot drift from the socket it describes.
     #[must_use]
     pub(super) const fn is_tls(&self) -> bool {
         matches!(self, Self::Tls(_))
     }
 
-    /// The scheme the connection was dialled with, derived from the variant
-    /// like [`Self::is_tls`].
     #[must_use]
     pub(super) const fn scheme(&self) -> Scheme {
         if self.is_tls() {
@@ -178,10 +165,8 @@ struct PooledConn {
 
 /// Pool key includes TLS flag so HTTP and HTTPS connections to the same
 /// (host, port) — possible on mirrors reachable via both protocols on a
-/// non-default port — never get mixed up. The host is the refcounted
-/// `ClientHost` the mirror already carries, so building a key for a lookup
-/// is a refcount bump, not an allocation: no borrowed-key `Equivalent`
-/// mirror is needed here.
+/// non-default port — never get mixed up. `ClientHost` is refcounted, so
+/// building a key for a lookup does not allocate.
 type PoolKey = (ClientHost, u16, bool);
 
 static UPSTREAM_POOL: OnceLock<parking_lot::Mutex<hashbrown::HashMap<PoolKey, Vec<PooledConn>>>> =
@@ -222,7 +207,6 @@ impl<'a> From<UpstreamEndpoint<'a>> for scheme_cache::SchemeKeyRef<'a> {
     }
 }
 
-/// Resolve the dial port, defaulting to 80 or 443 based on TLS.
 pub(super) fn endpoint_port(endpoint: UpstreamEndpoint<'_>, is_tls: bool) -> u16 {
     endpoint
         .port
@@ -237,7 +221,6 @@ fn named_port(port: u16, is_tls: bool) -> Option<NonZero<u16>> {
     NonZero::new(port).filter(|port| port.get() != if is_tls { 443 } else { 80 })
 }
 
-/// What [`pool_checkout`] found for a key.
 #[cfg_attr(
     feature = "tls_rustls",
     expect(
@@ -271,8 +254,8 @@ fn pool_pop(host: &ClientHost, port: u16, is_tls: bool) -> Option<PooledConn> {
 /// Try to retrieve a live idle connection from the pool.
 ///
 /// Walks the key's entries most-recently-returned first and probes each
-/// ([`UpstreamConn::check_alive`], one non-blocking syscall) outside the
-/// lock: a server that closes after a request cap kills the busiest entry
+/// outside the lock: a server that closes after a request cap kills the
+/// busiest entry
 /// first, and giving up on it would open a fresh connection while a live
 /// one sat below it.
 pub(super) fn pool_checkout(host: &ClientHost, port: u16, is_tls: bool) -> PoolCheckout {
@@ -318,11 +301,8 @@ fn pool_take_idle(
     expired
 }
 
-/// Drop every pooled connection that idled past [`POOL_IDLE_TIMEOUT`].
-///
-/// Runs from [`pool_reaper`], independently of request traffic. Checkout
-/// and return only inspect their own key, keeping full-map scans off the
-/// per-request path.
+/// Checkout and return only inspect their own key; this full-map scan runs
+/// from [`pool_reaper`], off the per-request path.
 fn reap_idle_pool() {
     let now = coarsetime::Instant::now();
     let expired = pool_take_idle(&mut upstream_pool().lock(), now);
@@ -335,10 +315,8 @@ fn reap_idle_pool() {
     drop(expired);
 }
 
-/// The periodic sweep behind [`reap_idle_pool`]: one tick per
-/// [`POOL_IDLE_TIMEOUT`], so an entry lives at most twice the timeout on an
-/// otherwise idle proxy. Spawned once by the main loop; runs until the
-/// runtime shuts down.
+/// One tick per [`POOL_IDLE_TIMEOUT`], so an entry lives at most twice the
+/// timeout on an otherwise idle proxy.
 pub(crate) async fn pool_reaper() {
     let mut interval = tokio::time::interval(POOL_IDLE_TIMEOUT.into());
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -540,7 +518,6 @@ impl UpstreamConn {
         }
     }
 
-    /// The TCP socket under the connection.
     fn raw_fd(&self) -> RawFd {
         match self {
             Self::Tcp(tcp) => tcp.as_raw_fd(),
@@ -604,9 +581,6 @@ pub(super) enum Transience {
     Permanent,
 }
 
-/// An upstream connect failure, tagged with whether retrying it can plausibly
-/// succeed. Retrying a deterministic failure costs a full TCP connect plus a
-/// full TLS handshake per attempt and buys nothing.
 pub(super) struct ConnectError {
     pub(super) transience: Transience,
     pub(super) err: std::io::Error,
@@ -617,7 +591,6 @@ pub(super) struct ConnectError {
 }
 
 impl ConnectError {
-    /// Pair an already-classified failure with the error it was derived from.
     fn new(transience: Transience, err: std::io::Error) -> Self {
         Self {
             transience,
@@ -626,8 +599,6 @@ impl ConnectError {
         }
     }
 
-    /// The upstream's certificate was rejected; retrying re-runs the same
-    /// verification against the same chain.
     fn certificate_rejection(err: std::io::Error) -> Self {
         Self {
             transience: Transience::Permanent,
@@ -641,8 +612,7 @@ impl ConnectError {
         Self::new(Transience::Transient, err)
     }
 
-    /// Deterministic for this (host, scheme): unparsable server name, certificate
-    /// rejection. Retrying re-runs the same handshake and fails identically.
+    /// Deterministic for this (host, scheme), e.g. an unparsable server name.
     fn permanent(err: std::io::Error) -> Self {
         Self::new(Transience::Permanent, err)
     }
@@ -657,10 +627,9 @@ impl ConnectError {
 /// may be a transport hiccup.
 ///
 /// Pass the kind of the *original* error, before it is wrapped: a wrapper
-/// reports its own kind and keeps the cause behind `source()`. Split out of
-/// [`ConnectError`] so it stays unit-testable. The native-tls backend has no
-/// kinds to classify (its error is opaque) and treats every failure as
-/// transient.
+/// reports its own kind and keeps the cause behind `source()`. The native-tls
+/// backend has no kinds to classify (its error is opaque) and treats every
+/// failure as transient.
 #[cfg(feature = "tls_rustls")]
 const fn classify_tls_error(kind: ErrorKind) -> Transience {
     if matches!(kind, ErrorKind::InvalidData | ErrorKind::InvalidInput) {
@@ -795,7 +764,6 @@ async fn tcp_connect(host: &ClientHost, port: u16) -> std::io::Result<TcpStream>
         })
 }
 
-/// The error a TLS handshake that outlived `http_timeout` fails with.
 fn handshake_timed_out(http_timeout: Duration) -> ConnectError {
     metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
     ConnectError::transient(std::io::Error::new(
@@ -807,9 +775,6 @@ fn handshake_timed_out(http_timeout: Duration) -> ConnectError {
     ))
 }
 
-/// Perform TLS handshake over an established TCP connection.
-///
-/// Times out after the configured HTTP timeout.
 #[cfg(feature = "tls_rustls")]
 async fn tls_connect(tcp: TcpStream, host: &ClientHost) -> Result<TlsStream, ConnectError> {
     let connector = tokio_rustls::TlsConnector::from(Arc::clone(
@@ -854,10 +819,7 @@ async fn tls_connect(tcp: TcpStream, host: &ClientHost) -> Result<TlsStream, Con
 ///
 /// One `SSL_CTX` for every upstream connection: building a connector loads
 /// and parses the whole system CA bundle, and separate contexts share no
-/// session cache, so a per-connect connector paid that parse on every dial
-/// and could never resume a TLS session. The rustls backend gets the same
-/// sharing from `TLS_CLIENT_CONFIG`. A build failure is not cached: it is
-/// the local TLS stack refusing to initialise, reported per connect.
+/// session cache. A build failure is not cached, but reported per connect.
 #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
 fn native_tls_connector() -> Result<tokio_native_tls::TlsConnector, ConnectError> {
     static CONNECTOR: OnceLock<tokio_native_tls::TlsConnector> = OnceLock::new();
@@ -876,9 +838,6 @@ fn native_tls_connector() -> Result<tokio_native_tls::TlsConnector, ConnectError
     Ok(CONNECTOR.get_or_init(|| connector).clone())
 }
 
-/// Perform TLS handshake over an established TCP connection with timeout.
-///
-/// Times out after the configured HTTP timeout.
 #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
 async fn tls_connect(tcp: TcpStream, host: &ClientHost) -> Result<TlsStream, ConnectError> {
     let connector = native_tls_connector()?;
@@ -1041,8 +1000,6 @@ mod tests {
         );
     }
 
-    /// A pool holding only closed connections is a `Dead` miss (the entries
-    /// were there but unusable), distinct from an `Empty` one.
     #[tokio::test]
     async fn pool_checkout_reports_dead_when_every_entry_is_closed() {
         let (dead, dead_peer) = connected_tcp_pair().await;
@@ -1061,8 +1018,6 @@ mod tests {
         ));
     }
 
-    /// Checkout closes expired sockets and keeps looking for a live entry;
-    /// expiry alone remains an empty miss rather than a dead-peer miss.
     #[tokio::test]
     async fn pool_checkout_discards_expired_entries_without_counting_them_dead() {
         let host = test_host("pool-checkout-expired.invalid");

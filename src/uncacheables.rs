@@ -13,8 +13,6 @@ use crate::{config::ClientHost, metrics, nonzero, ringbuffer::RingBuffer};
 
 pub(crate) const UNCACHEABLES_MAX: NonZero<usize> = nonzero!(20);
 
-/// One uncacheable request: the host and port the client named, and the
-/// path it asked for. The port is part of the identity, as a mirror's is.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Uncacheable {
     host: ClientHost,
@@ -38,10 +36,6 @@ impl Uncacheable {
 static UNCACHEABLES: LazyLock<parking_lot::RwLock<RingBuffer<Uncacheable>>> =
     LazyLock::new(|| parking_lot::RwLock::new(RingBuffer::new(UNCACHEABLES_MAX)));
 
-/// Record a request as uncacheable for web-interface display.
-///
-/// A re-recorded entry moves to the end, refreshing its most-recently-seen
-/// position.
 pub(crate) fn record_uncacheable(host: &ClientHost, port: Option<NonZero<u16>>, path: &str) {
     let uncacheables = &mut *UNCACHEABLES.write();
 
@@ -61,10 +55,8 @@ pub(crate) fn record_uncacheable(host: &ClientHost, port: Option<NonZero<u16>>, 
             port,
             path: path.to_owned(),
         });
-        // Bump only on a fresh (host, port, path) insertion so the counter
-        // tracks unique resources observed (not raw request count). This
-        // is what the dashboard's "Uncacheable Evictions" line subtracts
-        // UNCACHEABLES_MAX from.
+        // Fresh entries only: the dashboard's "Uncacheable Evictions" line
+        // subtracts UNCACHEABLES_MAX from this counter.
         metrics::UNCACHEABLE.increment();
     }
 }

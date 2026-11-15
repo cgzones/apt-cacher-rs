@@ -20,11 +20,9 @@ const HTTP_DATE_FORMAT: &[FormatItem<'_>] = format_description!(
 /// digits (`Sun, 06 Nov 1994 08:49:37 GMT`).
 const IMF_FIXDATE_LEN: usize = 29;
 
-/// An IMF-fixdate held inline, as [`format_http_date`] returns it.
-///
-/// `Copy` and heap-free, so each response takes its own copy of the `Date`
-/// text rather than sharing one allocation (and its refcount) across
-/// threads.  Dereferences to `str`.
+/// An IMF-fixdate held inline: `Copy` and heap-free, so each response takes
+/// its own copy of the `Date` text rather than sharing one allocation (and
+/// its refcount) across threads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HttpDateText([u8; IMF_FIXDATE_LEN]);
 
@@ -52,46 +50,34 @@ impl std::fmt::Display for HttpDateText {
 
 /// A wall-clock point in time at HTTP-date (1-second) granularity.
 ///
-/// HTTP date headers (RFC 9110 §5.6.7, IMF-fixdate) encode whole seconds since the
-/// Unix epoch, so this is the natural precision for `Last-Modified`, `If-Range`,
-/// `If-Modified-Since`, and the `Date` header.
-///
-/// All constructors clamp the stored value to [`Self::MAX_SECS`], the last instant
-/// `OffsetDateTime` can represent, which is what makes [`HttpDate::format`]
-/// total: a filesystem reporting an absurd `st_mtime`/`st_btime` (the values
-/// reaching [`cache_file_http_date`]) yields the clamped date instead of
-/// panicking inside the formatter.
-///
-/// The current value is read via [`HttpDate::now`], which uses
-/// `coarsetime::Clock::now_since_epoch()` (`CLOCK_REALTIME_COARSE` on Linux — a
-/// jiffy-updated read, much cheaper than `SystemTime::now()`).
+/// All constructors clamp the stored value to [`Self::MAX_SECS`], which is
+/// what makes [`HttpDate::format`] total: a filesystem reporting an absurd
+/// `st_mtime`/`st_btime` yields the clamped date instead of panicking inside
+/// the formatter.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct HttpDate(u64);
 
 impl HttpDate {
     pub(crate) const UNIX_EPOCH: Self = Self(0);
 
-    /// Inclusive upper bound on the stored seconds value: `9999-12-31
-    /// 23:59:59 UTC`, the largest instant `OffsetDateTime` accepts from
-    /// `from_unix_timestamp` (the `time` crate's `large-dates` feature, which
-    /// would widen it, is off).  Clamping every constructor here is what lets
-    /// [`HttpDate::format`] `expect` both the `i64` conversion and the
-    /// `OffsetDateTime` construction.
+    /// `9999-12-31 23:59:59 UTC`, the largest instant `OffsetDateTime`
+    /// accepts from `from_unix_timestamp` (the `time` crate's `large-dates`
+    /// feature, which would widen it, is off).
     const MAX_SECS: u64 = 253_402_300_799;
 
-    /// Construct a value, clamping at [`Self::MAX_SECS`].
     #[must_use]
     fn clamped(secs: u64) -> Self {
         Self(secs.min(Self::MAX_SECS))
     }
 
-    /// Current wall-clock time truncated to whole seconds.
+    /// Reads the coarse clock (`CLOCK_REALTIME_COARSE`), much cheaper than
+    /// `SystemTime::now()`.
     #[must_use]
     fn now() -> Self {
         Self::clamped(coarsetime::Clock::now_since_epoch().as_secs())
     }
 
-    /// Whole seconds elapsed from `self` to now, None for future dates.
+    /// `None` for future dates.
     #[must_use]
     fn elapsed_secs(self) -> Option<u64> {
         Self::now().0.checked_sub(self.0)
@@ -103,7 +89,6 @@ impl HttpDate {
         self.format_inline().as_str().to_owned()
     }
 
-    /// [`Self::format`] into an inline buffer, without allocating.
     #[must_use]
     pub(crate) fn format_inline(self) -> HttpDateText {
         let secs_i64 = i64::try_from(self.0).expect("HttpDate is clamped to MAX_SECS");
@@ -139,12 +124,10 @@ impl HttpDate {
 }
 
 impl From<SystemTime> for HttpDate {
-    /// Converts a `SystemTime` to `HttpDate`, rounding up any sub-second component
-    /// and clamping to [`HttpDate::MAX_SECS`].
-    ///
-    /// Rounding up matches HTTP semantics: if a file changed at T+0.5s, reporting
-    /// `Last-Modified: T+1` is safe — an `If-Modified-Since: T` request correctly
-    /// reports "modified" rather than serving a stale 304.
+    /// Rounds up any sub-second component: if a file changed at T+0.5s,
+    /// reporting `Last-Modified: T+1` is safe — an `If-Modified-Since: T`
+    /// request correctly reports "modified" rather than serving a stale 304.
+    /// A time before the Unix epoch becomes the epoch.
     fn from(t: SystemTime) -> Self {
         match t.duration_since(SystemTime::UNIX_EPOCH) {
             Ok(d) => {
@@ -156,21 +139,14 @@ impl From<SystemTime> for HttpDate {
                 };
                 Self::clamped(rounded)
             }
-            Err(_e @ SystemTimeError { .. }) => {
-                // If the system time is before the Unix epoch, return the Unix epoch
-                Self::UNIX_EPOCH
-            }
+            Err(_e @ SystemTimeError { .. }) => Self::UNIX_EPOCH,
         }
     }
 }
 
-/// Format the current date and time as an HTTP date string.
-///
-/// Every response writer calls this once per response for the `Date`
+/// The current time as an HTTP date. Called once per response for the `Date`
 /// header, so the rendering is cached per thread at 1-second granularity:
-/// the steady state touches no shared memory, no lock and no refcount, and
-/// returns the text by value.  Each thread formats once per second it
-/// serves in.
+/// the steady state touches no shared memory, no lock and no refcount.
 #[must_use]
 pub(crate) fn format_http_date() -> HttpDateText {
     thread_local! {
@@ -194,29 +170,16 @@ pub(crate) fn format_http_date() -> HttpDateText {
 /// (2^31).
 const AGE_OVERFLOW_VALUE: u64 = 1u64 << 31;
 
-/// Return the timestamp considered representative of when a cached file was last replaced.
+/// The timestamp of when a cached file's content appeared in the cache: its
+/// creation time, as entries are replaced by rename-over.
 ///
-/// Permanent cache entries are replaced atomically (rename-over), so the file's creation
-/// timestamp is the best proxy for "when did this content first appear in the cache" and is
-/// used when the filesystem reports it.
-///
-/// On filesystems without birth-time support the function falls back to the modification
-/// timestamp. This has a subtle consequence for *volatile* files: revalidation touches the
-/// mtime (see `touch_volatile_mtime`) to record the last upstream check, so on non-btime
-/// filesystems the returned timestamp tracks that instead of the original creation time.
-/// Permanent entries are unaffected since they are never mtime-touched after rename.
-///
-/// The first client of a download whose upstream sent no `Last-Modified` gets the same
-/// fallback: both backends synthesize one from the temp file at open (`CacheInfo::with_meta`
-/// in hyper's `serve_unfinished_file`, `HeadValidators::last_modified` for splice). Without
-/// btime that is the mtime at the start of the download, while later cache hits see the
-/// mtime of the last body write, so a download crossing a second boundary hands out a
-/// validator no later hit reproduces: `If-Range` fails safe to a full 200,
-/// `If-Modified-Since` costs one refetch. The same drift voids the splice `If-Range` match
-/// on a resume: a retry resuming a `.partial` with the date its interrupted first attempt
-/// sent should get its `206`, but the partial's mtime has since moved with that attempt's
-/// writes, so the resumed download synthesizes a later date and the retry gets a full 200.
-/// Accepted as a degradation of such filesystems, which startup only warns about.
+/// Filesystems without birth time fall back to the mtime, which is not
+/// stable: revalidation touches a volatile file's mtime, and a download whose
+/// upstream sent no `Last-Modified` hands its first client a date synthesized
+/// at open that later cache hits (seeing the last body write's mtime) do not
+/// reproduce. Then `If-Range` fails safe to a full 200 and
+/// `If-Modified-Since` costs one refetch. Accepted as a degradation of such
+/// filesystems, which startup only warns about.
 #[must_use]
 pub(crate) fn cache_file_http_date(metadata: &std::fs::Metadata) -> HttpDate {
     let st = metadata.created().unwrap_or_else(|_err| {
@@ -227,21 +190,16 @@ pub(crate) fn cache_file_http_date(metadata: &std::fs::Metadata) -> HttpDate {
     HttpDate::from(st)
 }
 
-/// Compute the HTTP `Age` header value (in seconds) for a cached file.
-///
-/// Uses the file's creation timestamp (or modification timestamp as fallback). Saturates to
-/// `AGE_OVERFLOW_VALUE` per RFC 9111 §5.1, and returns 0 if the timestamp is somehow in the
-/// future (e.g. clock skew).
+/// The HTTP `Age` header value for a cached file: 0 if its timestamp is in
+/// the future (clock skew), saturating per RFC 9111 §5.1.
 #[must_use]
 pub(crate) fn compute_age(metadata: &std::fs::Metadata) -> u32 {
     let age = cache_file_http_date(metadata).elapsed_secs().unwrap_or(0);
     age.min(AGE_OVERFLOW_VALUE) as u32
 }
 
-/// Result of parsing an HTTP Range request header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ParsedRange {
-    /// Valid, satisfiable range.
     Satisfiable(ContentRange),
     /// The Range header is syntactically malformed. Per RFC 9110 §14.2, the recipient
     /// should ignore the header and serve the full entity (200).
@@ -282,7 +240,6 @@ enum RangeSpec {
     Suffix { length: u64 },
 }
 
-/// Computes the requested bytes range.
 #[must_use]
 pub(crate) fn http_parse_range(
     range: &str,
@@ -348,8 +305,7 @@ pub(crate) fn http_parse_range(
     }
 
     // A zero-length entity admits no satisfiable byte range (RFC 9110
-    // §14.1.2: a valid range requires start < current length, impossible at
-    // length zero); both arms yield `NotSatisfiable` for it.
+    // §14.1.2); both arms yield `NotSatisfiable` for it.
     let (start, end) = match spec {
         RangeSpec::Span { first, last } => {
             if first >= file_size {
@@ -358,8 +314,6 @@ pub(crate) fn http_parse_range(
             (first, last.map_or(file_size - 1, |e| min(e, file_size - 1)))
         }
         RangeSpec::Suffix { length } => {
-            // A zero suffix-length is unsatisfiable, and so is any suffix
-            // of a zero-length file.
             if length == 0 || file_size == 0 {
                 return ParsedRange::NotSatisfiable;
             }
@@ -384,16 +338,12 @@ pub(crate) fn http_parse_range(
     )
 }
 
-/// Evaluate an `If-Range` precondition (RFC 9110 §13.1.5) against the
-/// representation a `Range` would be cut from.
+/// Evaluate an `If-Range` precondition (RFC 9110 §13.1.5).
 ///
-/// An entity-tag condition must be a *strong* comparison against the stored
-/// `ETag`; a weak tag on either side never matches, because a weak validator
-/// says nothing about byte-for-byte identity.  An HTTP-date condition must
-/// match `cache_time` *exactly*, not merely be no older: a client holding a
-/// validator we cannot reproduce (e.g. the file-birth-time fallback) fails
-/// the condition and gets a safe full 200 instead of risking a 206 stitched
-/// onto bytes from a different revision.  An unparsable date fails too.
+/// An entity-tag must compare *strongly*: a weak tag on either side never
+/// matches. An HTTP-date must match `cache_time` *exactly*, not merely be no
+/// older: a client holding a validator we cannot reproduce gets a safe full
+/// 200 instead of a 206 stitched onto bytes from a different revision.
 #[must_use]
 fn if_range_matches(if_range: &str, cache_time: HttpDate, file_etag: Option<&str>) -> bool {
     if if_range.starts_with('"') {
@@ -407,8 +357,7 @@ fn if_range_matches(if_range: &str, cache_time: HttpDate, file_etag: Option<&str
 
 /// A parsed `Content-Range: bytes <start>-<end>/<total>` response header.
 ///
-/// The constructors reject everything but `start <= end < total`.  Those bounds are what make [`Self::total`]
-/// and [`Self::span`] `NonZero` and [`Self::runs_to_end`] wrap-free.
+/// Invariant: `start <= end < total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ContentRange {
     start: u64,
@@ -425,7 +374,6 @@ impl ContentRange {
         })
     }
 
-    /// First byte of the range.
     #[must_use]
     pub(crate) const fn start(self) -> u64 {
         self.start
@@ -437,7 +385,7 @@ impl ContentRange {
         self.total
     }
 
-    /// Number of bytes the range covers (`end - start + 1`).
+    /// Number of bytes the range covers.
     #[must_use]
     pub(crate) fn span(self) -> NonZero<u64> {
         NonZero::<u64>::MIN.saturating_add(self.end - self.start)
@@ -456,8 +404,6 @@ impl std::fmt::Display for ContentRange {
     }
 }
 
-/// Parse an HTTP `Content-Range` response header value.
-///
 /// Expects the complete `bytes {start}-{end}/{total}` form; the `*`
 /// unsatisfied-range and unknown-total spellings and any inconsistent
 /// bounds yield `None`.
@@ -484,7 +430,6 @@ mod tests {
         if_range_matches, parse_content_range,
     };
 
-    /// Helper to unwrap a `ParsedRange::Satisfiable` for concise test assertions.
     fn satisfiable(r: ParsedRange) -> Option<(String, u64, u64)> {
         match r {
             ParsedRange::Satisfiable(range) => {
@@ -494,7 +439,6 @@ mod tests {
         }
     }
 
-    /// The expected parse of a `bytes start-end/total` value.
     fn content_range(start: u64, end: u64, total: u64) -> ContentRange {
         ContentRange {
             start,
@@ -570,9 +514,6 @@ mod tests {
 
     #[test]
     fn clamps_to_max_representable_date() {
-        // An out-of-range seconds value must clamp so that `format` is total:
-        // both the i64 cast and `OffsetDateTime::from_unix_timestamp` inside
-        // it are infallible only because of this.
         assert_eq!(
             HttpDate::from_secs(u64::MAX),
             HttpDate::from_secs(u64::MAX - 1),
@@ -582,8 +523,6 @@ mod tests {
             HttpDate::from_secs(u64::MAX).format(),
             "Fri, 31 Dec 9999 23:59:59 GMT"
         );
-        // A filesystem reporting an absurd birth/modification time reaches
-        // `format` through `cache_file_http_date`; it must clamp, not panic.
         assert_eq!(
             HttpDate::from(SystemTime::UNIX_EPOCH + Duration::from_secs(300_000_000_001)).format(),
             "Fri, 31 Dec 9999 23:59:59 GMT"
@@ -592,12 +531,10 @@ mod tests {
 
     #[test]
     fn systemtime_round_trip() {
-        // Whole seconds pass through unchanged.
         assert_eq!(
             HttpDate::from(SystemTime::UNIX_EPOCH + Duration::from_secs(42)),
             HttpDate::from_secs(42)
         );
-        // Pre-epoch clocks saturate to UNIX_EPOCH.
         assert_eq!(
             HttpDate::from(SystemTime::UNIX_EPOCH - Duration::from_secs(1)),
             HttpDate::UNIX_EPOCH
@@ -954,7 +891,6 @@ mod tests {
 
     #[test]
     fn parse_content_range_test() {
-        // Valid ranges
         assert_eq!(
             parse_content_range("bytes 0-499/1000"),
             Some(content_range(0, 499, 1000))
@@ -972,31 +908,23 @@ mod tests {
             Some(content_range(34_744_111, 1_071_434_819, 1_071_434_820))
         );
 
-        // Invalid: missing prefix
         assert_eq!(parse_content_range("0-499/1000"), None);
-        // Invalid: start > end
+        // start > end
         assert_eq!(parse_content_range("bytes 500-499/1000"), None);
-        // Invalid: end >= total
+        // end >= total
         assert_eq!(parse_content_range("bytes 0-1000/1000"), None);
-        // Invalid: no slash
         assert_eq!(parse_content_range("bytes 0-499"), None);
-        // Invalid: no dash
         assert_eq!(parse_content_range("bytes 0/1000"), None);
-        // Invalid: wildcard total
         assert_eq!(parse_content_range("bytes 0-499/*"), None);
-        // Invalid: empty
         assert_eq!(parse_content_range(""), None);
         for signed in ["bytes +0-1/2", "bytes 0-+1/2", "bytes 0-1/+2"] {
             assert_eq!(parse_content_range(signed), None);
         }
-        // Invalid: garbage
         assert_eq!(parse_content_range("bytes abc-def/ghi"), None);
     }
 
     #[test]
     fn parse_content_range_accepts_boundary() {
-        // The boundary case: start=0, end=u64::MAX-1, total=u64::MAX.
-        // start <= end, end < total, end - start + 1 = u64::MAX (fits in u64).
         let s = format!("bytes 0-{}/{}", u64::MAX - 1, u64::MAX);
         let parsed = parse_content_range(&s).expect("consistent bounds");
         assert_eq!(parsed.start(), 0);
@@ -1007,20 +935,16 @@ mod tests {
 
     #[test]
     fn content_range_derives_span_and_tail() {
-        // A middle slice: the span is inclusive of both ends and the range
-        // stops short of the last byte.
         let middle = parse_content_range("bytes 40-98/100").expect("consistent bounds");
         assert_eq!(middle.start(), 40);
         assert_eq!(middle.total().get(), 100);
         assert_eq!(middle.span().get(), 59);
         assert!(!middle.runs_to_end());
 
-        // The remainder of the object, as a resume answer delivers it.
         let tail = parse_content_range("bytes 40-99/100").expect("consistent bounds");
         assert_eq!(tail.span().get(), 60);
         assert!(tail.runs_to_end());
 
-        // A single-byte tail is still a span of one.
         let last = parse_content_range("bytes 99-99/100").expect("consistent bounds");
         assert_eq!(last.span().get(), 1);
         assert!(last.runs_to_end());

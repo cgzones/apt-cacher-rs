@@ -1,10 +1,6 @@
 //! Shared parsing primitives for Debian `Packages` stanzas: the `Filename:`
 //! field, hex-encoded `SHA256:` / `SHA512:` digests, and the small helpers
 //! that derive cache lookup keys from a stanza's relative path.
-//!
-//! Used by `integrity.rs` (post-commit registry ingest/verify) and the
-//! `cleanup` sweep (and its tests). Cold-path only; the helpers
-//! stay free of hot-path-specific coupling.
 
 use std::{borrow::Cow, io, str::Utf8Error};
 
@@ -17,16 +13,14 @@ use crate::{
 
 /// Split one stanza line into its deb822 field name and trimmed value.
 ///
-/// **Security**: `None` for a continuation line (leading space or tab) - it
-/// folds into the field above it and is never a field of its own. A package
-/// maintainer writes such lines verbatim into a long `Description:`, so
-/// reading `  SHA256: <hex>` there as a field would let any maintainer
+/// **Security**: `None` for a continuation line (leading space or tab). A
+/// package maintainer writes such lines verbatim into a long `Description:`,
+/// so reading `  SHA256: <hex>` there as a field would let any maintainer
 /// override the digest the registry expects for any deb (a persistent
-/// checksum-mismatch denial of service), and a `Translation-*` blob would
-/// read as a `Packages` index. `None` too for a line without a colon.
+/// checksum-mismatch denial of service).
 ///
-/// Splits bytes, matching ASCII only: a `Packages` line need be UTF-8 only
-/// where [`Stanza::ingest`] decodes a value ([`field_text`]).
+/// Splits bytes: a `Packages` line need be UTF-8 only where a tracked value
+/// is decoded ([`field_text`]).
 fn split_field(line: &[u8]) -> Option<(&[u8], &[u8])> {
     if matches!(line.first(), Some(b' ' | b'\t')) {
         return None;
@@ -35,11 +29,10 @@ fn split_field(line: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((&line[..colon], line[colon + 1..].trim_ascii()))
 }
 
-/// Decode the value of a field [`Stanza`] reads. A tracked field that is not
-/// UTF-8 fails the whole index read, as any non-UTF-8 line once did: a
-/// consumer acting on part of an index (cleanup's reference set) must not
-/// mistake it for the whole. The bytes of every other field are never
-/// decoded, so a Latin-1 `Description:` is harmless.
+/// A tracked field that is not UTF-8 fails the whole index read: a consumer
+/// acting on part of an index (cleanup's reference set) must not mistake it
+/// for the whole. Other fields are never decoded, so a Latin-1
+/// `Description:` is harmless.
 fn field_text(value: &[u8]) -> io::Result<&str> {
     std::str::from_utf8(value).map_err(|_err @ Utf8Error { .. }| {
         io::Error::new(
@@ -49,17 +42,12 @@ fn field_text(value: &[u8]) -> io::Result<&str> {
     })
 }
 
-/// Gate a `Filename:` field value; `Err` carries the rejected value so
-/// [`Stanza::ingest`] can log it.
+/// Gate a `Filename:` field value; `Err` carries the rejected value for the
+/// log.
 ///
-/// Leading `./` segments are stripped ([`strip_leading_dot_segments`]) before
-/// the gate, so the value matches the cache path the key is compared against.
-///
-/// **Security**: rejects empty values, absolute paths, ASCII control bytes
-/// (including NUL and DEL), backslash, and any segment equal to `..` or `.`.
-/// An attacker-controlled upstream `Packages` stanza could otherwise inject a
-/// traversal sequence; rejecting here keeps downstream `HashMap` keys and
-/// filesystem joins honest.
+/// **Security**: an attacker-controlled upstream `Packages` stanza could
+/// otherwise inject a traversal sequence into downstream `HashMap` keys and
+/// filesystem joins.
 fn filename_value(value: &str) -> Result<&str, &str> {
     let filepath = strip_leading_dot_segments(value);
     if is_safe_filename_relpath(filepath) {
@@ -69,22 +57,13 @@ fn filename_value(value: &str) -> Result<&str, &str> {
     }
 }
 
-/// Strip the leading `./` segments an index generator may prefix onto a
-/// repo-relative path, so the value matches the cache path it is keyed
-/// against.
-///
 /// `apt-ftparchive packages .` (and `apt-ftparchive release .`) writes the
 /// directory argument verbatim, so whole flat archives publish every
-/// `Filename:` as `./<deb>`. Those are not traversal - `.` resolves to the
-/// same directory - but the cleanup candidate map and the checksum registry
-/// are keyed by the path relative to the mirror root, so an unstripped `./`
-/// misses every lookup just as silently as a rejection.
+/// `Filename:` as `./<deb>`, while the cleanup candidate map and the
+/// checksum registry are keyed by the path relative to the mirror root.
 ///
-/// Deliberately leading-only: it keeps the borrow (no allocation on the
-/// per-stanza path), and an interior `.` segment - which would need one to
-/// normalise - is not something any generator emits. Those still fail
-/// [`is_safe_filename_relpath`], as do `..` segments at any position: a
-/// leading `../` is left in place for the gate to reject.
+/// Leading-only: no generator emits an interior `.` segment, and those (like
+/// `..` anywhere) still fail [`is_safe_filename_relpath`].
 fn strip_leading_dot_segments(mut s: &str) -> &str {
     while let Some(rest) = s.strip_prefix("./") {
         s = rest;
@@ -92,9 +71,6 @@ fn strip_leading_dot_segments(mut s: &str) -> &str {
     s
 }
 
-/// `true` iff `s` is a safe relative path: non-empty, no leading `/`, no
-/// backslash, no ASCII control character (`< 0x20`, plus `0x7f` DEL), and
-/// every `/`-separated segment is non-empty and not `.` or `..`.
 fn is_safe_filename_relpath(s: &str) -> bool {
     if s.is_empty() || s.starts_with('/') {
         return false;
@@ -106,29 +82,21 @@ fn is_safe_filename_relpath(s: &str) -> bool {
         .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
-/// Derive the on-disk cache key for a structured-pool entry: the `.deb`
-/// basename. Borrows from `relpath` to avoid allocating a fresh `String` per
-/// matched stanza (the returned key borrows the input — the caller's source
-/// string must outlive it).
+/// The on-disk cache key for a structured-pool entry: the `.deb` basename.
 ///
-/// `relpath` must have passed [`is_safe_filename_relpath`] (a [`Stanza`]'s
-/// `Filename:` has): with no empty, `.` or `..` segment, the last
-/// `/`-separated segment is exactly what `Path::file_name` would return,
-/// without its component parser.
+/// `relpath` must have passed [`is_safe_filename_relpath`]: with no empty,
+/// `.` or `..` segment, the last segment is exactly `Path::file_name`.
 pub(crate) fn structured_lookup_key(relpath: &str) -> &str {
     debug_assert!(is_safe_filename_relpath(relpath), "{relpath:?}");
     relpath.rsplit_once('/').map_or(relpath, |(_, name)| name)
 }
 
-/// Decode `hex` into exactly `N` bytes. `None` on wrong length / non-hex.
-/// Accepts upper- and lower-case.
+/// `None` on wrong length / non-hex; accepts upper- and lower-case.
 ///
-/// `const_hex` decodes with runtime-dispatched SIMD (~4 ns per SHA-256
-/// digest, against ~20 ns for a branch-free lookup table and ~150 ns for the
-/// per-digit range `match` it replaced), which matters for the ~10^5 digests
-/// of a full `Packages` ingest. It also strips an optional `0x` prefix; the
-/// exact length check comes first, so a prefixed input is `2 * N` characters
-/// of which only `2 * N - 2` are digits and the decode rejects it.
+/// `const_hex` decodes with SIMD, which matters for the ~10^5 digests of a
+/// full `Packages` ingest. It also strips an optional `0x` prefix; the exact
+/// length check comes first, so a prefixed input has too few digits and the
+/// decode rejects it.
 pub(crate) fn hex_decode_exact<const N: usize>(hex: &str) -> Option<[u8; N]> {
     if hex.len() != N * 2 {
         return None;
@@ -136,13 +104,10 @@ pub(crate) fn hex_decode_exact<const N: usize>(hex: &str) -> Option<[u8; N]> {
     const_hex::decode_to_array(hex).ok()
 }
 
-/// Lowercase-hex encoding suitable for log messages.
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     const_hex::encode(bytes)
 }
 
-/// Hash algorithm accepted from Debian indices. SHA256 is the modern default;
-/// SHA512 is the fallback.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum HashAlgo {
     Sha256,
@@ -165,19 +130,16 @@ impl HashAlgo {
         }
     }
 
-    /// Validate the digest's shape without allocating or decoding it.
     pub(crate) fn matches_digest(self, digest: &str) -> bool {
         digest.len() == self.digest_len() && digest.bytes().all(|b| b.is_ascii_hexdigit())
     }
 
-    /// Infer a supported algorithm from a hexadecimal digest's shape.
     pub(crate) fn for_digest(digest: &str) -> Option<Self> {
         [Self::Sha256, Self::Sha512]
             .into_iter()
             .find(|algo| algo.matches_digest(digest))
     }
 
-    /// Inverse of [`Self::as_str`]; `None` for anything else.
     pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
             "SHA256" => Some(Self::Sha256),
@@ -187,7 +149,7 @@ impl HashAlgo {
     }
 }
 
-/// An algorithm and its exact-size digest. Boxing keeps async state compact.
+/// Boxed to keep async state compact.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Digest {
     Sha256(Box<[u8; 32]>),
@@ -231,8 +193,7 @@ impl std::ops::Deref for Digest {
     }
 }
 
-/// The stanza fields [`Stanza`] reads. A stanza may carry each at most once
-/// (see [`Stanza::repeated`]).
+/// The stanza fields [`Stanza`] reads; a stanza may carry each at most once.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TrackedField {
     Filename,
@@ -270,11 +231,9 @@ impl TrackedField {
 /// Accumulated state of the current Debian `Packages` stanza.
 #[derive(Debug)]
 pub(crate) struct Stanza {
-    /// The `Filename:` value, empty until one is seen (a valid value never
-    /// is: [`is_safe_filename_relpath`] rejects it). A `String` kept across
+    /// Empty until a `Filename:` is seen. A `String` kept across
     /// [`Self::reset`] rather than an `Option<String>`, so a stream of stanzas
-    /// reuses one allocation instead of making one per stanza; read it
-    /// through [`Self::filename`].
+    /// reuses one allocation.
     filename: String,
     pub(crate) sha256: Option<[u8; 32]>,
     pub(crate) sha512: Option<[u8; 64]>,
@@ -285,14 +244,12 @@ pub(crate) struct Stanza {
     /// malformed deb822 and ambiguous about which value is meant, so
     /// [`StanzaStream`] drops it whole rather than picking one.
     repeated: Option<TrackedField>,
-    /// Whether `ingest` should decode `SHA512:` fields at all — the
-    /// registry ingest only ever reads `sha256`, so it skips the 128-char
-    /// hex decode per stanza on mirrors that publish SHA512. A repeated
-    /// `SHA512:` still rejects the stanza.
+    /// `false` for the registry ingest, which only reads `sha256` and so
+    /// skips the 128-char hex decode per stanza. A repeated `SHA512:` still
+    /// rejects the stanza.
     want_sha512: bool,
     /// Which index these stanzas came from (`<host>/<mirror_path>/<file>`),
-    /// used only to make a rejected `Filename:` value actionable. Set via
-    /// [`Self::with_source`]; `None` in tests.
+    /// for the log lines only. `None` in tests.
     source: Option<String>,
 }
 
@@ -316,8 +273,6 @@ impl Stanza {
         stanza
     }
 
-    /// Name the index being parsed, so a rejected `Filename:` value points
-    /// at the mirror that published it.
     #[must_use]
     pub(crate) fn with_source(mut self, source: String) -> Self {
         self.source = Some(source);
@@ -328,15 +283,13 @@ impl Stanza {
         self.source.as_deref().unwrap_or("<unknown index>")
     }
 
-    /// The stanza's `Filename:` value, once one was seen.
     pub(crate) fn filename(&self) -> Option<&str> {
         (!self.filename.is_empty()).then_some(self.filename.as_str())
     }
 
-    /// Project the validated filename to a structured registry key. The cache
-    /// flattens `pool/.../<deb>` to its basename; flat repositories do not use
-    /// the registry. Keep the basename within Linux's `NAME_MAX`, since no
-    /// cache file can have a longer name, and bound pending key storage.
+    /// The structured registry key: the cache flattens `pool/.../<deb>` to
+    /// its basename. `None` past Linux's `NAME_MAX`, since no cache file can
+    /// have a longer name; this also bounds pending key storage.
     pub(crate) fn registry_key(&self) -> Option<&str> {
         let key = structured_lookup_key(self.filename()?);
         (key.len() <= MAX_REGISTRY_KEY_COMPONENT_LEN).then_some(key)
@@ -350,11 +303,7 @@ impl Stanza {
         self.repeated = None;
     }
 
-    /// Take one stanza line. Only a line starting in column 0 is a field
-    /// ([`split_field`]); a tracked field seen a second time marks the
-    /// stanza [`Self::repeated`] and keeps nothing of the repeat. `Err` for a
-    /// tracked field whose value is not UTF-8 ([`field_text`]), repeated or
-    /// not.
+    /// `Err` for a tracked field whose value is not UTF-8, repeated or not.
     fn ingest(&mut self, line: &[u8]) -> io::Result<()> {
         let Some((name, value)) = split_field(line) else {
             return Ok(());
@@ -372,11 +321,6 @@ impl Stanza {
             TrackedField::Filename => match filename_value(value) {
                 Ok(name) => self.filename.push_str(name),
                 Err(bad) => {
-                    // Dropping the field drops a real entry: integrity loses
-                    // this package's expected digest and cleanup loses its
-                    // reference, so the cached deb looks unreferenced and is
-                    // grace-swept. Name the index so the mirror is
-                    // identifiable.
                     warn_once!(
                         "Rejecting unsafe Filename value `{}` in a Packages stanza from {}; the package it names loses checksum verification and its cleanup reference",
                         bad.escape_debug(),
@@ -397,7 +341,6 @@ impl Stanza {
         Ok(())
     }
 
-    /// [`Self::ingest`] for a test line, which is text.
     #[cfg(test)]
     pub(crate) fn ingest_text(&mut self, line: &str) {
         self.ingest(line.as_bytes()).expect("a `str` is UTF-8");
@@ -419,7 +362,7 @@ impl Stanza {
             .or_else(|| self.sha512.map(|value| Digest::Sha512(Box::new(value))))
     }
 
-    /// Preferred `(algo, expected-digest)` pair: SHA256 wins, SHA512 fallback.
+    /// SHA256 wins, SHA512 is the fallback.
     pub(crate) fn chosen(&self) -> Option<(HashAlgo, &[u8])> {
         self.sha256
             .as_ref()
@@ -435,38 +378,21 @@ impl Stanza {
 /// Streams the stanzas of a (decoded) Debian `Packages` index, one complete
 /// stanza per [`Self::next`].
 ///
-/// The one line loop both consumers drive: cleanup's candidate reduce
-/// (`cleanup::packages::reduce_file_list`) and the checksum-registry ingest
-/// (`integrity::ingest_packages_file`) used to each spell out the
-/// [`read_line_capped`] loop with its EOF / skipped-line / blank-line /
-/// error arms, so the line-cap and flush semantics - which decide which debs
-/// count as referenced - could drift between them. They still differ in how
-/// they decode the file ([`crate::limits::packages_reader`]) and in what an
-/// unreadable index means (cleanup bails the mirror, ingest degrades); both
-/// stay at the callers, outside this loop.
+/// Pull-style rather than a `for_each_stanza(sink)` visitor: cleanup's
+/// per-stanza work is async and its tasks are spawned, and an `AsyncFnMut`
+/// sink's call future cannot be bounded `Send` on stable.
 ///
-/// Pull-style rather than a `for_each_stanza(sink)` visitor for the reason
-/// `cache_walk::Walker` is: cleanup's per-stanza work is async and its tasks
-/// are spawned, and an `AsyncFnMut` sink's call future cannot be bounded
-/// `Send` on stable. A caller keeps its natural loop shape and stops by
-/// leaving the loop.
+/// Yields only stanzas with a `Filename:`; one without a consumer-usable
+/// digest is still yielded (cleanup retains the file without verification)
+/// after a once-gated warn. A stanza repeating a tracked field is not
+/// yielded at all: which of two values a consumer would pick is exactly what
+/// a crafted index relies on, so neither is trusted.
 ///
-/// Yields only stanzas with a `Filename:`; one whose consumer-usable digest
-/// fields are all absent is still yielded (cleanup retains the file without
-/// verification, ingest has nothing to register) after the once-gated warn
-/// both consumers used to emit, so the warn has one wording and one site.
-/// A stanza repeating `Filename:`, `SHA256:` or `SHA512:` is not yielded at
-/// all (once-gated warn): which of two values a consumer would pick is
-/// exactly what a crafted index relies on, so neither is trusted. Fields
-/// start in column 0 only; see [`split_field`] for why an indented
-/// continuation line never counts. Only the values of those three fields
-/// must be UTF-8 ([`field_text`]); any other line may hold any bytes.
 /// A line over [`MAX_METADATA_LINE_LEN`] counts as non-blank (multi-kilobyte
-/// `Provides:`/`Depends:` fields are legitimate and never a field the
-/// stanza cares about) so the stanza is not flushed prematurely; a trailing
-/// stanza without a closing blank line is flushed at EOF. Whitespace is what
-/// `u8::is_ascii_whitespace` accepts -- space, tab, CR, LF and form feed, but
-/// not vertical tab -- a superset of the spaces and tabs deb822 uses.
+/// `Provides:`/`Depends:` fields are legitimate) so the stanza is not
+/// flushed prematurely; a trailing stanza without a closing blank line is
+/// flushed at EOF. A blank line is one of `u8::is_ascii_whitespace` bytes
+/// only, which excludes vertical tab.
 pub(crate) struct StanzaStream<R> {
     reader: R,
     stanza: Stanza,
@@ -484,9 +410,8 @@ impl<R: AsyncBufRead + Unpin> StanzaStream<R> {
         }
     }
 
-    /// The next stanza carrying a `Filename:`, or `Ok(None)` at EOF. A read
-    /// error (size/line limit, a tracked field that is not UTF-8, I/O) ends
-    /// the stream; the caller decides what an unreadable index means.
+    /// `Ok(None)` at EOF. A read error (size/line limit, a tracked field that
+    /// is not UTF-8, I/O) ends the stream.
     pub(crate) async fn next(&mut self) -> io::Result<Option<&Stanza>> {
         if self.done.get() {
             return Ok(None);
@@ -524,18 +449,14 @@ impl<R: AsyncBufRead + Unpin> StanzaStream<R> {
         }
     }
 
-    /// Whether to hand out the accumulated stanza: it must name a file and
-    /// repeat none of the tracked fields. Warns once for a rejected repeat,
-    /// and once when an accepted stanza advertises none of the digests its
-    /// consumer can use.
+    /// Whether to hand out the accumulated stanza.
     fn accept(&self) -> bool {
         let Some(filename) = self.stanza.filename() else {
             return false;
         };
         if let Some(field) = self.stanza.repeated {
-            // Per stanza, like the digest-less warn below: a malformed (or
-            // hostile) index repeats the fault in every stanza, so the first
-            // occurrence is the signal and the rest degrade to debug.
+            // A malformed (or hostile) index repeats the fault in every
+            // stanza, so only the first occurrence warns.
             warn_once_or_debug!(
                 "Packages stanza for `{}` from {} repeats its {} field; ignoring the stanza, so the package it names is exempt from checksum verification and loses its cleanup reference",
                 filename.escape_debug(),
@@ -545,9 +466,8 @@ impl<R: AsyncBufRead + Unpin> StanzaStream<R> {
             return false;
         }
         if self.stanza.chosen().is_none() {
-            // Fires per stanza on a digest-less index (a SHA512-only mirror
-            // is digest-less to the SHA256-only registry ingest), so degrade
-            // after the first.
+            // Fires per stanza on a digest-less index, so degrade after the
+            // first.
             warn_once_or_debug!(
                 "Packages stanza for `{}` from {} advertises no {} digest; the package it names is exempt from checksum verification",
                 filename.escape_debug(),
@@ -559,16 +479,10 @@ impl<R: AsyncBufRead + Unpin> StanzaStream<R> {
     }
 }
 
-/// Decode a `by-hash` URL's digest filename against the algorithm taken from
-/// the URL's `<algo>` path segment (validated by `deb_mirror::parse_request_path`
-/// and carried on `ResourceKind::ByHash` / `FlatByHash`).
-///
-/// A `/by-hash/SHA256/<hex>` (or `/SHA512/<hex>`) URL embeds the digest in the
-/// path component, so the filename *is* the expected digest -- but the
-/// authoritative algorithm is the `<algo>` segment, not the digest length. The
-/// hex length must match `algo` (64 for SHA256, 128 for SHA512); a length/algo
-/// mismatch or non-hex input returns `None`, so verification treats the
-/// resource as unverifiable rather than hashing with the wrong algorithm.
+/// Decode a `by-hash` URL's digest filename. The authoritative algorithm is
+/// the URL's `<algo>` segment, not the digest length: a length/algo mismatch
+/// returns `None`, so the resource is unverifiable rather than hashed with
+/// the wrong algorithm.
 pub(crate) fn byhash_digest_for_algo(algo: HashAlgo, filename: &str) -> Option<Digest> {
     match algo {
         HashAlgo::Sha256 => hex_decode_exact::<32>(filename).map(|d| Digest::Sha256(Box::new(d))),
@@ -576,30 +490,22 @@ pub(crate) fn byhash_digest_for_algo(algo: HashAlgo, filename: &str) -> Option<D
     }
 }
 
-/// Longest name a registry key may be: Linux's `NAME_MAX`. A key names a
-/// cache file, and no longer name can exist on disk, so no download could
-/// ever look such a key up.
+/// Linux's `NAME_MAX`.
 const MAX_REGISTRY_KEY_COMPONENT_LEN: usize = 255;
 
 /// Iterate the `(section, hex, path)` triples of every indented
-/// `<hex> <size> <path>` entry inside a `SHA256:`/`SHA512:` section of a Debian
-/// `Release`/`InRelease` file. Shared skeleton behind [`parse_release_checksums`]
-/// and [`parse_release_byhash_digests`] so the section state machine lives in one
-/// place.
+/// `<hex> <size> <path>` entry inside a `SHA256:`/`SHA512:` section of a
+/// Debian `Release`/`InRelease` file.
 ///
-/// Latches off at the `-----BEGIN PGP SIGNATURE-----` boundary: nothing past it
-/// is signed, so a later section header in the (unsigned) signature block must
-/// not re-open a section. Entry lines are indented with spaces or tabs (tabs
-/// accepted for non-canonical mirrors); a non-indented field switches
-/// section (`MD5Sum:`, `SHA1:`, ... switch out). A non-field line ending a
-/// supported section emits an error before switching out, so strict cleanup
-/// rejects incomplete references while tolerant ingestion keeps its recovery
-/// behavior. Field names follow deb822 syntax, including its ban on initial
-/// `#` and `-` characters. Tokens are separated by
-/// ASCII whitespace only -- the format never uses anything else, and the
-/// Unicode-aware split walks every line char by char. A 4th token means the
-/// path contained a space, so the entry is rejected. This iterator validates
-/// the unsigned `<size>`; callers validate the algorithm/length of `hex`.
+/// Stops at the `-----BEGIN PGP SIGNATURE-----` boundary: nothing past it is
+/// signed, so a section header in the signature block must not re-open a
+/// section. Entry lines are indented with spaces or tabs (tabs for
+/// non-canonical mirrors). A non-field line ending a supported section emits
+/// an error before switching out, so strict cleanup rejects incomplete
+/// references while tolerant ingestion recovers. Field names follow deb822
+/// syntax, including its ban on initial `#` and `-`. A 4th token means the
+/// path contained a space, so the entry is rejected. Validates the unsigned
+/// `<size>`; callers validate the algorithm/length of `hex`.
 fn release_hash_entries(
     content: &str,
 ) -> impl Iterator<Item = Result<(HashAlgo, &str, &str), &'static str>> + '_ {
@@ -626,7 +532,6 @@ fn release_hash_entries(
                 return malformed.then_some(Err("unindented checksum entry or malformed field"));
             }
             let section = section?;
-            // Indented entry: " <hex> <size> <path>".
             let mut parts = line.split_ascii_whitespace();
             let hex = parts.next()?; // Blank lines are harmless.
             let Some(size) = parts.next() else {
@@ -645,20 +550,13 @@ fn release_hash_entries(
         })
 }
 
-/// Iterate the `(repo-relative path, SHA256 digest)` entries from a Debian
-/// `Release` / `InRelease` file's `SHA256:` section whose path `wanted`
-/// accepts.
+/// Iterate the `(repo-relative path, SHA256 digest)` entries of a `Release`
+/// / `InRelease` file's `SHA256:` section whose path `wanted` accepts.
 ///
-/// Handles the `InRelease` clearsigned wrapper by stopping at the PGP
-/// signature boundary. Leading `./` segments are stripped
-/// ([`strip_leading_dot_segments`]) so the key matches the request's URI
-/// path; paths failing `is_safe_filename_relpath` are skipped.
-///
-/// `wanted` sees that stripped, validated path and runs before the digest is
-/// decoded: the registry ingest keeps only the `Packages` leaves, about a
-/// fifth of a Debian `InRelease`, and decoding every entry first cost more
-/// than the rest of the parse. The path is borrowed from `content`, so the
-/// caller allocates only the entries it keeps.
+/// Leading `./` segments are stripped so the key matches the request's URI
+/// path; unsafe paths are skipped. `wanted` sees the stripped, validated
+/// path and runs before the digest is decoded: the registry ingest keeps
+/// only the `Packages` leaves, about a fifth of a Debian `InRelease`.
 pub(crate) fn parse_release_checksums<'a>(
     content: &'a str,
     mut wanted: impl FnMut(&str) -> bool + 'a,
@@ -688,10 +586,8 @@ pub(crate) struct ReleaseHeader {
     pub(crate) valid_until: Option<i64>,
 }
 
-/// The [`ReleaseHeader`] of a `Release`/`InRelease`, read from the header
-/// paragraph only (it ends at the first checksum section; the clearsigned
-/// wrapper's `Hash:` line is not a field of interest). The first occurrence
-/// of each field counts.
+/// Reads the header paragraph only (it ends at the first checksum section).
+/// The first occurrence of each field counts.
 pub(crate) fn parse_release_header(content: &str) -> ReleaseHeader {
     let mut header = ReleaseHeader::default();
     let (mut date_seen, mut valid_until_seen) = (false, false);
@@ -734,8 +630,6 @@ fn parse_release_timestamp(value: &str) -> Option<i64> {
         .map(time::OffsetDateTime::unix_timestamp)
 }
 
-/// A content-addressed digest referenced by a `Release`/`InRelease`, tagged by
-/// the algorithm of the section it appeared in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ByHashRef {
     Sha256([u8; 32]),
@@ -749,19 +643,15 @@ pub(crate) struct ReleaseHashCoverage {
     pub(crate) sha512: bool,
 }
 
-/// Check the by-hash digests referenced by a Debian `Release`/`InRelease`,
-/// from BOTH the `SHA256:` and `SHA512:` sections, tagged by algorithm.
+/// The by-hash digests referenced by a `Release`/`InRelease`, from both the
+/// `SHA256:` and `SHA512:` sections.
 ///
-/// Unlike [`parse_release_checksums`] (SHA256-only, consumed by the integrity
-/// registry), this is deliberately path-agnostic: it does NOT filter to
-/// `Packages` leaves and does NOT apply `is_safe_filename_relpath`. Every listed
-/// resource (`Packages`, `Contents-*`, `Translation-*`, `Sources`, `.diff/Index`,
-/// ...) has a corresponding by-hash file, and only the digest -- not the path --
-/// is content-addressed, so the path is unused here. Stops at the PGP signature
-/// boundary like its sibling.
+/// Unlike [`parse_release_checksums`], deliberately path-agnostic: every
+/// listed resource (`Packages`, `Contents-*`, `Translation-*`, ...) has a
+/// by-hash file, and only the digest is content-addressed.
 ///
-/// Emits each digest to `on_digest`. The sink may receive a valid prefix before
-/// an error; callers must discard their accumulated result if parsing fails.
+/// The sink may receive a valid prefix before an error; callers must discard
+/// their accumulated result if parsing fails.
 pub(crate) fn parse_release_byhash_digests(
     content: &str,
     mut on_digest: impl FnMut(ByHashRef),
@@ -792,48 +682,33 @@ pub(crate) fn parse_release_byhash_digests(
     Ok(parsed)
 }
 
-/// What a download's [`StreamHasher`] (splice-only) computed, as handed to
-/// `integrity::verify_temp_file`.
-///
-/// The algorithm and the byte count travel with the digest because the
-/// verifier trusts it only after re-deriving both: the algorithm must be the
-/// one the expected digest uses, and `bytes` must equal the size of the
-/// finished file on disk. Either check failing means the digest covers
-/// something other than what is about to be renamed into the cache, and the
-/// verifier falls back to re-reading the file.
+/// What a download's [`StreamHasher`] computed. The verifier trusts the
+/// digest only if its algorithm is the one the expected digest uses and
+/// `bytes` equals the size of the finished file; otherwise it re-reads the
+/// file.
 ///
 /// Not gated on the `splice` feature even though only that backend produces
 /// one: `integrity::VerifyInput` carries the `Option` in every build.
 pub(crate) struct StreamedDigest {
     pub(crate) digest: Digest,
-    /// Bytes fed through `StreamHasher::update`. Every one of them was also
-    /// written to the cache file (both update sites hash exactly what they
-    /// write), so this is the size the finished file must have.
+    /// Bytes fed through `StreamHasher::update`. The caller must hash
+    /// exactly what it writes to the cache file, so this is the size the
+    /// finished file must have.
     pub(crate) bytes: u64,
 }
 
 /// A [`HashAlgo`]-dispatched incremental digest, for hashing a download's
 /// bytes as they are written instead of re-reading the finished file.
 ///
-/// The two `sha2` types are distinct, so the algorithm has to be chosen up
-/// front (`integrity::stream_hash_algo_for_download`) and carried. [`Self::finalize`]
-/// returns it alongside the digest and the byte count, which lets the verifier
-/// confirm the digest it is handed was computed with the algorithm it actually
-/// expects, over exactly the file it is about to commit, and fall back to a
-/// re-read when it was not.
-///
 /// Only the splice backend hashes a download as it writes it: the other
 /// backends have no single site every cache byte passes through, so they
-/// re-read and hash the finished file at commit time ([`hash_open_file`],
-/// which dispatches through this type too).
+/// re-read the finished file at commit time ([`hash_open_file`]).
 ///
-/// Both digests are boxed: a `Sha512` carries a 128-byte block buffer plus its
-/// chaining state inline, and this type is held in `splice::CacheTarget` across
-/// every await of a download, where that much dead weight pushed
-/// `try_sendfile_request`'s future over `clippy::large_futures`.
+/// Both digests are boxed: a `Sha512` carries a 128-byte block buffer plus
+/// its chaining state inline, and this type is held in `splice::CacheTarget`
+/// across every await of a download (`clippy::large_futures`).
 pub(crate) struct StreamHasher {
     state: StreamHasherState,
-    /// Bytes seen by [`Self::update`], carried into [`StreamedDigest::bytes`].
     bytes: u64,
 }
 
@@ -874,21 +749,16 @@ impl StreamHasher {
     }
 }
 
-/// Hash the contents of an open file with `algo`, from its current position
-/// to its end. Synchronous; blocks the current thread. Generic over the
-/// reader so the commit can hash through a shared `&std::fs::File`.
-///
-/// `size_hint` is the file's length (what its `fstat` said); it only sizes
-/// the read buffer, and the read runs to EOF whatever it says.
+/// Hashes from the file's current position to its end. Synchronous; blocks
+/// the current thread. `size_hint` only sizes the read buffer.
 pub(crate) fn hash_open_file(
     algo: HashAlgo,
     file: &mut impl io::Read,
     size_hint: u64,
 ) -> io::Result<Digest> {
-    /// Largest read for whole-file hashing. 1 MiB rather than the kernel's
-    /// default readahead window: cleanup hashes the whole cache and commit
-    /// hashes every download, so this is the read-syscall count for both.
-    /// Heap, not stack — a 1 MiB array would blow the frame.
+    /// 1 MiB rather than the kernel's default readahead window: cleanup
+    /// hashes the whole cache and commit hashes every download, so this is
+    /// the read-syscall count for both.
     const MAX_READ_BUFFER: usize = 1024 * 1024;
     /// Smallest read buffer: a small index is still read in one call, and
     /// no 1 MiB buffer is zeroed for it.
@@ -913,10 +783,6 @@ pub(crate) fn hash_open_file(
 mod tests {
     use super::*;
 
-    /// Extract the `Filename:` field's relative-path value from a Debian
-    /// `Packages` stanza line, discarding the reject reason. Production code
-    /// goes through [`Stanza::ingest`], which keeps the reason so it can log a
-    /// rejected value against its mirror.
     fn parse_filename_field(line: &str) -> Option<&str> {
         match split_field(line.as_bytes())? {
             (b"Filename", value) => filename_value(field_text(value).ok()?).ok(),
@@ -967,9 +833,6 @@ mod tests {
 
     #[test]
     fn parse_filename_field_rejects_traversal() {
-        // Path-traversal hardening: an attacker-controlled upstream
-        // Packages stanza must not be able to inject `..` segments or
-        // absolute paths that could later be joined to a filesystem path.
         assert_eq!(
             parse_filename_field("Filename: ../../../etc/passwd\n"),
             None,
@@ -977,9 +840,7 @@ mod tests {
         assert_eq!(parse_filename_field("Filename: pool/../escape.deb\n"), None);
         assert_eq!(parse_filename_field("Filename: /etc/shadow\n"), None);
         assert_eq!(parse_filename_field("Filename: a//b.deb\n"), None);
-        // A leading `./` is NOT traversal and is normalised away rather than
-        // rejected (flat archives publish every stanza that way); a `..`
-        // behind it still is.
+        // A leading `./` is not traversal; a `..` behind it still is.
         assert_eq!(
             parse_filename_field("Filename: ./foo.deb\n"),
             Some("foo.deb"),
@@ -989,13 +850,7 @@ mod tests {
             parse_filename_field("Filename: pool\\main\\evil.deb\n"),
             None,
         );
-        // NUL byte rejection — Rust strings allow `\0`; rust source uses
-        // an explicit escape to materialise the test input.
         assert_eq!(parse_filename_field("Filename: pool/x\0y.deb\n"), None,);
-        // Other ASCII control characters (tab, vertical tab, bare CR/LF
-        // embedded mid-segment, etc.) are likewise rejected so they can
-        // never reach a downstream HashMap lookup or future filesystem
-        // join.
         assert_eq!(parse_filename_field("Filename: pool/x\ty.deb\n"), None);
         assert_eq!(parse_filename_field("Filename: pool/x\x0by.deb\n"), None);
         assert_eq!(parse_filename_field("Filename: pool/x\x7fy.deb\n"), None);
@@ -1105,10 +960,7 @@ mod tests {
 
     #[test]
     fn stanza_ingest_strips_leading_dot_slash() {
-        // `apt-ftparchive packages .` writes the directory argument verbatim,
-        // so whole flat archives (e.g. NVIDIA's CUDA repos) publish every
-        // `Filename:` as `./<deb>`. Rejecting those loses each package's
-        // cleanup reference and cleanup-time digest.
+        // E.g. NVIDIA's CUDA repos publish every `Filename:` as `./<deb>`.
         let mut s = Stanza::new();
         s.ingest_text("Filename: ./collectx-bringup_1.22.1-1_amd64.deb\n");
         assert_eq!(s.filename(), Some("collectx-bringup_1.22.1-1_amd64.deb"),);
@@ -1219,9 +1071,6 @@ mod tests {
         assert_eq!(got, vec![("pool/a.deb".to_owned(), Some(HashAlgo::Sha256))]);
     }
 
-    /// Debian indices are CRLF-tolerant in the wild; the trailing `\r` must
-    /// neither end up in the `Filename:` value nor stop a blank line from
-    /// flushing the stanza.
     #[tokio::test]
     async fn stanza_stream_handles_crlf_line_endings() {
         let input = format!(
@@ -1239,7 +1088,6 @@ mod tests {
         );
     }
 
-    /// A line of only whitespace separates stanzas just like an empty one.
     #[tokio::test]
     async fn stanza_stream_flushes_on_a_whitespace_only_line() {
         let input = b"Filename: pool/a.deb\n \t \nFilename: pool/b.deb\n";
@@ -1253,10 +1101,8 @@ mod tests {
         );
     }
 
-    /// Vertical tab is not whitespace to `trim_ascii`, so a line holding only
-    /// one is a (field-less) stanza line: the two stanzas around it merge,
-    /// and the repeated `Filename:` rejects the result. No generator writes
-    /// such a line; this pins that the parser does not treat it as blank.
+    /// Vertical tab is not whitespace to `trim_ascii`: the two stanzas around
+    /// the line merge, and the repeated `Filename:` rejects the result.
     #[tokio::test]
     async fn stanza_stream_vertical_tab_line_does_not_separate() {
         let input = b"Filename: pool/a.deb\n\x0b\nFilename: pool/b.deb\n";
@@ -1264,11 +1110,6 @@ mod tests {
         assert_eq!(got, vec![]);
     }
 
-    /// A deb822 continuation line (leading space or tab) belongs to the
-    /// folded field above it - a long `Description:` a package maintainer
-    /// writes - and is never a field of its own. Treating `  SHA256: ...`
-    /// there as the stanza's digest let a maintainer override the registry
-    /// digest of any deb, making every download of it a checksum mismatch.
     #[test]
     fn stanza_ingest_ignores_indented_continuation_lines() {
         let mut s = Stanza::new();
@@ -1297,9 +1138,6 @@ mod tests {
         assert!(stream.next().await.expect("readable").is_none());
     }
 
-    /// A stanza repeating `Filename:` or a digest field is malformed deb822
-    /// and ambiguous about which value is meant, so it is dropped whole
-    /// rather than resolved by first-wins; the stanzas around it survive.
     #[tokio::test]
     async fn stanza_stream_rejects_a_stanza_repeating_a_tracked_field() {
         let h256 = |b| hex_encode(&[b; 32]);
@@ -1374,9 +1212,8 @@ mod tests {
         );
     }
 
-    /// A stanza whose `Filename:` fails the traversal gate has no usable
-    /// name, so it is dropped whole - it must not inherit the next stanza's
-    /// name or leak its digest into it.
+    /// A stanza whose `Filename:` fails the traversal gate is dropped whole:
+    /// it must not inherit the next stanza's name or leak its digest into it.
     #[tokio::test]
     async fn stanza_stream_drops_a_stanza_with_an_unsafe_filename() {
         let input = format!(
@@ -1401,9 +1238,8 @@ mod tests {
         drop(stream);
     }
 
-    /// A tracked field that is not UTF-8 fails the read, as any such line
-    /// once did, whether it comes first, as the value of a repeat, or as a
-    /// digest.
+    /// A tracked field that is not UTF-8 fails the read, whether it comes
+    /// first, as the value of a repeat, or as a digest.
     #[tokio::test]
     async fn stanza_stream_fails_on_a_non_utf8_tracked_field_and_ends() {
         let digest = hex_encode(&[0x11; 32]);
@@ -1424,9 +1260,6 @@ mod tests {
         }
     }
 
-    /// Bytes outside the tracked fields are never decoded: a Latin-1
-    /// `Description:` (and its continuation lines), or a stray byte in a
-    /// field name nobody reads, leaves the stanza intact.
     #[tokio::test]
     async fn stanza_stream_ignores_non_utf8_bytes_outside_tracked_fields() {
         let mut input =
@@ -1469,9 +1302,7 @@ mod tests {
         assert!(byhash_digest_for_algo(HashAlgo::Sha256, "").is_none());
         assert!(byhash_digest_for_algo(HashAlgo::Sha256, "deadbeef").is_none()); // too short
         assert!(byhash_digest_for_algo(HashAlgo::Sha256, &"z".repeat(64)).is_none()); // non-hex
-        // Length/algo mismatch: a 128-hex digest under a SHA256 URL segment (or
-        // a 64-hex one under SHA512) must be rejected, never hashed as the other
-        // algorithm.
+        // Length/algo mismatch.
         assert!(byhash_digest_for_algo(HashAlgo::Sha256, &"a".repeat(128)).is_none());
         assert!(byhash_digest_for_algo(HashAlgo::Sha512, &"a".repeat(64)).is_none());
     }
@@ -1622,7 +1453,6 @@ mod tests {
     #[test]
     fn release_byhash_digests_rejects_space_in_path() {
         let d = hex_encode(&[0x66; 32]);
-        // A 4th whitespace-separated token means the path had a space.
         let content = format!("SHA256:\n {d} 10 main/with space/Packages\n");
         assert!(parse_release_byhash_digests(&content, |_| {}).is_err());
     }
@@ -1630,8 +1460,7 @@ mod tests {
     #[test]
     fn release_entries_split_on_ascii_whitespace_only() {
         // A no-break space is not a separator: the path keeps it and stays
-        // the 3rd token (the Unicode-aware split used to make it a 4th and
-        // drop the entry).
+        // the 3rd token.
         let d = hex_encode(&[0x77; 32]);
         let content = format!("SHA256:\n {d} 10 main/a\u{a0}b/Packages\n");
         assert_eq!(
@@ -1786,9 +1615,8 @@ SHA256:
 
     #[test]
     fn parse_release_checksums_stops_at_pgp_signature() {
-        // Shares the `release_hash_entries` latch with the by-hash parser: a
-        // `SHA256:` block after the (unsigned) signature boundary must not
-        // re-open a section and inject entries into the integrity registry.
+        // A `SHA256:` block after the (unsigned) signature boundary must not
+        // inject entries into the integrity registry.
         let inrelease = "\
 -----BEGIN PGP SIGNED MESSAGE-----
 Hash: SHA512
@@ -1817,11 +1645,8 @@ SHA256:
         assert_eq!(date(inrelease), Some(1_789_894_413));
         assert_eq!(date("Origin: Debian\nSHA256:\n"), None);
         assert_eq!(date("Date: yesterday\n"), None);
-        // A `Date:`-looking line after a checksum section header is not the
-        // header paragraph's `Date:`. Unindented (unlike an entry line under
-        // the section) so that, absent the section cutoff, it would parse
-        // successfully -- the case actually exercises the cutoff rather than
-        // passing on `Date:`'s own indentation requirement.
+        // A `Date:` after a checksum section header is not the header
+        // paragraph's; unindented, so only the section cutoff rejects it.
         assert_eq!(date("SHA256:\nDate: Sun, 20 Sep 2026 08:53:33 UTC\n"), None);
     }
 

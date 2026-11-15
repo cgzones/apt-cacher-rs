@@ -5,22 +5,17 @@ use std::{
 
 use crate::{http_range::HttpDate, xattr_helpers::XattrValue};
 
-/// Validate that a string is a parseable HTTP-date per RFC 9110 §5.6.7,
-/// IMF-fixdate form only - legacy RFC 850 and asctime are rejected as
-/// malformed.  The underlying `HttpDate::parse` only accepts IMF-fixdate
-/// (and the RFC 2822 superset); broadening that parser is a behaviour
-/// change, out of scope here.
+/// IMF-fixdate (and its RFC 2822 superset) only: the legacy RFC 850 and
+/// asctime forms of RFC 9110 §5.6.7 are rejected as malformed.
 #[must_use]
 pub(crate) fn is_valid_http_date(s: &str) -> bool {
     HttpDate::parse(s).is_some()
 }
 
 /// A validated upstream `Last-Modified` value, persisted on a cached file as
-/// `user.apt_cacher_rs.last_modified` (RFC 9110 §10.2.2: forward the
-/// origin's value). Carries both the raw header string (for the
-/// `Last-Modified` response header) and its parsed [`HttpDate`] (for
-/// `If-Modified-Since` comparison), so consumers never re-parse.
-/// Parsed headers retain their accepted spelling; [`Self::from_date`] constructs an IMF-fixdate.
+/// `user.apt_cacher_rs.last_modified`. Keeps the origin's spelling for the
+/// response header (RFC 9110 §10.2.2: forward the origin's value) next to
+/// its parsed [`HttpDate`], so consumers never re-parse.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LastModified {
     raw: Arc<str>,
@@ -89,8 +84,7 @@ mod tests {
         assert!(!is_valid_http_date("not a date"));
         assert!(!is_valid_http_date("Thu, 32 Jan 1970 00:00:00 GMT"));
 
-        // The two obsolete formats RFC 9110 section 5.6.7 lists alongside
-        // IMF-fixdate are rejected, as this module's doc states.
+        // The two obsolete formats of RFC 9110 section 5.6.7.
         assert!(!is_valid_http_date("Sunday, 06-Nov-94 08:49:37 GMT"));
         assert!(!is_valid_http_date("Sun Nov  6 08:49:37 1994"));
 

@@ -26,13 +26,10 @@ use crate::{
     warn_once_or_info,
 };
 
-/// Decode a `mirrors_v2.kind` column, defaulting to `Structured`.
-///
-/// `cleanup_invalid_rows` purges out-of-range encodings before any reader
-/// observes them, so the fallback is defence in depth -- but a `Flat` row
-/// silently read as `Structured` makes cleanup emit structured units and
-/// reconcile against an index that does not exist, so say so. Matches the
-/// `load_all_mirror_ids` reader, which already warns on the same condition.
+/// Decode a `mirrors_v2.kind` column. `cleanup_invalid_rows` purges
+/// out-of-range encodings at startup, so the `Structured` fallback is defence
+/// in depth; it warns because a `Flat` row read as `Structured` makes cleanup
+/// reconcile against an index that does not exist.
 fn decode_mirror_kind(kind: i64, path: &str) -> MirrorKind {
     if let Some(kind) = MirrorKind::from_db_int(kind) {
         kind
@@ -46,9 +43,8 @@ fn decode_mirror_kind(kind: i64, path: &str) -> MirrorKind {
 }
 
 /// Whole seconds of `d` as the `i64` `SQLite` stores timestamps and intervals
-/// in. Fails only for a duration beyond year 292'277'026'596, which no
-/// configuration or clock can produce; reported as an argument error rather
-/// than truncated so the caller's query never runs on a wrong cutoff.
+/// in. An out-of-range duration is an argument error rather than truncated,
+/// so the caller's query never runs on a wrong cutoff.
 fn duration_as_secs_i64(d: Duration) -> Result<i64, Error> {
     i64::try_from(d.as_secs())
         .map_err(|err: TryFromIntError| Error::InvalidArgument(err.to_string()))
@@ -110,11 +106,10 @@ impl MirrorEntry {
         self.host.format_authority(self.port())
     }
 
-    /// The on-disk identity of this mirror, for every `CachePaths`
-    /// derivation (`mirror_dir`, `entry_dir`, `tmp_dir`, ...).  Rows store
-    /// the canonical (alias-resolved) host -- `decide_request` resolves
-    /// aliases before any row is minted and `merge_alias_rows` folds legacy
-    /// alias rows at startup -- so this is the same projection as
+    /// The on-disk identity of this mirror. Rows store the canonical
+    /// (alias-resolved) host -- `decide_request` resolves aliases before any
+    /// row is minted and `merge_alias_rows` folds legacy alias rows at
+    /// startup -- so this is the same projection as
     /// `ConnectionDetails::site`.
     #[must_use]
     pub(crate) fn site(&self) -> MirrorSite<'_> {
@@ -128,9 +123,6 @@ impl MirrorEntry {
 
 #[cfg(test)]
 impl MirrorEntry {
-    /// Test-only constructor: production code only builds a `MirrorEntry`
-    /// from a SQL row, but `cleanup::model::classify_mirror`'s pure unit
-    /// tests need to build one directly.
     pub(crate) fn new_for_test(
         host: ClientHost,
         port: Option<NonZero<u16>>,
@@ -159,8 +151,7 @@ impl From<MirrorEntry> for Mirror {
     }
 }
 
-/// `host[:port]/path` rendered straight into a `Formatter`, so a dashboard
-/// row costs no intermediate `String`.
+/// Displays as `host[:port]/path`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MirrorUri<'a> {
     host: &'a ClientHost,
@@ -202,8 +193,6 @@ impl MirrorStatEntry {
         NonZero::new(self.port)
     }
 
-    /// Which layouts the mirror owns on disk: a `Flat` row has no structured
-    /// tree (see `MirrorEntry::kind`).
     #[must_use]
     pub(crate) fn kind(&self) -> MirrorKind {
         decode_mirror_kind(self.kind, &self.path)
@@ -218,8 +207,7 @@ impl MirrorStatEntry {
         }
     }
 
-    /// The on-disk identity of this mirror; the same projection as
-    /// [`MirrorEntry::site`] (rows are canonical).
+    /// See [`MirrorEntry::site`].
     #[must_use]
     pub(crate) fn site(&self) -> MirrorSite<'_> {
         MirrorSite {
@@ -277,9 +265,6 @@ impl OriginEntry {
 
 #[cfg(test)]
 impl OriginEntry {
-    /// Test-only constructor: production code only builds an `OriginEntry` from
-    /// a SQL row, but `cleanup::refs`' pure unit tests need to build one
-    /// directly.
     pub(crate) fn new_for_test(
         host: ClientHost,
         mirror_path: String,
@@ -315,12 +300,7 @@ pub(crate) struct TopPackageEntry {
     pub(crate) package_size: i64,
 }
 
-/// The dashboard's two Top-Packages rankings, from one aggregate pass.
-///
-/// The two tables rank the same `GROUP BY debname` aggregate differently, so
-/// they used to be two statements scanning `deliveries` end to end for the
-/// same numbers. [`Database::get_top_packages`] ranks both ways in one query
-/// and splits the result here.
+/// The dashboard's two Top-Packages rankings.
 #[derive(Debug)]
 pub(crate) struct TopPackages {
     /// Most deliveries first.
@@ -330,7 +310,7 @@ pub(crate) struct TopPackages {
 }
 
 /// Bytes downloaded from upstream and delivered to clients over the
-/// dashboard's two reporting windows, from one statement.
+/// dashboard's two reporting windows.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BandwidthWindows {
     /// `(downloaded, delivered)` over the last 24 hours.
@@ -362,8 +342,7 @@ pub(crate) struct DownloadRow {
     pub(crate) client_ip: [u8; 16],
 }
 
-/// A mirror row without origins, as returned by
-/// [`Database::get_mirrors_without_origins`].
+/// A mirror row without origins.
 #[derive(Debug)]
 pub(crate) struct OrphanMirror {
     pub(crate) id: i64,
@@ -392,7 +371,6 @@ impl OriginRow {
     }
 }
 
-/// Remove a mirror and its dependants within the caller's transaction.
 async fn delete_mirror_rows(tx: &mut SqliteConnection, id: i64) -> Result<(), Error> {
     query!(r"DELETE FROM origins WHERE mirror_id = ?;", id)
         .execute(&mut *tx)
@@ -567,7 +545,6 @@ impl Database {
         .await
     }
 
-    /// Returns mirrors whose `last_seen` is within the `active` range from the current time.
     #[cfg(feature = "hyper")]
     pub(crate) async fn get_recent_mirrors(
         &self,
@@ -588,11 +565,9 @@ impl Database {
         .await
     }
 
-    /// Return every mirror row whose `path` collides with the host-level
-    /// `flat/` anchor used by the new flat-repository layout — i.e. a
-    /// structured mirror at `path = 'flat'` or `path` starting with
-    /// `'flat/'`.  Used at startup to seed the
-    /// [`crate::flat_blocklist`].
+    /// Structured mirrors whose `path` is `flat` or starts with `flat/` and so
+    /// collides with the host-level `flat/` anchor of the flat-repository
+    /// layout. Seeds the [`crate::flat_blocklist`] at startup.
     pub(crate) async fn load_flat_collision_mirrors(&self) -> Result<Vec<MirrorEntry>, Error> {
         query_as!(
             MirrorEntry,
@@ -683,11 +658,9 @@ impl Database {
         .await
     }
 
-    /// `true` iff a `mirrors_v2` row exists for the given identity tuple.
-    /// Used by `task_cleanup` to gate the flat-cleanup root fallback: a
-    /// mint-and-fetch path that would otherwise insert a fresh row on
-    /// miss.  Reusing only pre-existing rows keeps the DB free of
-    /// cleanup-synthesised mirror entries.
+    /// Lets `task_cleanup` gate its flat-cleanup root fallback on a
+    /// pre-existing row, keeping the DB free of cleanup-synthesised mirror
+    /// entries.
     pub(crate) async fn mirror_exists(
         &self,
         host: &ClientHost,
@@ -792,14 +765,10 @@ impl Database {
             .collect())
     }
 
-    /// Bytes downloaded from upstream and delivered to clients over both of
-    /// the dashboard's reporting windows.
-    ///
-    /// One statement rather than two calls of a single-window query: the four
-    /// scalar subselects each ride `idx_{downloads,deliveries}_timestamp`, and
-    /// issuing them together costs one round trip through the pool instead of
-    /// two. Both windows consequently degrade together on error, which is what
-    /// the single "N/A" fallback in the Cache Statistics section expects.
+    /// One statement for both windows: the four scalar subselects each ride
+    /// `idx_{downloads,deliveries}_timestamp`, and the windows degrade
+    /// together on error, which is what the single "N/A" fallback in the
+    /// Cache Statistics section expects.
     pub(crate) async fn get_bandwidth_windows(
         &self,
         day_epoch: i64,
@@ -840,13 +809,9 @@ impl Database {
         Ok(())
     }
 
-    /// Both Top-Packages rankings from one pass over `deliveries`.
-    ///
-    /// The two tables the dashboard renders differ only in their ordering, so
-    /// this ranks the aggregate both ways with `ROW_NUMBER()` and returns the
-    /// union of the two top-`limit` sets -- at most `2 * limit` rows -- rather
-    /// than scanning the table twice. The aggregate CTE is referenced exactly
-    /// once, so there is no CTE-materialisation question.
+    /// Both Top-Packages rankings from one pass over `deliveries`: the query
+    /// returns the union of the two top-`limit` sets, at most `2 * limit`
+    /// rows.
     pub(crate) async fn get_top_packages(&self, limit: u32) -> Result<TopPackages, Error> {
         struct RankedPackage {
             debname: String,
@@ -863,9 +828,9 @@ impl Database {
         // Permanent .deb packages always end in `.deb`, `.udeb`, or `.ddeb`
         // (see `deb_mirror::VALID_DEB_EXTENSIONS`).
         //
-        // `debname` as the secondary sort key is a tie-break the two separate
-        // queries never had: without it equal counts order arbitrarily, which
-        // is untestable and makes consecutive dashboard loads reshuffle rows.
+        // `debname` as the secondary sort key is a tie-break: without it equal
+        // counts order arbitrarily, which is untestable and makes consecutive
+        // dashboard loads reshuffle rows.
         let rows = query_as!(
             RankedPackage,
             r#"
@@ -927,8 +892,7 @@ impl Database {
                 by_count.push(entry());
             }
         }
-        // `ORDER BY rank_by_count` already ordered `by_count`; `by_size` holds
-        // at most `limit` elements, so this sort is on 5 items by default.
+        // `ORDER BY rank_by_count` already ordered `by_count`.
         by_size.sort_unstable_by_key(|&(rank, _)| rank);
 
         Ok(TopPackages {
@@ -937,11 +901,8 @@ impl Database {
         })
     }
 
-    /// Hydrate the in-memory mirror-id cache at startup.
-    ///
-    /// Returns one entry per row in `mirrors_v2`. Used by the batched
-    /// `db_loop` so subsequent delivery/download/origin events resolve the
-    /// `mirror_id` from memory instead of upserting on every event.
+    /// One entry per valid `mirrors_v2` row, to hydrate the in-memory
+    /// mirror-id cache at startup.
     pub(crate) async fn load_all_mirror_ids(&self) -> Result<Vec<(i64, Mirror)>, Error> {
         struct Row {
             id: i64,
@@ -1014,8 +975,6 @@ impl Database {
     /// seed at next startup cannot lose a collision that surfaced only after
     /// a flat row already existed for the same `(host, port, path)`.
     ///
-    /// Issued on a mirror-id cache miss in the batched `db_loop`.
-    ///
     /// The explicit transaction is load-bearing although the upsert is one
     /// statement: `fetch_one` stops at the `RETURNING` row and sqlx resets
     /// the statement without reporting the reset's result, so under
@@ -1077,13 +1036,11 @@ impl Database {
 
     /// Bulk-update `mirrors_v2.last_seen` for a set of (id, `last_seen`) pairs.
     ///
-    /// Issues one UPDATE per chunk: a CTE injects all pairs as a single
-    /// `VALUES` clause, then the UPDATE joins on it and uses `MAX(existing, new)`
-    /// so flushes are idempotent even if a stale timestamp arrives after a
-    /// fresh one. `UPDATE FROM` scans the values once and looks up each target
-    /// by primary key, avoiding a correlated values scan for every row.
-    /// Chunked by [`SQLITE_MAX_BIND_PARAMETERS`]; all chunks share
-    /// one transaction. Returns the total rows affected.
+    /// Uses `MAX(existing, new)` so a stale timestamp arriving after a fresh
+    /// one cannot move `last_seen` backwards. `UPDATE FROM` scans the values
+    /// once and looks up each target by primary key, avoiding a correlated
+    /// values scan for every row. Chunked by [`SQLITE_MAX_BIND_PARAMETERS`];
+    /// all chunks share one transaction. Returns the total rows affected.
     pub(crate) async fn batch_update_mirror_last_seen(
         &self,
         pairs: &[(i64, i64)],
@@ -1119,11 +1076,8 @@ impl Database {
         Ok(affected)
     }
 
-    /// Insert a batch of delivery rows in a single transaction.
-    ///
-    /// Chunks the input so no single statement exceeds
-    /// [`SQLITE_MAX_BIND_PARAMETERS`]. All chunks share one transaction so the
-    /// flush remains atomic from the caller's perspective.
+    /// Chunked by [`SQLITE_MAX_BIND_PARAMETERS`]; all chunks share one
+    /// transaction so the flush stays atomic.
     pub(crate) async fn batch_insert_deliveries(&self, rows: &[DeliveryRow]) -> Result<(), Error> {
         const BINDS_PER_ROW: usize = 6;
         const CHUNK_SIZE: usize = SQLITE_MAX_BIND_PARAMETERS / BINDS_PER_ROW;
@@ -1151,8 +1105,7 @@ impl Database {
         tx.commit().await
     }
 
-    /// Insert a batch of download rows in a single transaction; chunked like
-    /// [`Self::batch_insert_deliveries`].
+    /// Chunked like [`Self::batch_insert_deliveries`].
     pub(crate) async fn batch_insert_downloads(&self, rows: &[DownloadRow]) -> Result<(), Error> {
         const BINDS_PER_ROW: usize = 5;
         const CHUNK_SIZE: usize = SQLITE_MAX_BIND_PARAMETERS / BINDS_PER_ROW;
@@ -1238,8 +1191,7 @@ impl Database {
     /// Startup only. The daemon has never written such a row, and the DELETE
     /// holds the write lock for a full scan of both usage tables — during
     /// which the batch flusher stalls and the request path can block in
-    /// `send_db_command`. Paying that once at startup is a repair; paying it
-    /// daily is a tax on a condition that cannot arise.
+    /// `send_db_command`.
     pub(crate) async fn cleanup_invalid_usage_rows(&self) -> Result<(), Error> {
         let downloads_deleted = query!(r"DELETE FROM downloads WHERE length(client_ip) != 16;")
             .execute(&self.conn)
@@ -1361,8 +1313,6 @@ impl Database {
         for mirror in mirrors {
             let bad_host = DomainName::new(&mirror.host).is_err();
             let bad_kind = MirrorKind::from_db_int(mirror.kind).is_none();
-            // The path becomes directories below the cache root that cleanup
-            // walks and sweeps.
             let bad_path = !is_plain_relative_path(&mirror.path);
 
             if !bad_host && !bad_kind && !bad_path {
@@ -1610,8 +1560,7 @@ impl Database {
         &self.conn
     }
 
-    /// A fresh schema in a temporary directory, for unit tests in this and
-    /// other modules (`database_task`). The directory lives as long as the
+    /// A fresh schema in a temporary directory that lives as long as the
     /// returned guard.
     pub(crate) async fn temp() -> (tempfile::TempDir, Self) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1768,9 +1717,6 @@ mod retention_tests {
         }
     }
 
-    /// `last_seen` comes straight from the database, so a hand-edited row can
-    /// carry a pre-epoch value. It must read as stale instead of aborting the
-    /// cleanup task that calls this for every origin.
     #[test]
     fn origin_activity_tolerates_an_out_of_range_last_seen() {
         let entry = |last_seen| {
@@ -1824,9 +1770,6 @@ mod retention_tests {
         assert_eq!(left[0].mirror_path, "fresh");
     }
 
-    /// A self-aliasing group that got past `Config::validate` stops the merge
-    /// before it touches a row: folding a row into itself would delete it
-    /// and its origins.
     #[tokio::test]
     #[should_panic(expected = "lists itself as an alias")]
     async fn merge_alias_rows_refuses_a_self_alias() {
@@ -1993,12 +1936,6 @@ mod retention_tests {
         assert_eq!(db.get_mirrors().await.expect("mirrors").len(), 1);
     }
 
-    /// Regression: an earlier version minted origins from any directory that
-    /// was not a pseudo-arch, so deployments carry rows for metadata trees at
-    /// `binary-<arch>` depth (Ubuntu's `cnf`). Cleanup fetches a `Packages`
-    /// for each active origin; that 404 bails the mirror's whole sweep, and
-    /// nothing refreshes such a row any more, so it would sit there for the
-    /// eight weeks of the retention window. The repair pass drops them.
     #[tokio::test]
     async fn origins_outside_a_binary_architecture_are_purged() {
         let (_dir, db) = Database::temp().await;
@@ -2042,7 +1979,6 @@ mod retention_tests {
         .await
         .expect("insert short client_ip");
 
-        // The periodic path must not scan the usage tables.
         db.cleanup_invalid_rows().await.expect("periodic cleanup");
         assert_eq!(
             count_downloads(&db).await,
@@ -2050,7 +1986,6 @@ mod retention_tests {
             "the daily cycle must not scan the usage tables"
         );
 
-        // The startup path still repairs it.
         db.cleanup_invalid_usage_rows()
             .await
             .expect("startup scrub");
@@ -2061,7 +1996,6 @@ mod retention_tests {
         );
     }
 
-    /// Insert a `deliveries` row for the dashboard aggregate tests.
     async fn insert_delivery(db: &Database, mirror_id: i64, debname: &str, size: i64, ts: i64) {
         query(
             "INSERT INTO deliveries (mirror_id, debname, size, duration, partial, client_ip, timestamp) \
@@ -2094,9 +2028,6 @@ mod retention_tests {
         entries.iter().map(|e| e.debname.as_str()).collect()
     }
 
-    /// The two rankings come from one pass, so they must still disagree where
-    /// the old pair of queries disagreed: `many.deb` wins by count, `big.deb`
-    /// by bytes.
     #[tokio::test]
     async fn top_packages_ranks_by_count_and_by_size_independently() {
         let (_dir, db) = Database::temp().await;
@@ -2120,8 +2051,6 @@ mod retention_tests {
         assert_eq!(many.package_size, 10, "package_size is MAX(size), one copy");
     }
 
-    /// Volatile index files are re-delivered constantly and would dominate
-    /// both rankings; only `.deb`/`.udeb`/`.ddeb` may appear.
     #[tokio::test]
     async fn top_packages_excludes_non_package_deliveries() {
         let (_dir, db) = Database::temp().await;
@@ -2138,9 +2067,6 @@ mod retention_tests {
         assert_eq!(names(&top.by_size), ["only.ddeb"]);
     }
 
-    /// Equal counts used to order arbitrarily; the SQL tie-break makes the
-    /// order deterministic, which is what keeps the dashboard from
-    /// reshuffling rows between loads.
     #[tokio::test]
     async fn top_packages_breaks_ties_by_name() {
         let (_dir, db) = Database::temp().await;
@@ -2156,8 +2082,6 @@ mod retention_tests {
         assert_eq!(names(&top.by_size), ["a.deb", "b.deb"]);
     }
 
-    /// Both windows come from one statement now; each must still filter on
-    /// its own cutoff.
     #[tokio::test]
     async fn bandwidth_windows_filter_each_cutoff_separately() {
         let (_dir, db) = Database::temp().await;
@@ -2185,7 +2109,6 @@ mod retention_tests {
         );
     }
 
-    /// An empty database must report zeroes, not an error or a missing row.
     #[tokio::test]
     async fn bandwidth_windows_report_zero_on_an_empty_database() {
         let (_dir, db) = Database::temp().await;

@@ -1,14 +1,9 @@
-//! The one hyper body wrapper that does per-delivery accounting.
+//! Per-delivery accounting for every hyper body that ships bytes to a
+//! client; the completion bookkeeping runs on `Drop`.
 //!
-//! Every hyper body that ships bytes to a client is wrapped in
-//! [`AccountedBody`]: it holds the `ACTIVE_CLIENT_DOWNLOADS` counter for the
-//! body's lifetime, counts data bytes, remembers whether the stream ended
-//! cleanly or with which error, and on `Drop` runs the completion
-//! bookkeeping for its [`Subject`] - `delivery::finish_cached_serve` for
-//! cached files, the passthrough summary for the simple proxy. "Fully
-//! delivered" (the `SERVED_*` credit) is decided here: every promised byte
-//! shipped for a cached file, clean end of stream for a passthrough, and no
-//! error surfaced either way.
+//! "Fully delivered" (the `SERVED_*` credit) is decided here: every promised
+//! byte shipped for a cached file, clean end of stream for a passthrough, and
+//! no error surfaced either way.
 //!
 //! Cleanup's synthetic index fetches (`ClientInfo::is_cleanup_synthetic`)
 //! read their response through the same body but are no client: the
@@ -39,8 +34,8 @@ use crate::{
 
 /// What the body delivers, i.e. which completion line and metrics apply.
 pub(crate) enum Subject {
-    /// A cached (or in-progress) file: `Served cached file ... via <mech>`,
-    /// a `deliveries` row on completion.
+    /// A cached (or in-progress) file; records a `deliveries` row on
+    /// completion.
     Cached {
         conn_details: ConnectionDetails,
         mechanism: Mechanism,
@@ -50,7 +45,7 @@ pub(crate) enum Subject {
         /// A 206 delivery.
         partial: bool,
     },
-    /// An uncached passthrough: `simple proxy: passed through ...`, no DB row.
+    /// An uncached passthrough; no DB row.
     Passthrough {
         host: String,
         path: String,
@@ -104,9 +99,8 @@ pub(crate) struct AccountedBody<B: Body<Error = DeliveryFailure>> {
 }
 
 impl<B: Body<Error = DeliveryFailure>> AccountedBody<B> {
-    /// Wrap `inner`; bumps the subject's `REQUESTS_*` counter and takes the
-    /// active-download slot, unless the subject is cleanup-synthetic. Source
-    /// and client-rate adapters are inside this owner.
+    /// Source and client-rate adapters belong inside `inner`, so their
+    /// errors are seen here.
     #[must_use]
     pub(crate) fn new(inner: B, subject: Subject) -> Self {
         let client_slot = if subject.client().is_cleanup_synthetic() {
@@ -191,8 +185,6 @@ impl<B: Body<Error = DeliveryFailure>> PinnedDrop for AccountedBody<B> {
             // Cleanup-synthetic: nothing to account (see the module doc).
             return;
         }
-        // Logging is synchronous and the DB enqueue has a sync fast path -
-        // no per-request task spawn needed here.
         match subject {
             Subject::Cached {
                 conn_details,
@@ -278,8 +270,8 @@ mod tests {
         }
     }
 
-    /// A single test owns the process-global DB queue and channel metric deltas.
-    /// It checks consumer progress, complete credit, and the sticky error veto.
+    /// A single test, as it owns the process-global DB queue and channel
+    /// metric deltas.
     #[tokio::test]
     async fn channel_accounting_has_one_consumer_owner() {
         let (db_tx, mut db_rx) = tokio::sync::mpsc::channel(16);
@@ -378,8 +370,6 @@ mod tests {
         assert!(matches!(db_rx.try_recv(), Ok(DatabaseCommand::Transfer(cmd)) if cmd.size == 2));
         assert!(db_rx.try_recv().is_err());
     }
-    /// Cleanup's synthetic index fetch reads a real hyper body but is no
-    /// client: no request, served or byte credit, no `deliveries` row.
     #[tokio::test]
     async fn cleanup_synthetic_subject_is_not_accounted() {
         let (db_tx, mut db_rx) = tokio::sync::mpsc::channel(16);

@@ -1,10 +1,6 @@
 //! The collapsed Metrics section of the dashboard: every counter in
-//! `metrics.rs` except the limiter gauges and their peaks, time-at-cap
-//! clocks, admission counters and `LOGSTORE_EVICTIONS` (the Capacity
-//! section, `dashboard.rs`), `ACTIVE_CLIENT_DOWNLOADS_PEAK` (Daemon Status),
-//! `ORPHANED_PARTIAL_*` (Cache Statistics) and `CACHE_QUOTA_UTIL_PEAK_BPS`
-//! (the disk-usage cell), split into titled
-//! subsections with the alert/warn policy applied per row.
+//! `metrics.rs` that no other section shows, split into titled subsections
+//! with the alert/warn policy applied per row.
 //!
 //! Every row should send the operator somewhere: to a config option (the
 //! tooltip names it), to a client (the Clients table) or to a mirror (the
@@ -49,7 +45,6 @@ use super::{
     table::{DetailsList, Highlights, Kind},
 };
 
-/// Percentage suffix rendered only when the total is non-zero.
 struct OptPctSuffix {
     num: u64,
     total: u64,
@@ -64,7 +59,6 @@ impl Display for OptPctSuffix {
     }
 }
 
-/// `req/conn` suffix rendered only when connections have been accepted.
 struct OptReqPerConn {
     requests: u64,
     connections: u64,
@@ -104,17 +98,12 @@ fn share_row(
         ));
 }
 
-/// Backends compiled into this build. A counter only a compiled-out backend
-/// bumps reads 0 forever; its row is not shown.
-///
-/// The splice backend: its delivery path, upstream pool, pipe resizes and
-/// client demotion.
+// Backends compiled into this build. A counter only a compiled-out backend
+// bumps reads 0 forever; its row is not shown.
 const SPLICE: bool = cfg!(feature = "splice");
-/// The hyper backend: the copy and channel delivery paths, its body-stream
-/// errors and unhandled-header discovery.
 const HYPER: bool = cfg!(feature = "hyper");
-/// The sendfile backend: its delivery path and its own header-read loop (the
-/// only reader of the request-read and header-timeout counters).
+/// The sendfile backend's own header-read loop is the only reader of the
+/// request-read and header-timeout counters.
 const SENDFILE: bool = cfg!(feature = "sendfile");
 
 /// Which rows can move in this configuration (the build is [`SPLICE`],
@@ -126,18 +115,12 @@ const SENDFILE: bool = cfg!(feature = "sendfile");
     reason = "one independent switch per configuration-gated row set"
 )]
 struct Shown {
-    /// `https_upgrade_mode` other than `Never`.
     https_upgrade: bool,
-    /// `https_tunnel_enabled`.
     tunnels: bool,
-    /// `verify_checksums`: the Integrity group, the verify throttle and the
-    /// checksum abort cause. Off, an Unverified row reading 0 would claim a
-    /// coverage nothing checks.
+    /// Off, an Unverified row reading 0 would claim a coverage nothing
+    /// checks.
     verify_checksums: bool,
-    /// `min_download_rate` set: the rate-limit cancellations, which only a
-    /// rate check triggers.
     rate_checks: bool,
-    /// `reject_pdiff_requests`.
     pdiff_rejection: bool,
 }
 
@@ -217,8 +200,6 @@ impl Display for Funnel {
     }
 }
 
-/// The two cells a delivery path contributes: its request-to-served funnel
-/// and the bytes it moved.
 fn delivery_path(
     t: &mut DetailsList,
     labels: [&'static str; 2],
@@ -627,7 +608,6 @@ fn build_client_delivery_group(g: &mut Groups, shown: Shown) {
 }
 
 fn build_delivery_group(g: &mut Groups) {
-    // Sample the compiled-in paths in display order before rendering the group.
     let bytes = [
         #[cfg(feature = "sendfile")]
         Segment {

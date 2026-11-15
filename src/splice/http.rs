@@ -3,15 +3,9 @@
 //! [`parse_upstream_response`] into [`UpstreamResponse`] on the response
 //! side, and the body relays hanging off the shared [`BodyFraming`]
 //! (`relay_to_client`, `read_to_vec`) that stream or buffer a body according
-//! to its framing.
-//! [`ChunkDecoder`] is the one chunked transfer-coding state machine;
-//! [`forward_upstream_chunked_body`] and [`read_dechunk_body_to_vec`] are its
-//! I/O wrappers. A relayed chunked body reaches an HTTP/1.1 client in its raw
-//! encoding but an HTTP/1.0 client de-chunked and close-delimited
+//! to its framing. A relayed chunked body reaches an HTTP/1.1 client in its
+//! raw encoding but an HTTP/1.0 client de-chunked and close-delimited
 //! ([`ChunkedRelay`]).
-//!
-//! Consumers: `acquire` (request/parse), the drive in
-//! `mod.rs` and `volatile`/`simple_proxy`/`cleanup_bridge` (framing relays).
 
 use std::{
     future::Future,
@@ -90,8 +84,6 @@ impl HeadError {
 pub(super) type RequestConditions<'a> =
     crate::upstream_head::FetchMode<'a, &'a VolatileCondHeaders>;
 
-/// One upstream `GET`: the `Host` authority, the request target and its
-/// conditions.
 #[derive(Clone, Copy)]
 pub(super) struct UpstreamRequest<'a> {
     pub(super) authority: &'a str,
@@ -160,9 +152,6 @@ fn format_http_request(request: UpstreamRequest<'_>) -> String {
     )
 }
 
-/// Send an HTTP GET request to the upstream stream (generic over TCP/TLS).
-///
-/// Times out after the configured HTTP timeout.
 async fn send_upstream_request(
     upstream: &mut UpstreamConn,
     request: UpstreamRequest<'_>,
@@ -187,10 +176,7 @@ async fn send_upstream_request(
     }
 }
 
-/// Read HTTP response headers from the upstream stream (generic over TCP/TLS).
 /// Returns the byte index where the body starts.
-///
-/// Times out after the configured HTTP timeout.
 async fn read_upstream_response_headers(
     upstream: &mut UpstreamConn,
     buf: &mut BytesMut,
@@ -199,9 +185,6 @@ async fn read_upstream_response_headers(
     let deadline = tokio::time::sleep(http_timeout);
     tokio::pin!(deadline);
 
-    // Incremental scan offset: bytes before this index were already checked for
-    // the \r\n\r\n terminator on a prior iteration. Subtract 3 so a terminator
-    // that straddles the read boundary is still found.
     let mut search_offset = 0usize;
 
     loop {
@@ -243,8 +226,7 @@ async fn read_upstream_response_headers(
         match capped_header_end(buf, scan_from, MAX_UPSTREAM_HEADER_SIZE) {
             HeadEnd::Complete(end) => return Ok(end),
             HeadEnd::TooLarge(size) => {
-                // Counted here, like the parser's refusals in
-                // `send_and_read_headers`: every `HeadError::Protocol` is one
+                // Every `HeadError::Protocol` is one
                 // `UPSTREAM_PROTOCOL_VIOLATION`, bumped where it was detected.
                 metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                 return Err(HeadError::Protocol(format!(
@@ -256,9 +238,8 @@ async fn read_upstream_response_headers(
     }
 }
 
-/// The splice side of [`BodyFraming`], whose type and resolution rule
-/// (`resolve_body_framing`) live in `upstream_head`, shared with hyper: the
-/// framing line a relayed head announces and the body relays.
+/// The splice side of [`BodyFraming`], which `upstream_head` shares with
+/// hyper.
 impl BodyFraming {
     /// The client connection's fate after a response relayed with this
     /// framing to a `client` speaking that HTTP version: a body relayed
@@ -317,7 +298,6 @@ impl BodyFraming {
         body_prefix: &[u8],
         max_bytes: usize,
     ) -> Result<u64, DeliveryFailure> {
-        /// Write the bytes that arrived with the headers, rate-checked.
         async fn write_prefix(
             client_stream: &TcpStream,
             body_prefix: &[u8],
@@ -350,9 +330,8 @@ impl BodyFraming {
                 Ok(prefix_len + forwarded)
             }
             Self::Chunked => {
-                // Chunk framing is retained for HTTP/1.1 and decoded for
-                // HTTP/1.0. The helper consumes and strips trailers so the
-                // upstream connection stays reusable on success.
+                // The helper consumes and strips trailers so the upstream
+                // connection stays reusable on success.
                 let forwarded = forward_upstream_chunked_body(
                     &mut upstream,
                     client_stream,
@@ -382,10 +361,7 @@ impl BodyFraming {
     /// Read the whole response body into memory, framed per `self`, up to
     /// `max_bytes` of payload (`body_prefix` included).
     ///
-    /// Same poolability contract as [`Self::relay_to_client`]: the upstream
-    /// is closed on every error and for close-delimited bodies, and becomes
-    /// reusable only after a length-delimited or chunked body was consumed
-    /// to its terminator.
+    /// Same poolability contract as [`Self::relay_to_client`].
     pub(super) async fn read_to_vec(
         self,
         mut upstream: ResponseBody,
@@ -412,7 +388,6 @@ impl BodyFraming {
     }
 }
 
-/// Parsed upstream response header info.
 pub(super) struct UpstreamResponse {
     pub(super) status_code: StatusCode,
     pub(super) framing: BodyFraming,
@@ -459,8 +434,6 @@ impl UpstreamResponse {
         is_followed_redirect(self.status_code)
     }
 
-    /// The body's fixed length, only when the response is length-delimited
-    /// (`Content-Length`). `None` for chunked or close-delimited framing.
     fn content_length(&self) -> Option<u64> {
         match self.framing {
             BodyFraming::ContentLength(n) => Some(n),
@@ -469,9 +442,9 @@ impl UpstreamResponse {
     }
 
     /// The backend-neutral projection consumed by
-    /// `upstream_head::plan_download`.
-    /// Its `ETag` goes through the same `well_formed_etag` filter as hyper's
-    /// projection, so the planner's input does not depend on whether
+    /// `upstream_head::plan_download`. Its `ETag` goes through the same
+    /// `well_formed_etag` filter as hyper's projection, so the planner's
+    /// input does not depend on whether
     /// [`Self::discard_invalid_validators`] ran first.
     pub(super) fn head(&self) -> UpstreamHead<'_> {
         UpstreamHead {
@@ -485,8 +458,8 @@ impl UpstreamResponse {
     /// Discard malformed `ETag`/`Last-Modified` values before they reach a
     /// client response header, an `If-Range` comparison or an xattr.
     ///
-    /// Wording mirrors `hyper_conn.rs::serve_new_file` modulo the subsystem
-    /// prefix.
+    /// The warn's wording mirrors `hyper_conn.rs::serve_new_file_worker`
+    /// modulo the subsystem prefix.
     pub(super) fn discard_invalid_validators(&mut self, conn_details: &ConnectionDetails) {
         let (etag, last_modified) = cache_metadata::check_upstream_validators(
             self.etag.take(),
@@ -619,9 +592,6 @@ fn parse_upstream_response(
     })
 }
 
-/// Send request and read+parse response headers on an existing connection.
-///
-/// Times out after the configured HTTP timeout.
 pub(super) async fn send_and_read_headers(
     up: &mut UpstreamConn,
     request: UpstreamRequest<'_>,
@@ -641,21 +611,15 @@ pub(super) async fn send_and_read_headers(
     Ok((resp, hdr_buf, hdr_end))
 }
 
-/// The `TimedOut` error every upstream body read in this module returns:
-/// bumps `HTTP_TIMEOUT_UPSTREAM_READ` and names the phase alongside the
-/// budget that ran out.
 fn upstream_read_timeout(timeout: Duration) -> UpstreamError {
     metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
     UpstreamError::timeout("upstream read timed out", timeout)
 }
 
 /// The upstream half of every body reader below: one read under the
-/// `http_timeout` deadline (a deadline hit surfaces as
-/// [`upstream_read_timeout`], an I/O error is tagged with `phase`), its
-/// `BYTES_DOWNLOADED_UPSTREAM` bump, the optional relay cap
-/// ([`Self::capped`]) and the mirror-rate gate, which fails with the shared
-/// `TimedOut` error once the mirror has fallen below `min_download_rate`. A
-/// `0` (EOF) passes no check and is the caller's to interpret.
+/// `http_timeout` deadline, counted, optionally capped ([`Self::capped`]) and
+/// gated on the mirror rate. A `0` (EOF) passes no check and is the caller's
+/// to interpret.
 struct UpstreamReader {
     /// `None` when `min_download_rate` is disabled.
     rate_checker: Option<RateChecker>,
@@ -664,7 +628,6 @@ struct UpstreamReader {
     cap: Option<RelayCap>,
 }
 
-/// The bytes a capped [`UpstreamReader`] has read, and its limit.
 struct RelayCap {
     max_bytes: usize,
     total: u64,
@@ -729,10 +692,9 @@ impl UpstreamReader {
 
 /// Forward the rest of a relayed body from upstream to client (no
 /// caching): `length` more bytes of a length-delimited body, else
-/// everything up to EOF, capped at `max_bytes`. Used for relaying bodies
-/// verbatim: non-200 responses on the cache path and any status via
-/// `splice_simple_proxy`. Returns the bytes forwarded.
-/// On error the connection state is indeterminate -- callers must mark the upstream non-poolable.
+/// everything up to EOF, capped at `max_bytes`. Returns the bytes forwarded.
+/// On error the connection state is indeterminate -- callers must not pool
+/// the upstream.
 async fn forward_upstream_body(
     upstream: &mut UpstreamConn,
     client: &TcpStream,
@@ -749,9 +711,6 @@ async fn forward_upstream_body(
     let buf_size = length.map_or(TLS_READ_BUF_SIZE, |length| {
         usize::try_from(length).map_or(TLS_READ_BUF_SIZE, |length| length.min(TLS_READ_BUF_SIZE))
     });
-    // `Vec::with_capacity` reserves uninitialized backing storage; `read_buf`
-    // fills bytes into the spare capacity via `BufMut`, so the buffer is
-    // never zero-initialized before being overwritten by upstream data.
     let mut buf: Vec<u8> = Vec::with_capacity(buf_size);
     let mut total: u64 = 0;
     let mut client_rate_checker = RateChecker::from_config(config);
@@ -907,21 +866,15 @@ fn parse_chunk_size_line(line: &[u8]) -> Result<usize, &'static str> {
 
 /// Incremental decoder for the chunked transfer coding (RFC 9112 section 7.1).
 ///
-/// The single framing implementation behind both the streaming relay
-/// [`forward_upstream_chunked_body`] (which forwards the raw encoding
-/// with trailer fields stripped, or, for an
-/// HTTP/1.0 client, streams the decoded payload) and the buffered reader
-/// [`read_dechunk_body_to_vec`] (which collects the decoded payload).
 /// Chunk-size lines are held to RFC 9112's grammar ([`parse_chunk_size_line`])
 /// and chunk extensions after `;` are ignored; trailer fields between `0\r\n`
-/// and the final `\r\n` are validated with the header parser. The declared payload total is
-/// checked against `max_bytes` at every chunk-size line.
+/// and the final `\r\n` are validated with the header parser. The declared
+/// payload total is checked against `max_bytes` at every chunk-size line.
 ///
-/// Terminator policy, binding on both readers: on success the closing
-/// `\r\n` after the `0\r\n` has been fully consumed from the upstream socket
-/// buffer, so the connection can be returned to the pool. On error the
-/// connection state is indeterminate and the caller must mark the upstream
-/// non-poolable.
+/// On success the closing `\r\n` after the `0\r\n` has been fully consumed
+/// from the upstream socket buffer, so the connection can be returned to the
+/// pool. On error the connection state is indeterminate and the caller must
+/// not pool the upstream.
 struct ChunkDecoder {
     state: ChunkedState,
     size_buf: Vec<u8>,
@@ -977,8 +930,6 @@ impl ChunkDecoder {
                         let chunk_size = parse_chunk_size_line(line).map_err(framing_violation)?;
                         self.size_buf.clear();
                         if chunk_size == 0 {
-                            // Terminal chunk; still need to consume the
-                            // trailer section through its closing CRLF.
                             self.state = ChunkedState::Trailers;
                         } else {
                             self.total += chunk_size;
@@ -993,7 +944,6 @@ impl ChunkDecoder {
                             };
                         }
                     } else if self.size_buf.len() > 64 {
-                        // Guard against absurdly long size lines.
                         return Err(framing_violation(
                             "chunked encoding: chunk-size line too long",
                         ));
@@ -1074,7 +1024,6 @@ enum ChunkedRelay {
 }
 
 impl ChunkedRelay {
-    /// How a chunked body is relayed to a client speaking `client`.
     fn for_client(client: ConnectionVersion) -> Self {
         match client {
             ConnectionVersion::Http11 => Self::Raw,
@@ -1090,13 +1039,10 @@ impl ChunkedRelay {
 /// consumed.
 ///
 /// Framing is validated before anything is forwarded, so the client never
-/// receives bytes past a detected framing error: on invalid framing the
-/// caller's error-return path closes the client connection, and without the
-/// pre-check the client would first receive the corrupt bytes and only then
-/// see the connection drop. When the terminator is consumed only the
-/// chunk prefix `data[..framed]` goes out in raw mode, followed by an empty
-/// trailer section; bytes past the upstream's closing `\r\n`
-/// are rejected afterwards by [`Consumed::ensure_no_trailing_bytes`].
+/// receives bytes past a detected framing error. When the terminator is
+/// consumed only the chunk prefix `data[..framed]` goes out in raw mode,
+/// followed by an empty trailer section; bytes past the upstream's closing
+/// `\r\n` are rejected afterwards by [`Consumed::ensure_no_trailing_bytes`].
 #[expect(
     clippy::too_many_arguments,
     reason = "one per-buffer step of one relay loop; the arguments are that loop's state"
@@ -1143,12 +1089,6 @@ async fn forward_chunked_buf(
 
 /// Forward a chunked transfer-encoded body from upstream to client.
 ///
-/// For [`ChunkedRelay::Raw`] chunk-size lines, data, and chunk CRLFs are
-/// forwarded unchanged. The [`ChunkDecoder`] consumes and validates the
-/// trailer section, which is replaced with an empty section downstream.
-/// For [`ChunkedRelay::Decoded`] only the payload the
-/// decoder reports goes out, as a close-delimited body.
-///
 /// Terminator and pool-safety policy: [`ChunkDecoder`].
 async fn forward_upstream_chunked_body(
     upstream: &mut UpstreamConn,
@@ -1164,8 +1104,6 @@ async fn forward_upstream_chunked_body(
     let mut decoder = ChunkDecoder::new(max_bytes);
     // The decoded payload of the current buffer; stays empty for `Raw`.
     let mut payload = Vec::new();
-    // Tracks the bytes written to the client: raw framing + data, or the
-    // decoded payload.
     let mut client_total: u64 = 0;
 
     // The bytes that arrived with the response headers go first.
@@ -1203,8 +1141,7 @@ async fn forward_upstream_chunked_body(
     }
 }
 
-/// Read upstream body into a `Vec<u8>` until EOF, up to `max_bytes`.
-/// Returns the buffered body. Connection is not poolable after this.
+/// Reads until EOF, so the connection is not poolable afterwards.
 async fn read_body_to_vec_until_eof(
     upstream: &mut UpstreamConn,
     prefix: &[u8],
@@ -1228,9 +1165,6 @@ async fn read_body_to_vec_until_eof(
         // single over-cap byte slip through so the check above can reject it
         // on the next iteration.
         let remaining = (max_bytes - body.len()).saturating_add(1);
-        // Ensure ample spare capacity so each read syscall can transfer a
-        // useful chunk; `Vec::reserve` is a no-op when spare capacity
-        // already covers this.
         body.reserve(TLS_READ_BUF_SIZE.min(remaining));
 
         let n = reader
@@ -1244,7 +1178,6 @@ async fn read_body_to_vec_until_eof(
     Ok(body)
 }
 
-/// Read an upstream body with known `Content-Length` into a `Vec<u8>`.
 async fn read_body_to_vec_with_content_length(
     upstream: &mut UpstreamConn,
     prefix: &[u8],
@@ -1288,10 +1221,8 @@ async fn read_body_to_vec_with_content_length(
     Ok(body)
 }
 
-/// Dechunk a chunked-encoded body from upstream into a `Vec<u8>`, up to `max_bytes`
-/// of decoded payload.
-///
-/// Terminator and pool-safety policy: [`ChunkDecoder`].
+/// `max_bytes` caps the decoded payload. Terminator and pool-safety policy:
+/// [`ChunkDecoder`].
 async fn read_dechunk_body_to_vec(
     upstream: &mut UpstreamConn,
     prefix: &[u8],
@@ -1931,7 +1862,6 @@ mod tests {
         Ok((body, consumed))
     }
 
-    // Drive a fresh decoder over a single input buffer.
     fn dechunk_once(
         input: &[u8],
         max_bytes: usize,
@@ -1991,9 +1921,7 @@ mod tests {
     #[test]
     fn test_chunk_decoder_rejects_garbage_after_zero_chunk() {
         // The bytes following `0\r\n` must be valid trailer fields or
-        // the closing CRLF. Garbage triggers a framing error rather than silently
-        // succeeding (the pre-fix decoder did the latter, leaving the
-        // garbage in the upstream socket buffer).
+        // the closing CRLF.
         let input: &[u8] = b"0\r\nXY\r\n";
         let err = dechunk_once(input, 1024).expect_err("garbage after 0-chunk must be rejected");
         assert_framing_error(&err);
@@ -2001,13 +1929,8 @@ mod tests {
 
     #[test]
     fn test_chunk_decoder_split_closing_crlf() {
-        // The closing `\r\n` arrives in two separate buffers (the `\r` in
-        // one read, the `\n` in the next). Verifies trailer parsing
-        // correctly handles buffer boundaries.
         let mut decoder = ChunkDecoder::new(1024);
 
-        // First buffer: data chunk + terminal `0\r\n` + the `\r` of the
-        // closing CRLF (1 byte short of the full terminator).
         let part1: &[u8] = b"5\r\nhello\r\n0\r\n\r";
         let (body1, c1) = feed_collect(&mut decoder, part1).expect("part1 decode");
         assert_eq!(body1, b"hello");
@@ -2022,7 +1945,6 @@ mod tests {
         );
         assert!(matches!(decoder.state, ChunkedState::Trailers));
 
-        // Second buffer: just the `\n` that finishes the closing CRLF.
         let part2: &[u8] = b"\n";
         let (body2, c2) = feed_collect(&mut decoder, part2).expect("part2 decode");
         assert_eq!(body2, b"");
@@ -2063,11 +1985,9 @@ mod tests {
             reason,
             "chunked encoding: trailing bytes after 0-length chunk"
         );
-        // A frame that ends exactly at the terminator passes the check.
         consumed
             .ensure_no_trailing_bytes(5)
             .expect("no trailing bytes when the input ends at the terminator");
-        // An unfinished frame never trips it, whatever the input length.
         Consumed {
             raw: 3,
             framed: 3,

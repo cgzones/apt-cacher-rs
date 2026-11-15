@@ -1,16 +1,9 @@
 //! The descriptors this process holds against its soft `RLIMIT_NOFILE`, for
 //! the dashboard's Capacity section.
 //!
-//! Sockets, cache files, splice pipes, the database: everything the daemon
-//! opens draws on one budget, and at its end `accept(2)` fails with `EMFILE`
-//! (Descriptor Exhaustion, under Accept Failures). `max_connections` defaults to three quarters
-//! of the soft limit (`client_counter::default_max_connections`); the
-//! gauge shows how much of the rest the other descriptors take.
-//!
 //! Sampled off the hot path, never per accept: by every dashboard render
-//! and by [`sampler`], a task ticking every [`SAMPLE_INTERVAL`], whose
-//! readings feed `metrics::OPEN_FDS_PEAK`. A burst between two samples is
-//! missed unless it reached the cap, which the accept loop reports through
+//! and by [`sampler`]. A burst between two samples is missed unless it
+//! reached the cap, which the accept loop reports through
 //! [`note_exhausted`]. Only this process's descriptors count; the
 //! system-wide table (`ENFILE`) is not tracked.
 
@@ -18,17 +11,13 @@ use std::{os::unix::fs::MetadataExt as _, path::Path, time::Duration};
 
 use crate::{error::ErrorReport, metrics, warn_once_or_debug};
 
-/// How often [`sampler`] reads the descriptor count into the peak.
 pub(crate) const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// The directory listing this process's descriptors.
 const PROC_SELF_FD: &str = "/proc/self/fd";
 
-/// Descriptors this process holds now, `None` when `/proc` cannot say.
-///
 /// Linux 6.2 and later report the count as the directory's size, one
 /// `stat(2)`; an older kernel reports 0 there, and the listing is counted
-/// instead. `/proc` is no cache path, so neither goes through `cache_walk`.
+/// instead.
 #[must_use]
 fn open_fds() -> Option<u64> {
     let dir = Path::new(PROC_SELF_FD);
@@ -78,8 +67,7 @@ pub(crate) fn nofile_limit() -> (Option<u64>, Option<u64>) {
     }
 }
 
-/// Read the descriptor count into the peak, returning it (a dashboard
-/// render).
+/// Read the descriptor count into the peak, returning it.
 #[must_use]
 pub(crate) fn sample() -> Option<u64> {
     let open = open_fds()?;
@@ -95,7 +83,6 @@ pub(crate) fn note_exhausted() {
     }
 }
 
-/// Feed the peak every [`SAMPLE_INTERVAL`] for the process's lifetime.
 pub(crate) async fn sampler() {
     let mut interval = tokio::time::interval(SAMPLE_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -128,8 +115,6 @@ mod tests {
         drop(files);
     }
 
-    /// The fallback for kernels before 6.2 agrees with the size the newer
-    /// ones report, its own listing descriptor excluded.
     #[test]
     fn the_listing_fallback_counts_like_the_stat() {
         let listed = listed_fds(Path::new(PROC_SELF_FD)).expect("listable");
@@ -140,8 +125,6 @@ mod tests {
         assert!(listed >= 3, "{listed}");
     }
 
-    /// An `EMFILE` from accept(2) is the process at its soft limit, so the
-    /// peak reads the limit even though no sample saw it.
     #[test]
     fn exhaustion_raises_the_peak_to_the_soft_limit() {
         let (soft, _) = nofile_limit();

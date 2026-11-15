@@ -28,7 +28,6 @@ pub(crate) enum TransferKind {
 }
 
 impl TransferKind {
-    /// Log noun for the record.
     fn noun(self) -> &'static str {
         match self {
             Self::Delivery { partial: _ } => "delivery",
@@ -66,23 +65,19 @@ pub(crate) enum DatabaseCommand {
 pub(crate) static DB_TASK_QUEUE_SENDER: OnceLock<tokio::sync::mpsc::Sender<DatabaseCommand>> =
     OnceLock::new();
 
-/// Send a `DatabaseCommand` on the channel, updating queue-depth metrics.
-///
-/// All call sites that enqueue work for the DB task should go through this
-/// helper so `DB_QUEUE_DEPTH_PEAK` and `DB_COMMANDS_SENT` stay accurate.
+/// Every enqueue for the DB task goes through this helper (or its
+/// nonblocking variant) so the queue metrics stay accurate.
 ///
 /// During graceful shutdown the DB task closes its receiver and exits while
 /// request tasks may still be finishing. Such sends are dropped (with a
-/// metric bump) rather than panicking — losing a tail of telemetry events is
-/// preferable to crashing the proxy.
+/// metric bump) rather than panicking.
 pub(crate) async fn send_db_command(cmd: DatabaseCommand) {
     let tx = DB_TASK_QUEUE_SENDER
         .get()
         .expect("Sender initialized in main_loop()");
     metrics::DB_COMMANDS_SENT.increment();
-    // `capacity() == 0` means every slot is in flight, so this send must wait
-    // for the DB task to drain one. Track it so operators can see how often
-    // the channel is saturated and whether its configured size needs tuning.
+    // A full queue makes this send wait for the DB task to drain a slot.
+    // Counted so operators can see whether the channel size needs tuning.
     if QUEUE_OBSERVER.admit(tx) {
         metrics::DB_QUEUE_FULL_WAITS.increment();
     }
@@ -91,8 +86,6 @@ pub(crate) async fn send_db_command(cmd: DatabaseCommand) {
     }
 }
 
-/// Delete mirror rows by id, with every row referencing them.
-///
 /// Routed through the DB task rather than run against the database
 /// directly: the task caches `Mirror -> id` for the process lifetime, so a
 /// row deleted behind its back would keep resolving to the dead id and
@@ -197,9 +190,6 @@ fn convert_size_duration(size: u64, elapsed: StdDuration) -> Option<(i64, i64)> 
 
 /// Resolve a mirror to its `mirrors_v2.id`, hitting the database only on a
 /// cache miss. Always bumps the cached `last_seen_observed` to now.
-///
-/// Hot path: the lookup borrows `mirror` directly so per-event cache hits
-/// allocate nothing. Only on a miss do we clone into the map.
 async fn resolve_mirror_id(
     db: &Database,
     cache: &mut HashMap<Mirror, CachedMirror>,
@@ -232,9 +222,9 @@ async fn resolve_mirror_id(
     Ok(id)
 }
 
-/// Stage a command into the batch buffers, resolving the mirror id first.
-/// Errors during mirror resolution are logged and the command is dropped.
-/// The Ping and `DeleteMirrors` arms run at once and reply inline.
+/// Stage a command into the batch buffers. A command whose mirror id cannot
+/// be resolved is logged and dropped. The Ping and `DeleteMirrors` arms run
+/// at once and reply inline.
 async fn stage(
     db: &Database,
     cache: &mut HashMap<Mirror, CachedMirror>,
@@ -381,8 +371,7 @@ async fn stage_received(
     }
 }
 
-/// Flush all three batch buffers in sequence. Errors are logged and the
-/// affected buffer is dropped — the next flush starts with empty buffers.
+/// A buffer whose flush fails is logged and dropped, not retried.
 async fn flush_batches(db: &Database, buf: &mut BatchBuffers, reason: FlushReason) {
     let total = buf.len();
     if total == 0 {
@@ -427,9 +416,6 @@ async fn flush_batches(db: &Database, buf: &mut BatchBuffers, reason: FlushReaso
     metrics::DB_BATCH_SIZE_PEAK.update(total as u64);
 }
 
-/// Flush the in-memory `last_seen` deltas back to `mirrors_v2`. Only entries
-/// whose observed timestamp is strictly newer than the last-flushed timestamp
-/// are written.
 async fn flush_last_seen(db: &Database, cache: &mut HashMap<Mirror, CachedMirror>) {
     let pairs: Vec<(i64, i64)> = cache
         .values()
@@ -558,8 +544,6 @@ pub(crate) async fn db_loop(
                 stage_received(&database, &mut cache, &mut buf, &mut received, flush_max_count).await;
 
                 if was_full && !at_cap {
-                    // `send_db_command` awaits on a full queue, so request
-                    // paths now block on database writes.
                     warn!(
                         "Database command channel full ({max_capacity}/{max_capacity}); request paths now block on database writes; consider raising `db_channel_capacity`"
                     );
@@ -680,10 +664,10 @@ mod tests {
         )
     }
 
-    /// Regression: a by-hash cache hit never contacts the upstream and its
-    /// scope is no part of the cache key, so the scope is unverified and must
-    /// mint no row — cleanup would fetch a `Packages` that 404s and bail the
-    /// mirror's sweep.
+    /// A by-hash cache hit never contacts the upstream and its scope is no
+    /// part of the cache key, so the scope is unverified and must mint no
+    /// row: cleanup would fetch a `Packages` that 404s and bail the mirror's
+    /// sweep.
     ///
     /// Ordering carries the assertion: both commands land in one batch, so
     /// once the verified row is visible the unverified one has had its turn.
@@ -715,9 +699,8 @@ mod tests {
         join(task).await;
     }
 
-    /// The other half: a cache hit is still evidence the client uses the
-    /// scope, so it refreshes `last_seen`. Without that a fully warm mirror
-    /// would age its own origins out.
+    /// A cache hit is still evidence the client uses the scope; without the
+    /// refresh a fully warm mirror would age its own origins out.
     #[tokio::test]
     async fn a_cache_hit_sighting_refreshes_an_existing_origin() {
         let fixture = Fixture::new().await;
@@ -753,9 +736,6 @@ mod tests {
         join(task).await;
     }
 
-    /// A mirror row deleted by cleanup must not keep resolving from the
-    /// mirror-id cache: a later transfer of that mirror re-creates the row
-    /// instead of being written against the dead id.
     #[tokio::test]
     async fn deleted_mirror_rows_leave_the_mirror_id_cache() {
         let fixture = Fixture::new().await;
@@ -783,9 +763,6 @@ mod tests {
         assert_eq!(fixture.transfers().await, (1, 2));
     }
 
-    /// A row staged for a mirror cleanup wants to delete proves the mirror
-    /// was used after cleanup judged it unused: the mirror is kept, reported
-    /// back, and the row is written against it.
     #[tokio::test]
     async fn a_mirror_with_staged_rows_is_kept() {
         let fixture = Fixture::new().await;

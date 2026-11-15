@@ -24,19 +24,16 @@
 //!   `AUTHZ_REJECTED_TUNNEL_MIRROR`) -- usually a repository in its sources
 //!   the allowlists miss: add the mirror, or fix the client.
 //!
-//! Each class is recorded where its global counter is bumped (for the
-//! delivery classes, where the failure is concluded), once per event, and
-//! never for cleanup's synthetic client.
+//! Each class is recorded where its global counter is bumped, once per
+//! event, and never for cleanup's synthetic client.
 //!
-//! Unlike mirrors, client addresses are unbounded, so the table keeps only
-//! the heaviest [`CAPACITY`] hitters with the space-saving algorithm: a
-//! newcomer to a full table displaces the entry with the lowest total and
-//! inherits that total as its starting weight, so a client that keeps
-//! causing trouble rises to the top while one-off noise churns through the
-//! bottom slots. A displaced client's counts are lost, and a newcomer's
-//! class counts are exact only since it entered (the inherited weight is
-//! kept apart as [`ClientTrouble::inherited`]). Only failure and refusal
-//! paths touch the table, under one short mutex.
+//! Client addresses are unbounded, so the table keeps only the heaviest
+//! [`CAPACITY`] hitters with the space-saving algorithm: a newcomer to a
+//! full table displaces the entry with the lowest total and inherits that
+//! total as its starting weight, so a client that keeps causing trouble
+//! rises to the top while one-off noise churns through the bottom slots. A
+//! displaced client's counts are lost, and a newcomer's class counts are
+//! exact only since it entered.
 
 use std::{net::IpAddr, sync::LazyLock};
 
@@ -52,7 +49,6 @@ pub(crate) enum Trouble {
     MirrorRefused,
 }
 
-/// One tracked client's counts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ClientTrouble {
     pub(crate) ip: IpAddr,
@@ -62,14 +58,13 @@ pub(crate) struct ClientTrouble {
     pub(crate) unauthorized: u64,
     pub(crate) mirror_refused: u64,
     /// The total of the entry this one displaced: an upper bound on the
-    /// events this client may have caused before it was tracked. 0 for a
-    /// client tracked since its first event.
+    /// events this client may have caused before it was tracked.
     inherited: u64,
 }
 
 impl ClientTrouble {
-    /// A client without any trouble: what the Clients table shows for a
-    /// persisted client the table does not track.
+    /// What the Clients table shows for a persisted client this table does
+    /// not track.
     #[must_use]
     pub(crate) const fn none(ip: IpAddr) -> Self {
         Self::new(ip, 0)
@@ -87,8 +82,7 @@ impl ClientTrouble {
         }
     }
 
-    /// The weight the table ranks by: the counted events plus the inherited
-    /// estimate.
+    /// The weight the table ranks by.
     #[must_use]
     const fn total(&self) -> u64 {
         self.slow
@@ -120,7 +114,6 @@ impl ClientTrouble {
     }
 }
 
-/// Clients tracked at once.
 const CAPACITY: usize = 32;
 
 /// A fixed-capacity space-saving table; linear scans are fine at this size.
@@ -162,7 +155,6 @@ impl HeavyHitters {
 static TABLE: LazyLock<parking_lot::Mutex<HeavyHitters>> =
     LazyLock::new(|| parking_lot::Mutex::new(HeavyHitters::new(CAPACITY)));
 
-/// Count one event against `client`, unless it is cleanup's synthetic one.
 pub(crate) fn record(client: &ClientInfo, trouble: Trouble) {
     if client.is_cleanup_synthetic() {
         return;
@@ -170,9 +162,8 @@ pub(crate) fn record(client: &ClientInfo, trouble: Trouble) {
     record_ip(client.ip(), trouble);
 }
 
-/// Count one event against a peer known only by its address (an accept-time
-/// refusal, before any request made it a `ClientInfo`). Canonicalized like
-/// `ClientInfo::ip`, so an IPv4-mapped peer joins its IPv4 entry.
+/// For a peer known only by its address (an accept-time refusal).
+/// Canonicalized, so an IPv4-mapped peer joins its IPv4 entry.
 pub(crate) fn record_ip(ip: IpAddr, trouble: Trouble) {
     TABLE.lock().record(ip.to_canonical(), trouble);
 }
@@ -225,7 +216,6 @@ mod tests {
         }
         table.record(ip(2), Trouble::Slow);
         table.record(ip(2), Trouble::Slow);
-        // Full: the newcomer replaces ip(2), the lighter of the two.
         table.record(ip(3), Trouble::Disconnect);
         assert!(table.entries.iter().all(|e| e.ip != ip(2)));
         let newcomer = table
@@ -237,7 +227,6 @@ mod tests {
         assert_eq!(newcomer.disconnect, 1, "its own events are exact");
         assert_eq!(newcomer.inherited, 2, "it inherits the displaced total");
         assert_eq!(newcomer.total(), 3);
-        // The heavy hitter kept its place and its counts.
         assert!(
             table
                 .entries

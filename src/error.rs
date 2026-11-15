@@ -33,27 +33,14 @@ pub(crate) struct UpstreamFetchError {
     pub(crate) reason: String,
 }
 
-/// Returns `true` when `err` indicates the peer terminated the connection
-/// (by reset, abort, half-close, or EOF). Used to demote routine "client
-/// went away" log lines from warn to info, since they are not actionable
-/// for the operator.
+/// Whether the peer terminated the connection (reset, abort, half-close or
+/// EOF): routine "client went away" events, logged at info rather than warn.
 ///
-/// `ErrorKind::TimedOut` is deliberately *not* included here: in this
-/// codebase, `TimedOut` `io::Error`s overwhelmingly originate from the
-/// proxy's own decisions — `wait_socket_rated` HTTP per-op timeouts and
-/// `rate_checked_body` rate-stalls — which already bump dedicated
-/// `HTTP_TIMEOUT_*` counters at construction. Folding them into
-/// "peer disconnect" was double-attributing them to
-/// `CLIENT_DISCONNECTED_MID_BODY`. The rare OS-level `ETIMEDOUT`
-/// (TCP keepalive / `TCP_USER_TIMEOUT`) is the only remaining source and
-/// is acceptable to log as a warn-level timeout rather than an
-/// info-level "peer disconnect" — the wording stays accurate either way.
-///
-/// A client write whose timeout should log like a hang-up uses
-/// `is_expected_client_end` (sendfile builds only); other call sites that
-/// want to demote a `TimedOut` to a different severity (e.g. the
-/// header-read idle-timeout debug path) MUST add an explicit
-/// `err.kind() == ErrorKind::TimedOut` branch before this check.
+/// `ErrorKind::TimedOut` is deliberately *not* included: such errors
+/// overwhelmingly come from the proxy's own timeouts and rate-stalls, which
+/// already bump dedicated `HTTP_TIMEOUT_*` counters; including them would
+/// double-attribute them to `CLIENT_DISCONNECTED_MID_BODY`. A call site that
+/// wants a different severity for a `TimedOut` must check for it first.
 #[must_use]
 pub(crate) fn is_peer_disconnect(err: &std::io::Error) -> bool {
     use std::io::ErrorKind;
@@ -69,9 +56,8 @@ pub(crate) fn is_peer_disconnect(err: &std::io::Error) -> bool {
 
 /// Whether a failed client write is an expected end of the exchange: the
 /// peer hung up ([`is_peer_disconnect`]) or stalled past its deadline
-/// (`TimedOut`, already counted by an `HTTP_TIMEOUT_*` counter). The untyped
-/// half of the client-delivery split in `docs/logging.md`, logged at INFO
-/// like its typed half (`DeliveryFailure::severity`); anything else is WARN.
+/// (`TimedOut`, already counted by an `HTTP_TIMEOUT_*` counter). Logged at
+/// INFO; anything else is WARN (see `docs/logging.md`).
 #[cfg(feature = "sendfile")]
 #[must_use]
 pub(crate) fn is_expected_client_end(err: &std::io::Error) -> bool {
@@ -79,9 +65,7 @@ pub(crate) fn is_expected_client_end(err: &std::io::Error) -> bool {
 }
 
 /// Whether any error in `err`'s `source()` chain is a `TimedOut` `io::Error`.
-/// Hyper wraps the connector's timeout several layers deep; this is what the
-/// hyper backend's 502/504 split reads, and what classifies an upstream
-/// transport failure as a timeout for the per-mirror health counts.
+/// Hyper wraps the connector's timeout several layers deep.
 #[must_use]
 pub(crate) fn is_io_timed_out_in_chain(err: &(dyn std::error::Error + 'static)) -> bool {
     chain(err)
@@ -102,8 +86,7 @@ pub(crate) fn chain<'a>(
 /// connection, timeout, no TLS on the port). Auto mode may fall back to
 /// plain HTTP after the latter, never after a rejection: presenting a bad
 /// certificate is what an interceptor does. Decided on the TLS library's
-/// typed error, never its message, for every TLS backend and both the hyper
-/// and the splice connector.
+/// typed error, never its message.
 ///
 /// An `io::Error`'s `source()` is its wrapped error's *source*, skipping the
 /// wrapped error itself (`tokio-rustls` wraps the `rustls::Error` that way),
@@ -126,7 +109,6 @@ pub(crate) fn is_tls_certificate_rejection(err: &(dyn std::error::Error + 'stati
     false
 }
 
-/// One link of [`is_tls_certificate_rejection`]'s walk, for rustls.
 #[cfg(feature = "tls_rustls")]
 fn is_certificate_rejection_error(err: &(dyn std::error::Error + 'static)) -> bool {
     matches!(
@@ -135,9 +117,9 @@ fn is_certificate_rejection_error(err: &(dyn std::error::Error + 'static)) -> bo
     )
 }
 
-/// One link of [`is_tls_certificate_rejection`]'s walk, for native-tls: on
-/// Linux its handshake failure's source is OpenSSL's error queue, where a
-/// failed chain verification is `SSL_R_CERTIFICATE_VERIFY_FAILED`.
+/// On Linux a native-tls handshake failure's source is OpenSSL's error
+/// queue, where a failed chain verification is
+/// `SSL_R_CERTIFICATE_VERIFY_FAILED`.
 #[cfg(feature = "tls_hyper")]
 fn is_certificate_rejection_error(err: &(dyn std::error::Error + 'static)) -> bool {
     // From OpenSSL's `err.h` and `sslerr.h`, which `openssl-sys` does not
@@ -155,12 +137,9 @@ fn is_certificate_rejection_error(err: &(dyn std::error::Error + 'static)) -> bo
 
 #[cfg(feature = "splice")]
 pub(crate) fn errno_to_io_error(errno: nix::errno::Errno, msg: &'static str) -> std::io::Error {
-    // `Display` prints only the context message; the errno text lives on the
-    // inner io::Error exposed via `source()` and is appended by `ErrorReport`.
-    // Embedding it here would duplicate the errno string because
-    // `io::Error::new(_, custom)` makes the outer io::Error's `source()`
-    // delegate to this struct's source, so `ErrorReport` would walk through
-    // this struct to the inner io::Error and print the errno a second time.
+    // `Display` prints only the context message: `ErrorReport` appends the
+    // errno text from the inner io::Error it reaches via `source()`, so
+    // embedding it here would print it twice.
     #[derive(Debug, thiserror::Error)]
     #[error("{msg}")]
     struct ErrnoIoError {
@@ -180,24 +159,19 @@ mod tests {
     #[cfg(feature = "splice")]
     #[test]
     fn errno_to_io_error_report_does_not_duplicate_errno_text() {
-        // ENOENT is portable enough to assert a stable substring on.
         let err = errno_to_io_error(nix::errno::Errno::ENOENT, "sendfile failed");
         let report = format!("{}", ErrorReport(&err));
 
-        // Expected shape: "<msg>:  <errno_text>" - the message once, the
-        // errno text once, separated by the two-space ErrorReport joiner.
         assert!(
             report.starts_with("sendfile failed:  "),
             "unexpected prefix: {report}"
         );
-        // The errno string must appear exactly once.
         let needle = "(os error";
         assert_eq!(
             report.matches(needle).count(),
             1,
             "errno text duplicated in report: {report}"
         );
-        // And the message must not be repeated either.
         assert_eq!(
             report.matches("sendfile failed").count(),
             1,
@@ -263,15 +237,12 @@ mod tests {
         #[error("leaf")]
         struct Leaf;
 
-        // outer -> middle -> io::Error(TimedOut): two `source()` hops deep.
         let timed_out = Outer(Middle(std::io::Error::from(std::io::ErrorKind::TimedOut)));
         assert!(is_io_timed_out_in_chain(&timed_out));
 
-        // The same depth with a non-timeout io::Error at the leaf.
         let other_io = Outer(Middle(std::io::Error::from(std::io::ErrorKind::BrokenPipe)));
         assert!(!is_io_timed_out_in_chain(&other_io));
 
-        // A chain that holds no io::Error at all.
         let no_io = Outer(Middle(Leaf));
         assert!(!is_io_timed_out_in_chain(&no_io));
     }

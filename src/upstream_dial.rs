@@ -1,6 +1,5 @@
-//! Dialling an upstream host. Every TCP connection the proxy opens to a mirror
-//! or a CONNECT target outside hyper's own connector goes through [`connect`]:
-//! the splice backend's `tcp_connect` and both CONNECT relays.
+//! Dialling an upstream host: every TCP connection the proxy opens to a mirror
+//! or a CONNECT target outside hyper's own connector goes through [`connect`].
 //!
 //! A name resolving to both address families is raced the way RFC 8305
 //! ("Happy Eyeballs") describes, in the simplified form hyper-util's
@@ -168,7 +167,6 @@ where
     Err(failure)
 }
 
-/// Why one address was given up on.
 #[derive(Debug)]
 enum AttemptError {
     Failed(io::Error),
@@ -245,7 +243,6 @@ mod tests {
     const V4_A: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 80);
     const V4_B: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), 80);
 
-    /// How a fake connect answers one address.
     #[derive(Clone, Copy)]
     enum Behaviour {
         Connects,
@@ -302,8 +299,7 @@ mod tests {
         .await
     }
 
-    /// The motivating case: a blackholed IPv6 address does not hold up the
-    /// IPv4 one past the fallback delay.
+    /// The motivating case: a blackholed IPv6 address.
     #[tokio::test(start_paused = true)]
     async fn a_hanging_preferred_family_falls_back_after_the_delay() {
         let fake = Fake::new(&[(V6_A, Behaviour::Hangs), (V4_A, Behaviour::Connects)]);
@@ -322,8 +318,6 @@ mod tests {
         );
     }
 
-    /// A refused preferred family hands over at once instead of waiting out
-    /// the delay.
     #[tokio::test(start_paused = true)]
     async fn a_failed_preferred_family_falls_back_immediately() {
         let fake = Fake::new(&[(V6_A, Behaviour::Refuses), (V4_A, Behaviour::Connects)]);
@@ -343,7 +337,6 @@ mod tests {
         );
     }
 
-    /// The preferred family is the resolver's first one, IPv4 included.
     #[tokio::test]
     async fn the_first_resolved_family_goes_first() {
         let fake = Fake::new(&[(V4_A, Behaviour::Connects), (V6_A, Behaviour::Connects)]);
@@ -359,8 +352,6 @@ mod tests {
         assert_eq!(fake.started(), [V4_A]);
     }
 
-    /// Within one family a hanging address gets only its share of the
-    /// timeout, so the next one is still tried.
     #[tokio::test(start_paused = true)]
     async fn a_hanging_address_leaves_time_for_the_rest_of_its_family() {
         let fake = Fake::new(&[(V6_A, Behaviour::Hangs), (V6_B, Behaviour::Connects)]);
@@ -375,8 +366,6 @@ mod tests {
         assert_eq!(winner, V6_B);
     }
 
-    /// A failed dial names every address it tried, and takes its kind from a
-    /// real failure over a timeout.
     #[tokio::test(start_paused = true)]
     async fn a_failed_dial_reports_every_attempt() {
         let fake = Fake::new(&[
@@ -408,7 +397,6 @@ mod tests {
         );
     }
 
-    /// Only a dial on which every attempt ran out of time is a timeout.
     #[tokio::test(start_paused = true)]
     async fn a_dial_of_only_timeouts_is_a_timeout() {
         let fake = Fake::new(&[(V6_A, Behaviour::Hangs), (V4_A, Behaviour::Hangs)]);
@@ -471,8 +459,6 @@ mod tests {
         assert_eq!(stream.peer_addr().unwrap(), v4_addr);
     }
 
-    /// A bracket-less IPv6 literal is dialled as an address, without a
-    /// resolver.
     #[tokio::test]
     async fn connect_dials_a_bare_ipv6_literal() {
         let listener = match tokio::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await {

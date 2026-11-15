@@ -2,9 +2,10 @@
 //!
 //! A span at the cap starts only when a sender finds the queue full and so
 //! has to wait; a send that merely fills the final slot starts none. Every
-//! later observation that finds room ends the span. The capacity read and clock transition share a short lock, so a delayed
-//! observation cannot start an idle clock or stop a refilled one based on
-//! an older sample. Channel operations remain asynchronous and unlocked.
+//! later observation that finds room ends the span. The capacity read and
+//! clock transition share a short lock, so a delayed observation cannot
+//! start an idle clock or stop a refilled one based on an older sample.
+//! Channel operations remain asynchronous and unlocked.
 //! These are observations, not a replacement for Tokio's channel: a brief
 //! full-to-drained transition between observations can still be missed.
 //!

@@ -10,29 +10,27 @@ use crate::verified_marker::{FileIdentity, has_valid_marker, stamp};
 /// Outcome of verifying a cache file against an expected digest.
 #[derive(Debug)]
 pub(super) enum Verdict {
-    /// Computed digest equals the expected one.
     Match,
-    /// Computed digest differs from the expected one and the underlying file
-    /// kept its [`FileIdentity`] during hashing. `size` is the on-disk size
-    /// observed before hashing, which the caller bills to the eviction.
-    Mismatch { computed: Digest, size: u64 },
+    /// The digest differs and the file kept its [`FileIdentity`] during
+    /// hashing. `size` is the on-disk size observed before hashing, which the
+    /// caller bills to the eviction.
+    Mismatch {
+        computed: Digest,
+        size: u64,
+    },
     /// The file's [`FileIdentity`] (inode, size, mtime) changed between hash
     /// start and finish, so a concurrent writer raced us; the cleanup leaves
     /// the file alone.
     Raced,
     /// The path is no longer a regular file — a type swap since the scan
-    /// classified it. Counted as `CACHE_NON_REGULAR` here; the caller retains
-    /// the entry without verifying it.
+    /// classified it. Already counted as `CACHE_NON_REGULAR`.
     NonRegular,
-    /// The file is gone (removed since the scan listed it); nothing to
-    /// verify, and not an I/O failure.
+    /// Removed since the scan listed it; not an I/O failure.
     Vanished,
     /// Open/read failed; cleanup leaves the file alone.
     IoError(std::io::Error),
 }
 
-/// What [`open_and_check_marker`] found: a verdict reached without reading
-/// the file, or the open file still to be hashed.
 enum Opened {
     Decided(Verdict),
     NeedsHash {
@@ -41,9 +39,7 @@ enum Opened {
     },
 }
 
-/// Blocking digest-and-compare with a [`FileIdentity`] race check after
-/// hashing: [`open_and_check_marker`] then [`hash_and_compare`], the two
-/// steps [`verify_cache_file`] runs as separate blocking jobs.
+/// The two steps [`verify_cache_file`] runs as separate blocking jobs.
 #[cfg(test)]
 fn verify_file_sync(path: &Path, expected: &Digest) -> Verdict {
     match open_and_check_marker(path, expected) {
@@ -87,8 +83,7 @@ fn open_and_check_marker(path: &Path, expected: &Digest) -> Opened {
     let pre_identity = FileIdentity::of(&pre_meta);
 
     // Memoized fast path: verified in an earlier cycle and unchanged since
-    // (same inode/size/mtime, same expected digest) — skip the full
-    // read+hash.
+    // (same inode/size/mtime, same expected digest).
     if has_valid_marker(&file, path, pre_identity, expected) {
         metrics::CLEANUP_CHECKSUM_SKIPS.increment();
         return Opened::Decided(Verdict::Match);
@@ -98,8 +93,8 @@ fn open_and_check_marker(path: &Path, expected: &Digest) -> Opened {
 }
 
 /// Hash the file [`open_and_check_marker`] opened and compare the digest,
-/// checking afterwards that `path` still names the file hashed (by
-/// `pre_identity`). Blocking: reads the whole file.
+/// checking afterwards that `path` still names the file hashed. Blocking:
+/// reads the whole file.
 fn hash_and_compare(
     mut file: std::fs::File,
     path: &Path,
@@ -107,8 +102,6 @@ fn hash_and_compare(
     expected: &Digest,
 ) -> Verdict {
     let pre_size = pre_identity.size();
-    // Past the memo fast path, which reads nothing but one xattr: from here
-    // the whole file is read, so the readahead hint is worth its syscall.
     hint_sequential_read(&file, pre_size, path);
 
     let computed = match hash_open_file(expected.algo(), &mut file, pre_size) {
@@ -139,17 +132,13 @@ fn hash_and_compare(
 
     // Race check: a fresh download finishing mid-hash replaces the file via
     // rename (different inode), and an in-place rewrite moves its size or
-    // mtime. Either way our digest is for content no longer at `path`, so
-    // bail. Use `symlink_metadata` (lstat): a hostile symlink planted at
-    // `path` after the open could otherwise point at a file whose identity
-    // happens to match `pre_identity`, masking the race.  lstat compares the
-    // symlink itself, so a swap is always detected.
+    // mtime. Either way our digest is for content no longer at `path`.
+    // lstat, so a symlink planted at `path` after the open cannot point at a
+    // file whose identity happens to match.
     //
-    // A stat failure here (e.g. another cleanup task already unlinked the
-    // file, or EACCES) is treated like the pre-hash stat failure: bump and
-    // return `Verdict::IoError` so the caller logs and retains.  Falling
-    // through to `Verdict::Mismatch` would emit a false checksum-corruption
-    // warn and then attempt a doomed `remove_file` on the missing path.
+    // A stat failure (e.g. another cleanup task already unlinked the file)
+    // must not fall through to `Mismatch`: that would emit a false
+    // checksum-corruption warn and attempt a doomed `remove_file`.
     match std::fs::symlink_metadata(path) {
         Ok(post_meta) if FileIdentity::of(&post_meta) != pre_identity => Verdict::Raced,
         Ok(_) => Verdict::Mismatch {
@@ -173,13 +162,12 @@ static VERIFY_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(
 
 /// Verify the cache file at `path` against `expected`.
 ///
-/// Two blocking jobs: the open and the memoized-marker check
-/// ([`open_and_check_marker`]) run unthrottled -- in steady state they
-/// answer nearly every file -- and only a file that must really be hashed
-/// takes one of the [`VERIFY_SLOTS`], so a few cold multi-second hashes
-/// never stall other mirrors' microsecond marker checks behind them. The
-/// hash job keeps the descriptor the first job opened, so its type and
-/// identity checks still hold for the file it reads.
+/// Two blocking jobs: the open and the memoized-marker check run unthrottled
+/// and only a file that must really be hashed takes one of the
+/// [`VERIFY_SLOTS`], so a few cold multi-second hashes never stall other
+/// mirrors' microsecond marker checks. The hash job keeps the descriptor the
+/// first job opened, so its type and identity checks still hold for the file
+/// it reads.
 pub(super) async fn verify_cache_file(path: PathBuf, expected: Digest) -> Verdict {
     let (opened, path, expected) = match tokio::task::spawn_blocking(move || {
         let opened = open_and_check_marker(&path, &expected);
@@ -207,8 +195,6 @@ pub(super) async fn verify_cache_file(path: PathBuf, expected: Digest) -> Verdic
     // The permit moves into the blocking job, which runs on even if this
     // future is dropped mid-hash: held here, a cancellation would free the
     // slot early and let one more hash run than `VERIFY_CONCURRENCY` allows.
-    // Nothing cancels it today (each mirror's cleanup is a spawned task that
-    // awaits its hashes inline); this keeps the bound from resting on that.
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
         hash_and_compare(file, &path, pre_identity, &expected)
@@ -270,8 +256,6 @@ mod tests {
         ));
     }
 
-    /// A file removed since the scan is a vanished entry: not an I/O
-    /// failure, and counted nowhere.
     #[test]
     fn verify_file_sync_reports_a_missing_path_as_vanished() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -284,8 +268,6 @@ mod tests {
         assert_eq!(metrics::CACHE_IO_FAILURE.get(), io_failure);
     }
 
-    /// A symlink swapped in since the scan is refused by `O_NOFOLLOW`: a
-    /// non-regular entry, not an I/O failure.
     #[test]
     fn verify_file_sync_reports_a_symlink_as_non_regular() {
         let dir = tempfile::tempdir().expect("tempdir");

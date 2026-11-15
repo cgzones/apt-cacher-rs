@@ -6,21 +6,20 @@ use tracing::debug;
 use crate::config::Config;
 use crate::{humanfmt::HumanFmt, ringbuffer::SumRingBuffer};
 
-/// A rate checker that tracks download speed over a sliding time window.
+/// Tracks download speed over a sliding window of one-second samples.
 pub(crate) struct RateChecker {
     buf: SumRingBuffer<usize>,
     last: Instant,
     min_download_rate: NonZero<usize>,
 }
 
-/// The result of a failed rate check.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct InsufficientRate {
-    /// The number of bytes transferred within the measured timeframe window.
+    /// Bytes transferred within the `timeframe` window.
     pub(crate) transferred: usize,
-    /// The number of seconds over which the download was measured.
+    /// In seconds.
     pub(crate) timeframe: NonZero<usize>,
-    /// The minimum download rate required in bytes per second.
+    /// In bytes per second.
     pub(crate) min_rate: NonZero<usize>,
     _private: (),
 }
@@ -48,9 +47,7 @@ impl InsufficientRate {
 }
 
 impl RateChecker {
-    /// The rate checker `config` asks for, or `None` when `min_download_rate`
-    /// is disabled.  The one place the two config keys are paired, so every
-    /// rate-checked loop agrees on the averaging window.
+    /// `None` when `min_download_rate` is disabled.
     #[must_use]
     pub(crate) fn from_config(config: &Config) -> Option<Self> {
         config
@@ -58,7 +55,6 @@ impl RateChecker {
             .map(|rate| Self::with_timeframe(rate, config.rate_check_timeframe))
     }
 
-    /// Creates a new `RateChecker` with the given minimum download rate and timeframe.
     #[must_use]
     pub(crate) fn with_timeframe(
         min_download_rate: NonZero<usize>,
@@ -71,16 +67,13 @@ impl RateChecker {
         }
     }
 
-    /// Returns the configured timeframe (in seconds) over which the
-    /// rate is averaged.  Used by callers (e.g. `wait_socket_rated`)
-    /// that need to size their own poll cadence relative to the window.
+    /// The averaging window in seconds.
     #[cfg(feature = "sendfile")]
     #[must_use]
     pub(crate) fn timeframe(&self) -> NonZero<usize> {
         self.buf.capacity()
     }
 
-    /// Adds the given number of bytes to the rate checker.
     pub(crate) fn add(&mut self, bytes: usize) {
         self.add_at(bytes, Instant::now());
     }
@@ -113,7 +106,7 @@ impl RateChecker {
         }
     }
 
-    /// Checks if the download rate is below the minimum threshold and returns an `InsufficientRate` error if so.
+    /// Never fails before the window has filled once.
     #[must_use]
     pub(crate) fn check_fail(&self) -> Option<InsufficientRate> {
         if !self.buf.is_full() {
@@ -144,12 +137,10 @@ mod tests {
     fn rate_checker_triggers_when_slow() {
         let mut rc = RateChecker::with_timeframe(nonzero!(100), nonzero!(3));
 
-        // Simulate 1 byte per second for 3 seconds.
         for _ in 0..3 {
             rc.add_at(1, rc.last + Duration::from_secs(1));
         }
 
-        // Buffer should now be full with 3 bytes over 3s = 1 B/s < 100 B/s.
         let fail = rc.check_fail();
         assert!(fail.is_some(), "rate check should fail for slow transfer");
         let ir = fail.unwrap();
@@ -161,12 +152,10 @@ mod tests {
     fn rate_checker_passes_when_fast() {
         let mut rc = RateChecker::with_timeframe(nonzero!(100), nonzero!(3));
 
-        // Simulate 500 bytes per second for 3 seconds.
         for _ in 0..3 {
             rc.add_at(500, rc.last + Duration::from_secs(1));
         }
 
-        // ~1500 bytes over 3s = 500 B/s > 100 B/s.
         assert!(
             rc.check_fail().is_none(),
             "rate check should pass for fast transfer"
@@ -177,7 +166,6 @@ mod tests {
     fn rate_checker_not_full_yet() {
         let mut rc = RateChecker::with_timeframe(nonzero!(100), nonzero!(3));
 
-        // Only 1 second elapsed — buffer not full.
         rc.add_at(1, rc.last + Duration::from_secs(1));
 
         assert!(
@@ -251,9 +239,6 @@ mod tests {
         );
     }
 
-    /// The window is "full" as soon as it holds `timeframe` samples, and the
-    /// sub-second path folds into the newest sample rather than pushing a
-    /// second one - so a one-second window is armed by the first `add`.
     #[test]
     fn one_second_window_is_armed_by_the_first_sample() {
         let mut rc = RateChecker::with_timeframe(nonzero!(1000), nonzero!(1));

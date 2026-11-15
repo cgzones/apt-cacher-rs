@@ -46,8 +46,6 @@ use crate::humanfmt::HumanFmt;
 use crate::limits::VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER;
 use crate::nonzero;
 
-/// Failure while loading or validating the configuration.
-///
 /// `Display` renders this error only; the underlying cause hangs off
 /// [`std::error::Error::source`], so log it via [`crate::error::ErrorReport`].
 #[derive(Debug, thiserror::Error)]
@@ -64,7 +62,6 @@ pub(crate) enum ConfigError {
     Invalid(String),
 }
 
-/// `return`s a [`ConfigError::Invalid`] built from the given format arguments.
 macro_rules! invalid {
     ($($arg:tt)*) => {
         return Err(ConfigError::Invalid(format!($($arg)*)))
@@ -101,10 +98,6 @@ pub(crate) enum HttpsUpgradeMode {
 }
 
 /// Why a host string is no [`DomainName`] (or no [`ConfigDomainName`]).
-///
-/// `Display` is the reason clause every rejection interpolates: the
-/// request edge's 400 line, the configuration error and the database row
-/// warning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum HostError {
     /// Neither a DNS name nor an IP address (nor, in the configuration, a
@@ -129,7 +122,6 @@ pub(crate) enum HostError {
 
 #[derive(Debug, PartialEq, Eq)]
 enum ConfigDomainNameInner {
-    /// One host, parsed by [`DomainName::new`].
     Exact(DomainName),
     /// The suffix after `*`, including its leading dot, lowercase.
     Wildcard(String),
@@ -142,15 +134,10 @@ enum ConfigDomainNameInner {
 pub(crate) struct ConfigDomainName(ConfigDomainNameInner);
 
 impl ConfigDomainName {
-    /// A `*.`-prefixed wildcard, or any host [`DomainName::new`] accepts
-    /// (an IPv6 address bare or bracketed), so an entry and the host a
-    /// request names are parsed by one parser.
+    /// A `*.`-prefixed wildcard, or any host [`DomainName::new`] accepts.
     pub(crate) fn new(domain: impl AsRef<str>) -> Result<Self, HostError> {
         let domain = domain.as_ref();
 
-        // DNS names are case-insensitive: normalise so `DEB.debian.org` and
-        // `deb.debian.org` are one allow-list entry, one cache tree and one
-        // mirror row.
         if let Some(suffix) = domain.strip_prefix('*') {
             if !is_valid_wildcard(domain) {
                 return Err(HostError::Invalid);
@@ -173,10 +160,7 @@ impl ConfigDomainName {
         }
     }
 
-    /// Whether the entry admits `domain`. Typed, so an entry and a host
-    /// compare as the one canonical value each spelling parses to. A
-    /// wildcard admits DNS names only: its suffix is DNS labels, which an
-    /// address never ends in.
+    /// A wildcard admits DNS names only.
     #[must_use]
     pub(crate) fn permits(&self, domain: &DomainName) -> bool {
         match self {
@@ -206,11 +190,8 @@ impl<'de> Deserialize<'de> for ConfigDomainName {
 }
 
 /// Inner strings are `Arc<str>`: `DomainName` rides inside
-/// `ClientHost`/`CacheHost`/`Mirror`, which are cloned into
-/// active-download keys, metadata-cache keys, DB commands, and the
-/// permitted-host cache on hot paths — a refcount bump instead of a
-/// String allocation each time.  `Arc<str>` hashes/compares by content,
-/// so map-key semantics are unchanged.
+/// `ClientHost`/`CacheHost`/`Mirror`, which are cloned into map keys and DB
+/// commands on hot paths.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum DomainNameInner {
     Dns(std::sync::Arc<str>),
@@ -220,22 +201,18 @@ enum DomainNameInner {
 
 /// A validated mirror host: a DNS name, an IPv4 or an IPv6 address.
 ///
-/// The one parser for every host the proxy reads - a request's authority,
-/// a CONNECT target, a redirect `Location`, the configuration and a
-/// database row - so each spelling of a host maps to one value. The text it
-/// keeps ([`Self::as_str`]) is canonical and bare: a DNS name lowercased, an
-/// IPv6 address in its RFC 5952 form without brackets. That text keys every
-/// store and table; [`Self::format_authority`] is its URI form, for URIs,
-/// the `Host` header, cache directory names and log lines.
+/// Each spelling of a host maps to one value. The text it keeps
+/// ([`Self::as_str`]) is canonical and bare: a DNS name lowercased, an IPv6
+/// address in its RFC 5952 form without brackets. That text keys every store
+/// and table; [`Self::format_authority`] is its URI form, for URIs, the
+/// `Host` header, cache directory names and log lines.
 /// `DomainName::new(h.as_str()) == Ok(h)` for every value.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct DomainName(DomainNameInner);
 
 impl DomainName {
-    /// Parse a host. An IPv6 address may be bare (`2001:db8::1`, the
-    /// configuration's form) or bracketed (`[2001:db8::1]`, the URI form);
-    /// a zone identifier or a trailing port is rejected with its own
-    /// [`HostError`].
+    /// An IPv6 address may be bare (`2001:db8::1`, the configuration's form)
+    /// or bracketed (`[2001:db8::1]`, the URI form).
     pub(crate) fn new(domain: impl AsRef<str>) -> Result<Self, HostError> {
         let domain = domain.as_ref();
 
@@ -265,9 +242,6 @@ impl DomainName {
             return Ok(Self(DomainNameInner::Ipv4(addr.to_string().into())));
         }
 
-        // At this point we've already proven there's no `:` and the string
-        // is not a valid IPv4 address, so skip those branches in the
-        // validator.
         if !is_valid_dns_label_string(domain) {
             return Err(HostError::Invalid);
         }
@@ -307,7 +281,6 @@ impl DomainName {
         }
     }
 
-    /// Return `true` if this domain name is a DNS name, not an address.
     #[must_use]
     #[inline]
     const fn is_dns(&self) -> bool {
@@ -317,9 +290,8 @@ impl DomainName {
         }
     }
 
-    /// Return `true` if this is a link-local IPv6 address (`fe80::/10`),
-    /// which is only reachable through a zone identifier naming the
-    /// interface, and the parser refuses zones.
+    /// A link-local IPv6 address (`fe80::/10`) is only reachable through a
+    /// zone identifier naming the interface, and the parser refuses zones.
     #[must_use]
     const fn is_ipv6_link_local(&self) -> bool {
         match self {
@@ -328,7 +300,6 @@ impl DomainName {
         }
     }
 
-    /// Return `true` if this domain name is an IPv6 address.
     #[must_use]
     #[inline]
     pub(crate) const fn is_ipv6(&self) -> bool {
@@ -348,10 +319,8 @@ impl DomainName {
         }
     }
 
-    /// Format as a URI authority component (RFC 3986 §3.2).
-    ///
-    /// IPv6 addresses are bracketed per §3.2.2.
-    /// A port is appended with `:` when present.
+    /// Format as a URI authority component (RFC 3986 §3.2), IPv6 addresses
+    /// bracketed.
     ///
     /// This is also the per-host cache directory name
     /// (`cache_paths::CachePaths::host_dir`): only the bracketed form keeps
@@ -480,79 +449,51 @@ impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for DomainName {
 // Host-kind newtypes
 // ---------------------------------------------------------------------------
 //
-// Two semantically distinct flavours of host string exist in this codebase:
+// Two distinct flavours of host exist, both wrapping a validated
+// [`DomainName`] and equal in content when no alias maps the client name:
 //
-// * [`ClientHost`] — a validated wire-side host name: what the client put
-//   on the wire (`ConnectionDetails::upstream_host`, used for the upstream
-//   TCP/TLS connect and the outgoing `Host:` header), and the host of a
-//   canonical `Mirror` (the alias' main host, or the client host when no
-//   alias matched) that keys the active-downloads registry, the
-//   `mirrors_v2` rows and the origins.
-// * [`CacheHost`]  — the alias-resolved on-disk identity.  Used for the
-//   per-host cache directory, the flat-collision blocklist, and the
-//   cleanup/scan filesystem traversal.
+// * [`ClientHost`] - a wire-side host name: what the client put on the wire
+//   (used for the upstream TCP/TLS connect and the outgoing `Host:` header),
+//   and the host of a canonical `Mirror` that keys the active-downloads
+//   registry, the `mirrors_v2` rows and the origins.
+// * [`CacheHost`] - the alias-resolved on-disk identity, for the per-host
+//   cache directory, the flat-collision blocklist, and the cleanup/scan
+//   filesystem traversal.
 //
 // Alias resolution happens exactly once, in `request_dispatch::decide_request`;
-// every consumer downstream sees the canonical `Mirror`.  Both wrap a
-// validated [`DomainName`] and carry the same byte content when no alias
-// maps the client name.  Keeping them as distinct types prevents callers
-// from accidentally handing a resolved name to a function that expects a
-// raw one (and vice versa) — the invariant used to rest on careful variable
-// naming alone.
-//
-// [`ClientHost::as_cache_host`] returns a zero-alloc `&CacheHost` borrow
-// through `ref-cast`, which checks the `#[repr(transparent)]` layout
-// itself; the private `CacheHost::from_domain_ref` keeps that cast inside
-// this module.
+// every consumer downstream sees the canonical `Mirror`.
 
 /// Host name as supplied by the client on the wire (post-validation).
-///
-/// Stored in [`crate::deb_mirror::Mirror::host`] and in the
-/// `mirrors_v2.host` column; threaded into the upstream-connection path
-/// (TCP connect, TLS SNI, outgoing `Host:` header).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, sqlx::Type)]
 #[sqlx(transparent)]
 pub(crate) struct ClientHost(DomainName);
 
-/// Alias-resolved on-disk identity.
-///
-/// Equal to [`Alias::main`] when an alias mapping fires for the
-/// originating client host, otherwise equal (in byte content) to that
-/// client host.  Used by [`crate::cache_layout::ConnectionDetails`] for
-/// path construction and by [`crate::flat_blocklist`] as the collision
-/// key.
+/// Alias-resolved on-disk identity: [`Alias::main`] when an alias mapping
+/// fires for the originating client host, otherwise that client host.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, RefCastCustom)]
 #[repr(transparent)]
 pub(crate) struct CacheHost(DomainName);
 
 impl ClientHost {
-    /// Parse a [`ClientHost`] from a string.
-    ///
-    /// Returns why if the string is no valid host ([`DomainName::new`]).
     pub(crate) fn new(host: impl AsRef<str>) -> Result<Self, HostError> {
         DomainName::new(host).map(Self)
     }
 
-    /// The host name as a string slice: what `Display` renders, without the
-    /// allocation.
     #[must_use]
     #[inline]
     pub(crate) fn as_str(&self) -> &str {
         self.0.as_str()
     }
 
-    /// Convert this client host to a [`CacheHost`] identity, without
-    /// allocating.
     #[must_use]
     pub(crate) fn into_cache_host(self) -> CacheHost {
         CacheHost(self.0)
     }
 
     /// Borrow this client host as its on-disk cache identity, without
-    /// allocating.  Encodes the `resolve_alias` fall-back rule (no
-    /// alias matched → cache identity equals client host).  Only call
-    /// this where the no-alias branch has been observed; otherwise
-    /// the borrow would mislabel a non-canonical name as canonical.
+    /// allocating.  Only call this where the no-alias branch of
+    /// `resolve_alias` has been observed; otherwise the borrow would
+    /// mislabel a non-canonical name as canonical.
     #[must_use]
     pub(crate) fn as_cache_host(&self) -> &CacheHost {
         CacheHost::from_domain_ref(&self.0)
@@ -599,9 +540,6 @@ impl std::fmt::Display for CacheHost {
     }
 }
 
-// Symmetric `PartialEq<str>` / `PartialEq<ClientHost> for str` mirror
-// the impls on `DomainName` so call sites comparing a raw `&str` (e.g.
-// `Uri::host()`) against a `ClientHost` need not reach for `.as_str()`.
 impl PartialEq<str> for ClientHost {
     fn eq(&self, other: &str) -> bool {
         self.0 == *other
@@ -645,19 +583,11 @@ pub(crate) struct Alias {
     pub(crate) aliases: Vec<ClientHost>,
 }
 
-/// Resolve a client-supplied host through `aliases` to the on-disk
-/// cache identity used by
-/// [`crate::cache_layout::ConnectionDetails::cache_file_path`].
+/// Resolve a client-supplied host through `aliases` to its on-disk cache
+/// identity; `None` when `host` is no alias of any configured group.
 ///
-/// Returns `Some(&main)` when `host` is listed as an alias of some
-/// configured group, otherwise `None` — callers that want the
-/// resolved-or-echo shape do `.unwrap_or(...)` themselves.  State
-/// keyed on the cache-dir identity (e.g. the flat-collision
-/// blocklist) must resolve through this so multiple aliases pointing
-/// at the same `main` share keys.
-///
-/// `aliases[].aliases` is sorted at config load (see `Config::load`),
-/// so the inner lookup is a binary search.
+/// `aliases[].aliases` must be sorted (done at config load) for the binary
+/// search.
 #[must_use]
 pub(crate) fn resolve_alias<'a>(aliases: &'a [Alias], host: &ClientHost) -> Option<&'a CacheHost> {
     aliases
@@ -760,8 +690,7 @@ fn parse_bracketed_addr(s: &str) -> Option<IpAddr> {
         .map(IpAddr::V6)
 }
 
-/// Parses the port of a `--bind` value; `input` is the whole value, quoted in
-/// the error so the diagnostic names what the user typed.
+/// `input` is the whole `--bind` value, quoted in the error.
 fn parse_bind_port(port: &str, input: &str) -> Result<NonZero<u16>, String> {
     let value = port
         .parse::<u16>()
@@ -840,13 +769,10 @@ pub(crate) struct Config {
     #[serde(deserialize_with = "from_bind_addr")]
     pub(crate) bind_addr: IpAddr,
 
-    /// Port to listen on.
     pub(crate) bind_port: NonZero<u16>,
 
-    /// Path to database.
     pub(crate) database_path: PathBuf,
 
-    /// Path to cache directory.
     pub(crate) cache_directory: PathBuf,
 
     /// Timeout (in seconds) of database operations after which a warning is generated.
@@ -876,7 +802,6 @@ pub(crate) struct Config {
     #[serde(deserialize_with = "from_secs_f64")]
     pub(crate) upstream_retry_budget: Duration,
 
-    /// HTTPS upgrade mode.
     pub(crate) https_upgrade_mode: HttpsUpgradeMode,
 
     /// Size (in bytes) of buffer used for internal data transfer.
@@ -923,10 +848,8 @@ pub(crate) struct Config {
     #[serde(deserialize_with = "from_nonzero_u64")]
     pub(crate) usage_retention_days: Option<NonZero<u64>>,
 
-    /// Mirror aliases.
     pub(crate) aliases: Vec<Alias>,
 
-    /// List of allowed mirrors.
     pub(crate) allowed_mirrors: Vec<ConfigDomainName>,
 
     /// Ports a proxied request or a followed redirect may name on an
@@ -964,10 +887,9 @@ pub(crate) struct Config {
 
     /// Allowed ports for https tunneling.  Unlike
     /// [`Self::https_tunnel_allowed_mirrors`] this list is **fail-open**: an
-    /// empty list permits every port on an already-permitted host.  The
-    /// asymmetry is deliberate (a port list is a narrowing of the host list,
-    /// not a second gate), but it is surprising enough that `validate` warns
-    /// about it.
+    /// empty list permits every port on an already-permitted host (a port
+    /// list is a narrowing of the host list, not a second gate); `validate`
+    /// warns about it.
     pub(crate) https_tunnel_allowed_ports: Vec<NonZero<u16>>,
 
     /// Allowed mirrors for https tunneling.  Fail-closed like
@@ -1185,7 +1107,6 @@ where
     LevelFilter::from_str(&s).map_err(D::Error::custom)
 }
 
-/// `bind_addr`: an address, an IPv6 one optionally bracketed.
 fn from_bind_addr<'de, D>(deserializer: D) -> Result<IpAddr, D::Error>
 where
     D: Deserializer<'de>,
@@ -1220,9 +1141,6 @@ where
 }
 
 /// Failure while parsing a magnitude-suffixed size (`42 Gi`).
-///
-/// Reaches the user through `serde::de::Error::custom`, which only needs
-/// `Display`.
 #[derive(Debug, thiserror::Error)]
 enum MagnitudeError {
     #[error("Invalid number:  {0}")]
@@ -1370,8 +1288,7 @@ fn intersect<T: Ord>(a: &[T], b: &[T]) -> bool {
 }
 
 /// DNS-only label-string validator: caller has already excluded any
-/// IPv6/colon form.  All input bytes are required to be ASCII alphanumeric
-/// or hyphen; labels must be 1-63 bytes and must not start or end with `-`.
+/// IPv6/colon form.
 #[must_use]
 fn is_valid_dns_label_string(domain: &str) -> bool {
     /* No unicode characters allowed for now */
@@ -1387,9 +1304,7 @@ fn is_valid_dns_label_string(domain: &str) -> bool {
         if plen == 0 || plen > 63 {
             return false;
         }
-        // RFC 1035: a label must not start or end with a hyphen.  Hoisted
-        // out of the inner loop so the per-byte branch is just the
-        // alphanumeric-or-hyphen check.
+        // RFC 1035: a label must not start or end with a hyphen.
         if part[0] == b'-' || part[plen - 1] == b'-' {
             return false;
         }
@@ -1404,13 +1319,12 @@ fn is_valid_dns_label_string(domain: &str) -> bool {
 }
 
 /// Validator for a `*.` wildcard allow-list entry (the whole entry, `*`
-/// included); every other entry is a host [`DomainName::new`] parses.
+/// included).
 ///
-/// A wildcard must cover at least two further labels — `*.org` would hand
-/// a whole TLD to the proxy — and must not look like a partial IPv4
+/// A wildcard must cover at least two further labels - `*.org` would hand
+/// a whole TLD to the proxy - and must not look like a partial IPv4
 /// address (`*.1.1`), which no `Ipv4Addr`-normalised lookup could ever
-/// match.  Everything past the wildcard is the plain DNS label rule, so it
-/// is checked by [`is_valid_dns_label_string`].
+/// match.
 #[must_use]
 fn is_valid_wildcard(domain: &str) -> bool {
     /* No unicode characters allowed for now */
@@ -1439,15 +1353,11 @@ fn ends_in_a_number(domain: &str) -> bool {
         .is_some_and(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// A URI port: ASCII digits, at least one.
 #[must_use]
 fn is_port(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Warn about a path option that is not absolute.  Such a path still
-/// resolves, but against the daemon's working directory (`/` under
-/// systemd) rather than where the operator was looking.
 fn warn_if_relative(warnings: &mut Vec<String>, key: &str, path: &Path) {
     if !path.is_absolute() {
         warnings.push(format!(
@@ -1457,8 +1367,6 @@ fn warn_if_relative(warnings: &mut Vec<String>, key: &str, path: &Path) {
     }
 }
 
-/// Outcome of [`Config::load`]: the loaded configuration plus what the
-/// caller has to report about how it came about.
 #[derive(Debug)]
 pub(crate) struct LoadedConfig {
     pub(crate) config: Config,
@@ -1471,14 +1379,10 @@ pub(crate) struct LoadedConfig {
 }
 
 impl Config {
-    /// Load the configuration from the given file.
-    ///
-    /// When supplied, `cache_directory` overrides [`Self::cache_directory`],
-    /// `database_path` overrides [`Self::database_path`] and `bind` overrides
-    /// [`Self::bind_addr`] and/or [`Self::bind_port`], applied on top of the
-    /// values from the configuration file (or the built-in defaults when no
-    /// file is loaded). A non-default `file` that does not exist is always an
-    /// error, even when the overrides are supplied.
+    /// The overrides are applied on top of the values from the configuration
+    /// file (or the built-in defaults when no file is loaded). A non-default
+    /// `file` that does not exist is always an error, even when the
+    /// overrides are supplied.
     pub(crate) fn load(
         file: &Path,
         cache_directory: Option<PathBuf>,
@@ -1581,9 +1485,6 @@ impl Config {
             warn_if_relative(&mut warnings, "log_file", path);
         }
 
-        // Every timeout shares the same floor and only differs in its
-        // ceiling, so they are one table: another timeout is a row here,
-        // not a fifth copy of the comparison and the message.
         {
             const MIN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -1742,7 +1643,6 @@ impl Config {
             );
         }
 
-        // Alias validation
         {
             for alias in &mut self.aliases {
                 alias.aliases.sort_unstable();
@@ -2315,8 +2215,6 @@ mod test {
         assert_eq!(config.bind_port, nonzero!(3143_u16));
     }
 
-    /// The configuration file takes an IPv6 `bind_addr` bare or bracketed,
-    /// like `--bind` does, and nothing else.
     #[test]
     fn bind_addr_accepts_a_bracketed_ipv6_address() {
         for (input, expected) in [
@@ -2336,8 +2234,6 @@ mod test {
         }
     }
 
-    /// A link-local `bind_addr` would need a zone identifier to bind, so it
-    /// is refused up front, from the file and from `--bind` alike.
     #[test]
     fn a_link_local_bind_addr_is_invalid() {
         let mut config = Config::from_toml("bind_addr = 'fe80::1'\n").expect("config parses");
@@ -2381,9 +2277,6 @@ mod test {
 
     #[test]
     fn test_magnitude_without_a_suffix_reports_the_number_error() {
-        // An empty value and an all-digit value that overflows share the
-        // "nothing to split on" branch; the diagnostic must name the
-        // number, not a magnitude suffix that was never written.
         for input in ["", "   ", "99999999999999999999999999"] {
             let err = parse_u64_with_magnitude(input).expect_err("must not parse");
             assert!(
@@ -2489,8 +2382,6 @@ mod test {
         }
     }
 
-    /// Every spelling of an IPv6 host parses to one value whose text is the
-    /// bare RFC 5952 form; that text parses back to the same value.
     #[test]
     fn an_ipv6_host_parses_bare_or_bracketed_to_one_canonical_value() {
         let canonical = dn("2001:db8::1");
@@ -2547,10 +2438,6 @@ mod test {
         }
     }
 
-    /// A name whose last label is numeric is an IPv4 address in another
-    /// notation to a resolver, so it is refused with its own reason; a
-    /// numeric label elsewhere, or a hex-looking one that is no number, is
-    /// an ordinary name.
     #[test]
     fn a_name_ending_in_a_number_is_refused() {
         for numeric in [
@@ -2581,8 +2468,6 @@ mod test {
         }
     }
 
-    /// The configuration takes the parser's hosts, IPv6 bare or bracketed,
-    /// and the error names the reason.
     #[test]
     fn a_config_entry_takes_a_bracketed_ipv6_host() {
         let cfg = Config::from_toml(
@@ -2678,8 +2563,6 @@ mod test {
 
     #[test]
     fn domain_names_are_case_insensitive() {
-        // DNS is case-insensitive; a mixed-case request host must map onto
-        // the same cache tree, mirror row and allow-list entry.
         let host = DomainName::new("DEB.Debian.ORG").expect("valid");
         assert_eq!(host.as_str(), "deb.debian.org");
         let exact = ConfigDomainName::new("Deb.debian.org").expect("valid");
@@ -2689,8 +2572,6 @@ mod test {
         assert!(wildcard.permits(&host));
     }
 
-    /// An entry and a host compare as parsed values: every spelling of an
-    /// address is the one host, and a wildcard never admits an address.
     #[test]
     fn an_entry_permits_every_spelling_of_its_host() {
         let entry = ConfigDomainName::new("[2001:db8::1]").expect("valid");
@@ -2748,8 +2629,6 @@ mod test {
 
     #[test]
     fn client_host_as_cache_host_zero_alloc_view() {
-        // `as_cache_host` reborrows the client's own `DomainName`, so the
-        // view shares its bytes.
         let client = clh("example.test");
         let cache_view = client.as_cache_host();
         assert_eq!(client.as_str(), cache_view.as_str());
@@ -2847,9 +2726,6 @@ mod test {
         cfg.validate().expect("config validates")
     }
 
-    /// A link-local address parses (without its zone) but can never be
-    /// dialled, so every list naming one warns, once per entry; a global
-    /// address does not.
     #[test]
     fn a_link_local_entry_warns_in_every_host_list() {
         let warnings = warnings_for(
@@ -2879,8 +2755,6 @@ mod test {
         assert_eq!(link_local.len(), 6, "{link_local:?}");
     }
 
-    /// An IPv4-mapped IPv6 address is the IPv4 host it maps, as a client
-    /// address is: one mirror, one cache tree, one allow-list entry.
     #[test]
     fn an_ipv4_mapped_address_is_its_ipv4_host() {
         let v4 = dn("192.0.2.1");
@@ -2943,10 +2817,6 @@ mod test {
         );
     }
 
-    /// The two tunnel ACLs have opposite empty-list semantics: an empty
-    /// mirror list refuses every CONNECT, an empty port list permits every
-    /// port. Both cases must be called out, or clearing the port list reads
-    /// as "no ports" and silently widens the relay.
     #[test]
     fn both_empty_tunnel_acls_warn() {
         let warnings = warnings_for(
@@ -3174,9 +3044,6 @@ mod test {
         }
     }
 
-    /// A removed option still loads, whatever value it carries, so an old
-    /// configuration file does not stop the daemon from starting; it only
-    /// earns a warning naming the key.
     #[test]
     fn removed_mmap_threshold_is_ignored_with_a_warning() {
         const WARNING: &str = "mmap_threshold is no longer supported and is ignored; remove it from the configuration";
@@ -3232,8 +3099,6 @@ mod test {
 
     #[test]
     fn numeric_options_just_past_their_range_are_rejected() {
-        // One row per `validate` rule, each one step past its bound; the
-        // twin at the bound is in `numeric_options_at_their_bounds_are_accepted`.
         for (input, expected) in [
             (
                 "buffer_size = '1023'",

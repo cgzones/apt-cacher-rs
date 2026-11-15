@@ -1,10 +1,8 @@
-//! Shared upstream connect-retry policy: the attempt budget, the wall-clock
-//! budget, the Fibonacci backoff schedule and the `UPSTREAM_RETRIES` accounting
-//! of backoff retries, used by both the hyper (`request_with_retry`) and
-//! splice (`standard_upstream_connect`) backends. The retry *control flow*
-//! stays backend-specific; only this policy is shared. The Auto-mode dial of
-//! the original scheme is an attempt too, counted by each backend where it
-//! dials.
+//! Upstream connect-retry policy shared by the backends: the attempt budget,
+//! the wall-clock budget, the Fibonacci backoff schedule and the
+//! `UPSTREAM_RETRIES` accounting. The retry control flow stays
+//! backend-specific. The Auto-mode dial of the original scheme is an attempt
+//! too, counted by each backend where it dials.
 
 use std::fmt;
 use std::time::Duration;
@@ -13,20 +11,16 @@ use coarsetime::Instant;
 
 use crate::metrics;
 
-/// Maximum upstream connect *retries* before giving up (both backends), so a
-/// request makes at most `MAX_ATTEMPTS + 1` backoff-paced connect attempts.
-/// Enforced by [`Backoff::next_retry`]; exposed only for the cross-module
-/// invariant assert in `hyper_conn.rs`.
+/// Maximum upstream connect *retries*, so a request makes at most
+/// `MAX_ATTEMPTS + 1` backoff-paced connect attempts.
 pub(crate) const MAX_ATTEMPTS: u32 = 10;
 
-/// Which budget ended the retry loop. Returned by [`Backoff::next_retry`] so the
-/// terminal log line tells an operator whether the attempt cap or
-/// `upstream_retry_budget` was the limiter.
+/// Which budget ended the retry loop, for the terminal log line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RetryLimit {
-    /// All `MAX_ATTEMPTS` retries were spent.
     Attempts,
-    /// The next delay would have run past the wall-clock budget.
+    /// The next delay would have run past the wall-clock budget
+    /// (`upstream_retry_budget`).
     Budget,
 }
 
@@ -62,14 +56,11 @@ impl From<RetryLimit> for RetryStop {
     }
 }
 
-/// First delay of the schedule, in milliseconds, and the value
-/// `Backoff::reset_delay` restarts from: keeping both seeds in one place is
-/// what makes a reset provably identical to a fresh schedule.
+/// First delay of the schedule, in milliseconds.
 const INITIAL_DELAY_MS: u64 = 500;
 
 /// The retry budgets plus a Fibonacci-style connect backoff seeded at 500 ms:
-/// 500, 500, 1000, 1500, 2500, 4000, 6500, … ms. Reproduces the schedule the
-/// hyper retry loop has used inline.
+/// 500, 500, 1000, 1500, 2500, 4000, 6500, … ms.
 pub(crate) struct Backoff {
     prev: u64,
     curr: u64,
@@ -81,8 +72,7 @@ pub(crate) struct Backoff {
 
 impl Backoff {
     /// `budget` bounds the total retry envelope in wall-clock time, measured
-    /// from `now`. The clock is injected rather than read here so the policy
-    /// stays unit-testable (same reason as `cleanup::sweep::sweep_candidates`).
+    /// from `now`.
     pub(crate) fn new(budget: Duration, now: Instant) -> Self {
         Self {
             prev: 0,
@@ -94,8 +84,7 @@ impl Backoff {
     }
 
     /// [`Self::new`] for traffic no metric describes (hyper's scheme-cache
-    /// warm-up, `hyper_conn::Traffic::WarmUp`): the same schedule and
-    /// budgets, without the `UPSTREAM_RETRIES` bumps.
+    /// warm-up): no `UPSTREAM_RETRIES` bumps.
     #[cfg(any(test, feature = "hyper"))]
     pub(crate) fn uncounted(budget: Duration, now: Instant) -> Self {
         Self {
@@ -104,21 +93,16 @@ impl Backoff {
         }
     }
 
-    /// The 1-based number of the attempt currently in flight — for log messages
-    /// and hyper's HTTPS-upgrade revert threshold.
+    /// The 1-based number of the attempt currently in flight.
     pub(crate) fn attempt(&self) -> u32 {
         self.attempt
     }
 
-    /// The delay to wait before retrying, or the limiting budget once the attempt budget OR
-    /// the wall-clock budget is spent and the caller must fail terminally.
-    /// Charges the attempt, advances the schedule and bumps `UPSTREAM_RETRIES`
-    /// (unless built by `Backoff::uncounted`, which is hyper-only).
+    /// The delay to wait before retrying, or the budget that is spent, on
+    /// which the caller must fail terminally.
     ///
     /// The wall-clock rule is "do not start a sleep that finishes past the
-    /// deadline": a delay ending after `now + budget` (measured from the `now`
-    /// passed to [`Backoff::new`]) returns an error rather than sleeping first and
-    /// failing anyway. Only the delays are bounded here — each attempt is
+    /// deadline". Only the delays are bounded here: each attempt is
     /// separately bounded by `http_timeout`, so a slow connect can still carry
     /// the envelope past the budget before the next check sees it.
     pub(crate) fn next_retry(&mut self, now: Instant) -> Result<Duration, RetryLimit> {
@@ -137,10 +121,8 @@ impl Backoff {
         Ok(delay)
     }
 
-    /// Restart the delay schedule without refunding either budget — neither the
-    /// attempts already charged nor the wall-clock deadline move. Only the
-    /// hyper HTTPS-revert branch reuses this; gated so a hyper-less splice build
-    /// does not flag it as dead code.
+    /// Restart the delay schedule without refunding either budget: neither
+    /// the attempts already charged nor the wall-clock deadline move.
     #[cfg(any(test, feature = "hyper"))]
     pub(crate) fn reset_delay(&mut self) {
         self.prev = 0;
@@ -181,8 +163,6 @@ mod tests {
         values.iter().copied().map(Duration::from_millis).collect()
     }
 
-    /// The warm-up's uncounted backoff keeps the schedule and the budgets;
-    /// only the metric bump differs.
     #[test]
     fn uncounted_backoff_keeps_the_schedule() {
         let now = Instant::now();
@@ -223,10 +203,8 @@ mod tests {
             assert_eq!(b.next_retry(now), Ok(Duration::from_millis(want)));
             now = advance(now, Duration::from_millis(want));
         }
-        // The attempt budget kept counting across the reset.
         assert_eq!(b.attempt(), 6);
-        // ... and so did the wall-clock budget: the deadline is still 30s after
-        // `start`, so a delay that would run past it is refused.
+        // The deadline is still 30s after `start`.
         let near_deadline = advance(start, Duration::from_millis(29_800));
         assert_eq!(b.next_retry(near_deadline), Err(RetryLimit::Budget));
     }
@@ -239,7 +217,6 @@ mod tests {
         for _ in 0..MAX_ATTEMPTS {
             assert!(b.next_retry(now).is_ok());
         }
-        // MAX_ATTEMPTS retries after the initial attempt: MAX_ATTEMPTS + 1 connects.
         assert_eq!(b.attempt(), MAX_ATTEMPTS + 1);
         assert_eq!(b.next_retry(now), Err(RetryLimit::Attempts));
         assert_eq!(b.next_retry(now), Err(RetryLimit::Attempts));

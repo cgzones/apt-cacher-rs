@@ -1,15 +1,7 @@
-//! Every on-disk path below the cache directory, derived in one place.
+//! Every on-disk path below the cache directory.
 //!
 //! [`CachePaths`] is the only code that joins the layout directory names
-//! (`flat/`, `dists/`, `by-hash/`, `tmp/`) onto a cache root.  The serve
-//! path (`ConnectionDetails::cache_file_path`), the `.partial` placement
-//! (`partial_file::create_partial_file`), cleanup's unit roots
-//! (`cleanup::model::classify_mirror`), the startup cache scan
-//! (`task_cache_scan`), the web interface's per-mirror size walk and the
-//! legacy-layout migration probe all derive their paths here, so they cannot
-//! disagree about where a file lives.  `root` is a parameter, so every helper
-//! is pure and unit-testable; the one `global_config()` read is
-//! [`CachePaths::global`].
+//! (`flat/`, `dists/`, `by-hash/`, `tmp/`) onto a cache root.
 //!
 //! # Layout
 //!
@@ -27,19 +19,12 @@
 //! {root}/{host[:port]}/{mirror_path}/flat/           legacy_flat_dir (pre-fix layout, probed only)
 //! ```
 //!
-//! Flat repositories anchor at the host-level `flat/` sibling rather than
-//! nesting beneath a per-mirror subdirectory, and the URL path becomes the
-//! on-disk path verbatim below it.  `{host}` is the alias-resolved cache
-//! host ([`MirrorSite`]) in its URI authority form
-//! (`DomainName::format_authority`): an IPv6 host is bracketed
-//! (`[2001:db8::1]:8080`), which keeps it apart from the portless address
-//! ending in the same digits.  The `{mirror_path}` and leaf strings are validated
-//! relative before they get here (`valid_mirrorname` / `valid_filename`),
-//! which every join re-asserts.
-//!
-//! The directory *names* walkers compare against (`SUBDIR_FLAT_BYHASH`,
-//! `SUBDIR_TMP`, ...) live here too, along with the names reserved by mirror
-//! path validation, so a rename is one edit.
+//! `{host}` is the alias-resolved cache host ([`MirrorSite`]) in its URI
+//! authority form (`DomainName::format_authority`): an IPv6 host is
+//! bracketed (`[2001:db8::1]:8080`), which keeps it apart from the portless
+//! address ending in the same digits.  The `{mirror_path}` and leaf strings
+//! are validated relative before they get here (`valid_mirrorname` /
+//! `valid_filename`), which every join re-asserts.
 
 use std::{
     num::NonZero,
@@ -48,62 +33,38 @@ use std::{
 
 use crate::{cache_layout::CacheLayout, config::CacheHost, global_config};
 
-// Subdirectory string constants.  Callers wrap with `Path::new(...)` at the
-// use site since `Path::new` is not yet stable as a `const fn` in static
-// context.
-//
 // TODO: convert these to `&'static Path` constants once `Path::new` is
 // stable as a `const fn` in static context (tracking issue
 // https://github.com/rust-lang/rust/issues/143874).  Call sites then drop
 // their `Path::new(...)` wrappers.
 
-/// Subdirectory holding `dists/`-anchored metadata (`Release`, `Packages*`,
-/// etc.) under each `{host}/{mirror_path}/` cache root.
 pub(crate) const SUBDIR_DISTS: &str = "dists";
 
-/// Subdirectory holding by-hash content-addressed files belonging to the
-/// structured `dists/` layout.
 const SUBDIR_DISTS_BYHASH: &str = "dists/by-hash";
 
-/// Host-level subdirectory anchoring every flat (trivial) repository served
-/// from a given host.  The on-disk layout below it mirrors the URL path
-/// verbatim: e.g. a flat-pool request for
-/// `apt/amd64/twilio_5.0.0_amd64.deb` lands at
-/// `{cache}/{host}/flat/apt/amd64/twilio_5.0.0_amd64.deb`.
 pub(crate) const SUBDIR_FLAT: &str = "flat";
 
-/// Prefix for mirror paths that collide with the host-level flat layout
-/// (i.e. paths starting with `"flat/"`).  Used by [`crate::flat_blocklist`]
-/// to detect collision patterns.
+/// A mirror path starting with this collides with the host-level flat
+/// layout.
 pub(crate) const SUBDIR_FLAT_PREFIX: &str = "flat/";
 
-/// Subdirectory holding by-hash content-addressed files belonging to a flat
-/// repository.  Appended below `{cache}/{host}/flat/{mirror_path}/` for a
-/// `Flat::ByHash` request.
 pub(crate) const SUBDIR_FLAT_BYHASH: &str = "by-hash";
 
-/// Partial-download scratch directory.  Lives per-mirror at
-/// `{cache}/{host}/{mirror_path}/tmp/` (structured) and
-/// `{cache}/{host}/flat/{mirror_path}/tmp/` (flat). Kept partials count
-/// towards quota and are reaped by `cleanup_tmp_dir`.
+/// Per-mirror partial-download directory.  Kept partials count towards
+/// quota and are reaped by `cleanup_tmp_dir`.
 pub(crate) const SUBDIR_TMP: &str = "tmp";
 
 /// Root-only volatile scratch space, disjoint from valid hostnames.
 pub(crate) const SUBDIR_SCRATCH: &str = ".apt-cacher-rs.tmp";
 
-/// Layout subdirectory names that may legitimately appear under each
-/// `{cache_directory}/{host}/{mirror_path}/` directory.  The startup cache
-/// scan recurses into each and tallies its size; anything else triggers an
-/// "Unrecognized directory entry" warning.
-///
-/// `tmp/` is intentionally **not** listed here: it is partial-download
-/// scratch space (not part of the served cache layout), is handled
-/// separately by `task_cache_scan`, and is reaped by `cleanup_tmp_dir`.
+/// Layout subdirectory names that may appear under a
+/// `{cache_directory}/{host}/{mirror_path}/` directory; the startup cache
+/// scan warns about anything else.  `tmp/` is not listed: `task_cache_scan`
+/// handles it separately.
 pub(crate) const KNOWN_MIRROR_SUBDIRS: &[&str] = &[SUBDIR_DISTS];
 
 /// The host-level anchor a path hangs off: the mirror directory itself, or
-/// the host's `flat/` sibling.  Names what a bare `bool` argument could not
-/// at the two call sites that have no [`CacheLayout`] in hand.
+/// the host's `flat/` sibling.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Anchor {
     /// `{root}/{host}/{mirror_path}/`
@@ -113,7 +74,6 @@ enum Anchor {
 }
 
 impl Anchor {
-    /// The anchor a layout's entries live under.
     const fn for_layout(layout: CacheLayout) -> Self {
         if layout.is_flat() {
             Self::Flat
@@ -131,10 +91,8 @@ impl Anchor {
     }
 }
 
-/// On-disk subdirectory below the layout's anchor for this variant, or
-/// `None` when the file lives directly under the anchor (structured pool,
-/// flat metadata / flat pool).  The `by-hash` segment is the only suffix
-/// represented here.
+/// The subdirectory below the layout's anchor, `None` when the file lives
+/// directly under it.
 const fn layout_subdir(layout: CacheLayout) -> Option<&'static str> {
     match layout {
         CacheLayout::StructuredPool | CacheLayout::Flat => None,
@@ -147,10 +105,8 @@ const fn layout_subdir(layout: CacheLayout) -> Option<&'static str> {
 /// The alias-resolved identity that places a mirror on disk: the cache host
 /// (an alias' `main` host when the request arrived via an alias), its port
 /// and the mirror path.  Every [`CachePaths`] helper takes one, so alias
-/// resolution happens once, by whoever owns the mirror
-/// (`ConnectionDetails::site`, `MirrorEntry::site`, `InitBarrier::site`),
-/// never inside a join - and two owners that resolve differently produce
-/// visibly different sites rather than silently different paths.
+/// resolution happens once, by whoever owns the mirror, never inside a
+/// join.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MirrorSite<'a> {
     pub(crate) host: &'a CacheHost,
@@ -159,8 +115,8 @@ pub(crate) struct MirrorSite<'a> {
 }
 
 impl std::fmt::Display for MirrorSite<'_> {
-    /// `{host[:port]}/{mirror_path}` - the mirror's directory relative to
-    /// the host level, for log lines naming a mirror by where it is cached.
+    /// `{host[:port]}/{mirror_path}`, for log lines naming a mirror by where
+    /// it is cached.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self { host, port, path } = self;
         host.fmt(f)?;
@@ -171,9 +127,7 @@ impl std::fmt::Display for MirrorSite<'_> {
     }
 }
 
-/// Path derivation below one cache root.  `Copy` so it can be handed around
-/// by value; construct it with [`Self::new`] from a `Config` the caller
-/// already holds, or [`Self::global`] from the daemon-wide config.
+/// Path derivation below one cache root.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CachePaths<'a> {
     root: &'a Path,
@@ -185,14 +139,12 @@ impl<'a> CachePaths<'a> {
         Self { root }
     }
 
-    /// The daemon's configured cache directory.  The single
-    /// `global_config()` read in this module; unit tests use [`Self::new`].
+    /// Paths below the daemon's configured cache directory.
     #[must_use]
     pub(crate) fn global() -> CachePaths<'static> {
         CachePaths::new(&global_config().cache_directory)
     }
 
-    /// The cache root itself.
     #[must_use]
     pub(crate) const fn root(self) -> &'a Path {
         self.root
@@ -247,10 +199,7 @@ impl<'a> CachePaths<'a> {
         self.below_anchor(Anchor::Structured, site, Some(Path::new(SUBDIR_FLAT)), None)
     }
 
-    /// The directory a `layout`'s cache entries live in directly:
-    /// `{anchor}/{subdir?}/` where the anchor is the structured mirror
-    /// directory or its `flat/{mirror_path}` counterpart, and `subdir` is
-    /// the layout's `dists/`, `dists/by-hash/` or `by-hash/` (see the
+    /// The directory a `layout`'s cache entries live in directly (see the
     /// module-level table).
     #[must_use]
     pub(crate) fn entry_dir(self, layout: CacheLayout, site: MirrorSite<'_>) -> PathBuf {
@@ -262,8 +211,7 @@ impl<'a> CachePaths<'a> {
         )
     }
 
-    /// [`Self::entry_dir`] plus the `leaf` file name, in one pre-sized
-    /// allocation - the serve path's per-request cache file path.
+    /// [`Self::entry_dir`] plus the `leaf` file name.
     #[must_use]
     pub(crate) fn entry_file(
         self,
@@ -281,8 +229,7 @@ impl<'a> CachePaths<'a> {
 
     /// `{anchor}/tmp/`: the per-mirror partial-download directory for a
     /// `layout`, a sibling of the layout's entries so the final `rename(2)`
-    /// stays on one filesystem.  Structured layouts share the structured
-    /// anchor's `tmp/`; flat layouts share the flat anchor's.
+    /// stays on one filesystem.
     #[must_use]
     pub(crate) fn tmp_dir(self, layout: CacheLayout, site: MirrorSite<'_>) -> PathBuf {
         self.below_anchor(
@@ -328,10 +275,9 @@ impl<'a> CachePaths<'a> {
         ])
     }
 
-    /// Join the present `parts` below the root in one pre-sized allocation
-    /// (+1 per separator): this runs once per request on both dispatch hot
-    /// paths and once per served file in the size walks, and `PathBuf`
-    /// growth showed up in profiles dominated by Path/Vec reallocation.
+    /// Join the present `parts` below the root in one pre-sized allocation:
+    /// this runs once per request and once per file in the size walks, and
+    /// `PathBuf` growth showed up in profiles.
     ///
     /// Every part must be relative - an absolute one would make `push`
     /// discard everything before it - and non-empty, since pushing an empty
@@ -373,7 +319,6 @@ mod tests {
         ClientHost::new(s).expect("valid host").into_cache_host()
     }
 
-    /// Every test derives below `/cache`.
     #[expect(non_snake_case, reason = "reads as the constant it stands in for")]
     fn PATHS() -> CachePaths<'static> {
         CachePaths::new(Path::new("/cache"))

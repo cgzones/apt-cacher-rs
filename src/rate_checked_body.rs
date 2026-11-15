@@ -9,11 +9,8 @@ use crate::{
     transfer_error::{ClientError, DeliveryFailure},
 };
 
-/// Error type for optional rate-checking operations.
 pub(crate) enum RateCheckedBodyErr<E> {
-    /// The download rate is below the minimum threshold.
     RateTimeout(InsufficientRate),
-    /// An error occurred while reading from the inner body.
     Inner(E),
 }
 
@@ -27,10 +24,8 @@ where
     inner: B,
     rchecker: Option<RateChecker>,
     /// Set once the rate breach has been surfaced, so a consumer that polls
-    /// on sees the body end rather than a second breach. Counting is not this
-    /// body's: the owner that ends the transfer concludes the failure once
-    /// (`AccountedBody` for a client body, the download runner for hyper's
-    /// `download_file`).
+    /// on sees the body end rather than a second breach. The breach is
+    /// counted by the owner that ends the transfer, not here.
     rate_failed: sticky::Bool,
 }
 
@@ -38,8 +33,6 @@ impl<B> MaybeRated<B>
 where
     B: Body,
 {
-    /// Check the body rate only when `rate_checker` is set (see
-    /// [`RateChecker::from_config`]).
     #[must_use]
     pub(crate) fn new(body: B, rate_checker: Option<RateChecker>) -> Self {
         Self {
@@ -49,7 +42,6 @@ where
         }
     }
 
-    /// Map rate and source failures into the client's typed delivery result.
     pub(crate) fn into_client_body(self) -> impl Body<Data = B::Data, Error = DeliveryFailure>
     where
         B::Error: Into<DeliveryFailure>,
@@ -75,8 +67,7 @@ where
 
     #[inline]
     fn is_end_stream(&self) -> bool {
-        // Mirrors the `poll_frame` short-circuit below, per the `Body`
-        // contract that `true` implies only `Ready(None)` follows.
+        // `Body` contract: `true` implies only `Ready(None)` follows.
         self.rate_failed.get() || self.inner.is_end_stream()
     }
 
@@ -133,10 +124,8 @@ mod tests {
         body
     }
 
-    /// A rate breach is surfaced exactly once. Every later poll yields the
-    /// terminal `Ready(None)`, so a consumer that keeps polling cannot
-    /// re-bump `RATE_LIMIT_*` per frame - the idempotency `channel_body`'s
-    /// `errored` flag provides for its own terminal error.
+    /// A consumer that keeps polling must not re-bump `RATE_LIMIT_*` per
+    /// frame.
     #[test]
     fn rate_failure_is_surfaced_once_and_latches() {
         let mut body = breaching_body();
@@ -219,9 +208,6 @@ mod tests {
         }
     }
 
-    /// Without a configured minimum rate the wrapper is a pass-through: the
-    /// inner body's frames arrive unchanged, only wrapped in the common
-    /// error type.
     #[test]
     fn unrated_body_passes_frames_through() {
         let mut body = MaybeRated::new(Full::new(bytes::Bytes::from_static(b"payload")), None);

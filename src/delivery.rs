@@ -1,14 +1,7 @@
-//! Completion bookkeeping for bodies served from the cache to a client.
-//!
-//! Every path that ships a cached (or in-progress) file - hyper stream,
-//! channel, sendfile - ends the same way: bump `SERVED_<mechanism>` +
-//! `SERVED_TOTAL` iff the body was fully delivered, log one completion or
-//! abort line whose wording only differs in the mechanism token and the
-//! cached/late-joiner phrasing, and record a `deliveries` row on success.
-//! [`finish_cached_serve`] is the single implementation; the hyper bodies
-//! call it from `Drop` (see `accounted_body.rs`), sendfile after its
-//! syscall loop. (The splice path logs a combined upstream+client line and
-//! stays separate.)
+//! Completion bookkeeping for bodies served from the cache to a client:
+//! the `SERVED_*` credit, the completion or abort log line and the
+//! `deliveries` row. The splice path logs a combined upstream+client line
+//! and does not come through here.
 
 use std::time::Duration;
 
@@ -40,7 +33,6 @@ pub(crate) enum Mechanism {
 }
 
 impl Mechanism {
-    /// The `via` token of the completion line.
     #[must_use]
     fn via(self) -> &'static str {
         match self {
@@ -53,7 +45,6 @@ impl Mechanism {
         }
     }
 
-    /// The per-request counter bumped when a body of this kind is created.
     #[cfg(feature = "hyper")]
     #[must_use]
     pub(crate) fn requests(self) -> &'static Counter {
@@ -65,7 +56,6 @@ impl Mechanism {
         }
     }
 
-    /// The byte accumulator for bytes shipped by this mechanism.
     #[cfg(feature = "hyper")]
     #[must_use]
     pub(crate) fn bytes_served(self) -> &'static metrics::Accumulator {
@@ -77,7 +67,7 @@ impl Mechanism {
         }
     }
 
-    /// The "body fully delivered" counter; parent is `SERVED_TOTAL`.
+    /// The "body fully delivered" counter.
     fn served(self) -> &'static Counter {
         match self {
             #[cfg(feature = "hyper")]
@@ -118,7 +108,6 @@ impl Role {
     }
 }
 
-/// What happened to one served body.
 pub(crate) struct ServeOutcome {
     /// Bytes the response promised (after Range trimming).
     pub(crate) size: u64,
@@ -128,13 +117,12 @@ pub(crate) struct ServeOutcome {
     pub(crate) partial: bool,
     /// Client-side transfer window (from the first body byte).
     pub(crate) elapsed: Duration,
-    /// How the delivery ended.
     pub(crate) end: DeliveryEnd,
 }
 
-/// Finish one cached-file delivery: metrics, the completion/abort log line,
-/// and - on a complete delivery - the `deliveries` row to enqueue. The
-/// caller sends the row (`send_db_command` from async code,
+/// Finish one cached-file delivery: metrics and the completion/abort log
+/// line. Returns the `deliveries` row of a complete delivery, which the
+/// caller sends (`send_db_command` from async code,
 /// `send_db_command_nonblocking` from `Drop`).
 #[must_use]
 pub(crate) fn finish_cached_serve(
@@ -231,9 +219,6 @@ mod tests {
             }
         }
 
-        /// The sink owns no counter table: the failure counts itself exactly
-        /// once through `record_terminal`, and reports itself at its own
-        /// `severity`.
         #[test]
         fn cached_abort_counts_once_and_uses_the_policy_level() {
             let before = metrics::CLIENT_DISCONNECTED_MID_BODY.get();
@@ -248,9 +233,8 @@ mod tests {
             assert_eq!(levels, vec![Level::INFO], "{levels:?}");
         }
 
-        /// A client that stops reading is expected client behaviour, so the
-        /// severity table reports it at INFO even though it is not a
-        /// disconnect; the pre-policy sink logged this one at WARN.
+        /// A client that stops reading is expected client behaviour, so it is
+        /// reported at INFO even though it is not a disconnect.
         #[test]
         fn a_client_timeout_abort_is_reported_at_info() {
             let cd = connection_details("slow.deb");

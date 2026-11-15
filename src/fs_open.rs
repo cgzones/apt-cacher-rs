@@ -86,7 +86,6 @@ impl NoFollowOptions {
     }
 }
 
-/// Options for cache-path opens, with `O_NOFOLLOW` enforced by the type.
 pub(crate) fn nofollow_options() -> NoFollowOptions {
     NoFollowOptions::new(0)
 }
@@ -107,14 +106,11 @@ pub(crate) fn nofollow_nonblock_options() -> NoFollowOptions {
 /// Open a cache file for reading on the calling thread, for a cache hit.
 ///
 /// Through [`tokio::fs`] the `openat` is a blocking-pool round trip on every
-/// hit (a pool thread's wake, the wake back, a few `futex` calls), where the
-/// call itself resolves a hot dentry in about a microsecond; the hit path
-/// already `fstat`s and `sendfile`s on the worker. `block_in_place` would
-/// not save the handoff: it moves the worker's core to another thread
-/// through the same blocking pool. `O_NONBLOCK`, inert for a regular file,
-/// keeps a FIFO planted at the path from blocking the worker in `open`
-/// ([`nofollow_nonblock_options`]); callers reject every non-regular file
-/// after the `fstat`, as they do for any open.
+/// hit, where the call itself resolves a hot dentry in about a microsecond.
+/// `block_in_place` would not save the handoff: it moves the worker's core
+/// to another thread through the same blocking pool. `O_NONBLOCK` keeps a
+/// FIFO planted at the path from blocking the worker in `open`; callers
+/// reject every non-regular file after the `fstat`.
 pub(crate) fn open_cached_file_inline(path: &Path) -> std::io::Result<tokio::fs::File> {
     nofollow_nonblock_options()
         .read(true)
@@ -125,9 +121,7 @@ pub(crate) fn open_cached_file_inline(path: &Path) -> std::io::Result<tokio::fs:
 /// Whether a failed syscall on a cache path failed because something other
 /// than a regular file sits there: a symlink `O_NOFOLLOW` refused (`ELOOP`),
 /// a directory opened for writing or read as a file (`EISDIR`), or a socket
-/// (`ENXIO`). That is a `CACHE_NON_REGULAR` anomaly -- the same fact an
-/// `fstat` of the opened descriptor or a cache walk reports -- not a
-/// `CACHE_IO_FAILURE`.
+/// (`ENXIO`).
 ///
 /// Decided on the raw errno, so it must see the syscall's own error: a
 /// wrapper built with `io::Error::new` answers `None` from `raw_os_error`.
@@ -139,9 +133,6 @@ pub(crate) fn is_non_regular_errno(err: &std::io::Error) -> bool {
     )
 }
 
-/// Bump the one counter a failed cache-path syscall belongs to:
-/// `CACHE_NON_REGULAR` for [`is_non_regular_errno`], `CACHE_IO_FAILURE` for
-/// every other errno.
 pub(crate) fn count_cache_failure(err: &std::io::Error) {
     if is_non_regular_errno(err) {
         metrics::CACHE_NON_REGULAR.increment();
@@ -157,13 +148,8 @@ pub(crate) fn count_cache_failure(err: &std::io::Error) {
 #[derive(Debug)]
 pub(crate) struct CacheAccessFailure(pub(crate) Logged);
 
-/// `statx` an already-open file without the blocking-pool round trip.
-///
-/// Synchronous on purpose. `tokio::fs::File::metadata` is a `spawn_blocking`
-/// under the hood — a condvar wake of a pool thread, a wake back to the
-/// worker and two context switches for a stat of an in-memory inode, paid on
-/// every cache hit. The late-joiner path in `sendfile_conn.rs` already stats
-/// inline for the same reason.
+/// `statx` an already-open file without the blocking-pool round trip that
+/// `tokio::fs::File::metadata` pays on every cache hit.
 ///
 /// It must stay a `statx`, not an `fstat`: `cache_file_http_date` reads
 /// `Metadata::created()` (btime) and only falls back to mtime, while
@@ -197,8 +183,8 @@ fn borrowed_metadata_with(
     }
 }
 
-/// Validate an open cache file and count failures once. The caller's owner
-/// reports the returned error, which retains the operation and path.
+/// Counts the failure; the caller reports the returned error, which retains
+/// the operation and path.
 pub(crate) fn regular_file_metadata_typed(
     file: &tokio::fs::File,
     path: &Path,
@@ -225,10 +211,8 @@ fn validate_regular_metadata(
     }
 }
 
-/// `statx` an open cache file and require a regular file.
-///
-/// Reporting adapter for callers that return an already-logged cache failure.
-/// Validation and counters belong to [`regular_file_metadata_typed`].
+/// [`regular_file_metadata_typed`] for callers that return an already-logged
+/// cache failure.
 pub(crate) fn regular_file_metadata(
     file: &tokio::fs::File,
     path: &Path,
@@ -241,9 +225,7 @@ pub(crate) fn regular_file_metadata(
     })
 }
 
-/// Update a volatile file's mtime to `now` to reset the 30-second freshness window,
-/// stat-ing the open file first; see [`touch_volatile_mtime_with`] for a caller that
-/// already holds the file's metadata.
+/// [`touch_volatile_mtime_with`], stat-ing the open file first.
 #[cfg(feature = "hyper")]
 pub(crate) async fn touch_volatile_mtime(
     file: tokio::fs::File,
@@ -267,8 +249,8 @@ pub(crate) async fn touch_volatile_mtime(
 /// Update a volatile file's mtime to `now` to reset the 30-second freshness window.
 /// Only updates mtime when the filesystem supports birth time (btime), so mtime can
 /// serve as a "last revalidated" timestamp separate from the content creation time.
-/// `metadata` is the open file's own, taken by the caller; only its btime support is
-/// read, so a stat from before an earlier touch is as good as a fresh one.
+/// Only `metadata`'s btime support is read, so a stat from before an earlier touch
+/// is as good as a fresh one.
 /// Takes ownership of the file handle (for the `into_std()` / `from_std()` conversion
 /// needed by `set_modified()`) and returns it for continued use.
 pub(crate) async fn touch_volatile_mtime_with(
@@ -322,15 +304,10 @@ fn renew_volatile_mtime(
 const SEQUENTIAL_HINT_MIN_SIZE: u64 = 256 * 1024;
 
 /// Hint to the kernel that `file` will be read sequentially from start to end,
-/// so the page-cache readahead window can grow more aggressively.  Used on
-/// every cache file we are about to stream to a client through the
-/// hyper/sendfile paths, and on files hashed for integrity verification.
-/// Accepts any `AsFd`, so both `tokio::fs::File` (async serve paths) and
-/// `std::fs::File` (synchronous hashing) can call it.  `transfer_size` is the
-/// number of bytes about to be read (`u64::MAX` when unknown, e.g. a
-/// still-growing download); small transfers skip the syscall.  Failure is
-/// non-fatal — the first failure is logged at warn level (subsequent ones at
-/// debug) and we fall back to the kernel's default readahead policy.
+/// so the page-cache readahead window can grow more aggressively.
+/// `transfer_size` is the number of bytes about to be read (`u64::MAX` when
+/// unknown, e.g. a still-growing download); small transfers skip the syscall.
+/// Failure is non-fatal.
 pub(crate) fn hint_sequential_read(
     file: impl std::os::fd::AsFd,
     transfer_size: u64,
@@ -360,8 +337,7 @@ pub(crate) fn hint_sequential_read(
 /// Cleanup hashes its way through the whole cache on a schedule; without
 /// this, one pass streams every file through the page cache and evicts the
 /// hot serving set. Deliberately NOT used at commit time, where the file was
-/// just written and may be served within milliseconds. Failure is non-fatal
-/// — the first is logged at warn level, subsequent ones at debug.
+/// just written and may be served within milliseconds. Failure is non-fatal.
 pub(crate) fn release_page_cache(file: impl std::os::fd::AsFd, display_path: &Path) {
     use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
 
@@ -379,7 +355,7 @@ pub(crate) fn release_page_cache(file: impl std::os::fd::AsFd, display_path: &Pa
 mod tests {
     use super::*;
 
-    /// Create `dir/target` and a `dir/link` symlink pointing at it.
+    /// Returns the path of a symlink to a regular file, both under `dir`.
     fn planted_symlink(dir: &Path) -> std::path::PathBuf {
         let target = dir.join("target");
         std::fs::write(&target, b"x").expect("write target");
@@ -427,8 +403,6 @@ mod tests {
         }
     }
 
-    /// A refused symlink and a directory opened for writing are non-regular
-    /// entries, counted as such; any other errno is a cache I/O failure.
     #[test]
     fn open_errnos_of_a_non_regular_entry_count_as_non_regular() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -464,9 +438,8 @@ mod tests {
         assert_eq!(metrics::CACHE_IO_FAILURE.get(), io_failure + 1);
     }
 
-    /// The nonblock variant exists so an open of a FIFO or character device
-    /// cannot strand a blocking-pool thread; `custom_flags` overwrites rather
-    /// than ORs, so a stray second call would silently drop `O_NONBLOCK`.
+    /// `custom_flags` overwrites rather than ORs, so a stray second call
+    /// would silently drop `O_NONBLOCK`.
     #[test]
     fn only_the_nonblock_variant_sets_o_nonblock() {
         use nix::fcntl::{FcntlArg, OFlag, fcntl};
@@ -498,9 +471,6 @@ mod tests {
         );
     }
 
-    /// The EINTR retry cannot be provoked with a real signal, so it is driven
-    /// through its injection seam: a retried `statx` must be invisible to the
-    /// caller, which sees only the result of the call that finally landed.
     #[test]
     fn borrowed_metadata_retries_an_interrupted_stat() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -522,8 +492,6 @@ mod tests {
         assert_eq!(calls, 3, "both interruptions are retried");
     }
 
-    /// Only `Interrupted` is a retry: any other failure is the caller's to
-    /// report, and retrying it would spin.
     #[test]
     fn borrowed_metadata_returns_a_non_eintr_failure_at_once() {
         let mut calls = 0_u32;
@@ -552,13 +520,9 @@ mod tests {
         let meta = regular_file_metadata(&file, &path).expect("regular file");
 
         assert_eq!(meta.len(), 10);
-        // `regular_file_metadata` must stay statx-backed: compare its
-        // `created()` availability against a path-based std stat (which
-        // goes through the same statx). This fails if the helper ever
-        // regresses to an fstat(2), which carries no btime, while staying
-        // green on a filesystem that genuinely reports none -- an `||`
-        // against `modified()` would not, since `modified()` is `Ok`
-        // whenever the stat itself succeeds.
+        // Compared against a path-based std stat (the same statx) so the
+        // check fails on a regression to fstat(2), which carries no btime,
+        // while staying green on a filesystem that reports none.
         let via_path = std::fs::metadata(&path).expect("path stat");
         assert_eq!(
             meta.created().is_ok(),
@@ -567,8 +531,6 @@ mod tests {
         );
     }
 
-    /// The typed sibling carries the path in the error instead of a log line,
-    /// and keeps the same `CACHE_NON_REGULAR` accounting.
     #[test]
     fn typed_metadata_rejects_a_fifo_without_waiting_for_a_writer() {
         let dir = tempfile::tempdir().expect("tempdir");

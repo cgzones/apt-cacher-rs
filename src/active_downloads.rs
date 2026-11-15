@@ -1,32 +1,17 @@
 //! Coordinated state for in-flight downloads.
 //!
-//! [`ActiveDownloads`] is the single source of truth for "is a download for
-//! this (mirror, debname) currently in flight?", shared between the hyper,
-//! splice, and sendfile delivery backends. It is also the single enforcement
-//! site for `max_upstream_downloads`: a new origination at the cap returns
+//! [`ActiveDownloads`] answers "is a download for this (mirror, debname)
+//! currently in flight?" for every backend, and enforces
+//! `max_upstream_downloads`: a new origination at the cap returns
 //! `AtCapacity` from [`ActiveDownloads::register`] (late joiners are exempt:
-//! they open no new upstream connection), which every backend answers from
-//! [`at_capacity_refusal`]. It also drives the related metric accounting so
-//! callers don't have to:
+//! they open no new upstream connection). It drives the late-joiner,
+//! cap-saturation and cap-rejection metrics itself.
 //!
-//! - Late-joiner counts ([`metrics::LATE_JOINERS_TOTAL`] /
-//!   [`metrics::LATE_JOINER_PEAK_PER_DOWNLOAD`]) — bumped atomically when
-//!   [`ActiveDownloads::register`] joins or `ActiveDownloads::attach` hits.
-//! - Saturation transitions for `max_upstream_downloads`
-//!   ([`metrics::UPSTREAM_DOWNLOAD_CAP_TRANSITIONS`]) — debounced via the
-//!   registry-owned saturation latch so each saturation episode counts once.
-//! - Cap rejections ([`metrics::UPSTREAM_DOWNLOAD_REJECTED_CAP`]) — bumped
-//!   for every refused origination.
-//!
-//! The cap counts [`UpstreamSlot`]s, not entries. A slot is minted with the
-//! origination and released by dropping it, so the count is exactly the
-//! number of alive tokens: no derived subtraction, no flag to remember to
-//! set. An entry outlives its slot on purpose -- it stays mapped through
-//! verification and rename so a joiner arriving in that window finds it
-//! rather than missing both the entry and the cache file -- which is why
-//! [`ActiveDownloads::len`] (the shutdown summary, the dashboard: "what
-//! would be dropped now") and [`ActiveDownloads::upstream_slots`] (the cap,
-//! the parallel-hack probability) are two different numbers.
+//! The cap counts [`UpstreamSlot`]s, not entries. An entry outlives its slot
+//! on purpose -- it stays mapped through verification and rename so a joiner
+//! arriving in that window finds it rather than missing both the entry and
+//! the cache file -- which is why [`ActiveDownloads::len`] and
+//! [`ActiveDownloads::upstream_slots`] are two different numbers.
 
 use std::num::NonZero;
 use std::path::PathBuf;
@@ -52,9 +37,7 @@ use crate::{global_config, metrics, verify_throttle, warn_once_or_info};
 /// Why an originator ended its registry entry without downloading anything:
 /// it answered its client from the upstream's head or from its own policy.
 /// A joiner answers what the originator answered ([`Self::response_parts`]),
-/// where a `Cancelled` abort would claim a failure of unknown cause.  An
-/// originator declining on its own policy answers from the same table, so
-/// the two agree by construction.
+/// where a `Cancelled` abort would claim a failure of unknown cause.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Declined {
     /// The upstream answered with a status that is relayed, not cached.
@@ -79,10 +62,7 @@ pub(crate) enum Declined {
 
 impl Declined {
     /// The status + body a joiner answers with: the originator's own answer,
-    /// except that a relayed upstream body cannot be replayed.  Every
-    /// originator declining on a proxy-side condition (quota, verify
-    /// throttle, relay cap, planner refusal, empty volatile body) answers
-    /// from here, with [`Self::retry_after`].
+    /// except that a relayed upstream body cannot be replayed.
     #[must_use]
     pub(crate) fn response_parts(self) -> (StatusCode, &'static str) {
         match self {
@@ -104,7 +84,6 @@ impl Declined {
         }
     }
 
-    /// `Retry-After` value for the response, when the decline carries one.
     #[must_use]
     pub(crate) fn retry_after(self) -> Option<std::time::Duration> {
         match self {
@@ -142,53 +121,45 @@ impl std::fmt::Display for Declined {
 
 #[derive(Debug)]
 pub(crate) enum AbortReason {
-    /// The incomplete download's terminal cause, shared without reconstruction.
+    /// The incomplete download's terminal cause.
     Failed(Arc<DownloadFailure>),
-    /// The originator answered without downloading; see [`Declined`].
     Declined(Declined),
     /// Every upstream byte was written, but `RenameBarrier::commit`
     /// discarded the download (checksum mismatch, verify I/O or rename
-    /// failure). Readers holding an open handle drain it exactly like
-    /// `Verifying` (the clients attached before the verdict get the bytes
-    /// they were promised; apt verifies them itself), while anyone still
-    /// looking for the file fails like the other abort reasons — the temp
-    /// file may already be unlinked. `checksum_mismatch` marks the verdict
-    /// that armed the verify throttle (under the same status write lock),
-    /// so a joiner reading this status answers with the throttle's 503
-    /// instead of a generic abort.
-    Discarded { checksum_mismatch: bool },
+    /// failure). Readers holding an open handle drain it like `Verifying`
+    /// (apt verifies the bytes itself), while anyone still looking for the
+    /// file fails: the temp file may already be unlinked.
+    /// `checksum_mismatch` marks the verdict that armed the verify throttle,
+    /// so a joiner reading this status answers with the throttle's 503.
+    Discarded {
+        checksum_mismatch: bool,
+    },
 }
 
 #[derive(Debug)]
 pub(crate) enum ActiveDownloadStatus {
     Init(tokio::sync::watch::Receiver<()>),
-    /// In-flight download; `meta` carries upstream-supplied `ETag` /
-    /// Last-Modified for late joiners that need them for response headers
-    /// or conditional-request decisions, avoiding xattr reads on the temp
-    /// file while it's still being written.
+    /// `meta` carries the upstream `ETag` / `Last-Modified` for late
+    /// joiners, avoiding xattr reads on the temp file while it is still
+    /// being written.
     Download {
         path: PathBuf,
         content_length: ContentLength,
         rx: tokio::sync::watch::Receiver<()>,
         meta: Arc<UpstreamMetadata>,
     },
-    /// All upstream bytes have been written to `path` (the partial / temp
-    /// file) but the file is still being hashed and renamed by
-    /// `RenameBarrier::commit` on a blocking thread. Readers that observe
-    /// this state can treat the file as a complete, drainable copy of the
-    /// resource: existing late-joiner file handles remain valid across the
-    /// upcoming rename (Linux keeps the inode open). The watch sender has
-    /// already been dropped by `begin_rename`, so this is the variant
-    /// late-joiners see after `RecvError` instead of a stale `Download`.
+    /// All upstream bytes are in `path` (the partial / temp file), which
+    /// `RenameBarrier::commit` is still hashing and renaming. Readers can
+    /// drain it as a complete copy: open handles stay valid across the
+    /// rename. The watch sender is already dropped, so this is what late
+    /// joiners see after `RecvError`.
     Verifying {
         path: PathBuf,
         meta: Arc<UpstreamMetadata>,
     },
-    /// Rename-completed (or revalidation-confirmed) cached file.
-    /// `meta` is `Some` when the values came from a fresh upstream
-    /// response (`RenameBarrier::commit`); `None` when the entry was
-    /// produced by `InitBarrier::finished` (e.g. volatile-revalidation
-    /// 304) — in that case readers fall through to the post-flight
+    /// Rename-completed (or revalidation-confirmed) cached file. `meta` is
+    /// `None` when the entry was produced by `InitBarrier::finished` (e.g.
+    /// a volatile-revalidation 304); readers then fall through to the
     /// [`crate::cache_metadata`] cache, which lazy-loads from xattrs.
     Finished {
         path: PathBuf,
@@ -201,12 +172,8 @@ pub(crate) enum ActiveDownloadStatus {
 /// Admission for new joiners stays separate: a discarded file may be unlinked.
 #[derive(Debug)]
 pub(crate) enum AttachedReaderState {
-    /// Neither on disk nor failed: the writer is still streaming
-    /// (`Download`) or has not started yet (`Init`). The two are one
-    /// variant because no consumer can act on the difference: a follower
-    /// that observes this state after the progress sender dropped treats
-    /// both as a logic error, and the sendfile EOF re-check retries on
-    /// both.
+    /// The writer is still streaming (`Download`) or has not started yet
+    /// (`Init`); no consumer can act on the difference.
     Incomplete,
     Drainable,
     Failed(Arc<DownloadFailure>),
@@ -256,9 +223,6 @@ pub(crate) async fn await_progress(
     match receiver.changed().await {
         Ok(()) => Ok(Progress::More),
         Err(_err @ tokio::sync::watch::error::RecvError { .. }) => {
-            // Verifying means all bytes are on disk and the writer is hashing
-            // on a blocking thread; the open file handle stays valid across
-            // the upcoming rename, so drain like Finished.
             let state = status.read().await.attached_reader();
             match state {
                 AttachedReaderState::Drainable => Ok(Progress::Drained),
@@ -273,7 +237,7 @@ pub(crate) async fn await_progress(
 /// with the file already open. Produced by [`await_serveable`].
 pub(crate) enum Serveable {
     /// The writer is still streaming: serve from the growing partial file,
-    /// tailing `rx` for progress pings (see `DownloadBarrier::ping`).
+    /// tailing `rx` for progress pings.
     InProgress {
         file: tokio::fs::File,
         path: PathBuf,
@@ -318,7 +282,6 @@ pub(crate) enum JoinFailure {
 }
 
 impl JoinFailure {
-    /// The canonical status + body both backends answer with.
     #[must_use]
     pub(crate) fn response_parts(&self) -> (StatusCode, &'static str) {
         match self {
@@ -337,13 +300,10 @@ impl JoinFailure {
     }
 
     /// Whether the originator declined on a gate `client` is exempt from, so
-    /// the caller looks the resource up again and fetches it itself instead
-    /// of answering this failure: cleanup's synthetic client skips the
-    /// pre-upstream verify-throttle gate (a 503 would bail the mirror's
-    /// cleanup), so a throttled originator's decline is no answer for it.
-    /// Only hyper's `serve_cache_miss` can see such a joiner.  (The same
-    /// variant from a discarded download never reaches cleanup's client:
-    /// `discarded_join` exempts it before arming the answer.)
+    /// the caller fetches the resource itself instead of answering this
+    /// failure: cleanup's synthetic client skips the pre-upstream
+    /// verify-throttle gate (a 503 would bail the mirror's cleanup), so a
+    /// throttled originator's decline is no answer for it.
     #[must_use]
     pub(crate) fn exempts(&self, client: &ClientInfo) -> bool {
         matches!(
@@ -352,7 +312,6 @@ impl JoinFailure {
         ) && client.is_cleanup_synthetic()
     }
 
-    /// `Retry-After` value for the response, when the failure carries one.
     #[must_use]
     pub(crate) fn retry_after(&self) -> Option<std::time::Duration> {
         match self {
@@ -363,8 +322,7 @@ impl JoinFailure {
 }
 
 /// Wait for an in-flight download to leave `Init`, then open the file a late
-/// joiner serves from. The one implementation of the late-joiner state
-/// machine shared by the hyper and sendfile backends.
+/// joiner serves from.
 ///
 /// `Download` opens the partial under the status read lock: the writer can
 /// only move the file after flipping to `Verifying`, which needs the write
@@ -507,9 +465,8 @@ pub(crate) async fn await_serveable(
                             );
                             return Err(failure);
                         }
-                        // The joiner gets the originator's 503: a request the
-                        // throttle rejected, like the `Discarded` joiner's in
-                        // `discarded_join` and the originator's own.
+                        // A request the throttle rejected, counted like the
+                        // originator's own.
                         if let Declined::VerifyThrottled { remaining: _ } = why {
                             metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.increment();
                         }
@@ -574,42 +531,28 @@ fn discarded_join(checksum_mismatch: bool, conn_details: &ConnectionDetails) -> 
 #[derive(Debug)]
 struct ActiveDownloadEntry {
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-    /// Number of late joiners that have attached to this download so far;
-    /// only ever grows (a joiner leaving is not subtracted), so the peak it
-    /// feeds is joiners per download, not concurrent joiners. Updated
-    /// under `inner`'s write-lock on every late-join insert and on each
-    /// `attach()` call.
+    /// Late joiners attached so far; only ever grows, so the peak it feeds
+    /// is joiners per download, not concurrent joiners.
     late_joiners: usize,
 }
 
 impl ActiveDownloadEntry {
-    /// Attach under the registry lock and return the cumulative count. The
-    /// caller records it only after dropping the registry guard, so metric
-    /// updates do not extend the critical section.
+    /// Returns the cumulative count; the caller records it only after
+    /// dropping the registry guard.
     fn join(&mut self) -> (Arc<tokio::sync::RwLock<ActiveDownloadStatus>>, usize) {
         self.late_joiners += 1;
         (Arc::clone(&self.status), self.late_joiners)
     }
 }
 
-/// The locked state: the entries, and the number of [`UpstreamSlot`]s alive.
-///
-/// The two are deliberately independent counts rather than one derived from
-/// the other. An entry outlives its upstream connection (it stays mapped
-/// through verification and rename so a joiner in that window still finds
-/// it), and the slot is what `max_upstream_downloads` caps -- so the cap
-/// reads `upstream_slots`, never `entries.len()`, and neither count is ever
-/// computed by subtracting the other.
 #[derive(Debug)]
 struct Registry {
-    /// Keyed by the same allocation the download's barrier chain names its
-    /// entry with ([`Origination::key`]), so an origination clones the
-    /// borrowed key once.
+    /// Keyed by the allocation the download's barrier chain names its entry
+    /// with ([`Origination::key`]).
     entries: HashMap<Arc<CacheEntryKey>, ActiveDownloadEntry>,
-    /// Alive [`UpstreamSlot`] tokens. Written only by [`UpstreamSlot::mint`]
-    /// and [`UpstreamSlot`]'s `Drop`, which are also the only places that
-    /// move the saturation latch: a count that can only change through those
-    /// two cannot change without the latch seeing it.
+    /// Alive [`UpstreamSlot`] tokens, which is what `max_upstream_downloads`
+    /// caps. Written only by [`UpstreamSlot::mint`] and [`UpstreamSlot`]'s
+    /// `Drop`, which also move the saturation latch.
     upstream_slots: usize,
     /// Count a saturation episode once until every slot drains.
     at_cap: bool,
@@ -639,16 +582,12 @@ impl std::fmt::Debug for ActiveDownloads {
 }
 
 /// The unit `max_upstream_downloads` counts: one upstream connection opened
-/// on behalf of a download. Minted by the origination that opens it
-/// ([`Admission::Originator`]) and released by drop, so it can neither
-/// be forgotten nor released twice -- whoever holds it holds the slot.
+/// on behalf of a download, released by drop.
 ///
-/// The barrier chain in `guards.rs` carries it from `InitBarrier::new` and
-/// drops it in `DownloadBarrier::begin_rename`, which is where every backend
-/// has necessarily finished reading the upstream body and which comes before
-/// the `fsync`, verify and rename that follow. The entry stays mapped until
-/// that commit ends, because joiners still need to find it: a released slot
-/// says "no upstream connection", not "no download".
+/// The barrier chain in `guards.rs` drops it in
+/// `DownloadBarrier::begin_rename`, where every backend has finished reading
+/// the upstream body, before the `fsync`, verify and rename. The entry stays
+/// mapped until that commit ends, because joiners still need to find it.
 #[must_use = "dropping the slot is what frees it; hold it for as long as the upstream connection is open"]
 pub(crate) struct UpstreamSlot {
     registry: ActiveDownloads,
@@ -661,8 +600,7 @@ impl std::fmt::Debug for UpstreamSlot {
 }
 
 impl UpstreamSlot {
-    /// Mint the slot for a new origination, under the registry's write lock
-    /// (`upstream_slots` is the locked count). The caller has already refused
+    /// Called under the registry's write lock, after the caller has refused
     /// the origination if the count is at `max`.
     fn mint(
         upstream_slots: &mut usize,
@@ -696,42 +634,35 @@ impl Drop for UpstreamSlot {
     }
 }
 
-/// What a successful origination hands its backend: the registry key, the
-/// `Init` ping sender the barrier drops when it leaves `Init`, the status
-/// handle, and the [`UpstreamSlot`] the download counts against
-/// `max_upstream_downloads` with. Consumed whole by `InitBarrier::new`, so no
-/// backend can register a download without also taking custody of its slot.
+/// What a successful origination hands its backend. Consumed whole by
+/// `InitBarrier::new`, so no backend can register a download without also
+/// taking custody of its slot.
 pub(crate) struct Origination {
-    /// The allocation the registry maps the entry under, shared with the
-    /// barrier chain rather than cloned again.
     pub(crate) key: Arc<CacheEntryKey>,
+    /// Dropped by the barrier when it leaves `Init`.
     pub(crate) init_tx: tokio::sync::watch::Sender<()>,
     pub(crate) status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     pub(crate) slot: UpstreamSlot,
 }
 
-/// Outcome of [`ActiveDownloads::register`]: originate a new download,
-/// join an existing one, or refuse a new origination at the configured cap.
-/// Late-joiner accounting is already complete when this returns; the
-/// status handle stays alive even after the registry entry is retired.
+/// Outcome of [`ActiveDownloads::register`]. Late-joiner accounting is
+/// already complete when this returns; the status handle stays alive even
+/// after the registry entry is retired.
 pub(crate) enum Admission {
-    /// A new entry, and with it the [`UpstreamSlot`] it counts against
-    /// `max_upstream_downloads` with.
     Originator(Origination),
     LateJoiner {
         status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     },
     /// A new origination was refused because `max` downloads were already in
-    /// flight; nothing was inserted. Carries the enforced cap so callers can
-    /// log the actual value the decision was made against. The caller answers
-    /// from [`at_capacity_refusal`]; the `UPSTREAM_DOWNLOAD_REJECTED_CAP` bump
-    /// already happened here.
-    AtCapacity { max: NonZero<usize> },
+    /// flight; nothing was inserted and `UPSTREAM_DOWNLOAD_REJECTED_CAP` is
+    /// already bumped. The caller answers from [`at_capacity_refusal`].
+    AtCapacity {
+        max: NonZero<usize>,
+    },
 }
 
-/// Log the refusal of an origination at the `max_upstream_downloads` cap
-/// ([`Admission::AtCapacity`]) and return the canonical 503 every backend
-/// answers it with. Not an error: the connection stays usable.
+/// Log the refusal of an origination at the `max_upstream_downloads` cap and
+/// return the 503 every backend answers it with.
 #[must_use]
 pub(crate) fn at_capacity_refusal(
     max: NonZero<usize>,
@@ -748,9 +679,8 @@ pub(crate) fn at_capacity_refusal(
     )
 }
 
-/// Mint-side cap tracking, under the registry's write lock: count the
-/// first saturation since its last full drain. The lock also protects the
-/// slot count, so the ordinary latch moves in step with it.
+/// Called under the registry's write lock: counts the first saturation since
+/// the last full drain.
 fn record_cap_saturation(upstream_slots: usize, max: Option<NonZero<usize>>, at_cap: &mut bool) {
     if max.is_some_and(|max| upstream_slots >= max.get()) {
         metrics::UPSTREAM_DOWNLOAD_CAP_CLOCK.enter();
@@ -762,7 +692,7 @@ fn record_cap_saturation(upstream_slots: usize, max: Option<NonZero<usize>>, at_
 }
 
 /// Any release stops the time-at-cap span, but only a full drain clears
-/// the transition latch. No config read is needed, even if the cap changed.
+/// the transition latch.
 fn record_cap_drain(upstream_slots: usize, at_cap: &mut bool) {
     metrics::UPSTREAM_DOWNLOAD_CAP_CLOCK.leave();
     if upstream_slots == 0 {
@@ -783,9 +713,8 @@ impl ActiveDownloads {
     }
 
     /// Every mapped entry, whether or not its upstream connection is still
-    /// open: "downloads this process would drop if it stopped now", which is
-    /// what the shutdown summary and the dashboard mean. The cap and the
-    /// parallel-hack probability want [`Self::upstream_slots`] instead.
+    /// open: the downloads this process would drop if it stopped now. The
+    /// cap and the parallel-hack probability read [`Self::upstream_slots`].
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.inner.read().entries.len()
@@ -815,42 +744,19 @@ impl ActiveDownloads {
         }
     }
 
-    /// Downloads with an upstream connection open right now: the number of
-    /// alive [`UpstreamSlot`]s, i.e. what `max_upstream_downloads` is
-    /// compared against. Smaller than [`Self::len`] by the entries that are
-    /// past their body and only verifying, renaming or being retired.
+    /// Downloads with an upstream connection open right now: what
+    /// `max_upstream_downloads` is compared against.
     #[must_use]
     pub(crate) fn upstream_slots(&self) -> usize {
         self.inner.read().upstream_slots
     }
 
-    /// Registration with an explicit cap: one `entry_ref` lookup under the
-    /// write lock, the Occupied (join) / Vacant (originate) transition, the
-    /// cap-saturation + peak + late-joiner accounting, and the neutral
-    /// [`Admission`].
+    /// [`Self::register`] with an explicit cap, so unit tests need no global
+    /// configuration.
     ///
-    /// This is also the single enforcement site for
-    /// `max_upstream_downloads`: a new origination while `upstream_slots` is
-    /// at the cap returns [`Admission::AtCapacity`] without inserting.
-    /// Late joiners are exempt by construction (an occupied entry opens no
-    /// new upstream connection), and the check happens under the same write
-    /// lock as the insert and the slot mint, so the cap is exact — no
-    /// check-then-insert race can overshoot it. Both backends inherit the
-    /// cap through the shared registration method and must map `AtCapacity`
-    /// to the canonical 503.
-    ///
-    /// Joining allocates nothing (the lookup borrows the key); an origination
-    /// allocates its owned key, watch channel and status inside the lock --
-    /// three small allocations, which buy the single lock round trip.
-    ///
-    /// `max_upstream_downloads` is threaded in by [`Self::register`]
-    /// (which reads it from `global_config()`) so this helper can be
-    /// driven from unit tests without standing up a full configuration.
-    /// The helper is not side-effect-free: minting the slot latches the
-    /// registry's saturation flag via [`record_cap_saturation`], and it
-    /// bumps the `ACTIVE_UPSTREAM_DOWNLOADS_PEAK`, `LATE_JOINERS_TOTAL`,
-    /// `LATE_JOINER_PEAK_PER_DOWNLOAD`, and (on a refused origination)
-    /// `UPSTREAM_DOWNLOAD_REJECTED_CAP` global metrics.
+    /// The cap check happens under the same write lock as the insert and the
+    /// slot mint, so no check-then-insert race can overshoot it. Late joiners
+    /// are exempt: an occupied entry opens no new upstream connection.
     fn lookup_or_insert(
         &self,
         keyref: CacheEntryKeyRef<'_>,
@@ -878,7 +784,6 @@ impl ActiveDownloads {
         // protects.
         let outcome =
             if let Some(max) = max_upstream_downloads.filter(|max| *upstream_slots >= max.get()) {
-                // Refused origination: nothing inserted.
                 Admission::AtCapacity { max }
             } else {
                 let key = Arc::new(keyref.to_owned());
@@ -895,8 +800,6 @@ impl ActiveDownloads {
                     key,
                     init_tx: tx,
                     status,
-                    // Under the same lock as the insert and the capacity check
-                    // above, so the cap is exact.
                     slot: UpstreamSlot::mint(upstream_slots, at_cap, self, max_upstream_downloads),
                 })
             };
@@ -910,23 +813,17 @@ impl ActiveDownloads {
         outcome
     }
 
-    /// Originate a new download or attach as a late joiner if one is already
-    /// in flight. Late-joiner accounting (`LATE_JOINERS_TOTAL`,
-    /// `LATE_JOINER_PEAK_PER_DOWNLOAD`) is performed atomically when joining,
-    /// so callers do not need to follow up with any metric helper.
-    /// `AtCapacity` means the `max_upstream_downloads` cap refused a new
-    /// origination — the caller answers with the canonical 503.
+    /// Originate a new download, or attach as a late joiner if one is
+    /// already in flight.
     #[must_use]
     pub(crate) fn register(&self, key: CacheEntryKeyRef<'_>) -> Admission {
         self.lookup_or_insert(key, global_config().max_upstream_downloads)
     }
 
-    /// Register `key` and hand back its status handle, skipping the
-    /// `max_upstream_downloads` gate that makes [`Self::register`] read the
-    /// config globals. Exists so tests elsewhere in the crate can build a
-    /// barrier over a *real* registry entry - `Drop` asserts the entry it
-    /// retires was registered. The slot is dropped on the spot: those
-    /// barriers are built by hand and never carry one.
+    /// Register `key` without the `max_upstream_downloads` gate and hand
+    /// back its status handle, so tests can build a barrier over a real
+    /// registry entry (`remove` asserts the entry was registered). The slot
+    /// is dropped on the spot.
     #[cfg(test)]
     pub(crate) fn insert_uncapped(
         &self,
@@ -955,10 +852,8 @@ impl ActiveDownloads {
         .expect("test key must be newly registered")
     }
 
-    /// Retire `key`'s entry. Touches the entries only: the cap and its
-    /// latch follow the [`UpstreamSlot`], which the owning barrier drops on
-    /// its own schedule (and which every barrier has dropped by the time it
-    /// removes its entry).
+    /// Retire `key`'s entry. The cap and its latch follow the
+    /// [`UpstreamSlot`], not the entry.
     pub(crate) fn remove(&self, key: CacheEntryKeyRef<'_>) {
         let was_present = self.inner.write().entries.remove(&key);
         assert!(
@@ -967,10 +862,8 @@ impl ActiveDownloads {
         );
     }
 
-    /// Attach as a late joiner to an in-flight download, atomically bumping
-    /// the per-entry `late_joiners` count and the global late-joiner metrics
-    /// under a write lock. Returns `None` if no download is in flight for
-    /// this key.
+    /// Attach as a late joiner to an in-flight download; `None` if none is
+    /// in flight for this key.
     ///
     /// When `serve_unfinished_sendfile` cannot frame the response (upstream
     /// omitted Content-Length) the returned status travels to hyper inside

@@ -1,21 +1,13 @@
-//! Cleanup's `Packages` index fetch: the `.xz` -> `.gz` -> raw format cascade
-//! ([`fetch_packages`]) and the complete, buffered index it yields
-//! ([`FetchedPackages`]), which `packages::reduce_file_list` decodes.
+//! Cleanup's `Packages` index fetch: the `.xz` -> `.gz` -> raw format cascade.
 //!
-//! The cascade is backend-neutral; each format attempt goes through the
-//! build's own adapter, `fetch_format`, which answers an [`IndexAnswer`]:
+//! Each format attempt goes through the build's own adapter, `fetch_format`:
 //!
 //! - hyper builds call `hyper_conn::process_cache_request`, the real serving
-//!   path, so a cleanup fetch takes part in registered downloads, late joining,
-//!   quota/throttle exemptions, conditional revalidation, cache commits and
-//!   ingest. The adapter recovers the transport cause from the response's
-//!   `UpstreamFetchError` extension and streams the body into a memfd,
-//!   checking it against the announced `Content-Length` (`via_hyper`). A complete body proves
-//!   nothing about the cache commit (see `guards.rs`): the adapter never waits
-//!   for it or reads the final cache path.
+//!   path, and stream the body into a memfd. A complete body proves nothing
+//!   about the cache commit: the adapter never waits for it or reads the
+//!   final cache path.
 //! - hyper-less builds call `splice::cleanup_index_fetch`, which reads a fresh
-//!   cached copy or the uncached upstream body into memory; the reduce decodes
-//!   those bytes in place (`via_bridge`).
+//!   cached copy or the uncached upstream body into memory.
 //!
 //! Only a complete body becomes a [`FetchedPackages`]: a 200 whose body then
 //! fails or comes up short ends the cascade with a [`FetchFailure`], so the
@@ -41,10 +33,9 @@ use via_bridge::fetch_format;
 #[cfg(feature = "hyper")]
 use via_hyper::fetch_format;
 
-/// Which `Packages` index a fetch targets, and therefore how it is named.
-/// `cache_name` is the on-disk debname under which the fetched index is cached
-/// (capital-P `Packages`); `index_name` names the buffered copy (lowercase-p
-/// `packages`): hyper's throwaway memfd and the reduce's log lines.
+/// Which `Packages` index a fetch targets. `cache_name` is the on-disk
+/// debname the fetched index is cached under; `index_name` names the buffered
+/// copy (hyper's throwaway memfd, the reduce's log lines).
 pub(super) enum DebnameKind<'a> {
     OriginScoped {
         distribution: &'a str,
@@ -55,7 +46,6 @@ pub(super) enum DebnameKind<'a> {
 }
 
 impl DebnameKind<'_> {
-    /// The fetched index's resource kind also determines its cache layout.
     const fn resource_kind(&self) -> ResourceKind {
         match self {
             Self::OriginScoped { .. } => ResourceKind::Packages,
@@ -94,12 +84,10 @@ impl DebnameKind<'_> {
     }
 }
 
-/// Typed reason a cleanup `Packages` fetch failed. Replaces the bare `StatusCode`
-/// error channel so an upstream transport failure surfaces its real reason (e.g.
-/// `... timed out`) in the cleanup decision log instead of a laundered
-/// `502 Bad Gateway`. `status` is retained as the best-known status (a real upstream
-/// code, or a `BAD_GATEWAY` sentinel); `upstream` is `Some` only when the upstream
-/// fetch itself failed.
+/// Why a cleanup `Packages` fetch failed. `status` is the best-known status (a
+/// real upstream code, or a `BAD_GATEWAY` sentinel); `upstream` is `Some` only
+/// when the upstream fetch itself failed, and then carries the real transport
+/// reason for the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FetchFailure {
     pub(crate) status: StatusCode,
@@ -128,8 +116,7 @@ pub(crate) enum IndexAnswer<B> {
 #[derive(Debug)]
 pub(super) struct FetchedPackages {
     pub(super) compression: PackagesCompression,
-    /// [`DebnameKind::index_name`], which identifies the origin's index in
-    /// the reduce's log lines.
+    /// Identifies the origin's index in the reduce's log lines.
     pub(super) name: String,
     /// The whole index: hyper's memfd, rewound to offset 0, or the bridge's
     /// bytes.
@@ -153,8 +140,7 @@ fn prefer_missing_status(best: Option<StatusCode>, seen: StatusCode) -> StatusCo
 }
 
 /// Fetch the index at `base_uri` + extension, trying `.xz`, `.gz`, raw in
-/// turn; the first format answering a complete body wins. `debname` determines
-/// the cache entry name and resource kind.
+/// turn; the first format answering a complete body wins.
 pub(super) async fn fetch_packages(
     mirror: &Mirror,
     base_uri: &str,
@@ -178,19 +164,13 @@ pub(super) async fn fetch_packages(
     .await
 }
 
-/// The format cascade behind [`fetch_packages`], over any per-format
-/// `attempt`.
 async fn probe_formats<B, F, Fut>(base_uri: &str, mut attempt: F) -> Result<B, FetchFailure>
 where
     F: FnMut(PackagesCompression, Uri) -> Fut,
     Fut: Future<Output = Result<IndexAnswer<B>, FetchFailure>>,
 {
-    // Remember a representative missing-ish status to surface after every
-    // format fails. AWS S3 returns 403 (not 404) for a missing object when
-    // the requester lacks `s3:ListBucket`, so we must not abort the
-    // fallback chain on the first non-200 response — but the caller's
-    // diagnostic log should still see the most informative upstream status
-    // rather than a synthetic 404 (see `prefer_missing_status`).
+    // The most informative missing-ish status, surfaced once every format
+    // has failed.
     let mut last_missing: Option<StatusCode> = None;
 
     for compression in [
@@ -206,11 +186,10 @@ where
             IndexAnswer::Status(status) => status,
         };
 
-        // Treat "missing-ish" upstream statuses as "try the next format":
-        // 404 Not Found, 403 Forbidden (S3 on missing object without
-        // ListBucket), 410 Gone. Anything else (5xx, 401, a cache access
-        // failure answered as 500) is fatal for this format chain — surface
-        // it immediately rather than silently masking it.
+        // "Missing-ish" statuses try the next format: AWS S3 answers 403
+        // (not 404) for a missing object when the requester lacks
+        // `s3:ListBucket`. Anything else (5xx, 401, a cache access failure
+        // answered as 500) is fatal for this format chain.
         let _: Never = match status {
             StatusCode::NOT_FOUND | StatusCode::FORBIDDEN | StatusCode::GONE => {
                 debug!("Cleanup request {uri} unavailable ({status})");
@@ -219,7 +198,7 @@ where
             }
             _ => {
                 // The caller logs the same failure with the mirror and the
-                // consequence; keep this one for the format-fallback detail.
+                // consequence.
                 debug!(
                     "cleanup request {uri} failed with status code {status}; aborting the Packages format-fallback chain"
                 );
@@ -237,7 +216,6 @@ where
     })
 }
 
-/// Each format attempt through hyper's serving path, buffered into a memfd.
 #[cfg(feature = "hyper")]
 mod via_hyper {
     use std::io;
@@ -268,7 +246,6 @@ mod via_hyper {
         upstream: None,
     };
 
-    /// One format attempt through hyper's serving path.
     pub(super) async fn fetch_format(
         conn_details: ConnectionDetails,
         uri: Uri,
@@ -289,12 +266,9 @@ mod via_hyper {
 
         let mut response = process_cache_request(conn_details, req, appstate.clone()).await;
 
-        // An upstream-fetch failure (timeout/connect/transport) is laundered into a
-        // synthetic 502 by process_cache_request but carries the real reason as a
-        // response extension. Recover it so the cleanup decision log names the
-        // transport error rather than a misleading "502 Bad Gateway".
-        // The download runner (`guards::ReportedDownloadFailure`) already logged
-        // the failure, once-gated for the connect and head phases -- don't re-warn.
+        // An upstream-fetch failure (timeout/connect/transport) arrives as a
+        // synthetic 502 carrying the real reason as a response extension.
+        // The download runner already logged it -- don't re-warn.
         if let Some(upstream) = response.extensions_mut().remove::<UpstreamFetchError>() {
             return Err(FetchFailure {
                 status: StatusCode::BAD_GATEWAY,
@@ -308,17 +282,14 @@ mod via_hyper {
         }
 
         // The 200 reflects only the response *header*; the body streams afterwards
-        // and can fail or truncate. Capture the announced length so a complete
-        // fetch can be told from a broken one.
+        // and can fail or truncate.
         let announced: Option<u64> = response
             .headers()
             .get(http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
 
-        // Typed body failures (rate limits, protocol violations, a cancelled
-        // delivery producer) and memfd/IO failures: skip the mirror conservatively
-        // and retry next cycle (packages_body_to_memfd already logged the cause).
+        // `packages_body_to_memfd` already logged the cause.
         let Ok((file, len)) =
             packages_body_to_memfd(&name, compression, response.body_mut(), buffer_size).await
         else {
@@ -340,9 +311,7 @@ mod via_hyper {
         }))
     }
 
-    /// Why buffering a Packages response into its memfd failed.  Every variant is
-    /// logged by [`packages_body_to_memfd`]; the caller maps all of them to a
-    /// conservative fetch failure (skip the mirror's reconcile this cycle).
+    /// Why buffering a Packages response into its memfd failed.
     ///
     /// `Display` renders the wrapped error through [`ErrorReport`] and exposes no
     /// `source()`.
@@ -357,24 +326,17 @@ mod via_hyper {
         /// Writing to or rewinding the memfd failed.
         #[error("{}", ErrorReport(.0))]
         Io(io::Error),
-        /// The body exceeded the buffering cap before decompression guards could
-        /// weigh in.
         #[error("compressed Packages exceeds the size cap of {max} bytes")]
         TooLarge { max: NonZero<u64> },
     }
 
     /// Buffer `body` into `file`, returning the file (rewound to offset 0) and the
-    /// number of bytes written. The caller compares the byte count against the
-    /// upstream-announced `Content-Length` as a defensive truncation check. Typed
-    /// body failures, including a cancelled delivery producer, propagate as errors.
+    /// number of bytes written.
     ///
-    /// `max_bytes` bounds how much is buffered before the (post-hoc) decompression
-    /// guards in `reduce_file_list` can weigh in: an abusive upstream could
-    /// otherwise stream an unbounded compressed (or raw) body straight into memory.
-    /// Exceeding it returns `Err` rather than truncating -- a short buffer would
-    /// silently shrink the reference set and over-evict -- which the caller maps to
-    /// a conservative fetch failure. The check is per-chunk, so at most one extra
-    /// buffer is held transiently over the cap.
+    /// `max_bytes` bounds how much an abusive upstream can stream into memory
+    /// before the decompression guards in `reduce_file_list` run. Exceeding it
+    /// is an `Err` rather than a truncation: a short buffer would silently
+    /// shrink the reference set and over-evict.
     async fn body_to_file(
         body: &mut ProxyCacheBody,
         file: tokio::fs::File,
@@ -407,10 +369,8 @@ mod via_hyper {
         Ok((file, written))
     }
 
-    /// `true` only when the upstream announced an exact `Content-Length` and we
-    /// buffered fewer bytes despite the body ending successfully.
-    /// `None` (chunked / volatile-unknown / legitimately empty) is never
-    /// "incomplete".
+    /// Whether the body ended short of an announced `Content-Length`. `None`
+    /// (chunked / volatile-unknown / legitimately empty) is never "incomplete".
     #[must_use]
     fn body_is_incomplete(announced: Option<u64>, written: u64) -> bool {
         matches!(announced, Some(expected) if written < expected)
@@ -436,9 +396,6 @@ mod via_hyper {
             );
             PackagesBufferError::Memfd(err)
         })?;
-        // Cap the buffered body at the most `reduce_file_list` would decode (the
-        // decompressed ceiling for a raw index, the compressed one otherwise), so
-        // memory is bounded before its guards run.
         body_to_file(body, file, packages_file_cap(compression), buffer_size)
             .await
             .inspect_err(|err| {
@@ -459,17 +416,11 @@ mod via_hyper {
 
         #[test]
         fn body_is_incomplete_only_flags_short_announced_bodies() {
-            // No announced length (chunked / volatile-unknown / legit empty): the
-            // byte count can't prove truncation, so never "incomplete".
             assert!(!body_is_incomplete(None, 0));
             assert!(!body_is_incomplete(None, 1234));
-            // Announced an exact length but buffered fewer bytes -> truncated.
-            assert!(body_is_incomplete(Some(100), 0)); // the reported zero-byte abort
-            assert!(body_is_incomplete(Some(100), 40)); // raw over-eviction guard
-            // Exact length fully buffered.
+            assert!(body_is_incomplete(Some(100), 0));
+            assert!(body_is_incomplete(Some(100), 40));
             assert!(!body_is_incomplete(Some(100), 100));
-            // Defensive: a zero announced length is never short (the proxy never
-            // actually emits Content-Length: 0, but the predicate must not flag it).
             assert!(!body_is_incomplete(Some(0), 0));
         }
 
@@ -504,9 +455,6 @@ mod via_hyper {
 
         #[tokio::test]
         async fn body_to_file_rejects_body_over_cap() {
-            // A single 4 KiB data frame against a 1 KiB cap: the first chunk already
-            // overshoots, so buffering must bail with an error (not truncate, which
-            // would silently shrink the reference set and over-evict).
             let mut body = full_body(bytes::Bytes::from(vec![b'x'; 4096]));
             let file = memfd_file("apt_cacher_rs_test_over_cap").expect("memfd");
 
@@ -521,7 +469,6 @@ mod via_hyper {
 
         #[tokio::test]
         async fn body_to_file_accepts_body_at_cap() {
-            // Exactly at the cap: `written > max_bytes` is strict, so this is kept.
             let mut body = full_body(bytes::Bytes::from(vec![b'y'; 1024]));
             let file = memfd_file("apt_cacher_rs_test_at_cap").expect("memfd");
 
@@ -533,8 +480,6 @@ mod via_hyper {
     }
 }
 
-/// Each format attempt through the hyper-less bridge, whose bytes the reduce
-/// decodes in place.
 #[cfg(not(feature = "hyper"))]
 mod via_bridge {
     use http::Uri;
@@ -669,8 +614,6 @@ mod tests {
         assert_eq!(requested.len(), 2);
     }
 
-    /// A transport failure, or a 200 whose body then failed, ends the
-    /// cascade with its own cause: a later format must not be reduced instead.
     #[tokio::test]
     async fn probe_formats_ends_on_a_failed_fetch_with_its_cause() {
         let failure = FetchFailure {
@@ -710,21 +653,17 @@ mod tests {
     #[test]
     fn prefer_missing_status_promotes_specific_over_generic_404() {
         use http::StatusCode as S;
-        // Nothing seen yet: whatever arrived.
         assert_eq!(prefer_missing_status(None, S::NOT_FOUND), S::NOT_FOUND);
-        // 403 (S3's "missing object without ListBucket") and 410 are more
-        // informative than the generic 404 and promote over it.
         assert_eq!(
             prefer_missing_status(Some(S::NOT_FOUND), S::FORBIDDEN),
             S::FORBIDDEN
         );
         assert_eq!(prefer_missing_status(Some(S::NOT_FOUND), S::GONE), S::GONE);
-        // A 404 never demotes an already-specific status ...
         assert_eq!(
             prefer_missing_status(Some(S::FORBIDDEN), S::NOT_FOUND),
             S::FORBIDDEN
         );
-        // ... and among non-404 statuses the first one seen wins.
+        // Among non-404 statuses the first one seen wins.
         assert_eq!(
             prefer_missing_status(Some(S::FORBIDDEN), S::GONE),
             S::FORBIDDEN
@@ -739,7 +678,6 @@ mod tests {
                 reason: "connection error:  timed out".to_owned(),
             }),
         };
-        // The laundered 502 must NOT show; the real transport reason does.
         assert_eq!(with_upstream.to_string(), "connection error:  timed out");
 
         let status_only = FetchFailure {

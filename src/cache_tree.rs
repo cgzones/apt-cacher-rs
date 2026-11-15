@@ -1,18 +1,8 @@
-//! What each directory of the on-disk cache layout means to a walk over it.
-//!
-//! The startup / reconcile size scan (`task_cache_scan`) and the dashboard's
-//! per-mirror size walk (`web::footprint`) descend the same layout: a mirror
-//! directory holding its pool, `dists/` and `tmp/`; the host-level `flat/`
-//! tree recursed verbatim; the content-addressed `by-hash/` and partial
-//! `tmp/` leaves (see the `cache_paths` layout table). [`Level`] is the
-//! walker tag both carry, and [`classify_dir`] / [`is_unexpected_file`] the
-//! one statement of which directory a level enters and which entry it
-//! reports, so the two walks cannot disagree about what a subtree holds.
-//!
-//! What a caller does *around* these rules stays its own: the scan rounds
-//! sizes to quota blocks and counts orphaned partials, and decides a mirror
-//! directory's non-layout subdirectories from the registered nested mirror
-//! paths; the dashboard stops at every other row's anchor directory.
+//! What each directory of the on-disk cache layout (see the `cache_paths`
+//! layout table) means to a walk over it: which directory a [`Level`] enters
+//! and which entry it reports.  Shared by the size scan (`task_cache_scan`)
+//! and the dashboard's per-mirror size walk (`web::footprint`), which must
+//! agree about what a subtree holds.
 
 use std::ffi::OsStr;
 
@@ -21,9 +11,8 @@ use crate::{
     deb_mirror::is_deb_package,
 };
 
-/// What a directory reached by a layout walk means, carried as the walker's
-/// per-directory tag so each entry's policy is decided without re-deriving
-/// it from the path.
+/// What a directory reached by a layout walk means: the walker's
+/// per-directory tag.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Level {
     /// `<host>/<mirror_path>/`: the pool's files, `dists/` entered as
@@ -44,7 +33,6 @@ pub(crate) enum Level {
     Tmp,
 }
 
-/// What [`classify_dir`] makes of a directory found at some [`Level`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DirRole {
     /// A layout directory: descend into it with this tag.

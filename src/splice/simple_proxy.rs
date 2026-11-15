@@ -35,22 +35,16 @@ use crate::upstream_head::{BodyFraming, RelayedHeaders};
 /// Rewrite upstream response headers for the simple-proxy pass-through.
 ///
 /// Drops every line [`RelayedHeaders`] drops (hop-by-hop, `Connection:`
-/// nominations, framing) and emits exactly one `Connection:` header
-/// matching the client's keep-alive decision regardless of how many
-/// `Connection:` headers the upstream sent.
+/// nominations, framing) and emits exactly one `Connection:` header of our
+/// own.
 ///
 /// The upstream's `Content-Length` / `Transfer-Encoding` lines are never
-/// forwarded either: the head announces the framing the relay applies to a
-/// `conn_version` client (`BodyFraming::header_line`; none for a chunked body
-/// de-chunked for HTTP/1.0). Forwarding them would let a client
+/// forwarded: the head announces the framing the relay applies (none for a
+/// chunked body de-chunked for HTTP/1.0). Forwarding them would let a client
 /// frame the body by a line the relay ignored (a second `Transfer-Encoding`,
-/// a conflicting `Content-Length`) or lose it to a `Connection:` nomination,
-/// and read the body's tail as a forged next response. The requested action
-/// is adjusted by `BodyFraming::client_action` and returned alongside the
-/// rewritten headers, so the caller keeps the announced connection policy.
-///
-/// Extracted from `splice_simple_proxy` so the filtering invariants can be
-/// unit-tested without requiring a live upstream socket.
+/// a conflicting `Content-Length`) and read the body's tail as a forged next
+/// response. Returns the connection action the head announced, which the
+/// caller must apply.
 pub(super) fn rewrite_simple_proxy_headers(
     raw_headers: &[u8],
     conn_version: ConnectionVersion,
@@ -98,9 +92,7 @@ pub(super) fn rewrite_simple_proxy_headers(
     Ok((buf, conn_action))
 }
 
-/// Connects to upstream, sends a GET request, and forwards the complete response
-/// (headers + body) to the client.  No caching, no active-download tracking,
-/// no resume handling — just a transparent relay.
+/// Relays one upstream response to the client uncached.
 ///
 /// Returns what becomes of the client connection: `conn.action`, unless the
 /// relayed body was close-delimited and the connection has to close.
@@ -119,14 +111,13 @@ pub(crate) async fn splice_simple_proxy(
     let host_authority = endpoint.format_authority();
     // Strip the query so cache identity (registry keys, Origin rows) stays
     // path-only; the query still rides on the upstream GET line via
-    // `upstream_path`. Matches the hyper backend.
+    // `upstream_path`.
     let original_uri_path = split_query(upstream_path).0;
 
-    // Account this passthrough under `ACTIVE_CLIENT_DOWNLOADS` for the
-    // duration of the function (RAII drop on every return path). The hyper
-    // passthrough is counted via `AccountedBody`; the splice passthrough
-    // serves bytes synchronously inside this frame and would otherwise be
-    // invisible to the counter.
+    // Counts this passthrough as an active client download until return.
+    // The hyper passthrough is counted via `AccountedBody`; this one serves
+    // synchronously inside this frame and would otherwise be invisible to
+    // the counter.
     let _client_count = client_counter::ClientDownload::new();
 
     let UpstreamExchange {
@@ -179,10 +170,6 @@ pub(crate) async fn splice_simple_proxy(
             .map_err(SpliceProxyError::client("simple-proxy reject 502"));
     }
 
-    // Rewrite response headers: adjust HTTP version and Connection header
-    // to match the client's protocol version and keep-alive strategy, which
-    // a body relayed close-delimited overrides (a close-delimited upstream
-    // body, or a chunked one de-chunked for an HTTP/1.0 client).
     let (rewritten_headers, conn_action) = match rewrite_simple_proxy_headers(
         &hdr_buf[..hdr_end],
         conn.version,
@@ -207,11 +194,9 @@ pub(crate) async fn splice_simple_proxy(
     metrics::record_client_status(resp.status_code);
     metrics::REQUESTS_PASSTHROUGH.increment();
 
-    // Mirror the hyper simple-proxy passthrough: record an Origin row on a
-    // 2xx response (only that proves the index exists), for a path the
-    // cache itself would accept, so the cleanup machinery can find the
-    // owning mirror. The row names the alias' main host the dispatcher
-    // resolved, not the dialled `mirror`.
+    // Record an Origin row on a 2xx response (only that proves the index
+    // exists), for a path the cache itself would accept, so cleanup can find
+    // the owning mirror.
     if resp.status_code.is_success()
         && let Some(origin) =
             Origin::from_path(original_uri_path, canonical_host, endpoint.port, &client)
@@ -225,10 +210,7 @@ pub(crate) async fn splice_simple_proxy(
         .await
         .map_err(SpliceProxyError::client("simple-proxy headers"))?;
 
-    // Forward the body that arrived with the headers plus the rest, framed
-    // per the upstream's framing. The parser resolved it (or refused an
-    // ambiguous head), and `rewrite_simple_proxy_headers` above announced
-    // exactly that framing, so the headers and the body framing agree.
+    // Relayed by the same `resp.framing` the rewritten head announced.
     let forwarded: u64 = resp
         .framing
         .relay_to_client(
@@ -389,9 +371,6 @@ mod tests {
         }
     }
 
-    /// A body relayed close-delimited closes the client connection: a
-    /// close-delimited upstream body, and a chunked one de-chunked for an
-    /// HTTP/1.0 client.
     #[test]
     fn close_delimited_framing_closes_the_client_connection() {
         for (version, framing, expected) in [

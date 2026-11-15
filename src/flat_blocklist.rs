@@ -1,45 +1,15 @@
 //! Per-host collision blocklist for the flat-repository layout.
 //!
-//! The host-anchored flat layout places every flat-repo file under
-//! `<cache>/<host>/flat/<mirror_path>/`.  That `<host>/flat/` directory is
-//! the same one a structured mirror registered with `mirror_path = "flat"`
-//! (or `"flat/<anything>"`) would write to — `<cache>/<host>/flat/dists/…`,
-//! `<cache>/<host>/flat/pool/…`, etc.
+//! Every flat-repo file lives under `<cache>/<host>/flat/<mirror_path>/`,
+//! the directory a structured mirror registered with `mirror_path = "flat"`
+//! (or `"flat/<anything>"`) would write to.  When such a mirror exists,
+//! **structured wins**: flat requests for that `(host, port)` are passed
+//! through uncached.
 //!
-//! When such a collision exists, **structured wins**: flat requests for the
-//! affected host are rejected and fall through to the simple-proxy
-//! passthrough path.  This module owns the in-memory set of blocked
-//! `(host, port)` pairs.
-//!
-//! Dispatch no longer lets such a structured mirror come into being: a
-//! structured request under `flat` is relayed uncached
-//! (`PassthroughReason::FlatAnchoredMirror`) and mints no origin, since the
-//! blocklist only reacted once the row was written -- after the colliding
-//! structured file had already landed in the flat tree.  The blocklist
-//! stays for rows recorded before that rule.
-//!
-//! The blocklist is a flat set that records "this host has a colliding
-//! structured mirror" — no longest-prefix index, no per-request URL
-//! rewriting, since the host-anchored layout means the URL path is the
-//! on-disk path verbatim.
-//!
-//! # Lifecycle
-//!
-//! - **Init**: `main_loop` calls [`init`] once at startup with the seed set
-//!   hydrated from a `SELECT … WHERE path = 'flat' OR path LIKE 'flat/%'`
-//!   query.  Logs one `warn!` per colliding mirror so operators see the
-//!   collision in the daemon's startup log.
-//! - **Maintenance**: [`record_mirror`] is called from
-//!   `Database::upsert_mirror_id` whenever the post-upsert row's `kind`
-//!   column is `Structured` (0).  That covers both fresh inserts and
-//!   the ON-CONFLICT path that latches a previously-`Flat` row to
-//!   `Structured`, so a collision that only surfaces after a flat
-//!   row already existed is still recorded.  Inserts the host into
-//!   the blocklist if the path matches the collision pattern.
-//! - **Lookup**: [`is_blocked`] is called from request classifiers after
-//!   a [`crate::cache_layout::CacheLayout::Flat`] / `FlatByHash` result
-//!   is produced.  Returns `true` if the (host, port) is in the set,
-//!   instructing the caller to pass through uncached.
+//! Dispatch relays a structured request under `flat` uncached
+//! (`PassthroughReason::FlatAnchoredMirror`) and mints no origin, so no new
+//! colliding mirror comes into being; the blocklist stays for rows recorded
+//! before that rule.
 
 use std::num::NonZero;
 use std::sync::OnceLock;
@@ -56,18 +26,16 @@ use crate::{
 
 type Port = NonZero<u16>;
 
-/// (host, port) entry shape used as the blocklist key.  The host is the
-/// alias-resolved cache identity, so sibling aliases of the same
-/// configured `main` share a single entry.
+/// The host is the alias-resolved cache identity, so sibling aliases of the
+/// same configured `main` share a single entry.
 #[derive(Debug, Eq, Hash, PartialEq)]
 struct BlocklistKey {
     host: CacheHost,
     port: Option<Port>,
 }
 
-/// Borrowed counterpart to [`BlocklistKey`] used for read-side lookups via
-/// `hashbrown::Equivalent`, so hot-path `is_blocked` callers do not need
-/// to clone the `CacheHost` on every flat request.
+/// Borrowed lookup form of [`BlocklistKey`], so `is_blocked` clones no
+/// `CacheHost` per flat request.
 #[derive(Hash)]
 struct BlocklistKeyRef<'a> {
     host: &'a CacheHost,
@@ -85,20 +53,18 @@ impl Equivalent<BlocklistKey> for BlocklistKeyRef<'_> {
     }
 }
 
-/// Process-wide handle to the singleton blocklist.  Installed once by
-/// [`init`]; subsequent callers borrow the inner `RwLock`.
 static BLOCKLIST: OnceLock<RwLock<HashSet<BlocklistKey>>> = OnceLock::new();
 
-/// Whether a mirror path collides with the host-anchored flat layout
-/// (i.e. `path == "flat"` or `path` begins with `"flat/"`).  Pulled out
-/// so both the DB hydration query and the in-process [`record_mirror`]
-/// path apply the same predicate.
+/// Whether a mirror path collides with the host-anchored flat layout.  The
+/// same predicate as the SQL in `database.rs` that hydrates the blocklist;
+/// keep the two in sync.
 #[must_use]
 pub(crate) fn path_collides_with_flat_layout(path: &str) -> bool {
     path == SUBDIR_FLAT || path.starts_with(SUBDIR_FLAT_PREFIX)
 }
 
-/// Install the blocklist singleton.
+/// Install the blocklist, seeded with the colliding mirror rows of the
+/// database.
 pub(crate) async fn init(database: &Database) -> Result<(), sqlx::Error> {
     let collision_rows = database.load_flat_collision_mirrors().await?;
 
@@ -127,14 +93,11 @@ pub(crate) async fn init(database: &Database) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-/// Append a (host, port) entry if `mirror_path` matches the collision
-/// pattern.  Called from the DB upsert path whenever the post-upsert
-/// row's `kind` column is `Structured` — that gate fires both on
-/// fresh inserts and on an UPDATE that latches a previously-`Flat`
-/// row to `Structured`, so the blocklist sees the collision
-/// even when it surfaced after a flat row already existed.  The
-/// `HashSet::insert` is idempotent, so repeat calls cost only a write
-/// lock + lookup.
+/// Block flat caching for `(host, port)` if `mirror_path` collides.  The DB
+/// upsert calls this whenever the resulting row's `kind` is `Structured`:
+/// on a fresh insert and on a previously-`Flat` row latching to
+/// `Structured`, so a collision surfacing after a flat row existed is still
+/// recorded.
 pub(crate) fn record_mirror(host: &CacheHost, port: Option<Port>, mirror_path: &str) {
     if !path_collides_with_flat_layout(mirror_path) {
         return;
@@ -156,7 +119,6 @@ pub(crate) fn record_mirror(host: &CacheHost, port: Option<Port>, mirror_path: &
     }
 }
 
-/// Whether flat caching is blocked for the given `(host, port)` pair.
 #[must_use]
 pub(crate) fn is_blocked(host: &CacheHost, port: Option<Port>) -> bool {
     BLOCKLIST

@@ -6,10 +6,11 @@
 //! A failure that ends a delivery or a download is *concluded* exactly once, by
 //! the owner that ends it: [`EndsDelivery::conclude`] (for a
 //! [`DeliveryFailure`] or a `HeaderWriteFailure`),
-//! [`DownloadFailure::conclude`] and `UpstreamError::conclude` bump the cause's terminal counters, log it
-//! and return the [`Reported`] proof. Terminal counting is private to this
-//! module, so no sink can count without logging, or count twice by forgetting
-//! that another sink already did; constructing a failure has no side effects.
+//! [`DownloadFailure::conclude`] and `UpstreamError::conclude` bump the
+//! cause's terminal counters, log it and return the [`Reported`] proof.
+//! Terminal counting is private to this module, so no sink can count without
+//! logging, or count twice by forgetting that another sink already did.
+//! Constructing a failure has no side effects.
 
 #[cfg(feature = "sendfile")]
 use std::time::Duration;
@@ -32,15 +33,10 @@ use crate::{
     upstream_retry::RetryStop,
 };
 
-/// Log level a terminal failure is reported at. [`DeliveryFailure::severity`]
-/// is the sole implementation of the delivery-severity table, so a sink picks
-/// its level by asking the failure rather than by re-deriving the table.
-///
-/// This implements the table in `docs/logging.md`: a client timeout and a
-/// client rate breach are INFO alongside a peer disconnect, because both are
-/// expected client behaviour that is already counter-backed -- an operator
-/// sees them in `RATE_LIMIT_CLIENT` and the socket-timeout counters, so a
-/// WARN per occurrence only floods the log.
+/// Log level a terminal failure is reported at, per the table in
+/// `docs/logging.md`: a client timeout and a client rate breach are INFO
+/// alongside a peer disconnect, because both are expected client behaviour
+/// that is already counter-backed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Severity {
     Info,
@@ -48,10 +44,10 @@ pub(crate) enum Severity {
     Error,
 }
 
-/// Where in the upstream exchange a failure happened. Connect and Head failures
-/// are once-gated per upstream host by [`DownloadFailure::conclude`] (a down
-/// mirror must not flood WARN); Body failures are ungated (each stalling mirror is operator
-/// signal).
+/// Where in the upstream exchange a failure happened. Connect and Head
+/// failures are once-gated per upstream host by [`DownloadFailure::conclude`]
+/// (a down mirror must not flood WARN); Body failures are ungated (each
+/// stalling mirror is operator signal).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
     Connect,
@@ -59,9 +55,7 @@ enum Phase {
     Body,
 }
 
-/// What went wrong in one operation. Shared by every failure family; what is
-/// family-specific (an upstream phase, retry attempts, a terminal counter)
-/// lives on the family, so no family carries a state it can never be in.
+/// What went wrong in one operation, shared by every failure family.
 #[derive(Debug)]
 enum Cause {
     Io(io::Error),
@@ -140,10 +134,8 @@ local_error!(InternalError);
 
 /// What kind of upstream failure this is: the exchange step it belongs to
 /// and, within a step, the class that picks its terminal counter and its
-/// per-mirror fault. Each constructor names one kind, and every property of a
-/// kind is an exhaustive match on it. A connect failure is the terminal end of
-/// the retry loop, so its attempt count and the reason the loop stopped belong
-/// to it and to no other kind.
+/// per-mirror fault. A connect failure is the terminal end of the retry
+/// loop, so it carries the attempt count and the reason the loop stopped.
 #[derive(Debug)]
 enum UpstreamKind {
     Connect {
@@ -323,11 +315,10 @@ impl UpstreamError {
         matches!(self.failure.kind, UpstreamKind::BodyRate)
     }
 
-    /// The terminal end of the connect-retry loop: `attempts` and the reason
-    /// that stopped it are part of the failure, not of the call site, so every
-    /// backend renders them identically. Counts `UPSTREAM_CONNECT_FAILED` once
-    /// concluded -- once per request, never per attempt, so a retried
-    /// connect or an Auto-mode fallback that ends up connected counts nothing.
+    /// The terminal end of the connect-retry loop. Counts
+    /// `UPSTREAM_CONNECT_FAILED` once concluded -- once per request, never
+    /// per attempt, so a retried connect or an Auto-mode fallback that ends
+    /// up connected counts nothing.
     pub(crate) fn connect(
         operation: &'static str,
         error: io::Error,
@@ -368,8 +359,7 @@ impl UpstreamError {
         )
     }
 
-    /// A head the transport delivered intact but HTTP could not accept: the
-    /// reason is the whole failure, so there is no source error under it.
+    /// A head the transport delivered intact but HTTP could not accept.
     /// Counts nothing here: every such head is counted in
     /// `UPSTREAM_PROTOCOL_VIOLATION` where it was parsed.
     pub(crate) fn head_protocol(reason: impl Into<String>) -> Self {
@@ -384,7 +374,6 @@ impl UpstreamError {
         self.failure.kind.phase()
     }
 
-    /// The one counter bump for an upstream failure that ends a transfer.
     fn record_terminal(&self) {
         if let Some(counter) = self.failure.kind.counter() {
             counter.increment();
@@ -393,7 +382,7 @@ impl UpstreamError {
 
     /// Count a failure that ends a transfer: its terminal counter, and its
     /// fault against `mirror`'s health where the transfer has a canonical
-    /// mirror. Both `conclude`s that can end an upstream exchange call this.
+    /// mirror.
     fn record(&self, mirror: Option<&Mirror>) {
         self.record_terminal();
         if let Some(mirror) = mirror
@@ -407,12 +396,6 @@ impl UpstreamError {
     /// health counts (`mirror_health`); `None` for a failure that is not the
     /// mirror's fault or names no class (a local body limit, a reset in the
     /// middle of a body).
-    ///
-    /// A connect failure and a head failure (reset, EOF or read timeout
-    /// before the head) are both "unreachable"; a head the transport
-    /// delivered but HTTP refused is a protocol violation, like a body
-    /// counted in `UPSTREAM_PROTOCOL_VIOLATION`; a body read that timed out
-    /// and a `min_download_rate` abort are "slow".
     pub(crate) fn mirror_fault(&self) -> Option<MirrorFault> {
         let UpstreamFailure { failure, kind } = self.failure.as_ref();
         kind.mirror_fault(failure)
@@ -420,9 +403,8 @@ impl UpstreamError {
 
     /// End the transfer this failure stops outside any download runner or
     /// delivery sink (a pass-through relay's connect, a cleanup fetch):
-    /// count it -- against `mirror`'s health too,
-    /// where the transfer has a canonical mirror (`None` for a passthrough,
-    /// whose path names no mirror) -- then log it through `log`, whose
+    /// count it -- against `mirror`'s health too, `None` for a passthrough,
+    /// whose path names no mirror -- then log it through `log`, whose
     /// [`Logged`] proves the line was written.
     pub(crate) fn conclude(
         self,
@@ -546,11 +528,9 @@ impl HeaderWriteFailure {
     }
 }
 
-/// A failure that can end a delivery. Concluding it is the one sink for that
-/// delivery: it bumps whatever terminal counters the failure's type carries,
-/// logs `{context}:  {report}` at [`DeliveryFailure::severity`] and proves
-/// it. Lets a sink shared by header and body writes take either without
-/// re-deciding at runtime which of them counts.
+/// A failure that can end a delivery. Concluding it bumps whatever terminal
+/// counters the failure's type carries, logs `{context}:  {report}` at
+/// [`DeliveryFailure::severity`] and proves it.
 ///
 /// `client` is the peer the delivery was for, so a client-side cause is
 /// also counted against it (`client_trouble`); `None` only where no
@@ -560,9 +540,6 @@ pub(crate) trait EndsDelivery {
     -> ReportedDelivery;
 }
 
-/// The one sink every owner that ends a delivery calls, once: it bumps the
-/// cause's terminal counters and logs `{context}:  {report}` at
-/// [`DeliveryFailure::severity`].
 impl EndsDelivery for DeliveryFailure {
     fn conclude(
         self,
@@ -593,11 +570,9 @@ impl EndsDelivery for HeaderWriteFailure {
 }
 
 /// One gate per upstream host (the mirror's authority, `host[:port]`) for the
-/// connect/head failures of every download: a host that is down fails
-/// identically for every request in flight, so the gate belongs to the
-/// condition, not to a call site -- and one host's outage must not demote
-/// another's first failure. Keyed by authority, not by the whole mirror: the
-/// path is the client's choice, reachability is the host's.
+/// connect/head failures of every download, so one host's outage does not
+/// demote another's first failure. Keyed by authority, not by the whole
+/// mirror: the path is the client's choice, reachability is the host's.
 static UPSTREAM_HOST_GATE: KeyedGate = KeyedGate::new(UPSTREAM_HOST_GATE_CAP);
 
 /// Distinct upstream hosts [`UPSTREAM_HOST_GATE`] warns for before every
@@ -631,8 +606,6 @@ impl DownloadFailure {
         matches!(self, Self::Upstream(error) if error.is_rate())
     }
 
-    /// The one counter bump for a download from `mirror` that ends here, its
-    /// mirror's health included; the cause decides.
     fn record_terminal(&self, mirror: Option<&Mirror>) {
         match self {
             Self::Upstream(error) => error.record(mirror),
@@ -641,7 +614,6 @@ impl DownloadFailure {
     }
 
     /// The response a backend still able to answer sends for this failure.
-    /// Every backend and every joiner consumes this shared status/body mapping.
     pub(crate) fn response_parts(&self) -> (StatusCode, &'static str) {
         match self {
             Self::Upstream(_) => (StatusCode::BAD_GATEWAY, "Upstream Error"),
@@ -687,7 +659,6 @@ impl ReportedDownloadFailure {
         self.get()
     }
 
-    /// Publish the retained cause to readers without reallocating it.
     pub(crate) fn shared(&self) -> Arc<DownloadFailure> {
         Arc::clone(self.get())
     }
@@ -718,9 +689,8 @@ impl DeliveryFailure {
         matches!(self, Self::Client(error) if error.is_peer_disconnect())
     }
 
-    /// The level this failure is reported at, wherever it lands. A shared
-    /// download carries the severity of the failure it wraps, so a joiner and
-    /// the writer report the same cause at the same level.
+    /// A shared download carries the severity of the failure it wraps, so a
+    /// joiner and the writer report the same cause at the same level.
     fn severity(&self) -> Severity {
         match self {
             Self::Client(error) => {
@@ -737,9 +707,9 @@ impl DeliveryFailure {
         }
     }
 
-    /// The one counter bump for a delivery that ends here. Rate probes that
-    /// end in demotion never reach a sink, so demotion counts only as demotion.
-    /// [`Self::Download`] does not re-count: the writer counted it.
+    /// Rate probes that end in demotion never reach a sink, so demotion
+    /// counts only as demotion. [`Self::Download`] does not re-count: the
+    /// writer counted it.
     fn record_terminal(&self) {
         match self {
             Self::Client(error) => {
@@ -758,8 +728,7 @@ impl DeliveryFailure {
     /// What this terminal failure says about the client, for the per-client
     /// counts: the same events `record_terminal` counts globally, plus a body
     /// write that timed out (`HTTP_TIMEOUT_CLIENT_BODY`, counted where the
-    /// deadline fired). A header write never gets here: its type counts
-    /// nothing.
+    /// deadline fired).
     fn client_trouble(&self) -> Option<Trouble> {
         match self {
             Self::Client(error) if error.is_timeout() => Some(Trouble::Slow),
@@ -835,10 +804,10 @@ pub(crate) enum MixedFailure {
     Internal(io::Error),
 }
 
-/// The one errno table for syscalls that touch a socket and a file or pipe.
-/// A socket errno is attributed to the socket's side whatever it means --
-/// peer loss or an unreachable network alike -- so a zero-copy transfer
-/// attributes it exactly like the userspace write of the same socket would.
+/// The errno table for syscalls that touch a socket and a file or pipe. A
+/// socket errno is attributed to the socket's side whatever it means -- peer
+/// loss or an unreachable network alike -- as the userspace write of the
+/// same socket would.
 #[cfg(feature = "sendfile")]
 pub(crate) fn classify_mixed_descriptor(
     errno: nix::errno::Errno,
@@ -1143,7 +1112,6 @@ mod tests {
         assert_eq!(metrics::UPSTREAM_HEAD_FAILED.get(), head_before + 1);
     }
 
-    /// Each terminal upstream failure names at most one per-mirror class.
     #[test]
     fn mirror_faults_follow_the_phase_and_cause() {
         let mut rc = RateChecker::with_timeframe(nonzero!(1000), nonzero!(1));

@@ -1,26 +1,18 @@
 //! Extended-attribute helpers: one typed layer over every
 //! `user.apt_cacher_rs.*` attribute the daemon persists.
 //!
-//! A persisted attribute is a type implementing [`XattrValue`] (`ETag`,
-//! `LastModified`, [`ExpectedSize`], [`crate::verified_marker::CleanupMarker`]); the generic
-//! [`try_read`] / [`read`] / [`write()`] / [`remove_stale`] helpers own the whole
-//! degradation policy once - the `XATTR_SUPPORTED` short-circuit, the
-//! absent/unsupported/`ENODATA` collapse to `None`, the malformed-value scrub
-//! and its once-gated warn, and the transient-failure warn - so a new
-//! attribute is a type, not a module plus three call sites. The `xattr`
-//! crate already does a single-syscall fast path per read; the hot cost of
-//! an attribute is its value, which `cache_metadata` caches.
+//! A persisted attribute is a type implementing [`XattrValue`]; the generic
+//! [`try_read`] / [`read`] / [`write()`] / [`remove_stale`] helpers own the
+//! degradation policy: absent, unsupported and `ENODATA` collapse to `None`,
+//! a malformed value is scrubbed, failures are logged and never propagated.
 //!
 //! # Blocking
 //!
 //! Every [`XattrTarget`] issues its syscall directly. The [`std::fs::File`]
-//! impl is for callers already on a blocking thread (cleanup's digest
-//! verification and `integrity::verify_temp_file`); [`XattrFile`] wraps a
+//! impl is for callers already on a blocking thread; [`XattrFile`] wraps a
 //! tokio file for a caller that enters one [`tokio::task::block_in_place`]
 //! section around all the operations it batches on that file (which needs
-//! a multi-threaded runtime). Unit tests also address a [`tokio::fs::File`]
-//! directly, through a test-only impl that wraps each syscall in its own
-//! `block_in_place`.
+//! a multi-threaded runtime).
 
 use std::{
     borrow::Cow,
@@ -36,13 +28,8 @@ use xattr::FileExt as _;
 
 use crate::{error::ErrorReport, log_once::warn_once_or_info_gated, warn_once_or_debug};
 
-/// Wrapper to implement [`xattr::FileExt`] for [`tokio::fs::File`].
-///
-/// As an [`XattrTarget`] it issues the syscall *directly*: it is for a
-/// caller that has already entered one [`tokio::task::block_in_place`]
-/// section around several attribute operations on the same file (see
-/// `cache_metadata::write_upstream_metadata`), so the download path pays one
-/// worker demotion instead of one per attribute.
+/// Wrapper to implement [`xattr::FileExt`] for [`tokio::fs::File`]. Issues
+/// the syscall directly; see the module doc's blocking section.
 pub(crate) struct XattrFile<'a>(pub(crate) &'a tokio::fs::File);
 
 impl std::os::fd::AsRawFd for XattrFile<'_> {
@@ -54,8 +41,6 @@ impl std::os::fd::AsRawFd for XattrFile<'_> {
 
 impl xattr::FileExt for XattrFile<'_> {}
 
-/// An open file the helpers address by descriptor (see the module doc's
-/// blocking section).
 pub(crate) trait XattrTarget {
     fn get(&self, key: &'static str) -> io::Result<Option<Vec<u8>>>;
     fn set(&self, key: &'static str, value: &[u8]) -> io::Result<()>;
@@ -115,7 +100,7 @@ impl XattrTarget for std::fs::File {
 pub(crate) trait XattrValue: Sized {
     /// Full attribute name, `user.apt_cacher_rs.<name>`.
     const KEY: &'static str;
-    /// Human name for log lines (`ETag`, `Last-Modified`, `expected_size`).
+    /// Human name for log lines.
     const LABEL: &'static str;
     /// Consequence clause of the write-failure warn: what the daemon loses
     /// when this value does not stick.
@@ -135,10 +120,8 @@ pub(crate) trait XattrValue: Sized {
 }
 
 /// Whether the cache filesystem supports the `user.apt_cacher_rs.*`
-/// namespace, recorded once by `task_setup`'s startup probe. Every helper
-/// short-circuits when it is false (no syscall, no log line), and cleanup
-/// announces once per cycle that digest-verification memoization cannot
-/// stick.
+/// namespace, recorded once by the startup probe. Every helper
+/// short-circuits when it is false (no syscall, no log line).
 static XATTR_SUPPORTED: AtomicBool = AtomicBool::new(true);
 
 pub(crate) fn disable_xattr_support() {
@@ -150,31 +133,21 @@ pub(crate) fn xattr_supported() -> bool {
 }
 
 /// Marker returned by [`try_read`] when the xattr syscall failed in a way
-/// that may succeed on retry - distinct from a stable "no value" outcome
-/// (xattr absent, filesystem doesn't support xattrs, or a malformed value
-/// was scrubbed). Callers that don't need the distinction use [`read`],
-/// which collapses both outcomes to `None`; callers that negative-cache
-/// (see [`crate::cache_metadata`]) must use [`try_read`] and skip the cache
-/// write on `Err`.
+/// that may succeed on retry - distinct from a stable "no value" outcome.
+/// Callers that negative-cache must skip the cache write on it.
 #[derive(Debug)]
 pub(crate) struct XattrIoError;
 
-/// Why an attribute is being removed; picks the wording of the failure
-/// warn, whose consequence is the same either way: the value stays on the
-/// file.
+/// Why an attribute is being removed; only picks the wording of the failure
+/// warn.
 #[derive(Clone, Copy, Debug)]
 enum Removal {
-    /// [`try_read`]'s scrub of a value [`XattrValue::parse`] rejected; the
-    /// next read discards it again.
     Malformed,
-    /// [`remove_stale`]'s unlink of a value the current download no longer
-    /// asserts.
     Stale,
 }
 
-/// Remove `V`'s attribute from the file. Logs on failure but never
-/// propagates errors; an attribute that is not there (`ENODATA`) is the
-/// success case for [`Removal::Stale`] and silent for both.
+/// Logs on failure but never propagates errors; an attribute that is not
+/// there (`ENODATA`) is silent.
 fn remove<V: XattrValue>(file: &impl XattrTarget, display_path: &Path, why: Removal) {
     if !xattr_supported() {
         return;
@@ -198,10 +171,7 @@ fn remove<V: XattrValue>(file: &impl XattrTarget, display_path: &Path, why: Remo
 
 /// Remove a `V` the current download does not carry, so an attribute left
 /// by an earlier attempt on the same file (a resumed partial) cannot outlive
-/// the value it belonged to. An absent attribute is success and silent; the
-/// caller is `cache_metadata::write_upstream_metadata`, which must leave the
-/// file's xattrs equal to the metadata it then publishes and calls this only
-/// for a resumed partial (a file the download created has nothing to remove).
+/// the value it belonged to. An absent attribute is success and silent.
 pub(crate) fn remove_stale<V: XattrValue>(file: &impl XattrTarget, display_path: &Path) {
     remove::<V>(file, display_path, Removal::Stale);
 }
@@ -263,17 +233,14 @@ pub(crate) fn try_read<V: XattrValue>(
     Ok(Some(value))
 }
 
-/// Read `V` from the file, `None` on any error (graceful degradation).
-/// Callers that need to distinguish transient I/O errors from a stable
-/// "no value" outcome (e.g. for negative caching) use [`try_read`].
+/// [`try_read`] with a transient I/O error collapsed to `None`.
 #[must_use]
 pub(crate) fn read<V: XattrValue>(file: &impl XattrTarget, display_path: &Path) -> Option<V> {
     try_read::<V>(file, display_path).ok().flatten()
 }
 
-/// Persist `value` on the file. Logs on failure but never propagates
-/// errors; `ErrorKind::Unsupported` is silent (the startup probe already
-/// warned once for the filesystem).
+/// Logs on failure but never propagates errors; `ErrorKind::Unsupported` is
+/// silent (the startup probe already warned once for the filesystem).
 pub(crate) fn write<V: XattrValue>(file: &impl XattrTarget, display_path: &Path, value: &V) {
     if !xattr_supported() {
         return;
@@ -357,7 +324,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Whether `V`'s key is present on the file, read raw.
     pub(crate) fn raw_present<V: XattrValue>(file: &std::fs::File) -> bool {
         file.get_xattr(V::KEY)
             .expect("read raw attribute after scrub")
@@ -388,7 +354,6 @@ pub(crate) mod tests {
 
         remove_stale::<V>(&file, &path);
         assert!(matches!(try_read::<V>(&file, &path), Ok(None)));
-        // Removing an absent attribute (`ENODATA`) is success: no warn.
         let levels = levels_during(|| remove_stale::<V>(&file, &path));
         assert!(
             levels.is_empty(),
@@ -398,9 +363,8 @@ pub(crate) mod tests {
     }
 
     /// Two values sharing one key would silently overwrite each other on
-    /// disk, and the shared prefix is what `task_setup`'s startup probe
-    /// tests for support - so both are asserted here rather than left to a
-    /// copy-paste review of four `impl` blocks in four modules.
+    /// disk, and the shared prefix is what the startup probe tests for
+    /// support.
     #[test]
     fn every_attribute_key_is_namespaced_and_distinct() {
         use crate::{

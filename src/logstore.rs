@@ -1,8 +1,7 @@
 //! The in-memory log ring behind the web interface's `/logs` page.
 //!
-//! `main()` installs [`LogStore`] as the writer of its own layer, filtered at
-//! `WARN`, so the ring holds only warnings and errors — never the full log
-//! stream the console/file sink receives.
+//! The ring holds only warnings and errors (its layer is filtered at `WARN`),
+//! never the full log stream the console/file sink receives.
 //!
 //! Being an `io::Write` sink, it receives raw formatted bytes rather than
 //! records: a subscriber may split one line across several `write` calls and
@@ -12,10 +11,8 @@
 //! Readers copy entries with [`LogStore::snapshot`], releasing the shared
 //! lock before rendering so that formatting cannot block logging threads.
 //!
-//! An entry keeps at most [`MAX_ENTRY_LEN`] bytes: some warnings quote
-//! upstream- or client-supplied values, and the ring holds
-//! `logstore_capacity` entries for the life of the process. The console/file
-//! sink still receives the whole line. A fragmented record keeps only a
+//! An entry keeps at most [`MAX_ENTRY_LEN`] bytes, as some warnings quote
+//! upstream- or client-supplied values. A fragmented record keeps only a
 //! bounded raw prefix while waiting for its newline; leading whitespace in
 //! an oversized fragmented line counts toward that prefix too.
 
@@ -36,8 +33,6 @@ const MAX_FRAGMENT_BYTES: usize = MAX_ENTRY_LEN + 3;
 
 const TRUNCATION_MARK: &str = " [truncated]";
 
-/// The ring entry for one raw log line: lossily decoded, trimmed, and cut to
-/// [`MAX_ENTRY_LEN`].
 fn entry_from_line(line: &[u8], truncated: bool) -> String {
     // A cut record can end inside a scalar; drop that partial scalar rather
     // than decode it to U+FFFD.
@@ -126,9 +121,8 @@ impl std::io::Write for LogStoreImpl {
     }
 }
 
-/// Lives in a `static` (`main.rs`'s `LOGSTORE`), so the log layer writes
-/// through a shared `&'static LogStore`: `io::Write` is implemented for the
-/// reference, as std does for `&File`.
+/// Lives in a `static`, so `io::Write` is implemented for the reference, as
+/// std does for `&File`.
 #[derive(Debug)]
 pub(crate) struct LogStore {
     inner: parking_lot::RwLock<LogStoreImpl>,
@@ -150,8 +144,6 @@ impl LogStore {
         self.inner.read().entries.len()
     }
 
-    /// Entries held and the heap they take: the ring's slots, each entry's
-    /// text and the scratch buffer.
     pub(crate) fn footprint(&self) -> Footprint {
         let inner = self.inner.read();
         let text: usize = inner.entries.iter().map(String::capacity).sum();
@@ -185,8 +177,6 @@ mod tests {
         LogStore::new(NonZero::new(capacity).expect("non-zero capacity"))
     }
 
-    /// The subscriber writes formatted bytes, not records: a line can arrive
-    /// in pieces and must not surface until its newline does.
     #[test]
     fn a_line_split_across_writes_surfaces_only_once_terminated() {
         let store = new_store(4);
@@ -198,7 +188,6 @@ mod tests {
         assert_eq!(store.snapshot(), ["hello world"]);
     }
 
-    /// One `write` can carry several records plus the head of the next one.
     #[test]
     fn one_write_is_split_on_every_newline_and_trimmed() {
         let store = new_store(4);
@@ -213,9 +202,6 @@ mod tests {
         assert_eq!(count, 2, "the unterminated tail is not an entry yet");
     }
 
-    /// Overflow is expected (the ring is a tail view), but it is the one
-    /// condition an operator can fix by raising `logstore_capacity`, so it
-    /// has to be counted.
     #[test]
     fn overflowing_the_ring_drops_the_oldest_entry_and_counts_it() {
         let store = new_store(2);
@@ -233,8 +219,6 @@ mod tests {
         assert_eq!(metrics::LOGSTORE_EVICTIONS.get(), before + 1);
     }
 
-    /// A line longer than the entry cap is kept cut and marked, so a warning
-    /// quoting a huge upstream value cannot pin that much memory per entry.
     #[test]
     fn an_overlong_line_is_truncated_at_a_char_boundary() {
         let store = new_store(4);
@@ -316,7 +300,6 @@ mod tests {
         assert_eq!(store.snapshot()[3], format!("{shifted}{TRUNCATION_MARK}"));
     }
 
-    /// Invalid UTF-8 must not lose the record or panic the logging path.
     #[test]
     fn invalid_utf8_is_replaced_rather_than_dropped() {
         let store = new_store(4);

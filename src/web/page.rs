@@ -14,12 +14,9 @@ use super::{
     fmt::HtmlEscape,
 };
 
-/// The system hostname, read once at first use.
-///
-/// Without it two daemons are indistinguishable in a browser tab and in a
-/// screenshot pasted into a ticket; it is the only instance identity the
-/// server can put in the page, since the URL the client typed never reaches
-/// us in a form worth trusting.
+/// The system hostname, read once at first use: the only instance identity
+/// the server can put in the page, since the URL the client typed never
+/// reaches us in a form worth trusting.
 static HOSTNAME: LazyLock<Box<str>> = LazyLock::new(|| {
     nix::unistd::gethostname()
         .ok()
@@ -40,9 +37,7 @@ impl Display for PageTitle {
     }
 }
 
-/// First-run guidance. With nothing fetched yet the dashboard is a wall of
-/// zeroes, and the one thing its reader needs is the line that points apt at
-/// this daemon.
+/// First-run guidance: the line that points apt at this daemon.
 pub(super) struct SetupHint(pub(super) std::num::NonZero<u16>);
 
 impl Display for SetupHint {
@@ -71,10 +66,6 @@ impl Display for Heading {
         )
     }
 }
-
-// ---------------------------------------------------------------------------
-// Page chrome
-// ---------------------------------------------------------------------------
 
 /// User-selected colour theme.
 ///
@@ -167,7 +158,6 @@ impl OpenSections {
         Self::bit(key).is_some_and(|bit| self.0 & bit != 0)
     }
 
-    /// `self` with `key` added if absent, removed if present.
     fn toggled(self, key: &str) -> Self {
         Self(self.0 ^ Self::bit(key).unwrap_or(0))
     }
@@ -295,7 +285,7 @@ pub(super) fn parse_query(query: Option<&str>) -> QueryOptions {
     }
 
     // `&` only — the legacy `;` separator was dropped from WHATWG URL and
-    // browsers no longer emit it. Keeping the parser surface minimal.
+    // browsers no longer emit it.
     for pair in query.split('&') {
         let Some((k, v)) = pair.split_once('=') else {
             continue;
@@ -324,9 +314,7 @@ pub(super) fn parse_query(query: Option<&str>) -> QueryOptions {
     options
 }
 
-/// Renders a navigation link's URL preserving `refresh` and `theme` params.
-/// Implemented as `Display` so the surrounding `<a href="…">…</a>` boilerplate
-/// can be emitted in a single `write!` instead of multiple `push_str` calls.
+/// A link's URL, carrying the `refresh`, `theme` and `open` params along.
 struct QueryUrl<'a> {
     path: &'a str,
     options: QueryOptions,
@@ -350,8 +338,7 @@ impl Display for QueryUrl<'_> {
     }
 }
 
-/// Seconds the dashboard's auto-refresh link switches on. Shared by the link
-/// target and its label so the two cannot disagree.
+/// Seconds the dashboard's auto-refresh link switches on.
 const AUTO_REFRESH_SECS: u32 = 30;
 
 #[derive(Clone, Copy)]
@@ -409,8 +396,6 @@ pub(super) fn build_nav_html(page: Page, options: QueryOptions) -> String {
             html.push_str("<span class=\"dim\">|</span>");
             html.push_str("<a href=\"/healthcheck\">Health JSON</a>");
             html.push_str("<span class=\"dim\">|</span>");
-            // The link toggles: it turns auto-refresh off while it is on,
-            // and on at `AUTO_REFRESH_SECS` while it is off.
             let target = QueryUrl {
                 path: "/",
                 options: QueryOptions {
@@ -462,11 +447,8 @@ pub(super) fn build_nav_html(page: Page, options: QueryOptions) -> String {
     html
 }
 
-// ---------------------------------------------------------------------------
-// Favicon — small inline SVG (box/archive icon), served at /favicon.svg
-// (and /favicon.ico for browsers that auto-probe that path).
-// ---------------------------------------------------------------------------
-
+// Served at /favicon.svg, and at /favicon.ico for browsers that auto-probe
+// that path.
 pub(super) const FAVICON_SVG: &str = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'>\
 <rect x='1' y='4' width='14' height='10' rx='1' fill='#4a7bcc'/>\
 <rect x='0' y='2' width='16' height='4' rx='1' fill='#2c3e50'/>\
@@ -574,7 +556,6 @@ mod tests {
 
     #[test]
     fn parse_query_oversize_dropped_entirely() {
-        // Even valid pairs are ignored when the whole query exceeds the cap.
         let mut q = String::with_capacity(MAX_QUERY_LEN + 32);
         q.push_str("theme=dark&");
         while q.len() <= MAX_QUERY_LEN {

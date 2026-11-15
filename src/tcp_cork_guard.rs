@@ -10,13 +10,9 @@ use tracing::warn;
 
 use crate::{error::ErrorReport, warn_once_or_debug};
 
-/// One end of a socket as the log lines below render it: the address, or
-/// `<unknown>` when `getsockname`/`getpeername` failed. Formats straight into
-/// the `Formatter` instead of allocating a `String` per log site.
-///
-/// The IP is canonicalized as `ClientInfo` renders it, so an IPv4 client of
-/// the dual-stack listener reads `192.0.2.1:40000` here too, not
-/// `[::ffff:192.0.2.1]:40000`.
+/// A socket address for log lines, or `<unknown>` when it could not be
+/// read. The IP is canonicalized, so an IPv4 client of the dual-stack
+/// listener reads `192.0.2.1:40000`, not `[::ffff:192.0.2.1]:40000`.
 struct Endpoint(std::io::Result<SocketAddr>);
 
 impl Display for Endpoint {
@@ -35,13 +31,11 @@ impl Display for Endpoint {
 pub(crate) struct CorkGuard<'a>(&'a TcpStream);
 
 impl<'a> CorkGuard<'a> {
-    /// Creates a new `CorkGuard` that sets `TCP_CORK` on the given stream.
     fn new(stream: &'a TcpStream) -> std::io::Result<Self> {
         setsockopt(stream, TcpCork, &true)?;
         Ok(Self(stream))
     }
 
-    /// Creates a new `CorkGuard` that sets `TCP_CORK` on the given stream, if possible.
     #[must_use = "dropping the guard immediately uncorks the socket"]
     pub(crate) fn new_optional(stream: &'a TcpStream) -> Option<Self> {
         match Self::new(stream) {
@@ -94,8 +88,6 @@ mod tests {
 
     use super::*;
 
-    /// An IPv4 peer of the dual-stack listener renders as IPv4, like every
-    /// other log line names that client; a real IPv6 peer stays bracketed.
     #[test]
     fn endpoint_renders_a_mapped_peer_as_ipv4() {
         let mapped = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped(), 40000));

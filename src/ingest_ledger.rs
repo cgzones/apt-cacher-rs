@@ -2,25 +2,17 @@
 //! digests of, so an index answered from cache is re-ingested exactly when
 //! its digests are missing (restart, eviction, a skipped or failed ingest).
 //!
-//! Pure bookkeeping, no I/O and no globals: `integrity` owns the one
-//! instance and runs the ingests. Keyed by the index's cache path; an
-//! unmarked path (never claimed, invalidated, retryable) has no entry. A
-//! path is `Running` while one ingest task owns it, which is also the dedupe: a
-//! second claim of a running path is refused. A commit that replaces the
-//! file while its ingest runs sets `rerun`, and the owner runs again instead
-//! of marking the old file's result on the new one.
+//! Keyed by the index's cache path; an unmarked path (never claimed,
+//! invalidated, retryable) has no entry. A path is `Running` while one
+//! ingest task owns it, which is also the dedupe: a second claim of a
+//! running path is refused. A commit that replaces the file while its ingest
+//! runs sets `rerun`, and the owner runs again instead of marking the old
+//! file's result on the new one.
 //!
 //! `Ingested` records the registry scope's eviction epoch at the start of
 //! the run; a later eviction from that scope bumps the epoch, and a mark
 //! from an older epoch no longer counts. That is the scope-wide unmark,
 //! without walking the ledger.
-//!
-//! At the cap, [`IngestLedger::claim`]'s overflow clear keeps only `Running`
-//! entries and drops every other mark, `Failed` included: a path marked
-//! failed can therefore be decoded once more after an overflow evicts its
-//! entry, and fail again deterministically. CPU stays bounded regardless --
-//! `integrity`'s decode permits (`PACKAGES_INGEST_PERMITS`) cap concurrent
-//! decodes independently of how many paths the ledger currently tracks.
 
 use std::path::{Path, PathBuf};
 
@@ -29,10 +21,8 @@ use parking_lot::Mutex;
 
 use crate::mem_usage::Footprint;
 
-/// What one ingest run concluded about its file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
-    /// Every digest was registered.
     Ingested,
     /// The file can never ingest (too large or corrupt); not retried until a
     /// commit replaces it.
@@ -49,7 +39,6 @@ enum State {
     Running { rerun: bool, epoch_at_start: u64 },
 }
 
-/// See the module doc.
 #[derive(Debug)]
 pub(crate) struct IngestLedger {
     paths: Mutex<HashMap<PathBuf, State>>,
@@ -70,7 +59,8 @@ impl IngestLedger {
     ///
     /// At the cap, every entry but the running ones is dropped first: a
     /// running entry's task still owns its path, and dropping it would let
-    /// a second task ingest the same path and lose a pending rerun.
+    /// a second task ingest the same path and lose a pending rerun. A
+    /// dropped `Failed` mark only costs one more (failing) decode.
     pub(crate) fn claim(&self, path: &Path, epoch: u64) -> Option<Claim<'_>> {
         let running = State::Running {
             rerun: false,
@@ -97,8 +87,6 @@ impl IngestLedger {
         })
     }
 
-    /// Paths tracked and the heap they take: the table and each path's
-    /// text. Walks the table, which the cap keeps small.
     pub(crate) fn footprint(&self) -> Footprint {
         let paths = self.paths.lock();
         let text: usize = paths.keys().map(PathBuf::capacity).sum();
@@ -162,9 +150,8 @@ impl IngestLedger {
 }
 
 /// Ownership of one claimed path's run. Dropped without a final
-/// [`Self::finish`] (a panic, runtime shutdown), it leaves the path
-/// unmarked (removes its entry), so the next claim runs it instead of
-/// finding it `Running` forever.
+/// [`Self::finish`] (a panic, runtime shutdown), it removes the entry, so
+/// the next claim runs it instead of finding it `Running` forever.
 #[derive(Debug)]
 pub(crate) struct Claim<'a> {
     ledger: &'a IngestLedger,
@@ -173,7 +160,6 @@ pub(crate) struct Claim<'a> {
 }
 
 impl Claim<'_> {
-    /// The claimed path: the cache file the run ingests.
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }

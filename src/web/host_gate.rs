@@ -10,9 +10,6 @@
 //! rebound: an IP literal, `localhost`, the system hostname and the
 //! operator's `webif_hostnames`. Everything else is a 421 Misdirected
 //! Request (`RejectReason::MisdirectedWebUi`).
-//!
-//! The set is built once at startup ([`WebifHosts::from_system`]); matching
-//! ([`WebifHosts::permits`]) is pure so the rules are unit-testable.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 

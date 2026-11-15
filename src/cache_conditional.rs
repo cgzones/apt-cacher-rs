@@ -1,16 +1,9 @@
 //! Conditional-request handling shared across delivery paths.
 //!
-//! Centralizes the cached representation's metadata view (`ETag` /
-//! `Last-Modified` / cache `Age`), the RFC 9110 §13.1 precedence rules for
-//! evaluating `If-None-Match` / `If-Modified-Since` against a cached file,
-//! and - via [`CacheInfo::plan`] - the whole 304 / 416 / 206 / 200 decision
-//! for a fully-cached serve, including `Range` / `If-Range`.  The plan is
-//! pure: it neither touches I/O nor writes a response, so the hyper path in
-//! `hyper_conn.rs` and the sendfile path in `sendfile_conn.rs` share one
-//! decision and only differ in how they emit it.  [`RangeRequestHeaders`]
-//! carries the four request headers the plan reads, extracted once per
-//! backend representation (`extract` for httparse, `from_http` for hyper),
-//! so the malformed-header logging lives here too.
+//! [`CacheInfo::plan`] makes the whole 304 / 416 / 206 / 200 decision for a
+//! fully-cached serve (RFC 9110 §13.1 preconditions, `Range` / `If-Range`).
+//! It is pure: it neither touches I/O nor writes a response, so the backends
+//! share one decision and only differ in how they emit it.
 
 use std::{
     borrow::Cow,
@@ -37,8 +30,7 @@ use crate::{
     warn_once_or_debug, warn_once_or_info,
 };
 
-/// Whether the volatile cache file at `path`, whose metadata is `metadata`,
-/// may still be served: its age by [`volatile_freshness`], judged at `now`.
+/// The age of a volatile cache file still fresh enough to serve at `now`.
 pub(crate) fn volatile_file_freshness(
     path: &Path,
     metadata: &std::fs::Metadata,
@@ -50,8 +42,6 @@ pub(crate) fn volatile_file_freshness(
     volatile_freshness(path, modified, now)
 }
 
-/// The freshness check of a lookup site about to serve a cached volatile
-/// file: [`volatile_file_freshness`] now, logging a fresh copy's age.
 pub(crate) fn check_volatile_hit(
     path: &Path,
     metadata: &std::fs::Metadata,
@@ -68,8 +58,7 @@ pub(crate) fn check_volatile_hit(
 
 /// A volatile copy is fresh only within the fixed cache window. Compare raw
 /// timestamps: HTTP-date rounding can turn subsecond mtimes into future dates.
-/// Future timestamps are stale, so clock skew cannot freeze an index in cache;
-/// one is logged against `path`.
+/// Future timestamps are stale, so clock skew cannot freeze an index in cache.
 fn volatile_freshness(
     path: &Path,
     modified: SystemTime,
@@ -89,11 +78,9 @@ fn volatile_freshness(
     }
 }
 
-/// Raw `Range` / `If-Range` / `If-None-Match` / `If-Modified-Since` values
-/// from a client request, as the plan reads them.  Header values that are
-/// not valid UTF-8 are treated as absent, except `If-Range` and
-/// `If-None-Match`: unreadable values remain present as empty, unmatchable
-/// validators. This preserves `If-None-Match` precedence over
+/// Header values that are not valid UTF-8 are treated as absent, except
+/// `If-Range` and `If-None-Match`: unreadable values remain present as empty,
+/// unmatchable validators. This preserves `If-None-Match` precedence over
 /// `If-Modified-Since`, including when decoding fails.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RangeRequestHeaders<'a> {
@@ -127,13 +114,10 @@ impl<'a> RangeRequestHeaders<'a> {
         }
     }
 
-    /// Extract from a hyper header map. Unreadable `If-None-Match` values
-    /// remain present as empty validators. An unreadable `If-Modified-Since`
-    /// is dropped with a one-shot warning, while an unreadable `If-Range`
-    /// becomes an empty validator with a one-shot warning. `If-Range` is only
-    /// read alongside a `Range` (it is meaningless without one), and a
-    /// non-UTF-8 `Range` is ignored silently - RFC 9110 §14.2 says to serve
-    /// the full entity for a malformed `Range` anyway.
+    /// Extract from a hyper header map. `If-Range` is only read alongside a
+    /// `Range` (it is meaningless without one), and a non-UTF-8 `Range` is
+    /// ignored silently - RFC 9110 §14.2 says to serve the full entity for a
+    /// malformed `Range` anyway.
     #[cfg(feature = "hyper")]
     #[must_use]
     pub(crate) fn from_http(headers: &'a HeaderMap, client: &ClientInfo) -> Self {
@@ -195,9 +179,7 @@ fn combine_conditions<'a>(values: impl Iterator<Item = &'a [u8]>) -> Option<Cow<
     Some(combined)
 }
 
-/// Byte-range parameters for serving a cached representation.  A present
-/// `Content-Range` *is* the 206-ness of the delivery, so the status and the
-/// partial flag are derived rather than stored alongside it.
+/// Byte-range parameters for serving a cached representation.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ServeParams {
     Full { length: u64 },
@@ -205,25 +187,19 @@ pub(crate) enum ServeParams {
 }
 
 /// The client's `Range` is syntactically valid but no byte of the
-/// representation satisfies it ([`ServeParams::from_parsed`]); answer 416.
+/// representation satisfies it; answer 416.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RangeNotSatisfiable;
 
 impl ServeParams {
-    /// The whole representation as a 200.
     #[must_use]
     pub(crate) const fn full(file_size: u64) -> Self {
         Self::Full { length: file_size }
     }
 
     /// Resolve an already-parsed `Range` (`None` when the request carried
-    /// none) against the representation's `file_size`. A malformed `Range`
-    /// and a failed `If-Range` precondition both serve the whole
-    /// representation (RFC 9110 sections 14.2 and 13.1.5).
-    ///
-    /// The cached-serve planner ([`CacheInfo::plan`]) handles the
-    /// malformed-`Range` warning and 304 precedence before resolving these
-    /// outcomes here too, so the serve paths cannot drift.
+    /// none). A malformed `Range` and a failed `If-Range` precondition both
+    /// serve the whole representation (RFC 9110 sections 14.2 and 13.1.5).
     pub(crate) fn from_parsed(
         parsed: Option<ParsedRange>,
         file_size: u64,
@@ -258,14 +234,12 @@ impl ServeParams {
         }
     }
 
-    /// Whether this is a 206 delivery of a sub-range.
     #[must_use]
     pub(crate) fn is_partial(&self) -> bool {
         matches!(self, Self::Partial(_))
     }
 
-    /// One past the last representation byte to send. Only the splice
-    /// backend needs it: the others hand a start and a length to the kernel.
+    /// One past the last representation byte to send.
     #[cfg(feature = "splice")]
     #[must_use]
     pub(crate) fn content_end(&self) -> u64 {
@@ -273,22 +247,19 @@ impl ServeParams {
     }
 }
 
-/// Outcome of [`CacheInfo::plan`].  The caller emits the response: a 304 or
-/// 416 without a body, or the bytes described by the [`ServeParams`].
+/// Outcome of [`CacheInfo::plan`]; the caller emits the response.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ServePlan {
-    /// The preconditions hold; answer 304 Not Modified.
+    /// Answer 304 Not Modified.
     NotModified,
-    /// A syntactically valid `Range` that no byte of the file satisfies;
-    /// answer 416 with `Content-Range: bytes */{file_size}`.
+    /// Answer 416 with `Content-Range: bytes */{file_size}`.
     NotSatisfiable,
     /// Serve the file (200) or the requested sub-range (206).
     Serve(ServeParams),
 }
 
-/// Pre-computed cache representation metadata used to evaluate conditional
-/// request headers and to populate response headers (`Last-Modified`, `ETag`,
-/// `Age`).
+/// The cached representation's validators and `Age`, for evaluating
+/// conditional request headers and populating response headers.
 pub(crate) struct CacheInfo {
     pub(crate) file_etag: Option<ETag>,
     pub(crate) last_modified: LastModified,
@@ -296,9 +267,8 @@ pub(crate) struct CacheInfo {
 }
 
 impl CacheInfo {
-    /// Build a [`CacheInfo`] for a post-flight cache-hit serve, consulting
-    /// the caller's prefetched snapshot first, including an empty one. Otherwise
-    /// consult the in-process [`cache_metadata`] cache, lazy-loading xattrs on miss.
+    /// A prefetched snapshot wins, even an empty one; otherwise consult the
+    /// in-process [`cache_metadata`] cache, lazy-loading xattrs on miss.
     #[must_use]
     pub(crate) fn resolve(
         file: &tokio::fs::File,
@@ -317,10 +287,8 @@ impl CacheInfo {
         Self::with_meta(metadata, meta)
     }
 
-    /// Build a [`CacheInfo`] from a caller-supplied [`UpstreamMetadata`]
-    /// snapshot — typically the one carried on
-    /// [`crate::active_downloads::ActiveDownloadStatus::Download`] for late-joiner reads, so
-    /// no xattr/cache lookup happens at all.
+    /// No xattr/cache lookup happens; a missing upstream `Last-Modified`
+    /// falls back to the cache file's timestamp.
     #[must_use]
     pub(crate) fn with_meta(metadata: &std::fs::Metadata, meta: &UpstreamMetadata) -> Self {
         let cache_ts = cache_file_http_date(metadata);
@@ -339,10 +307,9 @@ impl CacheInfo {
         }
     }
 
-    /// Apply RFC 9110 §13.1.2 precedence: `If-None-Match` evaluated against the
-    /// stored `ETag` wins; otherwise fall back to `If-Modified-Since` against the
-    /// stored `Last-Modified`. Header values come pre-decoded as strings;
-    /// a nonmatching `If-None-Match` still suppresses the date.
+    /// RFC 9110 §13.1.2 precedence: a present `If-None-Match` decides alone,
+    /// even when it does not match; only without one is `If-Modified-Since`
+    /// compared against the stored `Last-Modified`.
     #[must_use]
     fn decide_serve_304(
         &self,
@@ -364,13 +331,9 @@ impl CacheInfo {
         false
     }
 
-    /// Decide how to answer a request for this representation of
-    /// `file_size` bytes: the RFC 9110 §13.1.2 conditional precedence
-    /// ([`Self::decide_serve_304`]) first, then `Range` / `If-Range` per
-    /// [`http_parse_range`].  A malformed `Range` is ignored (full 200, RFC
-    /// 9110 §14.2) and a failed `If-Range` serves the full entity.  Pure: the
-    /// caller writes the 304 / 416 or the bytes.  `client` is named only in
-    /// the malformed-Range log line.
+    /// The 304 preconditions come first, then `Range` / `If-Range`. A
+    /// malformed `Range` is ignored (full 200, RFC 9110 §14.2) and a failed
+    /// `If-Range` serves the full entity.
     #[must_use]
     pub(crate) fn plan(
         &self,
@@ -391,12 +354,9 @@ impl CacheInfo {
                 self.file_etag.as_deref(),
             );
             if matches!(parsed, ParsedRange::Invalid) {
-                // RFC 9110 says to ignore a malformed Range and serve the
-                // whole entity, which is what `from_parsed` does -- but a
-                // client that expected a resume silently receives the full
-                // object, so say so. (An `If-Range` that did not match is an
-                // ordinary outcome and stays quiet: the client asked for the
-                // full entity if the validator moved on.)
+                // A client that expected a resume silently receives the full
+                // object, so say so. A failed `If-Range` is an ordinary
+                // outcome and stays quiet.
                 warn_once_or_debug!(
                     "Ignoring malformed Range header `{}` from client {client}; serving the full file",
                     range.escape_debug()
@@ -482,8 +442,6 @@ mod tests {
 
     #[test]
     fn plan_if_none_match_mismatch_ignores_if_modified_since() {
-        // RFC 9110 precedence: a present If-None-Match that does not match
-        // means "modified", even when If-Modified-Since alone would say 304.
         let headers = RangeRequestHeaders {
             if_none_match: Some("\"other\"".into()),
             if_modified_since: Some(LAST_MODIFIED),
@@ -582,16 +540,11 @@ mod tests {
     fn decide_serve_304_precedence_and_parse_failures() {
         let tagged = info(Some(ETAG));
 
-        // An unparsable If-Modified-Since is treated as absent, not as a
-        // passing precondition.
+        // An unparsable If-Modified-Since is treated as absent.
         assert!(!tagged.decide_serve_304(None, Some("garbage")));
-        // "not modified since" is `stored <= sent`, so a client timestamp
-        // newer than the stored validator still yields 304.
+        // A client timestamp newer than the stored validator still yields 304.
         assert!(tagged.decide_serve_304(None, Some("Mon, 07 Nov 1994 08:49:37 GMT")));
-        // An older one does not.
         assert!(!tagged.decide_serve_304(None, Some("Sat, 05 Nov 1994 08:49:37 GMT")));
-        // A present but non-matching If-None-Match ends the evaluation: the
-        // date is never consulted (RFC 9110 section 13.1.3).
         assert!(!tagged.decide_serve_304(Some("\"other\""), Some(LAST_MODIFIED)));
         // The cached representation exists independently of its validators.
         assert!(tagged.decide_serve_304(Some("*"), None));
@@ -684,7 +637,6 @@ mod tests {
         assert_eq!(extracted.if_modified_since, Some(LAST_MODIFIED));
     }
 
-    /// Unreadable If-Range remains present and cannot authorize a partial response.
     #[cfg(feature = "hyper")]
     #[test]
     fn from_http_drops_non_utf8_headers() {
@@ -705,8 +657,6 @@ mod tests {
         assert_eq!(extracted.if_modified_since, None);
     }
 
-    /// `If-Range` is meaningless without a `Range`, so it is never read then
-    /// -- and a request carrying only `If-Range` gets the full entity.
     #[cfg(feature = "hyper")]
     #[test]
     fn from_http_ignores_if_range_without_range() {
@@ -745,8 +695,6 @@ mod tests {
 
     #[test]
     fn from_parsed_resolves_each_outcome() {
-        // No `Range` and a failed `If-Range` both serve the whole entity; a
-        // valid-but-unsatisfiable range is the caller's 416.
         assert_eq!(ServeParams::from_parsed(None, 7), Ok(ServeParams::full(7)));
         assert!(!ServeParams::full(7).is_partial());
         assert_eq!(
@@ -812,7 +760,6 @@ mod tests {
         assert_eq!(info.last_modified.time(), expected);
         assert_eq!(info.last_modified.as_ref(), expected.format());
 
-        // An upstream `Last-Modified` wins over the file timestamp.
         let raw = "Sun, 06 Nov 1994 08:49:37 +0000";
         let upstream = HttpDate::parse(raw).unwrap();
         let info = CacheInfo::with_meta(

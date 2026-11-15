@@ -1,6 +1,4 @@
-//! HTML table builders: [`Table`] for column tables, [`DetailsList`] for
-//! key/value grids, the [`tr!`] row macro and the `<div class="section">`
-//! wrappers the dashboard page assembles sections with.
+//! HTML table and section builders for the dashboard page.
 //!
 //! Every section wrapper takes a `key`: the block renders as
 //! `<div class="section" data-section="{key}">` with its heading anchored at
@@ -17,12 +15,6 @@ use crate::humanfmt::HumanFmt;
 
 use super::fmt::{Count, HtmlEscaped, Level, Nonzero, RelTime, StackBar, Unit, now_epoch};
 
-// ---------------------------------------------------------------------------
-// Table builders — append rows directly via `swrite!`. `Table::cell` needs to
-// inspect a rendered value before emitting it and reuses one scratch buffer
-// for that, so no cell allocates a `String` of its own.
-// ---------------------------------------------------------------------------
-
 pub(super) struct Table {
     out: String,
     /// Reused across cells so [`Table::cell`] can inspect a rendered value
@@ -38,9 +30,8 @@ pub(super) struct Table {
 }
 
 impl Table {
-    /// A table whose columns at `columns` hold figures -- counts, sizes,
-    /// shares -- which are right-aligned (headers included) so the digits of
-    /// consecutive rows line up in the tabular numerals the stylesheet sets.
+    /// A table whose columns at `columns` hold figures, right-aligned
+    /// (headers included) so the digits of consecutive rows line up.
     pub(super) fn numeric(key: &'static str, headers: &[&'static str], columns: &[usize]) -> Self {
         assert!(
             headers.len() <= u64::BITS as usize,
@@ -58,7 +49,6 @@ impl Table {
     /// docs.
     fn build(key: &'static str, headers: &[&'static str], numeric: u64) -> Self {
         // Realistic dashboard tables (Mirrors, Origins) easily exceed 10 KB.
-        // Pre-size to skip the reallocation chain.
         let mut out = String::with_capacity(16 * 1024);
         // The wrapper is what scrolls when the table is wider than its
         // section; without it a wide table forces a page-wide scrollbar.
@@ -270,7 +260,6 @@ pub(super) struct DetailsList {
     /// The wall-clock second every relative time in this list is measured
     /// against, read once so two rows cannot disagree about "now".
     now: i64,
-    /// How many of this list's rows are highlighted; see [`Highlights`].
     highlights: Highlights,
     /// Where this list's rows sit, for their series keys (see
     /// [`Self::scoped`]): empty, or the Metrics group title followed by the
@@ -383,8 +372,7 @@ impl DetailsList {
     /// render in: a row's series key (`data-series`, see [`Entry::figure`])
     /// becomes its path, `Upstream › 2xx › 200 OK`, so the
     /// scripts' activity panel, which lists rows away from their group, can
-    /// tell the upstream "2xx" from the client one, and every key on the page
-    /// is unique by construction rather than by the labels happening to be.
+    /// tell the upstream "2xx" from the client one.
     #[must_use]
     pub(super) fn scoped(mut self, scope: &'static str) -> Self {
         scope.clone_into(&mut self.scope);
@@ -395,8 +383,7 @@ impl DetailsList {
         self.entry(label).value(value);
     }
 
-    /// Like [`Self::row`], but renders the label with a `title` tooltip
-    /// shown when the user hovers over it. See [`Entry::tip`].
+    /// [`Self::row`] with a tooltip (see [`Entry::tip`]).
     pub(super) fn row_tip(
         &mut self,
         label: &'static str,
@@ -520,13 +507,9 @@ pub(super) struct Entry<'a> {
     /// [`Entry::parts`]).
     parts: Option<String>,
     last: Option<u64>,
-    /// A line of context under the value (see [`Entry::note`]).
     note: Option<String>,
     kind: Kind,
-    /// The counter behind the value (see [`Entry::figure`]).
     figure: Option<(u64, Unit)>,
-    /// Whether the page's own background refresh moves the figure (see
-    /// [`Entry::polled`]).
     polled: bool,
 }
 
@@ -597,7 +580,6 @@ impl Entry<'_> {
         self
     }
 
-    /// What kind of figure this is (live, peak, persisted); see [`Kind`].
     pub(super) fn kind(mut self, kind: Kind) -> Self {
         self.kind = kind;
         self
@@ -657,8 +639,6 @@ impl Entry<'_> {
         }
         swrite!(out, ">{label}</dt><dd>{value}</dd>");
         if let Some(tip) = tip {
-            // The title only shows on hover, which a touch screen has not:
-            // the same text behind a disclosure the stylesheet shows there.
             swrite!(
                 out,
                 "<dd class=\"help\"><details><summary title=\"What is this?\">?</summary>{tip}</details></dd>"

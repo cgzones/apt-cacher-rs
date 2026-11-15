@@ -2,25 +2,18 @@
 //! and file totals `cache_quota` reconciles its running tally against.
 //!
 //! Runs at startup (awaited before the listener binds, so nothing is in
-//! flight) and after every cleanup cycle.  The traversal itself belongs to
-//! the shared [`Walker`], and what a directory means at each depth
-//! ([`Level`]) to `cache_tree`, which the dashboard's size walk shares; this
-//! module supplies which subtrees belong to a *different* mirror row
-//! ([`nested_paths_per_row`], shared with cleanup so both agree on where a
-//! mirror's tree ends) and which hold partial downloads (`tmp/`). Those are
-//! tallied like cached files: `cache_quota`
-//! counts the kept partials a failed download leaves behind, which cleanup
-//! reaps only once they age out. The cache root's `.apt-cacher-rs.tmp/` (volatile
-//! scratch files, purged at startup) is not counted.
+//! flight) and after every cleanup cycle.  The partial downloads in `tmp/`
+//! are tallied like cached files: `cache_quota` counts the kept partials a
+//! failed download leaves behind, which cleanup reaps only once they age
+//! out. The cache root's `.apt-cacher-rs.tmp/` (volatile scratch files,
+//! purged at startup) is not counted.
 //!
 //! The scan only counts.  Anything the layout does not allow is reported
-//! through `Entry::report_unexpected` and left on disk.
+//! and left on disk.
 //!
 //! Among the `tmp/` partials it also counts the *orphaned* ones, those no
-//! running download claims (`partial_claim`): resume state of downloads
-//! that failed or were abandoned, which occupies quota until cleanup reaps
-//! it.  A successful scan publishes that figure for the dashboard
-//! (`metrics::ORPHANED_PARTIAL_*`).
+//! running download claims, and a successful scan publishes that figure for
+//! the dashboard.
 
 use std::{net::Ipv6Addr, num::NonZero, path::Path};
 
@@ -56,10 +49,8 @@ pub(crate) enum CacheScanError {
     Sqlx(sqlx::Error),
 }
 
-/// Tally of one scan pass: the bytes counted towards the cache size and the
-/// number of regular files they came from.  The file count is what makes an
-/// `ENOSPC` from inode exhaustion legible next to a modest byte total, and it
-/// is directly comparable with cleanup's `retained`/`removed` file counts.
+/// Tally of one scan pass.  The file count is what makes an `ENOSPC` from
+/// inode exhaustion legible next to a modest byte total.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ScanTotals {
     /// Each file's `cache_quota::accounted_size`, the unit the quota counts in.
@@ -108,10 +99,8 @@ impl std::ops::AddAssign for ScanTotals {
     }
 }
 
-/// The mirror rows sharing one `{host[:port]}` cache directory, keyed by that
-/// directory's name: the resolved host the name came from (so the host-level
-/// `flat/` root is derived once per bucket) and every row that lives under it,
-/// with its nested-mirror boundaries ([`nested_paths_per_row`]).
+/// The mirror rows sharing one `{host[:port]}` cache directory, each with
+/// its nested-mirror boundaries ([`nested_paths_per_row`]).
 struct HostBucket<'a> {
     host: &'a CacheHost,
     port: Option<NonZero<u16>>,
@@ -152,7 +141,6 @@ fn is_legacy_ipv6_dir(name: &str) -> bool {
         })
 }
 
-/// Returns the size in bytes and the file count of the entire cache.
 /// Files that cannot be accessed are not included; a message is logged for each.
 pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, CacheScanError> {
     let config = global_config();
@@ -174,10 +162,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
 
     trace!("Scanning directory `{}`...", cache_path.display());
 
-    // Group mirrors by alias-resolved host directory name once, so each cache
-    // entry is matched via an O(1) HashMap lookup instead of an inner O(m)
-    // scan.  Keys are owned `String`s because the `Cow` from
-    // `format_authority` may borrow from local data (the formatted port).
+    // Keyed by the alias-resolved host directory name.
     let nested = nested_paths_per_row(&mirrors);
     let mut mirrors_by_dir: HashMap<String, HostBucket<'_>> = HashMap::with_capacity(mirrors.len());
     for (mirror, nested) in mirrors.iter().zip(&nested) {
@@ -209,10 +194,6 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
                 {
                     continue;
                 }
-                // A regular file at the cache root is an operator
-                // artefact (the cache root only ever holds host
-                // directories), not a tampering signal — the walker
-                // buckets it separately from FIFO/socket/device entries.
                 entry.report_unexpected("not counting it towards the cache size");
                 continue;
             }
@@ -223,17 +204,14 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
             continue;
         }
 
-        // The HashMap lookup needs a UTF-8 key.  A non-UTF-8 entry could
-        // never match a registered mirror dir (mirror hosts are validated as
-        // ASCII), so it is as unrecognized as an unknown host dir.
+        // A non-UTF-8 entry could never match a registered mirror dir
+        // (mirror hosts are validated as ASCII), so it is as unrecognized as
+        // an unknown host dir.
         let Some(bucket) = entry
             .name()
             .to_str()
             .and_then(|name| mirrors_by_dir.get(name))
         else {
-            // A legacy directory is unexpected disk usage like any other
-            // unmatched one, so it goes through the same report (and metric);
-            // only the consequence names the migration.
             entry.report_unexpected(
                 if entry.name().to_str().is_some_and(is_legacy_ipv6_dir) {
                     "it is a legacy IPv6 cache directory with an unbracketed host name, so its contents are no longer served or counted towards the cache size or disk quota; stop the daemon and verify the original host and port before moving its contents to the current authority directory (bracketed IPv6, or IPv4 for a mapped address), or remove the obsolete directory"
@@ -244,11 +222,8 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
             continue;
         };
 
-        // The bucket is keyed by the alias-resolved host directory's name, so
-        // mirror rows registered under an alias are silently consolidated
-        // under their `main` host directory — the intended layout, not a
-        // per-row anomaly.  Both sides of the assert derive that name, so the
-        // walker's entry and the bucket must name the same directory.
+        // Mirror rows registered under an alias are consolidated under their
+        // `main` host directory: the intended layout, not a per-row anomaly.
         debug_assert_eq!(
             entry.path(),
             paths.host_dir(bucket.host, bucket.port),
@@ -259,12 +234,10 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
             totals += scan_mirror_dir(cache_path, &mirror_dir, mirror, nested).await;
         }
 
-        // The host-level `flat/` subtree is a sibling of mirror dirs.
-        // Scan once per host regardless of how many mirror rows live
-        // under it — flat content is owned at the host level. The confined
-        // walk vets its root itself: an absent one is an empty tree, a
-        // symlink there is reported like any the walk lists, and a
-        // non-directory fails its read.
+        // The host-level `flat/` subtree is a sibling of mirror dirs: scanned
+        // once per host regardless of how many mirror rows live under it.
+        // The confined walk vets its root itself (absent, symlink,
+        // non-directory).
         let flat_path = paths.flat_root(bucket.host, bucket.port);
         let (_outcome, flat_totals) =
             scan_tree(cache_path, &flat_path, &FLAT_WALK, Level::Flat, "", &[]).await;
@@ -280,10 +253,8 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
     }
 }
 
-/// Tally one mirror row's `<host>/<mirror_path>/` tree at `mirror_path`
-/// (`CachePaths::mirror_dir`).  `nested` lists the registered mirror paths
-/// strictly below `mirror.path` on this host (see `nested_paths_per_row`),
-/// which the walk treats as foreign territory.
+/// `nested` lists the registered mirror paths strictly below `mirror.path`
+/// on this host, which the walk treats as foreign territory.
 #[must_use]
 async fn scan_mirror_dir(
     cache_root: &Path,
@@ -304,14 +275,11 @@ async fn scan_mirror_dir(
     .await;
 
     if matches!(outcome, WalkOutcome::RootMissing) {
-        // For a `Flat`-kind row the structured-pool path is expected
-        // not to exist — `kind` latches to `Structured` on the very
-        // first structured request (see `Database::upsert_mirror_id`), so a
-        // `Flat` row has by construction never written to
-        // `<host>/<mirror_path>/`. Logging above debug here would just
-        // add noise on every startup / SIGUSR2 cleanup. For
-        // `Structured` rows the absence is potentially a real
-        // inconsistency, so it warns once there and repeats at info.
+        // For a `Flat`-kind row the structured-pool path is expected not to
+        // exist: `kind` latches to `Structured` on the very first structured
+        // request, so a `Flat` row has never written to
+        // `<host>/<mirror_path>/`. For `Structured` rows the absence is
+        // potentially a real inconsistency.
         if mirror.kind() == MirrorKind::Flat {
             debug!(
                 "Mirror directory `{}` not found (flat-kind mirror, expected)",
@@ -336,16 +304,10 @@ async fn scan_mirror_dir(
     totals
 }
 
-/// Walk one tree tallying regular-file sizes; the [`Level`] tag decides,
-/// per directory, which subdirectories are descended into (`dists/`, `tmp/`,
-/// `by-hash/`, every flat URL-dir: [`classify_dir`]), skipped (nested
-/// mirrors), or reported as unexpected.  `mirror_path` / `nested` only matter at
-/// [`Level::Mirror`].
+/// Walk one tree tallying regular-file sizes.  `mirror_path` / `nested` only
+/// matter at [`Level::Mirror`].
 ///
-/// The walker owns the "Failed to read / iterate / get metadata" lines and
-/// the anomaly counters; a directory-level failure skips that directory's
-/// unread remainder and the walk carries on. `root` is reached from
-/// `cache_root` through directories only (`Walker::confined_to`): a mirror
+/// `root` is reached from `cache_root` through directories only: a mirror
 /// directory replaced by a symlink is reported and counted as empty, so the
 /// quota never counts a tree twice, or one outside the cache.
 #[must_use]
@@ -369,8 +331,6 @@ async fn scan_tree(
                 };
                 let size = accounted_size(mdata.len());
                 totals.add_file(size);
-                // A partial no running download holds: its download failed
-                // or was abandoned, and cleanup reaps it once it ages out.
                 if entry.tag() == Level::Tmp
                     && entry
                         .name()
@@ -387,16 +347,7 @@ async fn scan_tree(
                 }
             }
             EntryKind::Dir => match classify_dir(entry.tag(), entry.name()) {
-                // `dists/` and the partial downloads in `tmp/` of a mirror
-                // directory; inside the host-level `flat/` subtree every
-                // directory (the URL path is the on-disk path verbatim),
-                // its `tmp/` holding the flat partial downloads.
                 DirRole::Layout(level) => entry.descend(level),
-                // A subdir that is itself a registered mirror path under the
-                // same host (e.g. `debian/security` when scanning `debian`)
-                // is silently skipped -- it'll be walked under its own mirror
-                // row.  Flat repositories live under `<host>/flat/`
-                // (host-level sibling of mirror dirs), not below any mirror.
                 DirRole::MirrorSubdir => classify_mirror_subdir(&entry, mirror_path, nested),
                 DirRole::Stray => entry
                     .report_unexpected("not counting it or its contents towards the cache size"),
@@ -407,9 +358,10 @@ async fn scan_tree(
     (walker.finish(), totals)
 }
 
-/// Decide what an unknown directory directly under `<host>/<mirror_path>/`
-/// is: a nested mirror's territory (skipped silently), the container of one
-/// (also silent), or a stray directory (reported).
+/// A subdir that is itself a registered mirror path under the same host
+/// (e.g. `debian/security` when scanning `debian`), or the container of one,
+/// is silently skipped: it is walked under its own mirror row. Anything
+/// else is a stray directory and reported.
 fn classify_mirror_subdir(entry: &Entry<'_, Level>, mirror_path: &str, nested: &[String]) {
     let Some(name_str) = entry.name().to_str() else {
         entry.report_unexpected("not counting it or its contents towards the cache size");
@@ -475,8 +427,6 @@ mod tests {
         }
     }
 
-    /// Kept partials are disk usage the quota counts, so the scan tallies
-    /// the `tmp/` below a mirror and the ones inside the flat tree.
     #[tokio::test]
     async fn scan_tallies_the_partials_in_tmp() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -500,9 +450,6 @@ mod tests {
         );
     }
 
-    /// A partial a running download claims is live resume state, not an
-    /// orphan; both count towards the cache size alike. A file in `tmp/`
-    /// that is no partial, and a `.partial` outside `tmp/`, are no orphans.
     #[tokio::test]
     async fn only_unclaimed_partials_in_tmp_are_orphans() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -528,9 +475,6 @@ mod tests {
     }
 }
 
-/// The scan's totals on a mixed tree, pinned: the layout rules moved into
-/// `cache_tree`, which the dashboard's walk shares, and the quota must keep
-/// counting exactly what it counted before.
 #[cfg(test)]
 mod layout_totals_tests {
     use super::*;
@@ -585,8 +529,6 @@ mod layout_totals_tests {
         assert_eq!(totals.orphaned_files, 1);
     }
 
-    /// A mirror directory replaced by a symlink is reported and counted as
-    /// empty: the quota never counts a tree twice, or one outside the cache.
     #[tokio::test]
     async fn a_mirror_directory_behind_a_symlink_counts_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -599,11 +541,8 @@ mod layout_totals_tests {
         assert_eq!(metrics::CACHE_NON_REGULAR.get(), before + 1);
     }
 
-    /// The host-level flat root is walked without a probe first: the
-    /// confined walk counts an absent root as an empty tree, reports a
-    /// symlink there like any listed one (`CACHE_NON_REGULAR`) and a
-    /// regular file as an unreadable directory (`CACHE_IO_FAILURE`), and
-    /// counts nothing behind either.
+    /// An absent root is an empty tree, a symlink there is reported as
+    /// non-regular and a regular file as an unreadable directory.
     #[tokio::test]
     async fn the_flat_root_is_vetted_by_its_walk() {
         let dir = tempfile::tempdir().expect("tempdir");

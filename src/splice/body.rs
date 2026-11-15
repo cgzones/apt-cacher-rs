@@ -1,27 +1,13 @@
 //! Body transfer for the splice proxy: the zero-copy loop
 //! [`splice_proxy_body`] (socket -> pipe -> tee -> client + cache file) and
-//! the userspace-TLS loop [`splice_proxy_body_tls`], both keeping only their
-//! read and deliver steps while every shared piece lives on [`BodyTransfer`]
-//! and comes back as [`BodyOutcome`]. Also owns client demotion to file
-//! serving ([`write_client_or_demote`], [`prepare_file_serve`],
-//! [`ClientEnd::Demoted`]) on either trigger, `min_download_rate` or the
-//! [`DemotionFloor`] that frees a slow client's upstream slot, the
-//! [`SpliceRangeFilter`] applied to the client
-//! stream, [`DownloadFailure`]/[`DeliveryFailure`] attribution, and the
-//! pipe and `/dev/null` helpers ([`create_pipe`], [`SplicePipes::discard_duplicate`],
-//! [`drain_pipe_to_file`], [`range_slice`]). [`CacheBatch`] is both loops'
-//! policy for when received bytes reach the cache file, over the zero-copy
-//! loop's `pipe_B` ([`PipeSink`]) or the userspace loop's read buffer
-//! ([`BufferSink`]).
+//! the userspace-TLS loop [`splice_proxy_body_tls`], sharing [`BodyTransfer`],
+//! plus client demotion to file serving and [`CacheBatch`], both loops'
+//! policy for when received bytes reach the cache file.
 //!
 //! Both loops also run client-less: an absent client (the parallel-hack
 //! nudge's detached download, `super::detached`) starts the transfer in
 //! [`ClientStatus::Absent`], which every client-facing step already treats
 //! as cache-only.
-//!
-//! Consumers: the drive in `mod.rs` (body loops, `range_slice`, the outcome
-//! and handle types) and `super::detached` (the client-less form plus
-//! [`super::transfer_body`]).
 
 use std::{
     future::Future as _,
@@ -70,9 +56,7 @@ pub(super) struct SpliceRangeFilter {
 
 impl SpliceRangeFilter {
     /// The next client-range edge past body offset `at`, and whether the
-    /// bytes from `at` up to it are the client's. One decision yields both,
-    /// so a batch capped at the edge is classified by the very value that
-    /// bounds it: it lies wholly inside the range or wholly outside.
+    /// bytes from `at` up to it are the client's.
     const fn next_edge(self, at: u64) -> (u64, bool) {
         let range_end = self.skip + self.send;
         if at < self.skip {
@@ -89,22 +73,14 @@ impl SpliceRangeFilter {
 /// We increase it to 1 MiB to reduce the number of splice syscall pairs needed.
 const PIPE_BUFFER_SIZE: i32 = 1024 * 1024;
 
-/// Cadence of the upstream rate-check tick in `splice_proxy_body_tls`'s
-/// read loop.
 const RATE_TICK_PERIOD: Duration = Duration::from_secs(1);
 
-/// Process-wide write-only handle to `/dev/null` used by [`SplicePipes::discard_duplicate`] as the
-/// destination of `splice(2)` calls that discard pipe contents.
-///
-/// Opened lazily on first use; held for the lifetime of the process. The fd is
-/// `O_NONBLOCK` so `splice(2)` never parks a Tokio runtime thread when the pipe
-/// has data ready — `/dev/null` accepts any amount instantly, so the syscall
-/// either returns the bytes-moved count or `EAGAIN` (only the pipe side can
-/// stall).
+/// Write-only `/dev/null`, the destination of the `splice(2)` calls that
+/// discard pipe contents. `O_NONBLOCK` so `splice(2)` never parks a Tokio
+/// runtime thread: `/dev/null` accepts any amount instantly, so only an
+/// empty pipe yields `EAGAIN`.
 static DEV_NULL: OnceLock<std::fs::File> = OnceLock::new();
 
-/// Return a shared, lazily-opened handle to `/dev/null`. The first call opens
-/// the file; subsequent calls return the cached handle.
 fn dev_null() -> std::io::Result<&'static std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -122,13 +98,13 @@ fn dev_null() -> std::io::Result<&'static std::fs::File> {
     Ok(DEV_NULL.get_or_init(|| f))
 }
 
-/// Create a pipe and optionally increase its buffer size.
+/// Create a pipe and try to grow its buffer to `PIPE_BUFFER_SIZE`.
 fn create_pipe() -> std::io::Result<(pipe::Sender, pipe::Receiver)> {
     use nix::fcntl::{FcntlArg, fcntl};
 
     let (sender, receiver) = pipe::pipe()?;
 
-    // Try to increase pipe buffer size; ignore failure (non-fatal, just fewer bytes per round-trip)
+    // A failed resize is non-fatal: just fewer bytes per round trip.
     static_assert!(PIPE_BUFFER_SIZE > 0);
     if let Err(errno) = fcntl(sender.as_fd(), FcntlArg::F_SETPIPE_SZ(PIPE_BUFFER_SIZE)) {
         // `EPERM` is the kernel's quota answer for an unprivileged user: the
@@ -155,8 +131,7 @@ fn create_pipe() -> std::io::Result<(pipe::Sender, pipe::Receiver)> {
 }
 
 // Force-clear Tokio's cached readiness on a pipe end. See
-// `sendfile_conn::clear_tcp_writable_cache` for the rationale (the TCP
-// variants live there so the sendfile path can share them).
+// `sendfile_conn::clear_tcp_writable_cache` for the rationale.
 
 fn clear_pipe_readable_cache(receiver: &pipe::Receiver) {
     let _ignore = receiver.try_io(|| -> std::io::Result<()> { Err(ErrorKind::WouldBlock.into()) });
@@ -166,15 +141,10 @@ fn clear_pipe_writable_cache(sender: &pipe::Sender) {
     let _ignore = sender.try_io(|| -> std::io::Result<()> { Err(ErrorKind::WouldBlock.into()) });
 }
 
-// ---------------------------------------------------------------------------
-// Socket-to-socket splice proxy
-// ---------------------------------------------------------------------------
-
 use crate::transfer_error::{
     CacheError, ClientError, DeliveryFailure, Descriptors, DownloadFailure, EndsDelivery as _,
     InternalError, MixedFailure, ReportedDelivery, UpstreamError, classify_mixed_descriptor,
 };
-/// File delivery tasks return their byte progress and owned terminal cause.
 use crate::transfer_error::{DeliveryEnd, TransferOutcome};
 
 /// The demoted file-serve task: its bytes and the delivery end it concluded.
@@ -184,10 +154,9 @@ fn upstream_io(err: std::io::Error) -> DownloadFailure {
     UpstreamError::io("splice upstream body read", err).into()
 }
 
-/// Terminal splice errors involve both descriptors. The shared errno table
-/// attributes the socket's errnos to the upstream; everything else retains
-/// the operation. This direction writes into the pipe, so `EPIPE` names that
-/// destination.
+/// A splice error can come from either descriptor: the shared errno table
+/// attributes the socket's errnos to the upstream. This direction writes
+/// into the pipe, so `EPIPE` names that destination.
 fn upstream_splice_failure(errno: nix::errno::Errno) -> DownloadFailure {
     match classify_mixed_descriptor(errno, Descriptors::SocketToPipe) {
         MixedFailure::Socket(error) => UpstreamError::io("splice upstream socket", error).into(),
@@ -224,8 +193,7 @@ fn client_splice_failure(errno: nix::errno::Errno) -> DeliveryFailure {
 /// keeps its read blocked until the cache-only remainder of the download
 /// finishes and the connection task drops the socket.
 ///
-/// `shutdown(2)` is not readiness-gated, so no `try_io` dance is needed, and
-/// its result is discarded: every path reaching here ends as
+/// The result is discarded: every path reaching here ends as
 /// `SpliceProxyOutcome::ClientLost`, which closes the connection anyway.
 /// Not `sendfile_conn::graceful_close`: that one also drains the read side
 /// and is for a connection the task is about to drop, while this one runs
@@ -240,13 +208,11 @@ fn internal_io(err: std::io::Error) -> DownloadFailure {
     InternalError::io("splice pipe operation", err).into()
 }
 
-/// The client a body transfer starts with, as `transfer_body` sees it.
+/// The client a body transfer starts with.
 ///
-/// Only `Attached` arms the client-side accounting (`BodyTransfer::counter`,
-/// `client_rate_checker`) and puts a socket where
-/// [`ClientStatus::client_to_write`] can find it; the other two run the loop
-/// cache-only from the first chunk and differ only in what they mean at the
-/// end ([`ClientEnd`]).
+/// Only `Attached` arms the client-side accounting and has a socket to
+/// write to; the other two run the loop cache-only from the first chunk and
+/// differ only in how the transfer ends ([`ClientEnd`]).
 #[derive(Clone)]
 pub(super) enum BodyClient<'a> {
     /// The connection's client, still receiving, and who it is (a
@@ -256,15 +222,13 @@ pub(super) enum BodyClient<'a> {
     /// and the download runs detached.
     Absent,
     /// A header or prefix write already failed and was concluded: its
-    /// response is short and nothing more may be written to it. The loop
-    /// starts in [`ClientStatus::Aborted`] and the transfer ends as
-    /// [`ClientEnd::Aborted`].
+    /// response is short and nothing more may be written to it.
     Aborted(ReportedDelivery),
 }
 
 impl BodyClient<'_> {
     /// How the transfer ends when no body loop runs at all (the whole body
-    /// was in the prefix): whatever this client was, it still is.
+    /// was in the prefix).
     pub(super) fn settled(self) -> ClientEnd {
         match self {
             Self::Attached(_, _) => ClientEnd::Served,
@@ -274,11 +238,9 @@ impl BodyClient<'_> {
     }
 }
 
-/// How the client came out of a body transfer: the one thing the drive still
-/// has to resolve before it can reuse the connection, and the only form the
-/// demoted file-serve task's handle travels in.
+/// How the client came out of a body transfer.
 ///
-/// The handle is awaited in exactly one place, `commit::ClientSettlement::settle`,
+/// A `Demoted` handle is awaited only in `commit::ClientSettlement::settle`,
 /// which exists only after `DownloadBarrier::begin_rename` dropped the watch
 /// sender the task may be parked on; awaiting it anywhere a `DownloadBarrier`
 /// is still owned would wait for a wake-up that cannot come.
@@ -304,9 +266,9 @@ struct CacheFile {
     _write_lease: Arc<DownloadWriteLease>,
 }
 
-/// The single append owner: the file cursor, pending batch bytes, digest and
-/// write lease travel together. All direct writes flush earlier batched
-/// bytes internally; policy flushes retain the existing batching thresholds.
+/// The single append owner of the cache file: cursor, pending batch bytes,
+/// digest and write lease. A direct write first flushes the batched bytes
+/// that precede it.
 pub(super) struct CacheWriter {
     core: CacheWriterCore,
     sink: CacheSink,
@@ -340,7 +302,7 @@ impl std::ops::DerefMut for CacheWriter {
 }
 
 /// Typed borrow of the active sink. The owner retains the sink across failure
-/// and cancellation so the existing salvage path can still land its bytes.
+/// and cancellation so the salvage path can still land its bytes.
 pub(super) struct CacheWriterRef<'a, S> {
     core: &'a mut CacheWriterCore,
     sink: &'a mut S,
@@ -501,20 +463,19 @@ impl CacheWriter {
         self.view().write_cache_chunk(buf).await
     }
 
-    /// Preserve received bytes on failure, at the one exit of either body
-    /// loop. They were consumed from the upstream socket, so nothing delivers
-    /// them again; without this the `.partial` a later attempt resumes from
-    /// would be short of what was received.
+    /// Preserve received bytes on failure. They were consumed from the
+    /// upstream socket, so nothing delivers them again; without this the
+    /// `.partial` a later attempt resumes from would be short of what was
+    /// received.
     ///
-    /// The pipe owner resolves duplicate bytes before appending the remaining
-    /// unique tail; the read buffer lands only its unwritten tail, so nothing
-    /// lands twice. The cache file keeps its write lease even when the barrier
-    /// has already published an abort. The barrier is not pinged: the guarded
-    /// runner already retained the failure and will publish it after salvage,
-    /// or on cancellation. Nothing is counted either: the bytes were counted
-    /// as downloaded when they arrived, whether or not `note_chunk` got to
-    /// run. A failed salvage is reported here and does not replace the
-    /// transfer's own error.
+    /// Nothing lands twice: the pipe owner resolves duplicate bytes before
+    /// appending the unique tail, and the read buffer lands only its
+    /// unwritten tail. The cache file keeps its write lease even when the
+    /// barrier has already published an abort. The barrier is not pinged
+    /// (the guarded runner publishes the retained failure after salvage, or
+    /// on cancellation) and nothing is counted (the bytes were counted as
+    /// downloaded when they arrived). A failed salvage is reported here and
+    /// does not replace the transfer's own error.
     pub(super) async fn salvage(&mut self) {
         let landed = match std::mem::replace(&mut self.sink, CacheSink::Direct) {
             CacheSink::Direct => Ok(()),
@@ -689,23 +650,21 @@ impl CacheWriterRef<'_, CacheBatch<BufferSink>> {
 /// A client paces the whole download until it is demoted (the loops pull
 /// from upstream only as fast as they push to the client), and the download
 /// holds one global `max_upstream_downloads` slot until `begin_rename`. A
-/// client reading just above `min_download_rate` therefore pinned a slot for
-/// its whole slow transfer: a handful of them starved every other client's
-/// cache miss into a 503. The `min_download_rate` demotion cannot catch it,
-/// since that client passes the check, and the upstream checker measures
-/// the same paced rate. Demoted, the client keeps reading the growing cache
-/// file from its own task, and the download finishes at the mirror's pace.
+/// few clients reading just above `min_download_rate` would so pin the
+/// slots for their whole slow transfers and starve every other client's
+/// cache miss into a 503; the upstream checker cannot catch them, since it
+/// measures the same paced rate. Demoted, the client keeps reading the
+/// growing cache file from its own task, and the download finishes at the
+/// mirror's pace.
 ///
-/// The reference is the mirror's peak throughput (`mirror_perf`), which
-/// neither this transfer nor any other slow client's paced download can
-/// drag down. Without one (no download of 1 MiB or more from the mirror has
-/// committed since start) there is no floor. The window is
-/// `rate_check_timeframe`, so a body the client finishes within it is never
-/// floor-demoted; `min_download_rate` being disabled does not disarm it.
-/// A demotion costs the client little (the same bytes, from the page
-/// cache), so the divisor only has to keep clients near the mirror's pace
-/// out of it, while a client a whole order of magnitude below the peak
-/// is demoted.
+/// The reference is the mirror's peak throughput (`mirror_perf`), which no
+/// slow client's paced download can drag down. Without one (no download of
+/// 1 MiB or more from the mirror has committed since start) there is no
+/// floor. The window is `rate_check_timeframe`, so a body the client
+/// finishes within it is never floor-demoted; `min_download_rate` being
+/// disabled does not disarm it. A demotion costs the client little (the
+/// same bytes, from the page cache), so the divisor only has to keep
+/// clients near the mirror's pace out of it.
 struct DemotionFloor {
     /// Checks the client against `peak / PEAK_DIVISOR`.
     checker: RateChecker,
@@ -796,53 +755,36 @@ impl std::fmt::Display for DemoteTrigger {
     }
 }
 
-/// Per-body bookkeeping shared by the two body loops.
-///
-/// [`splice_proxy_body`] (zero-copy splice/tee) and [`splice_proxy_body_tls`]
-/// (userspace reads into its batch buffer) differ only in how they pull a chunk
-/// from upstream and how they hand it to the cache file and the client.
-/// Everything around that -- the client-download accounting, the rate
-/// checkers (upstream, client, [`DemotionFloor`]), the upstream-rate gate,
-/// the byte cursors, the client state machine and the demotion hand-off --
-/// lives here so it exists once.
+/// Per-body bookkeeping shared by the two body loops, which differ only in
+/// how they pull a chunk from upstream and hand it to the cache file and the
+/// client.
 ///
 /// A client-less transfer ([`BodyClient::Absent`], [`BodyClient::Aborted`])
 /// starts the state machine in the matching [`ClientStatus`] with the
 /// client-side accounting (`counter`, `client_rate_checker`,
-/// `demotion_floor`) unarmed; the
-/// socket itself is reachable only through [`ClientStatus::client_to_write`],
-/// so the client-less form needs no arms of its own.
-///
-/// Built by the caller (`transfer_body` in `mod.rs`) from the body's
-/// geometry and handed to one of the two loops by value; it comes back as
-/// the [`BodyOutcome`].
+/// `demotion_floor`) unarmed; the socket itself is reachable only through
+/// [`ClientStatus::client_to_write`], so the client-less form needs no arms
+/// of its own.
 pub(super) struct BodyTransfer<'a, S = CacheSink> {
-    /// Dropped at the demotion transition so the spawned
-    /// `serve_remaining_from_file` task's own `ClientDownload` (in
-    /// `async_sendfile_unfinished`) takes over the accounting cleanly; see
-    /// [`Self::maybe_demote`]. `Option` because it is taken exactly once --
-    /// and `None` from the start for a client-less transfer, which ships no
-    /// bytes to any client and so must not bump `ACTIVE_CLIENT_DOWNLOADS`.
+    /// Dropped at the demotion transition, where the spawned file-serve
+    /// task's own `ClientDownload` (in `async_sendfile_unfinished`) takes
+    /// over the accounting. `None` from the start for a client-less
+    /// transfer, which must not bump `ACTIVE_CLIENT_DOWNLOADS`.
     counter: Option<client_counter::ClientDownload>,
     cache: CacheWriterRef<'a, S>,
     barrier: &'a mut DownloadBarrier,
     rate_checker: Option<RateChecker>,
     client_rate_checker: Option<RateChecker>,
-    /// The second client checker, against the mirror's peak throughput
-    /// rather than `min_download_rate`; `None` without an attached client or
-    /// a known peak, or when the floor would not reach above
-    /// `min_download_rate`.
     demotion_floor: Option<DemotionFloor>,
     /// Body bytes still to be pulled from upstream.
     remaining: u64,
     client_status: ClientStatus<'a>,
     /// Body bytes pulled from upstream so far (the next chunk starts here).
     bytes_done: u64,
-    /// Absolute cache-file offset of the next byte the client expects.
-    /// Maintained together with `client_remaining` across the tee and
-    /// userspace delivery paths so that on demotion the file-serve task
-    /// gets the exact resume point and length regardless of resume offset,
-    /// body-prefix advance, or 206 range filtering.
+    /// Absolute cache-file offset of the next byte the client expects: with
+    /// `client_remaining`, the exact resume point and length a demotion
+    /// hands to the file-serve task, whatever the resume offset, body-prefix
+    /// advance or 206 range filtering.
     client_file_pos: u64,
     /// Bytes still owed to the client.
     client_remaining: u64,
@@ -855,7 +797,6 @@ pub(super) struct BodyTransfer<'a, S = CacheSink> {
 
 /// What a body loop hands back to `splice_proxy`.
 pub(super) struct BodyOutcome {
-    /// How the client came out of the loop.
     pub(super) client: ClientEnd,
     /// Bytes this loop delivered to the client.
     pub(super) client_bytes: u64,
@@ -864,8 +805,6 @@ pub(super) struct BodyOutcome {
 impl<'a> BodyTransfer<'a> {
     /// `content_length` is the byte count the loop has to pull from
     /// upstream; the cache writer supplies its starting file offset.
-    /// `mirror_peak` is the mirror's peak throughput, the reference of the
-    /// [`DemotionFloor`] an attached client gets.
     pub(super) fn new(
         client: BodyClient<'a>,
         cache: &'a mut CacheWriter,
@@ -877,12 +816,10 @@ impl<'a> BodyTransfer<'a> {
     ) -> Self {
         let file_start_offset = cache.position();
         let rate_checker = RateChecker::from_config(config);
-        // `REQUESTS_SPLICE` is bumped by `splice_proxy` alongside the
-        // response-headers emission (next to `record_client_status`), since
-        // the body loops are skipped when the entire response fits in the
-        // body prefix and we still need to count it. A transfer that ships
-        // no bytes to any client has nothing to account for and must not
-        // bump `ACTIVE_CLIENT_DOWNLOADS`.
+        // A transfer that ships no bytes to any client must not bump
+        // `ACTIVE_CLIENT_DOWNLOADS`. (`REQUESTS_SPLICE` is counted by
+        // `splice_proxy` with the response headers, since the body loops are
+        // skipped when the whole response fits in the body prefix.)
         let (counter, client_rate_checker, demotion_floor, client_status, peer) = match client {
             BodyClient::Attached(stream, peer) => (
                 Some(client_counter::ClientDownload::new()),
@@ -1022,12 +959,9 @@ impl<'a, S: CacheMode> BodyTransfer<'a, S> {
     /// between arriving and being noted, and the exit salvage that lands it
     /// then must not have to know whether it was counted.
     ///
-    /// The upstream RC is fed up-front (the bytes have already arrived) so
-    /// any `check_fail` later in this iteration -- in particular the
-    /// `DemoteRequested` adjudication in [`Self::maybe_demote`] -- sees the
-    /// freshest window. Without this the upstream RC would still be one
-    /// chunk behind the client RC at the moment a slow upstream causes the
-    /// client check to trip.
+    /// The upstream RC is fed up-front so the `DemoteRequested` adjudication
+    /// in [`Self::maybe_demote`] later in this iteration sees the freshest
+    /// window, not one a chunk behind the client RC's.
     fn note_chunk(&mut self, got: usize) -> Range<u64> {
         if let Some(ref mut rate_checker) = self.rate_checker {
             rate_checker.add(got);
@@ -1077,8 +1011,7 @@ impl<'a, S: CacheMode> BodyTransfer<'a, S> {
         self.client_status = ClientStatus::DemoteRequested { client, trigger };
     }
 
-    /// Only this delivery stops; upstream and cache progress retain their
-    /// owner. The one sink for a delivery the body loops end.
+    /// Only this delivery stops; the download continues cache-only.
     fn abort_client(&mut self, failure: DeliveryFailure) {
         // The response is short from here on: half-close so the peer stops
         // waiting for the promised length instead of blocking until the
@@ -1133,15 +1066,12 @@ impl<'a, S: CacheMode> BodyTransfer<'a, S> {
     /// Adjudicate a `DemoteRequested` client: no-op in every other state.
     ///
     /// Slow upstream is the most common reason the client RC trips, so the
-    /// upstream rate is checked first and its typed upstream-rate failure
-    /// surfaces the root cause instead of spinning up a doomed demoted
-    /// file-serve task. Only when the upstream is healthy is the client
-    /// really the bottleneck: accounting is handed to the spawned task (its
-    /// `async_sendfile_unfinished` creates its own `ClientDownload`, so net
-    /// `ACTIVE_CLIENT_DOWNLOADS` stays at 1 across the transition). A
-    /// [`DemotionFloor`] trigger passes through the same check, which the
-    /// loop's next iteration would run anyway: the floor never ends a
-    /// download the upstream checker would have let go on.
+    /// upstream rate is checked first and its failure surfaces the root
+    /// cause instead of spinning up a doomed file-serve task. Only when the
+    /// upstream is healthy is the client really the bottleneck: accounting
+    /// is handed to the spawned task (its `async_sendfile_unfinished`
+    /// creates its own `ClientDownload`, so `ACTIVE_CLIENT_DOWNLOADS` stays
+    /// at 1 across the transition).
     fn maybe_demote(&mut self) -> Result<(), DownloadFailure> {
         let ClientStatus::DemoteRequested { client, trigger } = self.client_status else {
             return Ok(());
@@ -1256,8 +1186,8 @@ impl BodyTransfer<'_, SplicePipes> {
     /// to write: absent, gone or demoted, or the bytes are outside its
     /// Range). They join the `pipe_B` batch and land under the
     /// [`CacheBatch`] policy, like a teed batch: draining `pipe_A` straight
-    /// to the file cost one blocking-pool round trip per batch, and a batch
-    /// ends at every `EAGAIN`, a few KiB apart on a trickling upstream.
+    /// to the file would cost one blocking-pool round trip per batch, and a
+    /// batch ends at every `EAGAIN`, a few KiB apart on a trickling upstream.
     async fn write_cache_only(&mut self, got: usize) -> Result<(), DownloadFailure> {
         let mut remaining = got;
         while remaining > 0 {
@@ -1317,10 +1247,8 @@ pub(super) async fn splice_proxy_body(
 /// The batch loop of [`splice_proxy_body`]: pull a batch from upstream into
 /// `pipe_A`, fan it out, repeat until the body is exhausted.
 ///
-/// Split out so that every way the loop can fail -- the upstream-rate gate,
-/// the rated park, a terminal splice error, a client or cache failure inside
-/// the fan-out -- returns through the one [`CacheWriter::salvage`] at the call
-/// site. No failure path in here has to remember what either pipe holds.
+/// Every failure returns straight out; the caller's [`CacheWriter::salvage`]
+/// lands whatever either pipe still holds.
 async fn drive_batches(
     xfer: &mut BodyTransfer<'_, SplicePipes>,
     upstream: &TcpStream,
@@ -1335,12 +1263,7 @@ async fn drive_batches(
         // Cap the batch at the next client-range edge so a batch is either
         // wholly inside or wholly outside the range: a tee moves a whole
         // batch, so one reaching across an edge could not be split between
-        // the client and the cache. The edge and the batch's side of it come
-        // from one decision. `bytes_done` does not move during the
-        // accumulation -- `note_chunk` runs once, after it -- so the cap is
-        // computed here. For a non-Range transfer (`skip == 0`, `send`
-        // spanning the whole splice region) the edge is the end of the body
-        // and the cap is `min(remaining, PIPE_BUFFER_SIZE)`.
+        // the client and the cache.
         let (edge, in_range) = range_filter.next_edge(xfer.bytes_done);
         static_assert!(PIPE_BUFFER_SIZE > 0 && (PIPE_BUFFER_SIZE as u64) < usize::MAX as u64);
         #[expect(
@@ -1352,29 +1275,27 @@ async fn drive_batches(
             .min(PIPE_BUFFER_SIZE as u64)
             .min(edge - xfer.bytes_done) as usize;
 
-        // Step 1: splice upstream → pipe_A, accumulating until the socket runs
-        // dry or the batch cap is reached.
+        // Step 1: splice upstream -> pipe_A, accumulating until the socket
+        // runs dry or the batch cap is reached.
         // Both fds are non-blocking; splice() never waits on I/O and reads
         // kernel buffer state directly rather than Tokio's userspace ready-flag.
-        // Try the syscall optimistically and only park on EAGAIN — that way the
+        // Try the syscall optimistically and only park on EAGAIN: that way the
         // rated wait (with its rc.add(0) ticks and http_timeout budget) only
         // runs when we're actually about to park, instead of being cancelled
         // mid-flight by `select!` on every busy iteration.
         //
-        // Accumulating is what keeps the fan-out off the per-read treadmill:
-        // a busy socket hands back one segment's worth per splice(2), so one
+        // Accumulating keeps the fan-out off the per-read treadmill: a busy
+        // socket hands back one segment's worth per splice(2), so one
         // fan-out per splice would mean one tee, one blocking-pool
         // splice-to-file and one client splice per segment. Never park to
-        // fill the pipe, though -- the
-        // EAGAIN-with-bytes break below is what keeps the loop streaming
-        // instead of turning a sub-cap download into store-and-forward.
+        // fill the pipe, though: the EAGAIN-with-bytes break below keeps the
+        // loop streaming instead of turning a sub-cap download into
+        // store-and-forward.
         //
         // A terminal error simply returns, whatever the batch already holds:
-        // the bytes in `pipe_A` were consumed from the socket, and the
-        // caller's `CacheWriter::salvage` lands them in the `.partial` on the
-        // way out. That is why EOF is reported at once instead of fanning the
-        // partial batch out first -- the client's response is truncated either
-        // way, and the cache file is what a later attempt resumes from.
+        // the caller's `CacheWriter::salvage` lands the bytes in `pipe_A` in
+        // the `.partial`. That is why EOF is reported at once instead of
+        // fanning the partial batch out first.
         let mut got: usize = 0;
         loop {
             let budget = batch_cap - got;
@@ -1399,10 +1320,7 @@ async fn drive_batches(
                 }
                 Err(nix::errno::Errno::EINTR) => continue,
                 // The socket ran dry and the batch already holds bytes: fan
-                // them out now instead of parking. With `got == 0` this falls
-                // through to the park arm below, so the rated wait keeps
-                // exactly its old meaning -- it runs when the transfer is
-                // genuinely stalled, never mid-batch.
+                // them out now instead of parking.
                 Err(nix::errno::Errno::EAGAIN) if got > 0 => break,
                 // EAGAIN/EWOULDBLOCK: see module-level static_assert.
                 Err(nix::errno::Errno::EAGAIN) => {
@@ -1413,11 +1331,8 @@ async fn drive_batches(
                     // *during* the park, not merely checked before it, so a
                     // client joining a long stall never reads a file more
                     // than `MAX_BATCH_AGE` behind. The flush restarts the
-                    // rated wait, so its http_timeout then counts from the
-                    // flush rather than the last byte; that happens at most
-                    // once per park (the batch is empty afterwards) and
-                    // within `MAX_BATCH_AGE` of the park's start, which
-                    // bounds the slack by the same constant.
+                    // rated wait, at most once per park, so its http_timeout
+                    // slack is bounded by the same constant.
                     clear_tcp_readable_cache(upstream);
                     clear_pipe_writable_cache(&xfer.cache.pipes().upstream_tx);
                     let batch_is_stale = tokio::select! {
@@ -1457,13 +1372,10 @@ async fn drive_batches(
         );
 
         if xfer.batch_to_client(chunk.end, edge, in_range) {
-            // Chunk is entirely inside client range — normal tee
             tee_and_splice(xfer, got).await?;
             xfer.maybe_demote()?;
         } else {
-            // Chunk is entirely outside the client range, or the client is
-            // absent/gone/demoted — cache only. `pipe_A` holds exactly the
-            // batch.
+            // Outside the client range, or no client to write: cache only.
             xfer.write_cache_only(got).await?;
         }
     }
@@ -1473,7 +1385,7 @@ async fn drive_batches(
 
 /// Writes `buf[range]` to the cache file via pwrite at the specified offset.
 /// The blocking job owns both its buffer and a file handle even if the awaiting
-/// future is cancelled. Return that handle through retries to avoid re-cloning.
+/// future is cancelled.
 ///
 /// The only digest update site, shared by prefixes, buffered bodies and the
 /// userspace loop's batches. The job that completes the write also hashes
@@ -1578,18 +1490,9 @@ async fn pwrite_buf_to_file(
 /// into the page cache exactly like `pwrite` -- so the direct form saves
 /// three syscalls per chunk.
 ///
-/// The read buffer is this loop's [`CacheBatch`] ([`BufferSink`]): every
-/// read appends to it, the client gets each read's bytes at once, and the
-/// cache file gets them when the batch is due, under the same policy as the
-/// zero-copy loop's `pipe_B`. While the link is slower than the proxy a
-/// read returns about one 16 KiB TLS record, so landing every read cost one
-/// blocking-pool `pwrite` per record; batched, it is one per
-/// [`CacheBatch::FLUSH_THRESHOLD`] plus the policy's early flushes.
-///
-/// Same exit shape as [`splice_proxy_body`]: the read loop returns the
-/// moment it sees an error, and the one exit here lands whatever the batch
-/// still holds ([`CacheWriter::salvage`]). The batch lands only its
-/// unwritten tail, so salvage can never write a byte twice.
+/// The read buffer is this loop's [`CacheBatch`] ([`BufferSink`]): the
+/// client gets each read's bytes at once, and the cache file gets them when
+/// the batch is due, under the same policy as the zero-copy loop's `pipe_B`.
 ///
 /// On error the upstream is left mid-message (fewer than `content_length`
 /// bytes consumed), so its socket still holds undelivered bytes -- the caller
@@ -1609,8 +1512,7 @@ pub(super) async fn splice_proxy_body_tls(
 /// repeat until the body is exhausted.
 ///
 /// Every failure returns straight out, leaving the not-yet-written bytes in
-/// the batch for the caller's [`CacheWriter::salvage`]; nothing in here has
-/// to remember them.
+/// the batch for the caller's [`CacheWriter::salvage`].
 async fn drive_reads(
     xfer: &mut BodyTransfer<'_, CacheBatch<BufferSink>>,
     upstream: &mut UpstreamConn,
@@ -1619,9 +1521,8 @@ async fn drive_reads(
     let range_filter = xfer.range_filter;
 
     // One pinned re-armable sleep per body for the http_timeout deadline
-    // and one for the 1 s rate-check tick — the previous version built two
-    // fresh `Timeout` futures per chunk (see `wait_socket_rated` for the
-    // same pattern and rationale).
+    // and one for the rate-check tick, instead of two fresh `Timeout`
+    // futures per chunk (see `wait_socket_rated` for the rationale).
     let outer = tokio::time::sleep(config.http_timeout);
     tokio::pin!(outer);
     let tick = tokio::time::sleep(RATE_TICK_PERIOD);
@@ -1664,8 +1565,8 @@ async fn drive_reads(
                 // Bytes in hand: probe the stream once and hand them on the
                 // moment it runs dry. One `poll_read` on a `TlsStream` yields
                 // about one 16 KiB TLS record however much capacity it is
-                // offered, so without this the loop paid a client write per
-                // record. Never *park* to fill the buffer, though -- that
+                // offered, so without this the loop would pay a client write
+                // per record. Never *park* to fill the buffer, though -- that
                 // would turn a sub-buffer download into store-and-forward.
                 // (Dropping a `Pending` `read_buf` future loses nothing: it
                 // polls the stream once and any decrypted plaintext stays in
@@ -1742,7 +1643,6 @@ async fn drive_reads(
             "a batch only ends with bytes; every failure returns"
         );
 
-        // Determine how this chunk overlaps with the client range.
         let chunk = xfer.note_chunk(got);
 
         // Step 2: queue the read for the cache and land the batch once it is
@@ -1767,7 +1667,6 @@ async fn drive_reads(
     Ok(())
 }
 
-/// The upstream closed before delivering `content_length` bytes.
 fn tls_premature_eof() -> DownloadFailure {
     UpstreamError::protocol("TLS upstream closed prematurely").into()
 }
@@ -1777,16 +1676,13 @@ fn tls_premature_eof() -> DownloadFailure {
 /// [`ClientStatus`] transitions instead of hard errors: a slow or gone client
 /// must not abort the download (late joiners depend on it).
 ///
-/// Mirrors the `tee_and_splice` client-splice semantics: a client
-/// rate-check trip after progress leaves `DemoteRequested` (the caller
-/// adjudicates via [`BodyTransfer::maybe_demote`]); every client failure --
-/// a peer disconnect, a rated-wait timeout, any other write error -- goes
-/// through [`BodyTransfer::abort_client`], whose conclusion owns the level
-/// and the counters, and leaves `Aborted`, so the download continues
-/// cache-only. The only error returned is a cache failure from one of the
-/// two [`CacheBatch`] flush points in here: before parking on a
-/// back-pressuring client, and before a demotion hand-off, whose file-serve
-/// task reads the partial from `client_file_pos`.
+/// A client rate-check trip after progress leaves `DemoteRequested` (the
+/// caller adjudicates via [`BodyTransfer::maybe_demote`]); every client
+/// failure goes through [`BodyTransfer::abort_client`] and leaves `Aborted`,
+/// so the download continues cache-only. The only error returned is a cache
+/// failure from one of the two [`CacheBatch`] flush points in here: before
+/// parking on a back-pressuring client, and before a demotion hand-off,
+/// whose file-serve task reads the partial from `client_file_pos`.
 ///
 /// The range is read in place on every write attempt: the delivery flushes
 /// the batch, which borrows the buffer, so it cannot hold a slice of it
@@ -1839,16 +1735,8 @@ async fn write_client_or_demote<'a>(
 }
 
 /// Capture the client socket and cache file before spawning their writer.
-/// The eventual `JoinHandle` leaves the loop as
-/// [`ClientEnd::Demoted`] and is awaited only by
-/// `commit::ClientSettlement::settle`.
-///
-/// The task parks in `receiver.changed()` with no timeout whenever it has
-/// drained the file but still owes the client bytes; its guaranteed wake-up
-/// is the watch sender's drop in `DownloadBarrier::begin_rename`. Awaiting
-/// the handle anywhere the barrier is still owned would therefore wait on a
-/// wake-up that cannot come. The settlement token is returned only after
-/// that drop and the commit spawn.
+/// The eventual `JoinHandle` leaves the loop as [`ClientEnd::Demoted`]; see
+/// [`ClientEnd`] for where it may be awaited.
 fn prepare_file_serve(
     client: &TcpStream,
     cache_file: &tokio::fs::File,
@@ -1901,21 +1789,15 @@ struct PreparedFileServe {
 }
 
 impl PreparedFileServe {
-    /// `peer` is who the demoted delivery is for (see `BodyTransfer::peer`).
     fn spawn(self, peer: Option<ClientInfo>) -> DemotedDelivery {
         tokio::task::spawn(serve_remaining_from_file(self, peer))
     }
 }
 
 /// Serve remaining bytes of a download from the cache file to a demoted client
-/// via Linux `sendfile(2)`.
-///
-/// Delegates to [`async_sendfile_unfinished`], which handles the same
-/// growing-file / `watch::Receiver` / `ActiveDownloadStatus` interplay used by
-/// the sendfile late-joiner path.  The request was already counted as
-/// `REQUESTS_SPLICE` when its response headers were emitted; only the bytes
-/// flow through `BYTES_SERVED_SENDFILE` (incremented inside
-/// `sendfile_chunk_loop`).
+/// via [`async_sendfile_unfinished`], like a sendfile late joiner. The
+/// request was already counted as `REQUESTS_SPLICE` when its response headers
+/// were emitted; only the bytes flow through `BYTES_SERVED_SENDFILE`.
 async fn serve_remaining_from_file(
     prepared: PreparedFileServe,
     peer: Option<ClientInfo>,
@@ -1934,10 +1816,7 @@ async fn serve_remaining_from_file(
         cache_path.display()
     );
 
-    // Demoted clients keep reading the partial cache file linearly via
-    // sendfile chunks, so warm the kernel readahead window before the loop
-    // starts.  The final size is unknown (file still growing), so always
-    // hint.
+    // The final size is unknown (file still growing), so always hint.
     hint_sequential_read(&file, u64::MAX, &cache_path);
 
     metrics::CLIENTS_DEMOTED.increment();
@@ -2131,7 +2010,7 @@ impl SplicePipes {
 /// Landing costs one blocking-pool round trip ([`drain_pipe_to_file`] or
 /// [`pwrite_buf_to_file`] runs on the pool), and a busy socket or a TLS
 /// stream hands back about one segment or one 16 KiB record per read, so
-/// landing every read used to mean one round trip per read. Letting the
+/// landing every read would mean one round trip per read. Letting the
 /// bytes sit turns that into one per [`Self::FLUSH_THRESHOLD`]. The flush
 /// points, and why each exists:
 ///
@@ -2316,25 +2195,17 @@ enum ClientStatus<'a> {
     Absent,
     /// The delivery ended mid-transfer; its failure is concluded.
     Aborted(ReportedDelivery),
-    /// Client send rate dropped below `min_download_rate` or the
-    /// [`DemotionFloor`] (`trigger`) and the teed bytes still in `pipe_A`
-    /// have been drained. The caller adjudicates whether to actually demote
-    /// (transitioning to [`ClientStatus::Demoted`]) or to abort the
-    /// whole splice with an upstream-rate timeout: when the upstream
-    /// rate has also fallen below threshold the client RC is observing
-    /// the upstream bottleneck, so the caller surfaces the upstream
-    /// failure instead of spawning a doomed file-serve task.
+    /// A client checker (`trigger`) asked for a demotion and the teed bytes
+    /// still in `pipe_A` have been drained; `BodyTransfer::maybe_demote`
+    /// adjudicates.
     DemoteRequested {
         /// The socket the spawned file-serve task takes over.
         client: &'a TcpStream,
         /// Which client checker asked for the demotion, for its log line.
         trigger: DemoteTrigger,
     },
-    /// Caller has accepted the demote: a file-serve task has been spawned
-    /// and is now responsible for the client. Subsequent iterations of the
-    /// splice loop treat this identically to `Aborted` (cache-only
-    /// path), and the byte counts the spawned task needs were already
-    /// supplied by the transfer owner when it adjudicated the demotion.
+    /// A file-serve task has been spawned and is now responsible for the
+    /// client; the loop carries on cache-only.
     Demoted(DemotedDelivery),
 }
 
@@ -2359,13 +2230,9 @@ impl<'a> ClientStatus<'a> {
 /// splice `pipe_A→client` and, once the batch is due, `pipe_B→cache`.
 ///
 /// If the client disconnects mid-transfer, the function continues to drain `pipe_A` and
-/// write to the cache file so concurrent hyper clients can still complete.
-///
-/// If the client send rate drops below the configured minimum or the
-/// [`DemotionFloor`], remaining bytes are drained and the client is left in
-/// `ClientStatus::DemoteRequested` so the caller ([`BodyTransfer::maybe_demote`]) can either promote it to
-/// `ClientStatus::Demoted` (spawn a file-serve task) or abort the splice with
-/// an upstream-rate timeout when the upstream is the actual bottleneck.
+/// write to the cache file so concurrent clients can still complete. A
+/// tripped client checker leaves `ClientStatus::DemoteRequested` for
+/// [`BodyTransfer::maybe_demote`].
 async fn tee_and_splice(
     xfer: &mut BodyTransfer<'_, SplicePipes>,
     got: usize,
@@ -2374,9 +2241,6 @@ async fn tee_and_splice(
 
     while remaining > 0 {
         if let Some(client) = xfer.client_status.client_to_write() {
-            // Tee pipe_A → pipe_B, flush pipe_B → cache when the batch is
-            // due, then splice pipe_A → client.
-
             // Step 2: tee pipe_A → pipe_B (duplicates without consuming from pipe_A)
             // Same optimistic-then-park pattern as Step 1: try tee first and
             // only `select!`-park on EAGAIN, after clearing both caches.
@@ -2431,8 +2295,6 @@ async fn tee_and_splice(
             // — they only run when the client is actually back-pressuring,
             // not on every busy iteration where pipe-readable would otherwise
             // win the `select!` race and cancel them mid-flight.
-            // The pipe owner tracks the duplicated head independently of
-            // the transfer's response-level client byte count.
             while xfer.cache.pipes().has_duplicate() {
                 let result = xfer.cache.pipes_mut().send_to_client(client, usize::MAX);
 
@@ -2444,14 +2306,9 @@ async fn tee_and_splice(
                     }
                     Ok(n) => {
                         if let Some(trigger) = xfer.note_client_bytes(n) {
-                            // A client checker tripped — drain remaining teed
-                            // bytes (cache already has them) and hand off to
-                            // the caller. The outer loop decides whether to
-                            // actually demote or to abort the splice on
-                            // upstream-rate failure (slow upstream is the
-                            // most common reason the client RC also trips).
-                            // The pipe owner already accounted the successful client splice,
-                            // so it discards only the remaining duplicated head.
+                            // A client checker tripped: discard the remaining
+                            // teed bytes (the cache already has them) and
+                            // hand off to the caller's `maybe_demote`.
                             xfer.cache
                                 .pipes_mut()
                                 .discard_duplicate()
@@ -2580,7 +2437,7 @@ fn range_overlap(
 /// One blocking-pool hop per call: splicing into a file is a disk write, and
 /// the whole loop runs inside the closure rather than one splice per hop.
 /// Both descriptors stay owned by that closure if its awaiting future is
-/// cancelled. The handles are shared across drains without further dup calls.
+/// cancelled.
 ///
 /// On an error the offset has still advanced by what landed before it, so
 /// the caller's `.partial` accounting stays exact.
@@ -3036,11 +2893,9 @@ mod tests {
         assert_eq!(scratch.contents(), [] as [u8; 0]);
     }
 
-    /// `maybe_demote` adjudicates a `DemoteRequested` client against the
-    /// upstream rate *before* spawning a file-serve task: a starved upstream
-    /// is the root cause and surfaces as the typed upstream-rate failure,
-    /// the client stays `DemoteRequested` (never `Demoted`), and `finish`
-    /// then concludes the un-served remainder as an internal failure.
+    /// A starved upstream surfaces as the upstream-rate failure before any
+    /// file-serve task is spawned, and `finish` then concludes the un-served
+    /// remainder as an internal failure.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn slow_upstream_wins_over_demotion() {
         use crate::nonzero;
@@ -3265,8 +3120,6 @@ mod tests {
         assert_eq!(suffix, b"suffix");
     }
 
-    /// The floor exists only with a known peak, and only where it sits above
-    /// `min_download_rate`; a disabled `min_download_rate` leaves it armed.
     #[test]
     fn demotion_floor_needs_a_peak_above_the_minimum_rate() {
         use crate::nonzero;
@@ -3288,9 +3141,6 @@ mod tests {
         assert!(DemotionFloor::new(peak(8), &config).is_some());
     }
 
-    /// Both client checkers see every delivered byte; the floor asks for a
-    /// demotion on its own, and `min_download_rate` names the trigger when
-    /// both trip.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn client_bytes_feed_the_demotion_floor() {
         use crate::nonzero;
@@ -3307,7 +3157,6 @@ mod tests {
         .await;
         let (_peer, client) = crate::test_support::connected_tcp_pair().await;
 
-        // One-second windows.
         let mut config = crate::config::Config::default();
         config.min_download_rate = Some(nonzero!(1_000));
         config.rate_check_timeframe = nonzero!(1);
@@ -3730,8 +3579,6 @@ mod tests {
         pipes.discard_duplicate().await.unwrap();
     }
 
-    /// Read the next `count` unique bytes out of `pipe_A`, to inspect what
-    /// it holds.
     async fn read_unique(pipes: &mut SplicePipes, count: usize) -> Vec<u8> {
         assert!(
             matches!(pipes.head, PipeHead::Unique),
@@ -3742,7 +3589,6 @@ mod tests {
         buf
     }
 
-    /// Each edge comes with the side of it the bytes before it are on.
     #[test]
     fn next_edge_classifies_the_bytes_it_bounds() {
         let filter = SpliceRangeFilter { skip: 2, send: 10 };
@@ -3756,10 +3602,6 @@ mod tests {
         assert_eq!(whole.next_edge(20), (u64::MAX, false));
     }
 
-    /// A batch reaching past its client-range edge cannot be teed without
-    /// corrupting the 206: it aborts the client with an internal failure and
-    /// goes cache-only, while an in-range batch is teed and a client-less
-    /// transfer concludes nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn a_batch_straddling_a_client_range_edge_aborts_the_client() {
         let scratch = ScratchFile::new();

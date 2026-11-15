@@ -1,8 +1,5 @@
-//! On-disk cache layout for cached resources.
-//!
-//! This module owns the single source of truth for **where** a `ResourceFile`
-//! lives on disk, and the unified [`classify_request`] entry point that
-//! decodes, validates, and classifies an incoming request.
+//! Where a `ResourceFile` lives on disk, and [`classify_request`], which
+//! decodes, validates and classifies an incoming request.
 //!
 //! # Layout
 //!
@@ -16,8 +13,7 @@
 //! Flat repositories anchor at the host-level `flat/` sibling rather than
 //! nesting beneath a per-mirror subdirectory.  The URL path becomes the
 //! on-disk path verbatim, so a request for `apt/amd64/twilio_5.0.0_amd64.deb`
-//! lands at `{cache}/{host}/flat/apt/amd64/twilio_5.0.0_amd64.deb` — no
-//! registry lookup, no longest-prefix base resolution.
+//! lands at `{cache}/{host}/flat/apt/amd64/twilio_5.0.0_amd64.deb`.
 //!
 //! # Per-variant mapping
 //!
@@ -51,14 +47,7 @@
 //! `Acquire-By-Hash: yes` mirror never sends a literal `Packages*` URL, so
 //! that scope is its only source of an `Origin` row.
 //!
-//! # Paths
-//!
-//! The joins themselves - and the subdirectory names (`dists/`, `flat/`,
-//! `by-hash/`, `tmp/`) - live in [`crate::cache_paths`]: this module decides
-//! *which* [`CacheLayout`] a resource has, [`crate::cache_paths::CachePaths`]
-//! turns a layout plus a [`crate::cache_paths::MirrorSite`] into the
-//! directory, and every scan / cleanup task derives its roots from the same
-//! helper.
+//! The path joins themselves live in [`crate::cache_paths`].
 
 use std::{
     borrow::Cow,
@@ -89,7 +78,7 @@ use crate::{
 };
 
 // ---------------------------------------------------------------------------
-// Cache-flavor and connection types (moved from main.rs)
+// Cache-flavor and connection types
 // ---------------------------------------------------------------------------
 
 /// Whether a cached resource is permanent (`.deb` / by-hash) or volatile
@@ -100,22 +89,15 @@ pub(crate) enum CachedFlavor {
     Volatile,
 }
 
-/// Owned discriminator for the [`crate::deb_mirror::ResourceFile`] variant a
-/// request classified to, and the single truth table behind a resource's
-/// [`CachedFlavor`] and [`CacheLayout`] ([`Self::cached_flavor`] /
-/// [`Self::layout`]).  Nothing stores those two alongside the kind: every
-/// consumer derives them, so a kind whose layout disagrees with its flavor is
-/// unrepresentable.  The precise kind is still needed on its own - integrity
-/// picks a verification strategy by it and decides whether to ingest the file
-/// as an index, which `(flavor, layout)` cannot tell (`Packages` vs any other
-/// `Dists`/`Volatile` metadata).  The two by-hash kinds carry the algorithm
-/// the parser validated for their `by-hash/<ALGO>/` directory and what the
-/// directory holding that `by-hash/` says about the object
-/// ([`ByHashContent`]), so neither the verifier nor the ingest re-reads the
-/// request path.  Populated by
-/// [`classify_request`]'s
-/// exhaustive match, so a new `ResourceFile` variant compile-errors the
-/// classifier (the existing safety net) and forces a decision here too.
+/// The [`crate::deb_mirror::ResourceFile`] variant a request classified to.
+/// A resource's [`CachedFlavor`] and [`CacheLayout`] are derived from it,
+/// never stored alongside, so the three cannot disagree.  The two by-hash
+/// kinds carry the algorithm the parser validated for their
+/// `by-hash/<ALGO>/` directory and what the directory holding that
+/// `by-hash/` says about the object ([`ByHashContent`]), so neither the
+/// verifier nor the ingest re-reads the request path.  Populated by
+/// [`classify_request`]'s exhaustive match, so a new `ResourceFile` variant
+/// is a compile error there and forces a decision here too.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ResourceKind {
     /// Structured `pool/...` `.deb`/`.udeb`/`.ddeb`.
@@ -173,10 +155,6 @@ impl ByHashContent {
 }
 
 impl ResourceKind {
-    /// Whether this kind is refresh-checked metadata or content that never
-    /// changes under its name.  `Release`-family files and every index are
-    /// `Volatile`; pool packages and content-addressed by-hash blobs are
-    /// `Permanent`.
     #[must_use]
     const fn cached_flavor(self) -> CachedFlavor {
         match self {
@@ -193,8 +171,6 @@ impl ResourceKind {
         }
     }
 
-    /// The on-disk tree this kind is cached under (see the module-level
-    /// per-variant table).
     #[must_use]
     pub(crate) const fn layout(self) -> CacheLayout {
         match self {
@@ -211,11 +187,6 @@ impl ResourceKind {
         }
     }
 
-    /// Which hit/miss counters a cache lookup of this kind lands in
-    /// ([`ConnectionDetails::count_lookup`]).  Derived from the same split as
-    /// [`Self::cached_flavor`] and [`Self::layout`]: `Index` is exactly the
-    /// `Volatile` kinds, `Package` the permanent pool layouts and `ByHash` the
-    /// permanent by-hash ones (a unit test pins the agreement).
     #[must_use]
     const fn lookup_bucket(self) -> LookupBucket {
         match self {
@@ -232,11 +203,10 @@ impl ResourceKind {
     }
 }
 
-/// The hit/miss counter family a cache lookup is counted in; see
-/// [`ResourceKind::lookup_bucket`].  The two permanent buckets split
-/// `CACHE_HITS` / `CACHE_MISSES`, because their remedies differ: a package
-/// miss rate points at clients naming one archive under different mirrors
-/// (`aliases`), a by-hash one at index churn.
+/// The hit/miss counter family a cache lookup is counted in.  The two
+/// permanent buckets split `CACHE_HITS` / `CACHE_MISSES`, because their
+/// remedies differ: a package miss rate points at clients naming one archive
+/// under different mirrors (`aliases`), a by-hash one at index churn.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum LookupBucket {
     /// A `.deb` from a structured or flat pool: `PACKAGE_HITS` /
@@ -249,7 +219,6 @@ enum LookupBucket {
     Index,
 }
 
-/// What a cache lookup decided, for [`ConnectionDetails::count_lookup`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LookupOutcome {
     /// A usable file was served from the cache (for an index: a fresh one).
@@ -299,8 +268,6 @@ pub(crate) enum CacheLayout {
 }
 
 impl CacheLayout {
-    /// Whether this layout is anchored under the per-host `flat/`
-    /// subdirectory rather than directly under `{host}/{mirror_path}/`.
     #[must_use]
     pub(crate) const fn is_flat(self) -> bool {
         match self {
@@ -322,26 +289,14 @@ impl CacheLayout {
 
 /// Identity of one cache entry across every per-entry store
 /// (`active_downloads`, `cache_metadata`, `verify_throttle`) and the
-/// download barrier chain: the in-flight and post-flight views of a resource
-/// must agree on what "the same file" is, so they all key on this one type.
+/// download barrier chain.
 ///
-/// Both [`Mirror::kind`] (inside `mirror`) and `layout` are part of the key:
-///
-/// - `Mirror::kind` distinguishes structured vs flat mirror identities for
-///   the same `(host, port, path)` tuple - the coarse "which subtree does
-///   this entry live in" axis.
-/// - `layout` carries the finer-grained on-disk shape within a subtree (e.g.
-///   `StructuredPool` vs `Dists` vs `DistsByHash` all share the same
-///   structured `Mirror::kind`). This is the value the cache pipeline already
-///   threads through [`ConnectionDetails`], so reusing it keeps the key
-///   uniform across the structured/flat split.
-///
-/// The two are redundant on the structured-vs-flat axis but not overall;
-/// dropping `layout` would lose the structured-subtree distinctions.
-/// Disambiguation between flat-pool `.deb`s living in different
-/// sub-directories (`apt/amd64/foo.deb` vs `apt/arm64/foo.deb`) is implicit
-/// in [`Mirror::path`], since the URL path becomes the mirror path verbatim
-/// under the host-anchored flat layout.
+/// [`Mirror::kind`] (inside `mirror`) and `layout` are redundant on the
+/// structured-vs-flat axis, but only `layout` tells the structured subtrees
+/// (`StructuredPool`, `Dists`, `DistsByHash`) apart.  Flat-pool `.deb`s in
+/// different sub-directories (`apt/amd64/foo.deb` vs `apt/arm64/foo.deb`)
+/// differ in [`Mirror::path`], since the URL path is the mirror path
+/// verbatim under the flat layout.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct CacheEntryKey {
     pub(crate) mirror: Mirror,
@@ -416,15 +371,12 @@ impl Equivalent<CacheEntryKey> for CacheEntryKeyRef<'_> {
     }
 }
 
-/// Verdict of a cache-file lookup that found nothing serveable for a
-/// [`ConnectionDetails`], produced by whichever backend ran the lookup and
-/// consumed by the backend that fetches.
+/// Verdict of a cache-file lookup that found nothing serveable.
 ///
-/// Hit/miss/refetch accounting belongs to the lookup site: the producer
-/// counts the miss ([`ConnectionDetails::count_lookup`]) when it builds one of
-/// these, so a consumer must never count it again.  The stale copy travels with the
-/// verdict so the fetcher can revalidate against it without a second
-/// open/stat.
+/// The producer counts the miss ([`ConnectionDetails::count_lookup`]) when
+/// it builds one of these, so a consumer must never count it again.  The
+/// stale copy travels with the verdict so the fetcher can revalidate against
+/// it without a second open/stat.
 #[derive(Debug)]
 // Only the hyper backend revalidates from the carried copy; the splice
 // backend re-opens the file on its own path, so in a splice-only build the
@@ -434,7 +386,6 @@ impl Equivalent<CacheEntryKey> for CacheEntryKeyRef<'_> {
     expect(dead_code, reason = "consumed only by hyper_conn::serve_cache_miss")
 )]
 pub(crate) enum CacheMiss {
-    /// No cache file on disk.
     NotFound,
     /// A volatile copy exists but is older than `VOLATILE_CACHE_MAX_AGE`
     /// (or its mtime is in the future); revalidate it upstream.
@@ -460,9 +411,7 @@ impl CacheMiss {
     }
 }
 
-/// Per-request state carried across the cache pipeline.  Owns enough of the
-/// classified resource to assemble the on-disk path via
-/// [`Self::cache_file_path`].
+/// Per-request state carried across the cache pipeline.
 #[derive(Clone, Debug)]
 pub(crate) struct ConnectionDetails {
     pub(crate) client: ClientInfo,
@@ -479,17 +428,13 @@ pub(crate) struct ConnectionDetails {
     /// unless an alias matched.
     pub(crate) upstream_host: ClientHost,
     pub(crate) debname: String,
-    /// The classified kind; [`Self::cached_flavor`] and [`Self::layout`] are
-    /// derived from it rather than stored, so the three cannot disagree.
     pub(crate) resource_kind: ResourceKind,
     /// The `Origin` this request would register, for real-arch index
     /// requests only -- a `Packages*` URL, or the architecture-scoped
-    /// `by-hash` URL an `Acquire-By-Hash: yes` mirror serves instead.
-    /// On an answered request, [`Self::record_origin`] handles a 2xx/304
-    /// upstream response and [`Self::refresh_origin`] handles a cache hit; a
-    /// probe the upstream 404s mints no row.  Boxed:
-    /// only index requests carry one, and `ConnectionDetails` rides inside
-    /// per-request enums whose size the other variants set.
+    /// `by-hash` URL an `Acquire-By-Hash: yes` mirror serves instead.  A
+    /// probe the upstream 404s mints no row.  Boxed: only index requests
+    /// carry one, and `ConnectionDetails` rides inside per-request enums
+    /// whose size the other variants set.
     pub(crate) origin_fields: Option<Box<OriginFields>>,
 }
 
@@ -498,10 +443,9 @@ impl ConnectionDetails {
     /// the upstream answered (fresh body or 304): the scope is proven, so the
     /// row is created if absent.
     ///
-    /// Idempotent per request (the DB batch dedups identical rows) and
-    /// skipped for cleanup's synthetic index fetches, which are bookkeeping,
-    /// not client demand.  Non-blocking: it runs on the request path, so a
-    /// saturated DB queue must not stall request handling.
+    /// Skipped for cleanup's synthetic index fetches, which are bookkeeping,
+    /// not client demand.  Non-blocking: a saturated DB queue must not stall
+    /// request handling.
     pub(crate) fn record_origin(&self) {
         self.send_origin(OriginSighting::Upstream);
     }
@@ -520,7 +464,6 @@ impl ConnectionDetails {
         self.send_origin(OriginSighting::CacheHit);
     }
 
-    /// Shared tail of [`Self::record_origin`] and [`Self::refresh_origin`].
     fn send_origin(&self, sighting: OriginSighting) {
         let Some(fields) = &self.origin_fields else {
             return;
@@ -540,8 +483,8 @@ impl ConnectionDetails {
     /// so a reader loading the parts before the parent never sees them
     /// exceed it; an index bumps `VOLATILE_HIT` / `VOLATILE_REFETCHED`.
     ///
-    /// Called only at the lookup sites, once per request. Cleanup's
-    /// synthetic index fetches are bookkeeping, not client demand, and count nothing.
+    /// Called only at the lookup sites, once per request.  Cleanup's
+    /// synthetic index fetches count nothing.
     pub(crate) fn count_lookup(&self, outcome: LookupOutcome) {
         if self.client.is_cleanup_synthetic() {
             return;
@@ -579,13 +522,11 @@ impl ConnectionDetails {
         part.increment();
     }
 
-    /// [`ResourceKind::cached_flavor`] of this request's resource.
     #[must_use]
     pub(crate) const fn cached_flavor(&self) -> CachedFlavor {
         self.resource_kind.cached_flavor()
     }
 
-    /// [`ResourceKind::layout`] of this request's resource.
     #[must_use]
     pub(crate) const fn layout(&self) -> CacheLayout {
         self.resource_kind.layout()
@@ -603,15 +544,14 @@ impl ConnectionDetails {
         }
     }
 
-    /// The entry identity every per-entry store keys on.
     #[must_use]
     pub(crate) fn key(&self) -> CacheEntryKeyRef<'_> {
         CacheEntryKeyRef::new(&self.mirror, &self.debname, self.layout())
     }
 
-    /// The on-disk identity of this request's mirror.  `mirror` is already
-    /// canonical, so this is a plain projection; `InitBarrier::site` derives
-    /// the same site, so the `.partial` lands next to its rename target.
+    /// The on-disk identity of this request's mirror.  `InitBarrier::site`
+    /// derives the same site, so the `.partial` lands next to its rename
+    /// target.
     #[must_use]
     pub(crate) fn site(&self) -> MirrorSite<'_> {
         self.mirror.site()
@@ -635,22 +575,19 @@ impl ConnectionDetails {
     }
 
     /// Log suffix naming the alias the client used (` via alias host X`),
-    /// empty when the request named the canonical host itself. Rendered
-    /// only when the line is formatted, so it costs nothing to pass along.
+    /// empty when the request named the canonical host itself.
     #[must_use]
     pub(crate) const fn alias_suffix(&self) -> AliasSuffix<'_> {
         AliasSuffix(self)
     }
 
-    /// The absolute cached file path for this request, in one pre-sized
-    /// allocation through [`CachePaths::entry_file`].
+    /// The absolute cached file path for this request.
     #[must_use]
     pub(crate) fn cache_file_path(&self) -> PathBuf {
         CachePaths::global().entry_file(self.layout(), self.site(), Path::new(&self.debname))
     }
 }
 
-/// [`ConnectionDetails::alias_suffix`]'s renderer.
 #[derive(Clone, Copy)]
 pub(crate) struct AliasSuffix<'a>(&'a ConnectionDetails);
 
@@ -669,9 +606,7 @@ impl std::fmt::Display for AliasSuffix<'_> {
 // Classification types
 // ---------------------------------------------------------------------------
 
-/// Which named field of a request URL is being validated.  Used both as a
-/// label in error messages/logs and to dispatch to the right `valid_*`
-/// validator inside [`classify_request`].
+/// Which named field of a request URL is being validated.
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum ValidateKind {
     /// A structured mirror's path, which additionally may not pass through
@@ -690,9 +625,6 @@ pub(crate) enum ValidateKind {
 }
 
 impl ValidateKind {
-    /// Whether the decoded value passes this field's `valid_*` rule.  Lives
-    /// next to the `Display` label so the two per-variant tables are read
-    /// (and extended) together.
     #[must_use]
     fn accepts(self, decoded: &str) -> bool {
         match self {
@@ -761,12 +693,10 @@ pub(crate) const MAX_DEBNAME_LEN: usize = NAME_MAX - PARTIAL_SUFFIX.len();
 
 /// Flatten an architecture-scoped `dists/` index into its cache debname.
 ///
-/// Single source of truth for the `{distribution}_{component}_{architecture}_
-/// {filename}` convention: [`classify_request`] mints the name for a client
-/// request, and `cleanup::packages::DebnameKind` mints the same name for the
-/// index fetches cleanup issues itself. If the two ever disagree, cleanup
-/// caches every index under a path the serve path never reads — an invisible
-/// shadow copy plus a re-download every cycle.
+/// [`classify_request`] mints the name for a client request, and
+/// `cleanup::packages::DebnameKind` for the index fetches cleanup issues
+/// itself.  If the two disagreed, cleanup would cache every index under a
+/// path the serve path never reads.
 #[must_use]
 pub(crate) fn dists_debname(
     distribution: &str,
@@ -777,10 +707,8 @@ pub(crate) fn dists_debname(
     format!("{distribution}_{component}_{architecture}_{filename}")
 }
 
-/// The result of [`classify_request`]: the decoded, validated mirror path,
-/// the per-variant `(debname, resource_kind)` pair needed to build
-/// [`ConnectionDetails`] (flavor and layout derive from the kind), and any
-/// deferred origin record to be sent post-hoc.
+/// The result of [`classify_request`], with every field decoded and
+/// validated.
 #[derive(Debug)]
 pub(crate) struct RequestClass {
     /// Shared, because it becomes [`Mirror`]'s path, which every clone of
@@ -816,11 +744,9 @@ impl RequestClass {
 }
 
 /// Errors returned by [`classify_request`].  `request_dispatch::decide_request`
-/// translates each into the verdict every backend acts on: a rejection or a
-/// passthrough reason.
+/// translates each into a rejection or a passthrough reason.
 #[derive(Debug)]
 pub(crate) enum ClassifyError<'a> {
-    /// URL-decoding the field value failed.
     BadEncoding {
         kind: ValidateKind,
         raw: &'a str,
@@ -836,17 +762,13 @@ pub(crate) enum ClassifyError<'a> {
     /// `public%2Fubuntu` and `public/ubuntu` -- distinct upstream URLs (RFC
     /// 3986 §2.2) -- would share one cache name.  `raw` is the value as sent.
     EncodedSeparator { kind: ValidateKind, raw: &'a str },
-    /// A structured `Pool` request had a filename whose extension is not
-    /// `.deb` / `.udeb` / `.ddeb`.  Both dispatchers treat this as a
-    /// non-cacheable request and fall through to the simple proxy.
+    /// A structured `Pool` filename whose extension is not `.deb` / `.udeb`
+    /// / `.ddeb`, relayed uncached.
     ///
     /// `Flat::Pool` reaches this variant when the *decoded* filename fails
     /// the strict shape check: `parse_request_path` runs
-    /// `is_flat_deb_filename` on the raw URL segment, and a percent-encoded
-    /// segment like `foo%5fbar_1.0_amd64.deb` (2 underscores raw, 3 once
-    /// decoded) can pass the raw check yet decode to a name that does not
-    /// match `<name>_<ver>_<arch>.<ext>`.  Re-checking the decoded form
-    /// closes that bypass.
+    /// `is_flat_deb_filename` on the raw URL segment, which
+    /// `foo%5fbar_1.0_amd64.deb` (2 underscores raw, 3 once decoded) passes.
     NonDebPool { filename: Cow<'a, str> },
     /// A distribution, component or architecture holding a `_`, the
     /// separator the `dists/` cache names join those fields with:
@@ -876,26 +798,12 @@ pub(crate) enum ClassifyError<'a> {
 // ---------------------------------------------------------------------------
 
 /// Decode + validate every URL-borne field in `resource`, then derive the
-/// on-disk classification (`debname`, `resource_kind`).  This is
-/// the single source of truth behind `request_dispatch::dispatch_request`,
-/// shared by the hyper (`hyper_conn.rs`) and sendfile (`sendfile_conn.rs`)
-/// dispatchers.
-///
-/// On success, the caller wraps `RequestClass` into a `ConnectionDetails`
-/// and routes the request through `process_cache_request` (or the sendfile
-/// pipeline equivalent).  On failure, `request_dispatch::decide_request`
-/// maps the `ClassifyError` variant to a rejection or a passthrough — see
-/// the variant docs.
-///
-/// `client` is borrowed only for inclusion in trace logs; nothing about the
-/// classification depends on the caller's identity.
+/// on-disk classification (`debname`, `resource_kind`).  `client` only
+/// labels trace logs.
 pub(crate) fn classify_request<'a>(
     resource: &'a ResourceFile<'_>,
     client: &ClientInfo,
 ) -> Result<RequestClass, ClassifyError<'a>> {
-    // Each arm decodes/validates only the fields that variant carries, then
-    // assembles the (mirror_path, debname, resource_kind, origin_fields)
-    // `RequestClass`; flavor and layout follow from the kind.
     match resource {
         ResourceFile::Pool {
             mirror_path,
@@ -1044,9 +952,8 @@ pub(crate) fn classify_request<'a>(
                 "Decoded mirror path: `{mirror_path}`; Decoded distribution: `{distribution}`; Decoded component: `{component}`; Decoded architecture: `{architecture}`; Decoded filename: `{filename}` (client {client})"
             );
 
-            // Per-component Release is metadata about Packages; it is never
-            // recorded as a per-binary origin (those come from the .deb
-            // fetch path), so `origin_fields` is unconditionally `None`.
+            // A per-component Release is metadata about the indices, never
+            // a per-binary origin.
             Ok(RequestClass {
                 mirror_path: Arc::from(mirror_path),
                 debname: dists_debname(&distribution, &component, &architecture, &filename),
@@ -1077,8 +984,6 @@ pub(crate) fn classify_request<'a>(
 
             let debname = dists_debname(&distribution, &component, &architecture, &filename);
 
-            // The debname is built, so the decoded fields can be moved into
-            // the record instead of re-formatted out of the `Cow`s.
             let origin_fields = OriginFields::of_scope(distribution, component, architecture);
 
             Ok(RequestClass {
@@ -1103,13 +1008,9 @@ pub(crate) fn classify_request<'a>(
             let resource_kind = match kind {
                 FlatKind::Metadata => ResourceKind::FlatMetadata,
                 FlatKind::Pool => {
-                    // `parse_request_path` runs `is_flat_deb_filename` on
-                    // the *raw* URL segment, so a percent-encoded
-                    // underscore can sneak a non-shape filename past the
-                    // strict check (e.g. `foo%5fbar_1.0_amd64.deb` ⇒ 2
-                    // raw underscores, but decoded to 3).  Re-validate the
-                    // decoded filename to keep flat-pool caching limited
-                    // to genuine `<name>_<ver>_<arch>.<ext>` packages.
+                    // `parse_request_path` checked the *raw* URL segment,
+                    // which a percent-encoded `_` can get past (see
+                    // `ClassifyError::NonDebPool`).
                     if !is_flat_deb_filename(&filename) {
                         return Err(ClassifyError::NonDebPool { filename });
                     }
@@ -1178,11 +1079,8 @@ fn validate_directories(dirs: &str) -> Result<Option<Cow<'_, str>>, ClassifyErro
 
 /// URL-decode `raw` and check the result with the validator selected by
 /// `kind`; a field the cache names join with `_` must additionally be free
-/// of one ([`ClassifyError::JoinedFieldUnderscore`]).  Returns a `Cow` borrowing the input when no percent-escape was
-/// present (the common case for ASCII Debian paths), so callers that feed
-/// the result into `format!` or a `&str`-taking validator pay no extra
-/// allocation; callers needing an owned value convert at the move site
-/// (`RequestClass.mirror_path` takes `Arc::from`).
+/// of one ([`ClassifyError::JoinedFieldUnderscore`]).  Borrows the input
+/// when no percent-escape was present, the common case.
 fn decode_validate(raw: &str, kind: ValidateKind) -> Result<Cow<'_, str>, ClassifyError<'_>> {
     let decoded = match percent_encoding::percent_decode_str(raw).decode_utf8() {
         Ok(s) => s,
@@ -1367,10 +1265,9 @@ mod tests {
         );
     }
 
-    /// Regression: an `Acquire-By-Hash: yes` mirror sends no literal
-    /// `Packages*` URL, so before this arm carried an origin it could mint
-    /// no `Origin` row at all - and cleanup, which reconciles cached debs
-    /// against the indices of *active* origins, lost its reference set.
+    /// An `Acquire-By-Hash: yes` mirror sends no literal `Packages*` URL, so
+    /// this arm is the only source of the `Origin` rows cleanup reconciles
+    /// its cached debs against.
     #[test]
     fn classify_byhash_mints_the_origin_a_packages_url_would() {
         const PATH: &str = "debian/dists/sid/main/binary-amd64/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba";
@@ -1955,8 +1852,6 @@ mod tests {
         assert!(ValidateKind::Component.accepts("non-free-firmware"));
     }
 
-    /// The alias suffix names the host the client used only when it is not
-    /// the canonical mirror host.
     #[test]
     fn alias_suffix_names_only_an_alias_host() {
         let mut details = crate::test_support::connection_details("foo_1.0_amd64.deb");

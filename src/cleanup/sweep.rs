@@ -17,33 +17,21 @@ use super::engine::{SpanClass, UnitStats};
 use super::scan::remove_non_regular;
 
 /// Drop the in-memory `cache_metadata` entry keyed by `(mirror, basename, layout)`.
-/// Non-UTF-8 filenames are silently skipped: debnames are URL-decoded ASCII,
-/// so any non-UTF-8 path can't be in the metadata store to begin with.
+/// Non-UTF-8 filenames are skipped: debnames are URL-decoded ASCII, so such a
+/// path cannot be in the metadata store.
 ///
-/// The key uses `path.file_name()` (basename) rather than a relpath because the
-/// stored `cache_metadata` key already carries the on-disk directory in
-/// `Mirror.path` (URL-directory-verbatim under the host-anchored flat layout),
-/// so basename + the cleanup mirror is the exact key — as long as the file's
-/// directory equals the cleanup mirror's registered path. That holds for every
-/// deb reached through its own mirror row: each flat-deb URL directory registers
-/// a row that `nested_paths_per_row` turns into a walk boundary, so the handling
-/// task always sees a single-segment relpath. The one gap is the recursive-scan
-/// safety net: a deb nested *below* the cleanup mirror's path whose own row is
-/// missing (e.g. pruned by `cleanup_invalid_rows`, or a DB reset with files left
-/// behind) is keyed here under the wrong `Mirror.path` and the invalidation
-/// misses. That only leaks an in-memory entry (the on-disk file is still removed
-/// correctly), and the store rebuilds lazily from xattrs, so it self-heals on
-/// restart.
+/// The basename is the exact key only while the file's directory equals the
+/// cleanup mirror's registered path. A deb nested *below* that path whose own
+/// mirror row is missing is keyed under the wrong `Mirror.path` and the
+/// invalidation misses; that only leaks an in-memory entry until restart.
 pub(super) fn invalidate_metadata_for(path: &Path, mirror: &Mirror, layout: CacheLayout) {
     if let Some(debname) = path.file_name().and_then(|n| n.to_str()) {
         cache_metadata::store().invalidate(&CacheEntryKeyRef::new(mirror, debname, layout));
     }
 }
 
-/// Per-[`SpanClass`] retention spans consulted by [`sweep_candidates`]: each
-/// candidate's class selects which span gates its removal. Chosen by
-/// [`decide_sweep`](crate::cleanup::model::decide_sweep) for the reconcile
-/// facets, and inline by `sweep_byhash_dir` for the by-hash ones.
+/// Per-[`SpanClass`] retention spans: each candidate's class selects which
+/// span gates its removal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SpanTable {
     pub deb: Duration,
@@ -52,8 +40,6 @@ pub(super) struct SpanTable {
 }
 
 impl SpanTable {
-    /// One span for every class — the shape of every policy that does not
-    /// distinguish by-hash coverage.
     pub(super) const fn uniform(span: Duration) -> Self {
         Self {
             deb: span,
@@ -63,12 +49,9 @@ impl SpanTable {
     }
 }
 
-/// Return the reference time to use for age-based eviction of a cached file.
-///
-/// Prefers `created()` (birthtime); falls back to `modified()` if birthtime is
-/// unavailable (e.g. on filesystems without birthtime support), logging once at
-/// INFO. If both fail, bumps `CACHE_IO_FAILURE`, logs at ERROR, and returns
-/// `None` so the caller can skip the entry.
+/// The reference time for age-based eviction of a cached file: birthtime,
+/// falling back to mtime on filesystems without birthtime support. `None`
+/// (logged) when neither is available.
 fn age_reference_time(meta: &std::fs::Metadata, path: &Path) -> Option<SystemTime> {
     match meta.created() {
         Ok(t) => Some(t),
@@ -99,9 +82,9 @@ fn age_reference_time(meta: &std::fs::Metadata, path: &Path) -> Option<SystemTim
 /// wording and its own once-gate for the future-timestamp warn.
 #[derive(Clone, Copy)]
 enum AgeSweep {
-    /// [`sweep_candidates`]: cached debs and by-hash files.
+    /// Cached debs and by-hash files.
     Candidates,
-    /// [`sweep_aged_metadata`]: top-level index files.
+    /// Top-level index files.
     Metadata,
 }
 
@@ -114,9 +97,8 @@ impl AgeSweep {
     /// `keep_span` would be removed while it is still requested every day.
     ///
     /// Only where the filesystem has birthtime: without it the touch is
-    /// skipped (`Renewal::NoBirthTime`, mtime being the only content-age
-    /// signal there), both times are the unchanged mtime, and a revalidated
-    /// index still ages from its last content change.
+    /// skipped (`Renewal::NoBirthTime`), both times are the unchanged mtime,
+    /// and a revalidated index still ages from its last content change.
     fn reference_time(self, meta: &std::fs::Metadata, path: &Path) -> Option<SystemTime> {
         let created = age_reference_time(meta, path)?;
         Some(match self {
@@ -127,11 +109,10 @@ impl AgeSweep {
         })
     }
 
-    /// Whether the regular file at `path` (lstat `meta`) is at least
-    /// `keep_span` old at `now`, by [`Self::reference_time`]. A file without a
-    /// usable timestamp is counted in `stats.io_failures` (logged there); a
-    /// file too young (logged by the candidate sweep only) or with a future
-    /// timestamp (warned once per sweep) is kept.
+    /// Whether the regular file at `path` is at least `keep_span` old at
+    /// `now`, by [`Self::reference_time`]. A file without a usable timestamp
+    /// is counted in `stats.io_failures`; a file with a future timestamp is
+    /// kept.
     fn is_due(
         self,
         path: &Path,
@@ -177,9 +158,8 @@ impl AgeSweep {
         }
     }
 
-    /// Settle the unlink of an aged-out file that was `size` bytes long:
-    /// on success drop its `cache_metadata` entry and tally the removal, on
-    /// failure log and count it. Returns whether the file was removed.
+    /// Settle the unlink of an aged-out file that was `size` bytes long.
+    /// Returns whether the file was removed.
     fn settle_unlink(
         self,
         path: &Path,
@@ -215,37 +195,24 @@ impl AgeSweep {
     }
 }
 
-/// Candidates [`sweep_candidates`] hands to one blocking job, like
-/// `cache_walk`'s listing batch: one blocking-pool hop per batch instead of
-/// two per removed candidate.
+/// Candidates [`sweep_candidates`] hands to one blocking job: one
+/// blocking-pool hop per batch instead of two per removed candidate.
 const SWEEP_BATCH: usize = 256;
 
 /// Remove cached files older than their per-class span, dropping any matching
 /// `cache_metadata` entries on success.
 ///
-/// Returns the removals (`removed`, `bytes_removed`, and `removed_unreferenced`
-/// for a removed [`SpanClass::ByHashCovered`] candidate) and `io_failures`;
-/// `scanned` is left to the caller, which knows what its unit considered.
+/// The returned stats leave `scanned` to the caller, which knows what its
+/// unit considered.
 ///
-/// Each candidate is `(name, class)` where `name` is the entry's path *relative
-/// to `root`* — a bare basename for the depth-1 trees, a `/`-joined relpath for
-/// the recursive flat walk. The full path is rebuilt here rather than carried on
-/// the candidate: the map is filled by the scan over the whole tree (~100k
-/// entries, ten mirrors at once) and only *then* reduced against the Packages
-/// index, so a `PathBuf` per *scanned* entry would be megabytes held for the
-/// whole unit — to spare the surviving candidates one join apiece. The sweep
-/// itself does allocate one joined path per candidate it inspects, a batch
-/// ([`SWEEP_BATCH`]) at a time.
+/// Each candidate's name is the entry's path *relative to `root`*. The full
+/// path is rebuilt here rather than carried on the candidate: the map holds
+/// every scanned entry (~100k, ten mirrors at once) until it is reduced
+/// against the index, so a `PathBuf` apiece would be megabytes held for the
+/// whole unit.
 ///
-/// A candidate's [`SpanClass`] selects its span from `spans`: `.deb` files use
-/// `spans.deb`; by-hash files use `spans.byhash_covered`/`byhash_uncovered`.
-/// `now` is injected (rather than read internally) so by-hash deletion paths are
-/// testable despite birthtime not being backdatable on Linux.
-///
-/// Used by the flat-cleanup path both when a Packages index has reduced the map
-/// down to genuinely-unreferenced files (short span) and as a fallback when the
-/// Packages index is unfetchable (long span, since we cannot tell which entries
-/// are still referenced).
+/// `now` is injected because birthtime is not backdatable on Linux, so tests
+/// could not otherwise exercise removal.
 pub(super) async fn sweep_candidates(
     root: &Path,
     candidates: &HashMap<OsString, SpanClass>,
@@ -277,8 +244,6 @@ pub(super) async fn sweep_candidates(
         };
         match tokio::task::spawn_blocking(job).await {
             Ok(batch_stats) => stats.accumulate(batch_stats),
-            // A panic in the job stays the mirror task's, as when the sweep
-            // ran on it.
             Err(join_err) => std::panic::resume_unwind(join_err.into_panic()),
         }
     }
@@ -286,10 +251,9 @@ pub(super) async fn sweep_candidates(
     stats
 }
 
-/// Inspect and age out one [`sweep_candidates`] candidate. Blocking: the
-/// lstat runs right before the unlink, never earlier (`cache_walk`'s
-/// reap rule: a stale stat would turn a concurrent removal into a reported
-/// unlink failure).
+/// Inspect and age out one [`sweep_candidates`] candidate. Blocking. The
+/// lstat runs right before the unlink, never earlier: a stale stat would turn
+/// a concurrent removal into a reported unlink failure.
 fn sweep_candidate(
     path: &Path,
     class: SpanClass,
@@ -316,8 +280,7 @@ fn sweep_candidate(
             return;
         }
         // Listed by the scan, removed since (a download replacing it,
-        // another cleanup unit): not an I/O failure (`cache_walk`'s
-        // vanished-entry rule).
+        // another cleanup unit): not an I/O failure.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             debug!(
                 "Cache entry `{}` vanished before it could be inspected; skipping it",
@@ -360,28 +323,14 @@ static METADATA_WALK: WalkContext = WalkContext {
 /// Age out stale top-level index files in a metadata directory, dropping any
 /// matching `cache_metadata` entries on success.
 ///
-/// These volatile `Release`/`InRelease`/`Packages*`/... files are refreshed
-/// while a distribution is in use -- replaced (a fresh inode, hence a fresh
-/// birthtime) when the upstream copy changed, mtime-touched when it
-/// revalidated unchanged -- but nothing otherwise reclaims a *retired*
-/// distribution's metadata, and while its `Release` lingers, reference-mode
-/// by-hash cleanup keeps every digest it lists pinned. Removing regular files
-/// neither replaced nor revalidated for `keep_span` (the later of birthtime
-/// and mtime, via `AgeSweep::reference_time`) bounds that growth and lets the
-/// next by-hash cycle reclaim the now-unreferenced files.
+/// Removes regular files neither replaced nor revalidated for `keep_span`
+/// (`AgeSweep::reference_time`). Only the direct children are scanned:
+/// sub-directories (`by-hash/`, `tmp/`, nested mirrors) have their own
+/// cleanup. A flat `layout` leaves any deb-named entry to the
+/// reference-based flat-deb cleanup.
 ///
-/// Sub-directories -- notably the `by-hash/` and `tmp/` subtrees, swept
-/// separately -- are skipped; a symlink / FIFO / socket / device is unlinked,
-/// as everywhere cleanup walks. A flat `layout` (the flat root co-mingles
-/// indexes with `.deb` files) leaves any deb-named entry to the
-/// reference-based flat-deb cleanup; the structured `dists/` tree holds no debs,
-/// so the filter is skipped there. Only the direct children are scanned (no
-/// recursion), so nested mirrors -- which own their own flat root and cleanup --
-/// are untouched.
-///
-/// `now` is injected for testability, matching [`sweep_candidates`]: birthtime is
-/// not backdatable on Linux, so removal cannot be exercised via mtime alone.
-/// Like [`sweep_candidates`], the result leaves `scanned` to the caller.
+/// Like [`sweep_candidates`], `now` is injected and the result leaves
+/// `scanned` to the caller.
 pub(super) async fn sweep_aged_metadata(
     cache_root: &Path,
     dir: &Path,
@@ -398,8 +347,6 @@ pub(super) async fn sweep_aged_metadata(
 
     while let Some(mut entry) = walker.next().await {
         match entry.kind() {
-            // `by-hash/`, `tmp/` and flat URL-dirs are swept by their own
-            // units.
             EntryKind::Dir => continue,
             EntryKind::NonRegular => {
                 if !remove_non_regular(&entry.path()).await {
@@ -410,10 +357,8 @@ pub(super) async fn sweep_aged_metadata(
             EntryKind::File => {}
         }
 
-        // The flat root co-mingles volatile indexes with `.deb` files; the debs
-        // are reconciled (with checksums) by the flat-deb cleanup, so leave them
-        // be and sweep only the index metadata. `dists/` has no debs. Filtered
-        // by name before the stat, so the whole deb population costs no syscalls.
+        // Filtered by name before the stat, so the whole deb population costs
+        // no syscalls.
         if skip_debs && entry.name().to_str().is_some_and(is_deb_package) {
             continue;
         }
@@ -474,9 +419,7 @@ mod tests {
         .collect();
 
         // Birthtime is not backdatable on Linux, so inject `now` ~100 days
-        // ahead: every file's age is ~100 days. Only the class whose span is
-        // under 100 days (by-hash covered) is reaped, proving span-by-class
-        // selection; its removal is counted as `removed_unreferenced`.
+        // ahead: every file's age is ~100 days.
         let now = SystemTime::now() + Duration::from_hours(100 * 24);
         let spans = SpanTable {
             deb: Duration::from_hours(200 * 24),
@@ -512,8 +455,6 @@ mod tests {
         );
     }
 
-    /// A candidate removed since the scan listed it is a vanished entry:
-    /// skipped, and not a cache I/O failure.
     #[tokio::test]
     async fn sweep_candidates_skips_a_vanished_candidate_uncounted() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -541,16 +482,12 @@ mod tests {
         std::fs::write(dir.path().join("sid_Release"), b"r").expect("write release");
         std::fs::write(dir.path().join("sid_main_binary-amd64_Packages.xz"), b"p")
             .expect("write packages");
-        // A `by-hash/` directory (and its contents) must be left untouched --
-        // the by-hash walk owns it.
         std::fs::create_dir(dir.path().join("by-hash")).expect("mkdir by-hash");
         std::fs::write(dir.path().join("by-hash/deadbeef"), b"x").expect("write byhash file");
 
         let mirror = test_mirror();
         let keep_span = Duration::from_hours(90 * 24);
 
-        // `now` far in the future so both regular files are past the span
-        // (birthtime is not backdatable on Linux, so inject `now` instead).
         let now = SystemTime::now() + Duration::from_hours(91 * 24);
         let res = sweep_aged_metadata(
             dir.path(),
@@ -574,7 +511,6 @@ mod tests {
             "the by-hash subtree must be left to the by-hash walk"
         );
 
-        // A young file (within the span) is retained.
         std::fs::write(dir.path().join("trixie_Release"), b"r").expect("write release");
         let now = SystemTime::now() + Duration::from_hours(24);
         let res = sweep_aged_metadata(
@@ -626,10 +562,6 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_aged_metadata_skip_debs_spares_aged_debs() {
-        // Regression for the flat-root follow-up: the flat root co-mingles
-        // volatile indexes with `.deb` files. With `skip_debs`, an aged `.deb`
-        // must be left to the reference-based flat-deb cleanup while the aged
-        // index metadata is still reclaimed.
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("Release"), b"r").expect("write release");
         std::fs::write(dir.path().join("Packages"), b"p").expect("write packages");

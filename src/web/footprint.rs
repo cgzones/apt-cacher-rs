@@ -1,6 +1,4 @@
-//! Which directories each mirror row's dashboard disk figures come from
-//! ([`Footprint`], planned for all rows at once by [`plan_footprints`]), and
-//! the walk that tallies one ([`walk_footprint`]).
+//! Which directories each mirror row's dashboard disk figures come from.
 //!
 //! This is dashboard attribution, not cleanup's ownership: cleanup runs each
 //! row's units on their own and arbitrates nothing across rows. The rules:
@@ -54,7 +52,6 @@ use crate::{
 
 use super::tables::DirStats;
 
-/// One directory a row owns, and the layout rules its walk starts with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Root {
     path: PathBuf,
@@ -102,7 +99,6 @@ pub(super) fn plan_footprints(
     rows: &[(MirrorSite<'_>, MirrorKind)],
     paths: CachePaths<'_>,
 ) -> Vec<Footprint> {
-    /// A root's row and the rules its walk starts with.
     struct Owner {
         row: usize,
         level: Level,
@@ -172,15 +168,10 @@ static DASHBOARD_WALK: WalkContext = WalkContext {
     anomalies: AnomalyLevel::Debug,
 };
 
-/// Tally `footprint` for the dashboard's Mirrors table.
-///
-/// The layout rules are the startup scan's (`cache_tree`), so this counts
-/// what the quota counts within these roots. Failures (a stat failure, an
-/// unreadable subdirectory) are logged and counted by the walker like
-/// everywhere else and the walk carries on, so one bad entry does not drop
-/// the whole mirror from the table. Anomalies are logged at `debug` only
-/// ([`AnomalyLevel::Debug`]): a viewer's refresh re-runs this walk, and the
-/// startup scan and cleanup already warn about the same entry.
+/// A failure (stat, unreadable subdirectory) is logged and the walk carries
+/// on, so one bad entry does not drop the whole mirror from the table.
+/// Anomalies are logged at `debug` only: a viewer's refresh re-runs this
+/// walk, and the startup scan and cleanup already warn about the same entry.
 pub(super) async fn walk_footprint(footprint: &Footprint) -> DirStats {
     let mut stats = DirStats::default();
     for root in &footprint.roots {
@@ -340,7 +331,6 @@ mod tests {
         assert_eq!(counted, owned, "every owned file is counted");
     }
 
-    /// The by-hash and deb tallies follow the layout level, not the path.
     #[tokio::test]
     async fn byhash_and_deb_counts_follow_the_layout() {
         let dir = tempfile::tempdir().expect("tempdir");

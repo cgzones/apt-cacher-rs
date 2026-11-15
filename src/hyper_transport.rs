@@ -3,8 +3,7 @@
 //! Hyper's HTTP/1 body decoder and TLS reads both return `io::Error`s with
 //! kinds such as `InvalidData`. Wrap the transport outside TLS and the
 //! timeout stream, so `hyper_conn::upstream_body_error` can recognize a
-//! decoder error without guessing from its message. Successful I/O is
-//! forwarded unchanged; only errors allocate a wrapper.
+//! decoder error without guessing from its message.
 
 use std::{
     io,

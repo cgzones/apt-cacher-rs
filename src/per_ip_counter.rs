@@ -1,13 +1,8 @@
 //! A per-source-IP concurrency limiter with an RAII permit.
 //!
-//! Two independent caps are expressed with it -
-//! `max_connections_per_client_ip` ([`crate::client_counter`]) and
-//! `https_tunnel_max_connections_per_client` ([`crate::connect_tunnel`]) -
-//! and each owns its own counter instance, its own refusal metric and its own
-//! composition with a global cap. What they share, and what used to be
-//! written twice, is the bookkeeping: admit while under the cap, and on
-//! release decrement and drop the entry at zero so an idle map does not grow
-//! one entry per IP ever seen.
+//! Used for `max_connections_per_client_ip` and
+//! `https_tunnel_max_connections_per_client`, each with its own counter
+//! instance and refusal metric.
 
 use std::{
     net::{IpAddr, Ipv6Addr},
@@ -23,17 +18,13 @@ use crate::metrics;
 /// ever seen.
 pub(crate) struct PerIpCounter {
     held: parking_lot::Mutex<Held>,
-    /// Gauge sampled on every admission, where the cap surfaces one. Kept
-    /// here rather than at the call site so the count and the gauge cannot
-    /// be read from different instants.
+    /// Gauge sampled on every admission.
     peak: Option<&'static metrics::Peak>,
-    /// Runs while at least one IP holds its cap, so the dashboard can say
-    /// how long the cap was refusing someone. Moved under the map lock, so
-    /// its spans are exact.
+    /// Runs while at least one IP holds its cap. Moved under the map lock,
+    /// so its spans are exact.
     cap_clock: &'static metrics::CapClock,
 }
 
-/// The map and, under the same lock, how many IPs sit at their cap.
 #[derive(Default)]
 struct Held {
     per_ip: HashMap<IpAddr, usize>,
@@ -53,25 +44,17 @@ impl PerIpCounter {
         }
     }
 
-    /// The most permits any single IP holds right now: the live figure the
-    /// per-IP cap is compared against.
+    /// The most permits any single IP holds right now.
     #[must_use]
     pub(crate) fn busiest(&self) -> usize {
         self.held.lock().per_ip.values().copied().max().unwrap_or(0)
     }
 
-    /// Admit one more concurrent user of `ip` while fewer than `max` are
-    /// held, or return `None` at the cap.
+    /// `None` at the cap.
     ///
-    /// `ip` is canonicalized here rather than trusted to arrive that way
-    /// (`ClientInfo::ip` already is): a dual-stack listener reports an IPv4
+    /// `ip` is canonicalized here: a dual-stack listener reports an IPv4
     /// client as `::ffff:a.b.c.d`, and keyed raw that client would hold a
-    /// second set of slots beside its plain IPv4 form. An IPv6 address then
-    /// counts as its first `ipv6_prefix_len` bits (`client_ipv6_prefix_len`,
-    /// see [`counter_key`]).
-    ///
-    /// Takes `&'static self` because the permit outlives the call and must
-    /// name the counter to release into; every counter is a `static`.
+    /// second set of slots beside its plain IPv4 form.
     #[must_use]
     pub(crate) fn try_acquire(
         &'static self,
@@ -105,9 +88,6 @@ impl PerIpCounter {
         })
     }
 
-    /// Whether `ip`, keyed as [`Self::try_acquire`] keys it with
-    /// `ipv6_prefix_len`, currently holds a permit. Only the tests need it;
-    /// the production paths hold a permit or they do not.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn tracks(&self, ip: IpAddr, ipv6_prefix_len: u8) -> bool {
@@ -134,7 +114,6 @@ fn counter_key(ip: IpAddr, ipv6_prefix_len: u8) -> IpAddr {
     }
 }
 
-/// One admitted slot, released on drop.
 pub(crate) struct PerIpPermit {
     counter: &'static PerIpCounter,
     ip: IpAddr,
@@ -173,8 +152,6 @@ mod tests {
     static COUNTER: std::sync::LazyLock<PerIpCounter> =
         std::sync::LazyLock::new(|| PerIpCounter::new(None, &CLOCK));
 
-    /// The clock runs while any IP sits at its cap, and stops once none
-    /// does: two IPs at the cap, one released, still at the cap.
     #[test]
     fn the_cap_clock_runs_while_any_ip_is_at_its_cap() {
         static CLOCK: metrics::CapClock = metrics::CapClock::new();
@@ -216,8 +193,6 @@ mod tests {
         assert_ne!(key("192.0.2.1", 64), key("192.0.2.2", 64));
     }
 
-    /// Grouped by `/64`, two addresses of one network share a cap and the
-    /// permit releases under the same key it was admitted under.
     #[test]
     fn a_prefix_groups_ipv6_addresses_under_one_cap() {
         let a: IpAddr = "2001:db8:41::a".parse().expect("test address");
@@ -284,9 +259,6 @@ mod tests {
         drop(unrelated);
     }
 
-    /// An IPv4 client reported by a dual-stack listener as an IPv4-mapped
-    /// IPv6 address shares its slots with the plain IPv4 form, and an IPv6
-    /// client stays apart from both.
     #[test]
     fn a_mapped_ipv4_client_shares_its_slots_with_the_plain_form() {
         let plain: IpAddr = "192.0.2.34".parse().expect("test address");

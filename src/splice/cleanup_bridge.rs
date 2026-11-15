@@ -1,9 +1,7 @@
-//! Cleanup's index fetch for hyper-less builds (gated on the `mod` line with
-//! `cfg(not(feature = "hyper"))`): [`cleanup_index_fetch`] answers one format
-//! attempt of cleanup's fetch cascade (`cleanup/fetch.rs`) with the complete
-//! index bytes, read from a fresh enough cached copy or fetched uncached through
-//! `acquire::standard_upstream_connect`, or with the status or failure that
-//! ended the attempt.
+//! Cleanup's index fetch for hyper-less builds: [`cleanup_index_fetch`]
+//! answers one format attempt of cleanup's fetch cascade with the complete
+//! index bytes (a fresh enough cached copy, or an uncached upstream fetch), or
+//! with the status or failure that ended the attempt.
 
 use std::{io::ErrorKind, num::NonZero, path::Path, time::SystemTime};
 
@@ -94,16 +92,13 @@ async fn read_cached_index(
     }
 }
 
-/// One format attempt of cleanup's index fetch in hyper-less builds, for the
-/// index at `uri`, buffering at most `max_bytes` (`limits::packages_file_cap`
-/// of its compression), plus one byte to detect a growing cached file.
+/// One format attempt of cleanup's index fetch, buffering at most `max_bytes`
+/// plus one byte to detect a growing cached file.
 ///
-/// Only copies younger than `VOLATILE_CACHE_MAX_AGE` (30s) may supply
-/// references. Older named indexes can omit packages introduced since their
-/// fetch, even while clients keep current by-hash indexes cached. Fetch them
-/// upstream; request headers cannot extend freshness. This bridge performs a
-/// full, uncached fetch, while Hyper may conditionally revalidate and caches
-/// what it fetched.
+/// Only copies younger than `VOLATILE_CACHE_MAX_AGE` may supply references:
+/// older named indexes can omit packages introduced since their fetch, even
+/// while clients keep current by-hash indexes cached. Anything older is
+/// fetched upstream in full and not cached (hyper revalidates and caches).
 pub(crate) async fn cleanup_index_fetch(
     conn_details: &ConnectionDetails,
     uri: &Uri,
@@ -166,9 +161,6 @@ async fn cleanup_upstream_fetch(
     {
         Ok(v) => v,
         Err(err) => {
-            // Cleanup fetches run without a download runner: conclude the
-            // upstream failure here; cleanup's decision log reports the
-            // cause.
             let reported = err.conclude(Some(mirror), |_err| {
                 Logged::debug(format_args!(
                     "splice cleanup request to {upstream_path} failed to connect/read headers"
@@ -205,11 +197,10 @@ async fn cleanup_upstream_fetch(
         .framing
         .read_to_vec(upstream, &hdr_buf[hdr_end..], max_bytes)
         .await
-        // An empty index is the upstream fault `RejectReason::ZeroContentLength`
-        // documents (its doc holds the rationale), whatever the framing: fail
-        // the fetch like the hyper backend's cleanup fetches do, so cleanup
-        // skips the mirror instead of reconciling against an empty reference
-        // set.
+        // An empty index is an upstream fault (see
+        // `RejectReason::ZeroContentLength`), whatever the framing: fail the
+        // fetch so cleanup skips the mirror instead of reconciling against an
+        // empty reference set.
         .and_then(|body| {
             if body.is_empty() {
                 Err(UpstreamError::protocol("empty body"))
@@ -221,8 +212,6 @@ async fn cleanup_upstream_fetch(
     match body {
         Ok(body) => Ok(IndexAnswer::Complete(body)),
         Err(err) => {
-            // No download runner owns this fetch either, so the body failure
-            // is concluded here as well (a rate abort is the common one).
             let reported = err.conclude(Some(mirror), |err| {
                 Logged::debug(format_args!(
                     "splice cleanup request to {host_authority}{upstream_path} failed to read the body:  {}",
@@ -316,7 +305,6 @@ mod tests {
         );
     }
 
-    /// A fresh copy past the buffering cap is refetched rather than read.
     #[tokio::test]
     async fn an_oversized_fresh_copy_is_refetched() {
         let dir = tempfile::tempdir().expect("tempdir");

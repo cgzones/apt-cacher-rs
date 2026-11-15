@@ -1,6 +1,4 @@
-//! Compile-time identity of this build: the crate name and version strings
-//! the daemon announces (`User-Agent`, `Via`, `Server`, the dashboard) and
-//! the feature-flag summary `--version` and the startup banner print.
+//! Compile-time identity of this build: name, version and feature summary.
 
 pub(crate) const APP_NAME: &str = env!("CARGO_PKG_NAME");
 pub(crate) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -26,7 +24,6 @@ macro_rules! feature_tls {
     };
 }
 
-// Expand to the literal "true" when `feature` is enabled, "false" otherwise.
 macro_rules! feature_bool {
     ($name:ident, $feature:literal) => {
         #[cfg(feature = $feature)]
@@ -48,7 +45,6 @@ feature_bool!(feature_hyper, "hyper");
 feature_bool!(feature_sendfile, "sendfile");
 feature_bool!(feature_splice, "splice");
 
-/// The `key=value` feature summary, joined by `$sep`.
 macro_rules! feature_summary {
     ($sep:expr) => {
         concat!(
@@ -67,12 +63,9 @@ macro_rules! feature_summary {
     };
 }
 
-/// The crate version followed by the newline-separated feature summary; what
-/// `--version` prints.
+/// What `--version` prints.
 pub(crate) const VERSION_AND_FEATURES: &str =
     concat!(env!("CARGO_PKG_VERSION"), "\n", feature_summary!("\n"));
 
-/// The feature summary on one line, for the startup banner and the
-/// dashboard's "Features" row. A separate const rather than a runtime
-/// `.replace('\n', " ")` at each of them.
+/// For the startup banner and the dashboard's "Features" row.
 pub(crate) const FEATURES_ONE_LINE: &str = feature_summary!(" ");

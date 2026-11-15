@@ -10,9 +10,6 @@ use super::{
     response::WebResponse,
 };
 
-// Logs endpoint
-// ---------------------------------------------------------------------------
-
 #[must_use]
 pub(super) async fn serve_logs(options: QueryOptions) -> WebResponse {
     let ls = LOGSTORE.get().expect("initialized in main()");

@@ -49,7 +49,6 @@ pub(super) struct Section {
 }
 
 impl Section {
-    /// No rows: the section renders collapsed with an empty body.
     const EMPTY: Self = Self {
         html: String::new(),
         rows: 0,
@@ -59,7 +58,6 @@ impl Section {
 // Per-mirror directory scan
 // ---------------------------------------------------------------------------
 
-/// TTL for cached per-mirror directory-scan results.
 const DIR_STATS_TTL_SECS: u64 = 60;
 
 /// Idle time after which a `DIR_STATS_CACHE` slot no load asked for is
@@ -68,20 +66,15 @@ const DIR_STATS_TTL_SECS: u64 = 60;
 /// however stale that load's mirror list.
 const DIR_STATS_IDLE_SECS: u64 = 2 * DIR_STATS_TTL_SECS;
 
-/// Maximum number of mirror directory walks running concurrently when the
-/// `DIR_STATS_CACHE` is cold. Bounds disk fan-out and FD usage.
+/// Bounds disk fan-out and FD usage while the `DIR_STATS_CACHE` is cold.
 const DIR_SCAN_CONCURRENCY: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct DirStats {
     pub(super) size: u64,
     pub(super) byhash_files: usize,
-    /// Files whose extension is `.deb`. Disjoint from `metadata_files`,
-    /// orthogonal to `byhash_files`.
     pub(super) deb_files: usize,
-    /// Files whose extension is anything other than `.deb` — Packages,
-    /// Release, by-hash entries, etc. Disjoint from `deb_files`. Together
-    /// they sum to `files`.
+    /// Every file that is not a `.deb`, by-hash entries included.
     pub(super) metadata_files: usize,
     max_file_size: u64,
     pub(super) oldest_mtime: Option<SystemTime>,
@@ -93,8 +86,6 @@ impl DirStats {
         self.deb_files + self.metadata_files
     }
 
-    /// Count one regular file named `name`, found under a `by-hash/` leaf
-    /// or not.
     pub(super) fn add_file(&mut self, name: &OsStr, metadata: &Metadata, in_byhash: bool) {
         let len = metadata.len();
         self.size += len;
@@ -142,7 +133,6 @@ fn merge_max(a: Option<SystemTime>, b: Option<SystemTime>) -> Option<SystemTime>
     a.into_iter().chain(b).max()
 }
 
-/// One row's cached walk result, with the footprint it was computed from.
 #[derive(Clone)]
 struct CachedStats {
     at: Instant,
@@ -156,9 +146,9 @@ struct CachedStats {
 /// again.
 type DirStatsSlot = Arc<tokio::sync::Mutex<Option<CachedStats>>>;
 
-/// A slot and when a load last asked for it (see [`DIR_STATS_IDLE_SECS`]).
 struct SlotEntry {
     slot: DirStatsSlot,
+    /// When a load last asked for the slot.
     used: Instant,
 }
 
@@ -176,11 +166,10 @@ async fn cached_footprint_stats(key: &Path, footprint: Footprint) -> DirStats {
     .await
 }
 
-/// The slot's result while it is younger than [`DIR_STATS_TTL_SECS`] and was
-/// computed from `footprint`. The footprint check is what keeps a fresh
-/// result from being summed with a stale one that still counts its files:
-/// a row that gains a nested mirror changes footprint, and so does one whose
-/// directory a refresh for an older mirror list published.
+/// The footprint check keeps a fresh result from being summed with a stale
+/// one that still counts its files: a row that gains a nested mirror changes
+/// footprint, and so does one whose directory a refresh for an older mirror
+/// list published.
 fn fresh_dir_stats(cached: Option<&CachedStats>, footprint: &Footprint) -> Option<DirStats> {
     cached
         .filter(|c| c.at.elapsed().as_secs() < DIR_STATS_TTL_SECS && c.footprint == *footprint)
@@ -202,11 +191,7 @@ async fn cached_dir_stats<F>(
 where
     F: Future<Output = DirStats> + Send + 'static,
 {
-    // Bind the slot to a local so the `MutexGuard` drops at this `;`,
-    // before any `.await` below — `parking_lot::Mutex` held across an
-    // await is a deadlock waiting for someone to extend the body.
-    // `entry_ref` looks up by the borrowed `&Path`; only a first visit
-    // materialises the owned `PathBuf` key.
+    // The `parking_lot` guard must drop before any `.await` below.
     let slot = {
         let mut cache = DIR_STATS_CACHE.lock();
         let entry = cache.entry_ref(key).or_insert_with(|| SlotEntry {
@@ -251,9 +236,7 @@ where
 }
 
 /// Drop the slots no load asked for within [`DIR_STATS_IDLE_SECS`], unless a
-/// refresh still holds one. Keeps `DIR_STATS_CACHE` from growing unbounded
-/// as mirrors come and go, without letting a load working from an older
-/// mirror list evict a slot a newer one just created.
+/// refresh still holds one.
 fn evict_idle_dir_stats() {
     DIR_STATS_CACHE.lock().retain(|_, entry| {
         entry.used.elapsed().as_secs() < DIR_STATS_IDLE_SECS || Arc::strong_count(&entry.slot) > 1
@@ -264,9 +247,7 @@ fn evict_idle_dir_stats() {
 // Table builders
 // ---------------------------------------------------------------------------
 
-/// `Display` wrappers used exclusively by the Mirrors table. Pulled out of
-/// `build_mirror_table` so the function body stays focused on data flow rather
-/// than on per-cell rendering details.
+/// `Display` wrappers for the Mirrors table's cells.
 mod mirror_cells {
     use std::fmt::{self, Display, Formatter};
 
@@ -284,10 +265,8 @@ mod mirror_cells {
 
     use super::super::fmt::{Age, HtmlEscape, HtmlEscaped, Latency, Meter, Pct, UtcText, warn_if};
 
-    /// The coloured dot in front of a mirror's name: green without a failure
-    /// since start, red once one of its files failed checksum verification
-    /// (the mirror serves content its index disagrees with), amber for any
-    /// other failure class. Its title spells the counts out.
+    /// The coloured dot in front of a mirror's name. Only a checksum failure
+    /// is red: the mirror serves content its index disagrees with.
     #[derive(Clone, Copy)]
     pub(super) struct HealthDot(pub(super) MirrorHealth);
     impl Display for HealthDot {
@@ -328,13 +307,11 @@ mod mirror_cells {
     }
 
     /// The scheme a mirror is dialled with, a chip between its health dot
-    /// and its name: `https`, `http`, or `?` before the first contact
-    /// decides it. The title says why, for the mirror and for every alias
+    /// and its name. The title says why, for the mirror and for every alias
     /// host that is dialled for it (each has a scheme of its own). Only a
     /// failed HTTPS probe -- of the mirror or of an alias -- warns.
     pub(super) struct SchemeChip<'a> {
         pub(super) verdict: SchemeVerdict,
-        /// Alias hosts of this mirror with their own verdicts.
         pub(super) aliases: &'a [(&'a ClientHost, SchemeVerdict)],
     }
     impl Display for SchemeChip<'_> {
@@ -614,18 +591,14 @@ const MIRROR_HEALTH_HEADERS: [&str; 4] = [
     "<span title=\"Downloads aborted because a body read timed out (http_timeout) or the mirror fell below min_download_rate over rate_check_timeframe.\">Timeouts / Slow</span> <span class=\"scope\">since start</span>",
 ];
 
-/// The Mirrors table's index-age column (`mirror_indexes`).
 const MIRROR_INDEX_HEADER: &str = "<span title=\"Age of this mirror's newest known Release/InRelease at its latest confirmation across all suites. A frozen release pocket beside a syncing -updates is fine; a suite no longer requested cannot freeze the age, and an idle mirror keeps its last reading. Over two weeks is a notice once the mirror served that newest index this old: it has likely stopped syncing; report it to the mirror's operator or switch to another mirror (a vendor repository that rarely publishes reads this way too). Over two weeks only because the suite carrying the newest index was not requested since reads unconfirmed: that suite may well have moved on. A suite served past its Valid-Until warns: apt refuses that index. Hover a cell for each suite's age when it was served. Needs verify_checksums, whose ingest reads the index.\">Newest Index</span> <span class=\"scope\">since start</span>";
 
-/// The Mirrors table's latency and throughput columns (`mirror_perf`),
-/// in-memory figures since the daemon started like the failure counts.
 const MIRROR_PERF_HEADERS: [&str; 2] = [
     "<span title=\"From the start of the upstream attempt that answered (its TCP and TLS connect included when no pooled connection was reused) to its parsed response head, for cached fetches answered with a body or a 304: the latest, and the longest since start. Warns when the longest passed half of http_timeout: the mirror came close to timing out; compare mirrors and switch to a closer or less loaded one.\">Time to First Byte</span> <span class=\"scope\">since start</span>",
     "<span title=\"Body bytes per second of the latest committed download of 1 MiB or more from this mirror, and the fastest since start. A lower bound while a client is attached: splice builds pace a download to its client until it is demoted, so a slow client (see the Clients table) reads here too. Warns while the latest is under twice min_download_rate: downloads from this mirror are close to being cancelled; if no client is slow, switch to a faster mirror, or lower min_download_rate.\">Throughput</span> <span class=\"scope\">since start</span>",
 ];
 
-/// The Mirrors table's failure-count cells, one per
-/// [`MIRROR_HEALTH_HEADERS`] column.
+/// One cell per [`MIRROR_HEALTH_HEADERS`] column.
 fn health_cells(table: &mut Table, health: MirrorHealth) {
     let MirrorHealth {
         unreachable,
@@ -643,8 +616,6 @@ fn health_cells(table: &mut Table, health: MirrorHealth) {
     }
 }
 
-/// The Mirrors table's name column: what the dot and the chip in front of
-/// each name mean.
 const MIRROR_HEADER: &str = "<span title=\"The dot is the mirror's upstream health since start (hover it for the failures); the chip is the scheme it is dialled with now (hover it for why).\">Mirror</span>";
 
 /// The [`mirror_cells::SchemeChip`] parts of `mirror`: its own verdict and
@@ -726,10 +697,8 @@ pub(super) async fn build_mirror_table(
         .map(|(site, _)| paths.mirror_dir(*site))
         .collect();
 
-    // Bound disk fan-out: cold-cache rebuilds otherwise spawn one concurrent
-    // walk per known mirror. We process in fixed-size chunks so (a) at most
-    // `DIR_SCAN_CONCURRENCY` walks run at once and (b) the collected order
-    // matches `footprints` (and therefore `sorted`).
+    // Fixed-size chunks: at most `DIR_SCAN_CONCURRENCY` walks run at once
+    // and the collected order matches `footprints` (and therefore `sorted`).
     let mut dir_stats: Vec<DirStats> = Vec::with_capacity(footprints.len());
     let mut footprints = footprints.into_iter();
     for keys in keys.chunks(DIR_SCAN_CONCURRENCY) {
@@ -913,11 +882,6 @@ fn efficiency_key(downloaded: u64, delivered: u64) -> Option<i128> {
         .then(|| (i128::from(delivered) - i128::from(downloaded)) * 1000 / i128::from(delivered))
 }
 
-/// Log a failed dashboard query and render its section's error notice.
-///
-/// One place so every section reports a DB failure identically: the
-/// `DB_OPERATION_FAILED` bump, an ERROR naming the section, and the notice
-/// the reader sees in place of the table.
 pub(super) fn db_error_section(label: &'static str, err: &sqlx::Error) -> Section {
     metrics::DB_OPERATION_FAILED.increment();
     error!(
@@ -929,7 +893,6 @@ pub(super) fn db_error_section(label: &'static str, err: &sqlx::Error) -> Sectio
     Section { html: buf, rows: 0 }
 }
 
-/// The Origins table's index-date column (`mirror_indexes`).
 const ORIGIN_INDEX_HEADER: &str = "<span title=\"The Date of the newest Release/InRelease of this distribution the mirror served since start: how current the index behind this origin is. Needs verify_checksums, whose ingest reads the index.\">Index Date</span> <span class=\"scope\">since start</span>";
 
 /// Renders borrowed rows (like [`build_mirror_table`]) rather than owning
@@ -993,9 +956,6 @@ pub(super) fn render_origin_table(
     }
 }
 
-/// The Clients table's address column. A row is one address, which an IPv6
-/// host using temporary (privacy) addresses changes daily or so: the tooltip
-/// says why one machine can fill several rows.
 const CLIENT_IP_HEADER: &str = "<span title=\"One row per client address; an IPv4 client of the dual-stack listener shows as IPv4. An IPv6 host using temporary (privacy) addresses gets a row for every address it used, and the per-client caps count each address on its own unless client_ipv6_prefix_len groups them by network.\">IP</span>";
 
 /// The Clients table's trouble columns: in-memory counts since the daemon
@@ -1009,8 +969,7 @@ const CLIENT_TROUBLE_HEADERS: [&str; 5] = [
     "<span title=\"Requests and CONNECT tunnels for a mirror outside allowed_mirrors or https_tunnel_allowed_mirrors: usually a repository in this client's sources that this proxy does not serve. Add the mirror, or remove it from the client. Not highlighted: a client with such an entry is refused on every update.\">Refused (mirror)</span> <span class=\"scope\">since start</span>",
 ];
 
-/// The Clients table's trouble cells, one per [`CLIENT_TROUBLE_HEADERS`]
-/// column.
+/// One cell per [`CLIENT_TROUBLE_HEADERS`] column.
 fn trouble_cells(table: &mut Table, counts: &ClientTrouble) {
     let warn = |value| Nonzero {
         value,
@@ -1127,12 +1086,9 @@ pub(super) fn build_uncacheable_table() -> Section {
     }
 }
 
-/// What a Top-Packages table renders besides the package name.
 #[derive(Clone, Copy)]
 pub(super) enum TopPackagesView {
-    /// Columns: Package, Deliveries, Size Each.
     ByCount,
-    /// Columns: Package, Delivered Total, Deliveries, Size Each.
     BySize,
 }
 
@@ -1152,8 +1108,6 @@ pub(super) fn render_top_packages_table(
 
     let rows = packages.len();
     let (key, headers, numeric): (&str, &[&str], &[usize]) = match view {
-        // "Package Size" meant the size of one copy in one table and the
-        // cumulative bytes in the other; name each for what it counts.
         TopPackagesView::ByCount => (
             "packages-count",
             &["Package", "Deliveries", "Size Each"],
@@ -1199,7 +1153,6 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
     }
 
-    /// Counts its calls; each takes 50 ms and reports seven files.
     fn counted_walk(
         walks: &Arc<std::sync::atomic::AtomicUsize>,
     ) -> impl FnOnce(Footprint) -> std::pin::Pin<Box<dyn Future<Output = DirStats> + Send>>
@@ -1218,8 +1171,6 @@ mod tests {
         }
     }
 
-    /// Dashboard loads that find the same entry stale share one walk: the
-    /// others wait for it and read its result.
     #[tokio::test(start_paused = true)]
     async fn concurrent_refreshes_of_one_directory_walk_it_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1238,8 +1189,6 @@ mod tests {
         DIR_STATS_CACHE.lock().remove(dir);
     }
 
-    /// A load cancelled mid-walk leaves the walk running: the next load
-    /// reads its result instead of walking again.
     #[tokio::test]
     async fn a_cancelled_refresh_still_publishes_its_walk() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1282,9 +1231,6 @@ mod tests {
         DIR_STATS_CACHE.lock().remove(dir);
     }
 
-    /// A row whose footprint changed (it gained a nested mirror, a legacy
-    /// row took a directory) is walked again although its result is young;
-    /// the same footprint is served from the cache.
     #[tokio::test(start_paused = true)]
     async fn a_changed_footprint_is_walked_again_before_the_ttl() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1346,9 +1292,6 @@ mod tests {
         DIR_STATS_CACHE.lock().remove(dir);
     }
 
-    /// Eviction drops only a slot no load asked for in a while and no
-    /// refresh holds; a slot just created (by a load working from a newer
-    /// mirror list than the evicting one) survives.
     #[test]
     fn eviction_keeps_recently_used_and_busy_slots() {
         let idle = Instant::now() - coarsetime::Duration::from_secs(DIR_STATS_IDLE_SECS + 1);
@@ -1374,8 +1317,6 @@ mod tests {
         }
     }
 
-    /// A tracked client without a persisted row is appended with `N/A` in
-    /// every persisted column; both rows carry the trouble cells.
     #[test]
     fn clients_without_a_row_fill_the_persisted_columns_with_na() {
         let persisted: std::net::IpAddr = "192.0.2.1".parse().unwrap();

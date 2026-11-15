@@ -42,12 +42,7 @@ use crate::cleanup::sweep::{SpanTable, sweep_aged_metadata, sweep_candidates};
 /// the `SpanTable`.
 ///
 /// Candidates live in a `HashMap<OsString, SpanClass>` keyed by the entry's path
-/// *relative to the unit's tree root*: produced by
-/// [`scan_candidates`], reduced by the
-/// index sources (which match that key against a `Filename:` value), and swept
-/// by [`sweep_candidates`], which
-/// rejoins it onto the root. Storing the full path per entry instead would cost
-/// megabytes on a large mirror for no lookup the key cannot already serve.
+/// *relative to the unit's tree root*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SpanClass {
     /// A pool/flat `.deb`: swept past the policy grace (or age fallback).
@@ -61,34 +56,21 @@ pub(super) enum SpanClass {
     ByHashUncovered,
 }
 
-/// A cleanup unit abandoned on a cache-directory failure.
-///
-/// The failure was logged - with its path, verb and consequence - and counted
-/// (`CACHE_IO_FAILURE`) where it happened: the walker's one directory-failure
-/// line (`cache_walk::WalkContext::dir_failure`, `DirFailure::Abort`), or the
-/// by-hash root probe (`refs::byhash_dir_present`).  The
-/// carried [`Logged`] is the proof, so every arm this passes through
-/// (`run_reconcile_unit`, `run_byhash_unit`, `run_mirror_units`) maps it
-/// silently; there is exactly one line per abandoned unit.
+/// A cleanup unit abandoned on a cache-directory failure, which was logged
+/// and counted where it happened (the carried [`Logged`] is the proof).
 #[derive(Debug)]
 pub(super) struct CleanupUnitError(pub(super) Logged);
 
-/// One mirror's cleanup result: the sum of its units' [`UnitStats`], summed
-/// again across mirrors by the orchestrator.
+/// One mirror's cleanup result.
 pub(super) struct CleanupDone {
     pub(super) mirror: Mirror,
     pub(super) stats: UnitStats,
-    /// Units of this mirror that did not do their whole job, each logged
-    /// where it stopped: abandoned on a directory they could not read, or
-    /// [`UnitStats::failed`].  A unit counts once however many of its entries
-    /// failed.
+    /// Units of this mirror that did not do their whole job, each already
+    /// logged.  A unit counts once however many of its entries failed.
     pub(super) failed_units: u64,
 }
 
-/// Cleanup counters: returned per sweep by [`sweep_candidates`] /
-/// [`sweep_aged_metadata`] and per unit by [`run_unit`], summed per mirror
-/// into [`CleanupDone`] by [`run_mirror_units`] and across mirrors by the
-/// orchestrator.
+/// Cleanup counters, per sweep, unit, mirror or run.
 ///
 /// Also the running tally threaded through a reconcile unit's resolvers, so
 /// deletions performed before a mid-cascade group failure stay accounted (an
@@ -96,13 +78,11 @@ pub(super) struct CleanupDone {
 /// discrepancy` warn).
 #[derive(Clone, Copy, Default)]
 pub(super) struct UnitStats {
-    /// Entries considered; the retained count is derived from it
-    /// ([`Self::retained`]) rather than tallied, so the two never disagree.
+    /// Entries considered.
     pub(super) scanned: u64,
     pub(super) removed: u64,
     pub(super) bytes_removed: u64,
-    /// Subset of `removed` deleted as unreferenced-but-covered by-hash files,
-    /// surfaced as `CLEANUP_BYHASH_UNREFERENCED` by the orchestrator.
+    /// Subset of `removed` deleted as unreferenced-but-covered by-hash files.
     pub(super) removed_unreferenced: u64,
     /// Bytes of the regular files a `tmp/` reap unlinked (kept partials and
     /// foreign files). The quota counts them like cached files, so the
@@ -110,20 +90,16 @@ pub(super) struct UnitStats {
     /// of `removed`/`bytes_removed` and the metrics fed from those.
     pub(super) tmp_bytes_removed: u64,
     /// Reconcile sweeps bailed for an incomplete reference set (an index that
-    /// could not be fetched, parsed or looked up): nothing of that tree is
-    /// reclaimed this cycle, which the dashboard labels as a failed step.
+    /// could not be fetched, parsed or looked up); the dashboard labels it as
+    /// a failed step.
     pub(super) bailed: u64,
     /// Entries the unit left in place, or directories it left unread, on a
-    /// cache I/O failure (an unreadable file type, metadata or timestamp, a
-    /// failed unlink or verification), each logged and counted
-    /// (`CACHE_IO_FAILURE`) where it failed. The rest of the unit ran, but
-    /// what it could not reach is unreclaimed, so the dashboard labels it as
-    /// a failed step. A vanished entry is no failure.
+    /// cache I/O failure, each already logged and counted; the dashboard
+    /// labels it as a failed step. A vanished entry is no failure.
     pub(super) io_failures: u64,
 }
 
 impl UnitStats {
-    /// Entries considered but kept: `scanned` minus `removed`.
     pub(super) const fn retained(&self) -> u64 {
         self.scanned.saturating_sub(self.removed)
     }
@@ -134,7 +110,6 @@ impl UnitStats {
         self.bailed > 0 || self.io_failures > 0
     }
 
-    /// Accumulate one finished sweep, unit or mirror into a running total.
     /// The destructure makes a new counter a compile error here rather than a
     /// silently unsummed field.
     pub(super) fn accumulate(&mut self, unit: Self) {
@@ -163,15 +138,15 @@ impl UnitStats {
     }
 }
 
-/// A single fetch-buffer-reduce unit: where to fetch a `Packages` index, how
-/// to name it, and how to map its `Filename:` values onto scanned candidates.
+/// Where to fetch a `Packages` index, how to name it, and how to map its
+/// `Filename:` values onto scanned candidates.
 struct FetchPlan<'a> {
     mirror: Mirror,
     // deb-owning mirror used to key `cache_metadata` invalidation on a
-    // checksum-mismatch eviction. Equals `mirror` for the structured-pool and
-    // co-located flat plans, but differs for the flat-root and strict-flat-pool
-    // fallbacks where `mirror` is the (truncated) Packages-fetch mirror while the
-    // candidate debs live under the original sub-path mirror.
+    // checksum-mismatch eviction. Differs from `mirror` for the flat-root and
+    // strict-flat-pool fallbacks, where `mirror` is the (truncated)
+    // Packages-fetch mirror while the candidate debs live under the original
+    // sub-path mirror.
     owner_mirror: &'a Mirror,
     base_uri: String,
     // deb-cache layout for metadata invalidation; distinct from the fetched index's layout
@@ -182,26 +157,18 @@ struct FetchPlan<'a> {
 
 /// Outcome of reducing the candidate set against one `Packages` index.
 enum ReduceOutcome {
-    /// Index fetched and reduced; candidates remain.
+    /// Candidates remain.
     Reduced,
-    /// Index fetched and reduced; no candidates remain.
+    /// No candidates remain.
     Exhausted,
-    /// Index could not be fetched (conservative bail for the mirror).
     FetchFailed(FetchFailure),
 }
 
-/// Fetch one `Packages` index for `plan`, buffer it, and reduce `candidates`
-/// against it (verifying matched cache files and evicting genuine
-/// checksum mismatches, whose removals fold straight into `tally`).
+/// Fetch one `Packages` index for `plan` and reduce `candidates` against it.
 ///
-/// A *fetch miss* (non-200), a *body-transfer failure* (upstream read timeout,
-/// rate abort, memfd/IO buffer error), or a *silently-truncated body* (the 200
-/// header arrived but the download aborted mid-stream, leaving fewer bytes than
-/// the announced `Content-Length`) all yield `Ok(ReduceOutcome::FetchFailed(_))`
-/// so the caller can bail the mirror conservatively. Only a *reduce parse error*
-/// (decompression bomb, malformed or zero-byte compressed index, local read
-/// failure) propagates as `Err`, unlogged - [`map_reduce`] logs it once with
-/// the resolver's consequence; every caller treats it conservatively too.
+/// Any fetch failure (non-200, body-transfer failure, truncated body) is
+/// `Ok(ReduceOutcome::FetchFailed(_))`. Only a reduce parse error propagates
+/// as `Err`, unlogged - [`map_reduce`] logs it.
 async fn reduce_against(
     plan: &FetchPlan<'_>,
     ctx: &ReconcileCtx<'_>,
@@ -247,9 +214,7 @@ async fn reduce_against(
 }
 
 /// Base URI of a flat repository's `Packages` index; the fetch cascade appends
-/// each compression extension in turn. Built for the mirror itself by the
-/// co-located source and for the truncated flat-repo root by
-/// [`flat_root_fetch_plan`].
+/// each compression extension in turn.
 fn flat_packages_base_uri(mirror: &Mirror) -> String {
     format!(
         "http://{}/{}/Packages",
@@ -260,8 +225,7 @@ fn flat_packages_base_uri(mirror: &Mirror) -> String {
 
 /// Build the `FetchPlan` for a flat-repo *root* `Packages` index, stripping the
 /// in-mirror `prefix` (trailing `/`) from `Filename:` values so a root index
-/// reconciles a sub-path mirror's cached debs. Shared by the root-first fast
-/// path and the co-located cascade's Step 2 fallback.
+/// reconciles a sub-path mirror's cached debs.
 fn flat_root_fetch_plan<'a>(mirror: &'a Mirror, seg: &str, prefix: &'a str) -> FetchPlan<'a> {
     let root_mirror = Mirror::new(
         mirror.host().clone(),
@@ -281,10 +245,8 @@ fn flat_root_fetch_plan<'a>(mirror: &'a Mirror, seg: &str, prefix: &'a str) -> F
     }
 }
 
-/// Run every `unit` of one mirror in order, folding their [`UnitStats`] into a
-/// single per-mirror [`CleanupDone`]. An abandoned unit ([`CleanupUnitError`],
-/// already logged where it failed) does NOT abort the remaining units for
-/// that mirror.
+/// Run every `unit` of one mirror in order. An abandoned unit does NOT abort
+/// the remaining units for that mirror.
 pub(super) async fn run_mirror_units(
     entry: MirrorEntry,
     units: Vec<CleanupUnit>,
@@ -294,11 +256,9 @@ pub(super) async fn run_mirror_units(
     let mirror: Mirror = entry.into();
     let now = SystemTime::now();
 
-    // The mirror's own `origins` rows, read once: the structured-pool reconcile
-    // and the structured by-hash completeness gate both reconcile against them
-    // and used to issue this identical query one apiece. A `MirrorKind::Flat`
-    // row emits neither unit, so it still issues none -- and never observes the
-    // `None` that a failed read would produce.
+    // Read once for the structured-pool reconcile and the structured by-hash
+    // completeness gate. A `MirrorKind::Flat` row emits neither unit, so it
+    // never observes this `None`.
     let self_origins = if mirror.kind() == MirrorKind::Flat {
         None
     } else {
@@ -338,9 +298,7 @@ pub(super) async fn run_mirror_units(
     }
 }
 
-/// Everything a unit needs that is fixed for the whole mirror: its identity, the
-/// DB/config handles, the once-per-cycle origins read, and the single reference
-/// instant every one of its trees is aged against.
+/// Everything a unit needs that is fixed for the whole mirror.
 struct MirrorCtx<'a> {
     mirror: &'a Mirror,
     appstate: &'a AppState,
@@ -349,15 +307,14 @@ struct MirrorCtx<'a> {
     /// [`read_self_origins`]).
     self_origins: Option<&'a [OriginEntry]>,
     /// One instant per mirror, so a single cycle ages every tree against the
-    /// same `now` (and so the by-hash / metadata deletion paths are testable,
-    /// birthtime not being backdatable on Linux).
+    /// same `now`.
     now: SystemTime,
 }
 
-/// Read this mirror's own `origins` rows. `None` means the lookup failed --
-/// logged and counted here, once, rather than at each consumer -- and every
-/// consumer must treat it as *unknown*, never as "this mirror has no origins":
-/// grace-sweeping on an unread origin set would delete still-referenced debs.
+/// Read this mirror's own `origins` rows. `None` means the lookup failed
+/// (logged here), and every consumer must treat it as *unknown*, never as
+/// "this mirror has no origins": grace-sweeping on an unread origin set would
+/// delete still-referenced debs.
 async fn read_self_origins(appstate: &AppState, mirror: &Mirror) -> Option<Vec<OriginEntry>> {
     match appstate
         .database
@@ -376,28 +333,22 @@ async fn read_self_origins(appstate: &AppState, mirror: &Mirror) -> Option<Vec<O
     }
 }
 
-/// Immutable context threaded through the reconcile-unit resolvers (the
-/// candidate map and tally are the only mutable state, kept separate).
 struct ReconcileCtx<'a> {
     mirror_ctx: &'a MirrorCtx<'a>,
     unit: &'a ReconcileUnit,
 }
 
 impl ReconcileCtx<'_> {
-    /// The unit's tree root: candidate keys are relative to it, so a resolver
-    /// needs it to turn a matched key back into an on-disk path. Named apart
-    /// from the archive-root / flat-root *segments* the resolvers call `root`.
+    /// The unit's tree root, which candidate keys are relative to. Named
+    /// apart from the archive-root / flat-root *segments* the resolvers call
+    /// `root`.
     fn tree_root(&self) -> &Path {
         &self.unit.tree.root
     }
 }
 
-/// Signal from a source-group resolver back to the generic tail.
-///
-/// A resolver reports only *what happened*; the tail derives the root segment
-/// and owning-group early exit from the [`IndexSource`] it dispatched.
+/// Signal from a source-group resolver back to `run_reconcile_unit`.
 enum GroupResolution {
-    /// The group ran with this outcome (pushed onto the tail's results).
     Ran(GroupOutcome),
     /// Reducing emptied the candidate map: short-circuit the whole
     /// unit — there is nothing left to sweep.
@@ -408,11 +359,6 @@ enum GroupResolution {
     Skipped,
 }
 
-/// Execute one [`CleanupUnit`]: hand each variant's payload to the arm that
-/// consumes it. The dispatch is the whole of it — every arm's signature names
-/// exactly the inputs that shape carries, so there is no facet -> layout table
-/// to drift from the roots the classifier built and no policy-shape guard to
-/// fall through.
 async fn run_unit(unit: &CleanupUnit, ctx: &MirrorCtx<'_>) -> Result<UnitStats, CleanupUnitError> {
     match unit {
         CleanupUnit::Reconcile(unit) => run_reconcile_unit(unit, ctx).await,
@@ -422,14 +368,10 @@ async fn run_unit(unit: &CleanupUnit, ctx: &MirrorCtx<'_>) -> Result<UnitStats, 
     }
 }
 
-/// Reap one [`PartialsUnit`]'s `tmp/` directory (the classifier emits one for
-/// the structured tree, one for the flat tree — see `model::classify_mirror`).
-///
-/// Delegates to [`cleanup_tmp_dir`] for the actual sweep and logs its count.
 /// Only the reaped bytes reach [`UnitStats`], as `tmp_bytes_removed`: the
 /// quota counts kept partials, so the reconcile must subtract them, but
-/// partial-download scratch files are not cached content and must not
-/// inflate `CLEANUP_EVICTIONS`/`CLEANUP_BYTES_RECLAIMED`.
+/// scratch files are not cached content and must not inflate
+/// `CLEANUP_EVICTIONS`/`CLEANUP_BYTES_RECLAIMED`.
 async fn run_partials_unit(unit: &PartialsUnit, ctx: &MirrorCtx<'_>) -> UnitStats {
     let mirror = ctx.mirror;
 
@@ -451,17 +393,8 @@ async fn run_partials_unit(unit: &PartialsUnit, ctx: &MirrorCtx<'_>) -> UnitStat
     }
 }
 
-/// Age out stale index metadata for a [`MetadataUnit`]: a direct
-/// [`sweep_aged_metadata`] over the unit's root. Structured
-/// (`CacheLayout::Dists`) sweeps the pure `dists/` metadata tree; flat
-/// (`CacheLayout::Flat`) sweeps the flat root, leaving co-mingled `.deb` files
-/// to the flat-deb cleanup. The summary line is
-/// emitted only when something was removed; the metadata units contribute nothing to `files_retained` (their
-/// `scanned` equals `removed`, so the derived retained count is zero).
-///
-/// The always-fired debug marker documents the unit ordering: the metadata sweep runs
-/// (and logs) before this mirror's by-hash units in the same cycle, so a stale
-/// `Release` freed now unpins its digests this cycle.
+/// Age out stale index metadata. Runs before this mirror's by-hash units, so
+/// a stale `Release` freed now unpins its digests this cycle.
 async fn run_metadata_unit(unit: &MetadataUnit, ctx: &MirrorCtx<'_>) -> UnitStats {
     let mirror = ctx.mirror;
 
@@ -497,17 +430,6 @@ async fn run_metadata_unit(unit: &MetadataUnit, ctx: &MirrorCtx<'_>) -> UnitStat
 
 /// Execute a [`ByHashUnit`]: probe the by-hash tree, build its `Release`
 /// reference set, and sweep the leftovers.
-///
-/// Invariant 5 (reference mode preconditions) is enforced entirely by
-/// [`build_byhash_reference_set`] / [`active_origin_distributions`]: structured
-/// trees gate on the complete active-origin distribution union (a DB error ⇒
-/// `None` ⇒ age mode); flat trees pass an empty expected list. A `None`
-/// reference set means age mode — every candidate stays `ByHashUncovered` and is
-/// judged purely by the backstop. The per-file keep/remove decision is made via
-/// candidate classes + span selection (see [`sweep_byhash_dir`]).
-///
-/// `byhash_dir_present` is probed up front so an absent tree (the common case
-/// for a mirror without by-hash) skips the origins query and Release reads.
 async fn run_byhash_unit(
     unit: &ByHashUnit,
     ctx: &MirrorCtx<'_>,
@@ -516,18 +438,15 @@ async fn run_byhash_unit(
     let layout = unit.layout;
     let cache_root = &ctx.config.cache_directory;
 
-    // Cheap absence check: skip the origins query + Release reads for a mirror
-    // whose per-layout by-hash tree does not exist. A failed probe abandons
-    // the unit.
+    // Skip the Release reads for a mirror without a by-hash tree (the common
+    // case).
     if !byhash_dir_present(&unit.root).await? {
         return Ok(UnitStats::default());
     }
 
-    // Build the union reference set (`None` ⇒ age-based fallback for the whole
-    // tree). Structured trees gate reference mode on the complete active-origin
-    // distribution set; a DB error there forces age mode (never reconcile
-    // against a possibly-incomplete origin set). Flat trees have a single root
-    // Release and no per-dist union, so they pass an empty expected list.
+    // `None` means age mode for the whole tree. Structured trees gate
+    // reference mode on the complete active-origin distribution set (an unread
+    // origin set forces age mode); flat trees have a single root Release.
     let reference = match unit.dist_gate {
         DistGate::ActiveOriginDists => match active_origin_distributions(ctx.self_origins) {
             Some(expected_dists) => {
@@ -575,24 +494,15 @@ static BYHASH_WALK: WalkContext = WalkContext {
 /// Walk one by-hash directory, classify each regular entry against `reference`,
 /// and sweep the leftovers on a per-class span.
 ///
-/// Referenced digests are removed from the candidate map (kept forever);
-/// unreferenced-but-covered candidates become `ByHashCovered` (swept past
-/// `grace`, counted as `removed_unreferenced`); anything uncovered,
-/// unclassifiable, or in age mode (`reference` is `None`) stays `ByHashUncovered`
-/// (swept past `backstop`). A symlink / FIFO / socket / device is unlinked
-/// inline without counting toward `removed` or the retained count: it was never
-/// cached content, so it is no eviction -- the walker's `CACHE_NON_REGULAR` is
-/// its count, as in every other cleanup walk. A stray directory is reported
-/// and retained. Removal, metadata invalidation, future-timestamp and I/O-error
-/// handling all flow through [`sweep_candidates`].
+/// Referenced digests are kept forever; unreferenced-but-covered ones are
+/// `ByHashCovered` (swept past `grace`, counted as `removed_unreferenced`);
+/// anything uncovered, unclassifiable, or in age mode (`reference` is `None`)
+/// is `ByHashUncovered` (swept past `backstop`). A non-regular entry is
+/// unlinked without counting toward `removed` or the retained count: it was
+/// never cached content.
 ///
 /// The returned `scanned` is the kept count (referenced digests plus
-/// candidates the sweep left in place) plus `removed`, so
-/// [`UnitStats::retained`] is the kept count.
-///
-/// `NotFound` is treated as "nothing to do" (TOCTOU: the caller pre-probes with
-/// `byhash_dir_present`, but the tree may vanish in between). The walk is
-/// confined to `cache_root` (`Walker::confined_to`).
+/// candidates the sweep left in place) plus `removed`.
 #[expect(
     clippy::too_many_arguments,
     reason = "single production call site; the tests drive each span and mode through it directly"
@@ -628,13 +538,8 @@ async fn sweep_byhash_dir(
             EntryKind::File => {}
         }
 
-        // Classify against the reference set inline (reference mode). A
-        // referenced digest is kept forever regardless of age, so it never
-        // enters the candidate map — in a healthy tree that is the bulk of the
-        // directory, and skipping it saves an owned key plus a map slot. An
-        // unreferenced covered digest gets the grace span; an uncovered
-        // algorithm, an unclassifiable name, or age mode (`reference` is `None`)
-        // gets the backstop, exactly as the old walk treated them.
+        // A referenced digest never enters the candidate map: in a healthy
+        // tree that is the bulk of the directory.
         let name = entry.name();
         let class = match reference.zip(name.to_str()) {
             Some((refset, digest)) => match refset.classify(digest) {
@@ -663,8 +568,7 @@ async fn sweep_byhash_dir(
         byhash_path,
         &candidates,
         SpanTable {
-            // No `Deb`-class candidates in a by-hash tree; the covered/uncovered
-            // spans are the ones that fire.
+            // No `Deb`-class candidates in a by-hash tree.
             deb: backstop,
             byhash_covered: grace,
             byhash_uncovered: backstop,
@@ -683,13 +587,9 @@ async fn sweep_byhash_dir(
     Ok(swept)
 }
 
-/// Generic candidate-reconcile engine tail, shared by every candidate facet:
-/// scan the tree, resolve each ordered [`IndexSource`] into a [`GroupResult`],
+/// Scan the tree, resolve each ordered [`IndexSource`] into a [`GroupResult`],
 /// let [`decide_sweep`] pick the [`SweepAction`] from the unit's policy, and act
-/// on it. The per-source resolvers (fetch / reduce / diagnostics) and the
-/// per-facet completion summaries are the only facet-specific parts — the
-/// *decision* is shared, so adding a facet is a new
-/// resolver arm, not a second decision path.
+/// on it.
 async fn run_reconcile_unit(
     unit: &ReconcileUnit,
     mirror_ctx: &MirrorCtx<'_>,
@@ -704,7 +604,6 @@ async fn run_reconcile_unit(
         now,
     } = mirror_ctx;
 
-    // An unreadable directory was logged by the walker; the unit is abandoned.
     let ScannedTree {
         candidates: mut cached_files,
         io_failures,
@@ -722,30 +621,22 @@ async fn run_reconcile_unit(
         io_failures,
     };
 
-    // Nothing to reconcile: no index source runs (no DB gate, no fetch; a
-    // reduce of an empty map would trip `reduce_file_list`'s debug-assert)
-    // and nothing is swept. From here on the map only empties through a
-    // reduce, which returns `Exhausted` and ends the unit, so every resolver
-    // below and the sweep see candidates.
+    // Nothing to reconcile, so no index source runs. From here on the map
+    // only empties through a reduce, which returns `Exhausted` and ends the
+    // unit, so every resolver below and the sweep see candidates.
     if cached_files.is_empty() {
         return Ok(tally);
     }
 
     let ctx = ReconcileCtx { mirror_ctx, unit };
 
-    // Resolve every source group in order and collect the full ordered result
-    // set. The tail's ONLY short-circuit is `Exhausted` (the candidate map
-    // emptied — nothing left to sweep); every other outcome is
-    // handed to `decide_sweep`, which needs *all* groups present (the flat
-    // cascade's decision depends on the always-last co-located group appearing
-    // even when an earlier root/hybrid group failed). Per-source bail (e.g.
-    // stop fetching remaining origins on the first failure) lives inside each
-    // resolver, which returns a single result — never a tail `break` that would
-    // hide later groups from `decide_sweep`.
+    // A failed group must not end the loop: `decide_sweep` needs *all* groups
+    // present (the flat cascade's decision depends on the always-last
+    // co-located group appearing even when an earlier root/hybrid group
+    // failed).
     let mut results: Vec<GroupResult> = Vec::with_capacity(unit.groups.len());
     // Set when an owning group (the hybrid archive-root reconcile) Completes:
-    // its archive-root segment, for the strict-reconcile summary. Its presence
-    // short-circuits the remaining root/colocated groups.
+    // its archive-root segment, for the strict-reconcile summary.
     let mut owning_root: Option<&str> = None;
     for group in &unit.groups {
         match resolve_group(&ctx, group, &mut cached_files, &mut tally).await {
@@ -756,7 +647,6 @@ async fn run_reconcile_unit(
                 // stop resolving further groups and grace-sweep the leftovers.
                 let owning_complete =
                     group.is_owning() && matches!(outcome, GroupOutcome::Complete);
-                // The root segment comes from the group the classifier emitted.
                 let root_seg = flat_root_segment(group);
                 // `decide_sweep` names the fallback warn's flat root by the
                 // nearest group carrying a segment, so an owning group must
@@ -777,29 +667,22 @@ async fn run_reconcile_unit(
         }
     }
 
-    // The shared decision core: policy + group results -> spans + reason.
     let (spans, reason) = match decide_sweep(policy, &results) {
         SweepAction::Sweep { spans, reason } => (spans, reason),
-        // Conservative bail: no sweep this cycle. The resolver
-        // already emitted the per-origin warn with the failing host/path/status.
+        // The resolver already emitted the per-origin warn.
         SweepAction::Bail => {
             tally.bailed += 1;
             return Ok(tally);
         }
     };
 
-    // The age fallback announces itself before sweeping: every index source
-    // failed, so the reference set is incomplete and leftovers age out on the
-    // long span instead of the short grace. Only the flat facet
-    // (`ReferencedOrAge`) ever gets here.
     if let SweepReason::AgeFallback {
         primary,
         root_failed,
     } = &reason
     {
-        // Diagnostic: the root fallback was unavailable because the
-        // flat-repo root has no `mirrors_v2` row (root-segment groups carry
-        // `root_seg`; the hybrid group does not, so it is not reported here).
+        // Root-segment groups carry `root_seg`; the hybrid group does not, so
+        // it is not reported here.
         for result in &results {
             if result.root_seg.is_some()
                 && let GroupOutcome::NotApplicable(SkipReason::NoRow { seg }) = &result.outcome
@@ -834,11 +717,6 @@ async fn run_reconcile_unit(
             swept.removed,
             HumanFmt::Size(swept.bytes_removed)
         ),
-        // Strict-hybrid finish: the owning archive-root group reconciled this
-        // flat-pool mirror against the structured `dists/` index of its archive
-        // root, so name the root instead of emitting the generic per-facet
-        // summary. Reaching the sweep with an empty map is impossible here: a
-        // reduce that empties it returns `Exhausted`, which short-circuits above.
         SweepReason::Grace => match owning_root {
             Some(archive_root) => info!(
                 "Strict-reconciled flat-pool mirror {mirror} against archive root `{archive_root}`: removed {} unreferenced deb files ({})",
@@ -853,10 +731,6 @@ async fn run_reconcile_unit(
     Ok(tally)
 }
 
-/// Dispatch one [`IndexSource`] to its resolver: the structured-pool, hybrid
-/// archive-root, and flat (root-segment / co-located) sources. Every
-/// [`IndexSource`] variant has an arm here — the by-hash `Release` digest set is
-/// not one of them, it lives on the [`ByHashUnit`] payload.
 async fn resolve_group(
     ctx: &ReconcileCtx<'_>,
     group: &IndexSource,
@@ -877,8 +751,6 @@ async fn resolve_group(
     }
 }
 
-/// Extract the archive-root segment of an owning hybrid group's source, for the
-/// strict-reconcile summary. Only [`IndexSource::ArchiveRoot`] carries one.
 fn archive_root_segment(source: &IndexSource) -> Option<&str> {
     match source {
         IndexSource::ArchiveRoot { root, prefix: _ } => Some(root.as_str()),
@@ -886,9 +758,6 @@ fn archive_root_segment(source: &IndexSource) -> Option<&str> {
     }
 }
 
-/// Extract the flat-repo root segment of a root-segment source. Stamped onto
-/// the group's [`GroupResult`] by the tail so [`decide_sweep`] can name it in
-/// the age-fallback warn suffix; only [`FlatFetch::RootSegment`] carries one.
 fn flat_root_segment(source: &IndexSource) -> Option<&str> {
     match source {
         IndexSource::FlatPackages {
@@ -902,11 +771,10 @@ fn flat_root_segment(source: &IndexSource) -> Option<&str> {
     }
 }
 
-/// The `mirrors_v2` row gate shared by the two resolvers whose referencing
-/// index belongs to *another* row (the archive root, the flat-repo root):
-/// cleanup never mints a row, so the group runs only when that row exists.
-/// `Ok(())` proceeds; `Err` is the group's resolution (`NoRow`, or `DbError`
-/// after the one error line naming `noun`).
+/// The `mirrors_v2` row gate for the resolvers whose referencing index
+/// belongs to *another* row (the archive root, the flat-repo root): cleanup
+/// never mints a row, so the group runs only when that row exists.
+/// `Ok(())` proceeds; `Err` is the group's resolution.
 async fn gate_on_row(
     ctx: &ReconcileCtx<'_>,
     seg: &str,
@@ -937,11 +805,9 @@ async fn gate_on_row(
     }
 }
 
-/// The fetch-buffer-reduce plan for one active origin's `dists/.../Packages*`
-/// index, shared by the two origin-driven resolvers.  `fetch_mirror` is the
-/// row the index is fetched through (the mirror itself, or its archive
-/// root); `owner_mirror` is where the candidate debs live and keys their
-/// `cache_metadata` invalidation, so it is the reconciled mirror in both.
+/// The fetch plan for one active origin's `dists/.../Packages*` index.
+/// `fetch_mirror` is the row the index is fetched through (the mirror itself,
+/// or its archive root); `owner_mirror` is where the candidate debs live.
 fn origin_fetch_plan<'a>(
     fetch_mirror: &Mirror,
     owner_mirror: &'a Mirror,
@@ -963,17 +829,10 @@ fn origin_fetch_plan<'a>(
     }
 }
 
-/// The one mapping of a [`reduce_against`] outcome onto a group's
-/// resolution, shared by every resolver: `Continue` means the index reduced
-/// and the resolver carries on (its next origin, or `Complete`); `Break`
-/// carries the group's resolution.  An emptied candidate map short-circuits
-/// as `Exhausted`; a fetch failure is handed to `on_fetch_failed` for the
-/// resolver's own diagnostic (the structured-pool bail warn, the hybrid
-/// debug line, or nothing where the tail's age-fallback warn reports the
-/// status) before resolving to `FetchFailed`; a reduce error is logged here,
-/// once, as `Failed to reduce {index} for mirror {mirror}; {consequence}:
-/// {cause}` - the cause ([`ReduceError`]) is unlogged until this point -
-/// and resolves to `ParseError`.
+/// Map a [`reduce_against`] outcome onto a group's resolution: `Continue`
+/// means the index reduced and the resolver carries on; `Break` carries the
+/// group's resolution.  A fetch failure is handed to `on_fetch_failed` for
+/// the resolver's own diagnostic; a reduce error is logged here.
 fn map_reduce(
     result: Result<ReduceOutcome, ReduceError>,
     mirror: &Mirror,
@@ -1003,20 +862,13 @@ fn map_reduce(
     }
 }
 
-/// Hybrid flat-pool source resolver (`ArchiveRoot`, issue
-/// #162, e.g. Gitea/Forgejo `.../pool/<dist>/<comp>`). The referencing
-/// `Packages` index lives in the structured `dists/` tree of the flat repo's
-/// *archive root*, so this reconciles the sub-path mirror's cached debs against
-/// the archive-root row's active origins, stripping the in-mirror `prefix` from
-/// `Filename:` values. Gated on an existing archive-root row so a fetch never
-/// mints a cleanup-synthesised mirror row. This is the unit's `owning` group: on
-/// full success (`GroupOutcome::Complete`) the tail short-circuits the remaining
-/// root/colocated groups and grace-sweeps. Conservative on any fetch/parse
-/// failure — the group resolves to `NotApplicable`/`FetchFailed`/`ParseError`
-/// and the cascade continues. Metadata invalidation keys by
-/// `owner_mirror = mirror` (the original sub-path mirror, NOT the truncated
-/// archive-root fetch mirror); any checksum-mismatch deletions performed before
-/// a mid-loop bail stay in the shared `tally`.
+/// Hybrid flat-pool source resolver (issue #162, e.g. Gitea/Forgejo
+/// `.../pool/<dist>/<comp>`). The referencing `Packages` index lives in the
+/// structured `dists/` tree of the flat repo's *archive root*, so this
+/// reconciles the sub-path mirror's cached debs against the archive-root
+/// row's active origins, stripping the in-mirror `prefix` from `Filename:`
+/// values. This is the unit's owning group: on `Complete` the remaining
+/// root/colocated groups are skipped; on any failure the cascade continues.
 async fn resolve_origin_packages_archive_root(
     ctx: &ReconcileCtx<'_>,
     root: &str,
@@ -1087,18 +939,10 @@ async fn resolve_origin_packages_archive_root(
     GroupResolution::Ran(GroupOutcome::Complete)
 }
 
-/// Flat root-segment source resolver (`FlatPackages { RootSegment }`): a flat
-/// sub-path mirror (e.g. `apt/amd64`) whose `Packages` index lives at its
-/// registered flat-repo root (`apt/`). Reconciles against that root index,
-/// stripping the in-mirror `prefix` from `Filename:` values (via
-/// [`flat_root_fetch_plan`], which also keys `owner_mirror` on the original
-/// sub-path mirror). Gated on an existing root row (`NoRow`/
-/// `DbError` → `NotApplicable`, both carrying `root_seg = Some(seg)` so
-/// [`decide_sweep`] can build the fallback warn suffix). Never `owning`: a
-/// complete root reference set still lets the always-last co-located group run
-/// unless the reduce `Exhausted`s the map (the short-circuit above — this is
-/// how the co-located probe is skipped when the root already references every
-/// subdir deb).
+/// Flat root-segment source resolver: a flat sub-path mirror (e.g.
+/// `apt/amd64`) whose `Packages` index lives at its registered flat-repo root
+/// (`apt/`). Never owning: a complete root reference set still lets the
+/// always-last co-located group run unless the reduce exhausts the map.
 async fn resolve_flat_root_segment(
     ctx: &ReconcileCtx<'_>,
     seg: &str,
@@ -1113,8 +957,8 @@ async fn resolve_flat_root_segment(
     }
 
     let plan = flat_root_fetch_plan(mirror, seg, prefix);
-    // A fetch failure is silent here: the tail's age-fallback warn reports
-    // the root status next to the co-located one.
+    // A fetch failure is silent here: `run_reconcile_unit`'s age-fallback
+    // warn reports the root status next to the co-located one.
     match map_reduce(
         reduce_against(&plan, ctx, cached_files, tally).await,
         mirror,
@@ -1127,11 +971,9 @@ async fn resolve_flat_root_segment(
     }
 }
 
-/// Co-located flat source resolver (`FlatPackages { Colocated }`): the
-/// always-last group, reconciling the mirror's own debs against its co-located
-/// `<mirror.path>/Packages*` index (`keymap: Relpath`, `owner_mirror = mirror`).
-/// Never `owning`. `decide_sweep` reads this (the last) group's outcome to pick
-/// grace vs age fallback.
+/// Co-located flat source resolver: the always-last group, reconciling the
+/// mirror's own debs against its `<mirror.path>/Packages*` index.
+/// `decide_sweep` reads this group's outcome to pick grace vs age fallback.
 async fn resolve_flat_colocated(
     ctx: &ReconcileCtx<'_>,
     cached_files: &mut HashMap<OsString, SpanClass>,
@@ -1147,8 +989,8 @@ async fn resolve_flat_colocated(
         debname: DebnameKind::Flat,
         keymap: KeyMapper::Relpath,
     };
-    // A fetch failure is silent here: the tail's age-fallback warn reports
-    // the co-located status.
+    // A fetch failure is silent here: `run_reconcile_unit`'s age-fallback
+    // warn reports the co-located status.
     match map_reduce(
         reduce_against(&plan, ctx, cached_files, tally).await,
         mirror,
@@ -1161,13 +1003,8 @@ async fn resolve_flat_colocated(
     }
 }
 
-/// Structured-pool source resolver (`SelfOrigins`). Looks up the
-/// mirror's own origins, filters to the active ones, logs the enumeration + the
-/// no-origin / stale diagnostics, then reduces the candidate map against each
-/// active origin's `dists/.../Packages*`. Returns a [`GroupResult`] the tail's
-/// `decide_sweep` turns into a grace sweep or a conservative bail; on a fetch
-/// miss it emits the exact invariant-1 warn *here* (where the origin host/path
-/// and status are in hand) before handing back `FetchFailed`.
+/// Structured-pool source resolver: reduces the candidate map against each
+/// active origin's `dists/.../Packages*`.
 async fn resolve_origin_packages_self(
     ctx: &ReconcileCtx<'_>,
     cached_files: &mut HashMap<OsString, SpanClass>,
@@ -1182,15 +1019,13 @@ async fn resolve_origin_packages_self(
         now: _,
     } = ctx.mirror_ctx;
 
-    // The grace window is used only for the diagnostics below; the tail derives
-    // the sweep spans from the same policy.
+    // Used only for the diagnostics below.
     let grace = policy.grace();
 
     let Some(origins) = self_origins else {
-        // The origins read failed (logged and counted at the read site): we
-        // cannot tell which cached debs are still referenced. Hand the tail a
-        // `DbError`, which `decide_sweep` turns into a bail -- treating it as
-        // "no origins" would grace-sweep files we never got to check.
+        // The origins read failed (logged at the read site). `DbError` bails
+        // the unit -- treating it as "no origins" would grace-sweep files we
+        // never got to check.
         return GroupResolution::Ran(GroupOutcome::NotApplicable(SkipReason::DbError));
     };
 
@@ -1212,11 +1047,8 @@ async fn resolve_origin_packages_self(
         mirror.site(),
     );
 
-    // Diagnostic: cached debs exist but cleanup will fetch no Packages
-    // index (no active origins).  Surface enough context to disambiguate
-    // "no recent .deb traffic" (origins present but stale) from "origins
-    // never recorded" (origins_count == 0).  Cheap: one extra info line
-    // per cleanup cycle, only when the smelly state actually fires.
+    // Disambiguate "no recent .deb traffic" (origins present but stale) from
+    // "origins never recorded".
     if active_origins.is_empty() {
         if origins_count == 0 {
             info!(
@@ -1224,8 +1056,6 @@ async fn resolve_origin_packages_self(
                 HumanFmt::Time(grace),
             );
         } else {
-            // Most-recent `last_seen` (epoch seconds) across the rows: how long
-            // ago the freshest of them was requested.
             let most_recent_origin: i64 = origins.iter().map(|o| o.last_seen).max().unwrap_or(0);
             let now_secs = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
             let age_secs = u64::try_from(now_secs.saturating_sub(most_recent_origin)).unwrap_or(0);
@@ -1237,18 +1067,10 @@ async fn resolve_origin_packages_self(
                 HumanFmt::Time(grace),
             );
         }
-        // No active origin index to reduce against: the group does not run.
-        // `decide_sweep` on the resulting empty result set returns `Grace`,
-        // matching the previous grace sweep (empty active origins swept the
-        // leftovers).
+        // `decide_sweep` on the resulting empty result set returns `Grace`.
         return GroupResolution::Skipped;
     }
 
-    // One fetch-buffer-reduce plan per active origin, built as its turn comes:
-    // the loop bails on the first failure, so materialising every plan up front
-    // would allocate for origins that are never probed. `keymap: Basename`
-    // because the structured pool flattens `Filename:` relpaths to basename;
-    // `layout: Dists` is where the referencing `Packages` index lives.
     for origin in active_origins {
         let plan = origin_fetch_plan(
             mirror,
@@ -1257,13 +1079,9 @@ async fn resolve_origin_packages_self(
             CacheLayout::StructuredPool,
             KeyMapper::Basename,
         );
-        // A missing Packages file leaves us unable to complete the reference
-        // set; deleting now risks wiping files referenced only by this origin
-        // (typical when a distribution goes EOL upstream). Warn here
-        // (host/path/status in hand) and hand the tail a `FetchFailed` so
-        // `decide_sweep` returns `Bail` - no sweep this cycle. A reduce error
-        // (malformed/decompression-bomb index, local read failure) leaves the
-        // reference set incomplete just like a fetch miss, so it bails too.
+        // A missing Packages file leaves the reference set incomplete;
+        // deleting now risks wiping files referenced only by this origin
+        // (typical when a distribution goes EOL upstream), so the unit bails.
         let step = map_reduce(
             reduce_against(&plan, ctx, cached_files, tally).await,
             mirror,
@@ -1281,16 +1099,9 @@ async fn resolve_origin_packages_self(
         }
     }
 
-    // Every active origin's index reduced; leftovers are genuinely
-    // unreferenced. `decide_sweep(ReferencedOrBail, [Complete])` returns
-    // `Grace`, so the tail reaps them on the short grace span.
     GroupResolution::Ran(GroupOutcome::Complete)
 }
 
-/// Per-facet reconcile-sweep completion summary for the `Grace` action —
-/// only the structured-pool and flat facets reach it (the by-hash units emit
-/// their own summary in `run_byhash_unit`). The flat `AgeFallback` path emits
-/// its own "aged flat deb files" line rather than routing through here.
 fn log_reconcile_removed(facet: ReconcileFacet, mirror: &Mirror, swept: &UnitStats) {
     match facet {
         ReconcileFacet::StructuredPool => info!(
@@ -1314,12 +1125,8 @@ mod tests {
 
     #[test]
     fn flat_root_fetch_plan_keys_metadata_by_owner_mirror() {
-        // Regression: the flat-root fallback fetches the *root* index, but the
-        // debs it reconciles live under the original sub-path mirror. Metadata
-        // invalidation must therefore key by `owner_mirror` (the sub-path
-        // mirror), never the truncated root fetch `mirror` -- `Mirror` equality
-        // includes path + kind, so a root-keyed invalidation could never match
-        // the stored entry and would leak it.
+        // `Mirror` equality includes path + kind, so an invalidation keyed by
+        // the root fetch mirror could never match the stored entry.
         let owner = Mirror::new(
             ClientHost::new("deb.example.com").expect("valid host"),
             None,
@@ -1329,17 +1136,12 @@ mod tests {
         let plan = flat_root_fetch_plan(&owner, "apt", "amd64/");
         assert_eq!(plan.owner_mirror, &owner);
         assert_eq!(plan.owner_mirror.path(), "apt/amd64");
-        // The fetch mirror is the truncated flat-repo root, distinct from owner.
         assert_ne!(plan.mirror, owner);
         assert_eq!(plan.mirror.path(), "apt");
     }
 
     #[test]
     fn archive_root_segment_only_for_owning_hybrid_source() {
-        // Only the hybrid `ArchiveRoot` source carries the archive-root segment
-        // the strict-reconcile summary needs; every other source (structured
-        // `SelfOrigins`, flat, by-hash) yields `None`, so the tail never mistakes a
-        // non-owning group for the strict early-finish.
         let hybrid = IndexSource::ArchiveRoot {
             root: "api/packages/85/debian".to_owned(),
             prefix: "pool/php-zts/main/".to_owned(),
@@ -1454,7 +1256,6 @@ mod tests {
             .await;
             assert!(references.is_none(), "malformed references force age mode");
 
-            // Birthtime cannot be backdated; advance the sweep's injected clock.
             let now = SystemTime::now();
             for (age_days, expected_removed) in [(10, 0), (91, 2)] {
                 let outcome = sweep(
@@ -1472,8 +1273,6 @@ mod tests {
         }
     }
 
-    /// A symlink in a by-hash directory is unlinked, but it was no cached
-    /// file: it counts in neither `removed` nor `retained`.
     #[tokio::test]
     async fn byhash_sweep_does_not_count_a_removed_symlink_as_eviction() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1512,13 +1311,11 @@ mod tests {
         }
         let now = SystemTime::now();
 
-        // Young files are kept in fallback mode.
         let young = now + Duration::from_secs(DAY);
         let outcome = sweep(dir.path(), None, young).await;
         assert_eq!(outcome.removed, 0);
         assert_eq!(outcome.retained(), 2);
 
-        // Past the backstop with no reference set -> aged out, not "unreferenced".
         let old = now + Duration::from_secs(91 * DAY);
         let outcome = sweep(dir.path(), None, old).await;
         assert_eq!(outcome.removed, 2);

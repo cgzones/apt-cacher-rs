@@ -2,10 +2,8 @@
 //! storage behind the dashboard's per-mirror columns (`mirror_health`, and
 //! every other since-start figure the Mirrors table joins in).
 //!
-//! Keyed by the canonical [`Mirror`] itself: a recording site hands in the
-//! `&Mirror` it already holds, the lookup hashes it in place, and only the
-//! first sighting of a mirror clones it into the map. One short uncontended
-//! lock per record, never held across an `.await`.
+//! Keyed by the canonical [`Mirror`] itself. One short lock per record,
+//! never held across an `.await`.
 //!
 //! A snapshot renders each key as `host[:port]/path` -- the Mirrors table's
 //! `MirrorUri`, so rows join by string -- and folds the entries that render
@@ -13,9 +11,9 @@
 //! requests are two `Mirror`s (the kind is part of its identity) but one
 //! table row.
 //!
-//! In memory only: a restart forgets everything, like every other
-//! process-lifetime metric. The map is capped at a number of distinct
-//! mirrors; a mirror first seen past the cap is not tracked.
+//! In memory only: a restart forgets everything. The map is capped at a
+//! number of distinct mirrors; a mirror first seen past the cap is not
+//! tracked.
 
 use std::sync::LazyLock;
 
@@ -27,7 +25,6 @@ use crate::mem_usage::Footprint;
 /// Per-mirror state two twins (the same `host[:port]/path`, different
 /// kinds) fold into one snapshot entry through.
 pub(crate) trait Twin {
-    /// Fold `other`, a twin's state, into `self`.
     fn merge(&mut self, other: &Self);
 }
 
@@ -37,7 +34,6 @@ pub(crate) trait Twin {
 /// memory.
 pub(crate) const MAX_MIRRORS: usize = 1024;
 
-/// See the module doc.
 pub(crate) struct MirrorRegistry<T> {
     map: LazyLock<parking_lot::Mutex<HashMap<Mirror, T>>>,
     cap: usize,
@@ -72,8 +68,7 @@ impl<T: Default + Clone + Twin> MirrorRegistry<T> {
     }
 
     /// Mirrors tracked and the heap they take: the table, each mirror's
-    /// text and what `heap` says each state owns. Walks the table, which
-    /// holds one entry per mirror.
+    /// text and what `heap` says each state owns.
     pub(crate) fn footprint(&self, heap: impl Fn(&T) -> usize) -> Footprint {
         let map = self.map.lock();
         let owned: usize = map
@@ -149,7 +144,6 @@ mod tests {
         assert_eq!(snapshot.get("b.example/ubuntu"), Some(&Tally(5)));
     }
 
-    /// A lookup reads one exact identity: the twin stays out of it.
     #[cfg(feature = "splice")]
     #[test]
     fn get_reads_one_identity() {
@@ -163,7 +157,6 @@ mod tests {
         assert_eq!(registry.get(&flat), Some(Tally(2)));
     }
 
-    /// A mirror's flat and structured requests are two keys but one row.
     #[test]
     fn twins_that_render_alike_merge_in_the_snapshot() {
         let registry = MirrorRegistry::<Tally>::new(8);

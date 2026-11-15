@@ -5,43 +5,28 @@ use std::{
 
 use crate::xattr_helpers::XattrValue;
 
-/// Return the opaque-tag portion of an `ETag`, stripping the `W/` prefix if present.
-///
-/// Used for weak comparison per RFC 9110 §8.8.3.2: two `ETag`s are weakly equivalent
-/// if their opaque-tags match, regardless of the weak indicator.
+/// The opaque-tag without a `W/` prefix: two `ETag`s are weakly equivalent
+/// if their opaque-tags match (RFC 9110 §8.8.3.2).
 #[must_use]
 fn etag_opaque_tag(s: &str) -> &str {
     s.strip_prefix("W/").unwrap_or(s)
 }
 
-/// Longest `ETag` accepted, in bytes. RFC 9110 sets no bound, and real
-/// servers send a few dozen bytes (an inode/size/mtime hash); an upstream
-/// head may carry ~400 KiB through the hyper client, and a validated tag is
-/// kept per cached file in the metadata store (sized for "a few hundred bytes
-/// each") and written to an xattr (which fails past 64 KiB). Past this
-/// length a tag is treated as malformed and discarded.
+/// Longest `ETag` accepted, in bytes; a longer one is treated as malformed.
+/// RFC 9110 sets no bound, but a validated tag is kept per cached file in
+/// the metadata store and written to an xattr (which fails past 64 KiB).
 pub(crate) const MAX_ETAG_LEN: usize = 1024;
 
-/// Validate that a string is a well-formed `ETag` per RFC 9110 §8.8.3.
-///
-/// Accepts both strong (`"<etagc>"`) and weak (`W/"<etagc>"`) forms, where etagc consists
-/// of `0x21` or `0x23..=0x7E`.
-/// Note that an empty `ETag` (`""`) is valid.
+/// Whether `s` is a well-formed strong or weak `ETag` per RFC 9110 §8.8.3
+/// (an empty `""` is valid) of at most [`MAX_ETAG_LEN`] bytes.
 ///
 /// Stricter than RFC 9110, which also allows obs-text (bytes `>= 0x80`) in
 /// etagc: hyper's `HeaderValue::to_str` rejects such a value, so the hyper
 /// backend never sees it, while splice parses the raw head bytes and would
-/// keep it. Accepting obs-text here made the backends disagree about one
-/// response (a non-ASCII tag resumed on hyper, where it was absent, and
-/// refetched on splice); refusing it makes the tag absent on both.
-/// A value longer than [`MAX_ETAG_LEN`] is not accepted.
+/// keep it. Refusing it makes the tag absent on both.
 ///
-/// Callers: `cache_metadata::check_upstream_validators` (an upstream
-/// response's tag), `upstream_head::well_formed_etag` (the planner's view of
-/// it) and [`ETag`]'s xattr parse (a stored tag). Client conditionals are
-/// not validated here: [`if_none_match`] and the `If-Range` comparison
-/// (`http_range`) match the client's value against a stored tag that was, so
-/// a malformed or overlong candidate simply never matches.
+/// Client conditionals are not validated: they are matched against a stored
+/// tag that was, so a malformed candidate simply never matches.
 #[must_use]
 pub(crate) fn is_valid_etag(s: &str) -> bool {
     if s.len() > MAX_ETAG_LEN {
@@ -143,11 +128,9 @@ pub(crate) fn etag_strong_match(a: &str, b: &str) -> bool {
     a.starts_with('"') && b.starts_with('"') && a == b
 }
 
-/// Split an `If-None-Match` header value into entity-tag candidates.
-///
 /// Commas are only treated as list separators when outside a quoted
 /// opaque-tag, because RFC 9110 §8.8.3 permits `,` (0x2C) inside the
-/// opaque-tag. Each yielded token is trimmed of surrounding OWS.
+/// opaque-tag.
 fn split_if_none_match(header: &str) -> impl Iterator<Item = &str> {
     let mut in_quotes = false;
     header
@@ -160,10 +143,8 @@ fn split_if_none_match(header: &str) -> impl Iterator<Item = &str> {
         .map(str::trim)
 }
 
-/// Check if a stored `ETag` matches an `If-None-Match` header value.
-///
-/// Parses comma-separated entity-tags or a lone `*` wildcard. Uses weak comparison
-/// per RFC 9110 §8.8.3.2: the `W/` prefix is stripped before comparing opaque-tags.
+/// Whether a stored `ETag` matches an `If-None-Match` header value: a lone
+/// `*` wildcard, or a list compared weakly (RFC 9110 §8.8.3.2).
 #[must_use]
 pub(crate) fn if_none_match(header: &str, etag: &str) -> bool {
     /// RFC 9110 allows long If-None-Match lists, but a sane client sends a
@@ -199,7 +180,6 @@ mod tests {
 
     #[test]
     fn is_valid_etag_test() {
-        // Valid strong ETags
         assert!(is_valid_etag("\"abc\""));
         assert!(is_valid_etag("\"\""));
         assert!(is_valid_etag("\"306ed-61a5ca11810f3\""));
@@ -213,25 +193,18 @@ mod tests {
         assert!(!is_valid_etag("\"caffe\u{e9}\""));
         assert!(!is_valid_etag("W/\"\u{e9}\""));
 
-        // Valid weak ETags
         assert!(is_valid_etag("W/\"abc\""));
         assert!(is_valid_etag("W/\"\""));
         assert!(is_valid_etag("W/\"306ed-61a5ca11810f3\""));
 
-        // Invalid: not quoted
         assert!(!is_valid_etag("abc"));
         assert!(!is_valid_etag(""));
-        // Invalid: malformed weak prefix
         assert!(!is_valid_etag("W/abc"));
-        // Invalid: contains forbidden 0x22 (double-quote) inside
         assert!(!is_valid_etag("\"a\"b\""));
-        // Invalid: contains DEL (0x7F)
         assert!(!is_valid_etag("\"a\x7Fb\""));
-        // Invalid: contains control chars
         assert!(!is_valid_etag("\"a\x00b\""));
         assert!(!is_valid_etag("\"a\nb\""));
         assert!(!is_valid_etag("\"a\rb\""));
-        // Invalid: single quote only
         assert!(!is_valid_etag("\""));
         // Only a leading `W/` is the weak indicator; inside the opaque-tag it
         // is ordinary etagc.
@@ -313,9 +286,7 @@ mod tests {
 
     #[test]
     fn if_none_match_caps_at_max_entries() {
-        // Build a header where "target" only appears at index 64 (past the cap of 64).
-        // The first 64 entries are all "x" (indices 0..63), then "target" at index 64.
-        // The cap stops scanning at index 64, so "target" is never reached.
+        // "target" only appears at index 64, past the cap.
         let mut parts = vec!["\"x\""; 64];
         parts.push("\"target\"");
         let header = parts.join(",");
@@ -330,19 +301,12 @@ mod tests {
 
     #[test]
     fn if_none_match_handles_comma_inside_opaque_tag() {
-        // RFC 9110 §8.8.3 etagc includes 0x2C (','), so `"a,b"` is a valid ETag.
-        // The split must not treat that comma as a list separator.
         assert!(is_valid_etag("\"a,b\""));
-        // Single-entry list whose only ETag contains a comma.
         assert!(if_none_match("\"a,b\"", "\"a,b\""));
-        // Same ETag embedded in the middle of a list, with OWS.
         assert!(if_none_match("\"x\", \"a,b\", \"y\"", "\"a,b\""));
-        // First and last positions of the list.
         assert!(if_none_match("\"a,b\", \"x\"", "\"a,b\""));
         assert!(if_none_match("\"x\", \"a,b\"", "\"a,b\""));
-        // Multiple commas inside one opaque-tag, plus a peer entry.
         assert!(if_none_match("\"a,b,c\", \"d\"", "\"a,b,c\""));
-        // Weak form on either side: weak comparison still strips W/.
         assert!(if_none_match("W/\"a,b\"", "\"a,b\""));
         assert!(if_none_match("\"a,b\"", "W/\"a,b\""));
         assert!(if_none_match("W/\"a,b\", \"x\"", "\"a,b\""));
@@ -350,19 +314,13 @@ mod tests {
 
     #[test]
     fn if_none_match_rejects_substrings_of_comma_etag() {
-        // Stored `"a"` must NOT match a header that only contains `"a,b"`:
-        // the comma is inside the opaque-tag, not a separator.
         assert!(!if_none_match("\"a,b\"", "\"a\""));
         assert!(!if_none_match("\"a,b\"", "\"b\""));
-        // And the inverse: stored `"a,b"` is not present in a list of `"a"`, `"b"`.
         assert!(!if_none_match("\"a\", \"b\"", "\"a,b\""));
     }
 
     #[test]
     fn if_none_match_malformed_unterminated_quote_does_not_match() {
-        // An unterminated quoted token can't be parsed as a valid entity-tag, so
-        // it must not match a well-formed stored ETag. Importantly, it also must
-        // not panic or read past the end.
         assert!(!if_none_match("\"abc", "\"abc\""));
         assert!(!if_none_match("\"abc, \"def\"", "\"def\""));
     }

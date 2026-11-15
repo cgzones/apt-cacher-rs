@@ -16,13 +16,11 @@ use crate::{
     index_parser::HashAlgo,
 };
 
-/// On-disk layout family of a mirror.  Stored in the `mirrors_v2.kind`
-/// INTEGER column (added by the `20260512155314_mirror_kind` migration);
-/// the row's unique key remains `(host, port, path)`.  A single
-/// `(host, port, path)` row tracks the strictest layout ever seen for
-/// that mirror — the upsert latches `kind` to `Structured` on conflict
-/// so the flat-collision blocklist still records a structured request
-/// that arrived after a flat row already existed for the same tuple.
+/// On-disk layout family of a mirror, stored in the `mirrors_v2.kind`
+/// INTEGER column.  The row's unique key remains `(host, port, path)`: the
+/// upsert latches `kind` to `Structured` on conflict, so the flat-collision
+/// blocklist still records a structured request that arrived after a flat
+/// row already existed for the same tuple.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum MirrorKind {
     Structured,
@@ -30,9 +28,8 @@ pub(crate) enum MirrorKind {
 }
 
 impl MirrorKind {
-    /// SQL/DB encoding stored in `mirrors_v2.kind` (INTEGER).
-    /// `0` = structured, `1` = flat — fixed by the migration default and
-    /// the application-side validation in [`Self::from_db_int`].
+    /// The `mirrors_v2.kind` encoding, fixed by the migration's column
+    /// default.
     #[must_use]
     pub(crate) const fn as_db_int(self) -> i64 {
         match self {
@@ -41,8 +38,7 @@ impl MirrorKind {
         }
     }
 
-    /// Reverse of [`Self::as_db_int`].  Returns `None` for any value not
-    /// matching the encoded set; the caller skips such rows so
+    /// `None` for an unknown value; the caller skips such rows so
     /// `cleanup_invalid_rows` can drop them later.
     #[must_use]
     pub(crate) const fn from_db_int(i: i64) -> Option<Self> {
@@ -62,10 +58,8 @@ pub(crate) struct Mirror {
     /// DB command, a registry entry) bumps a refcount instead of copying it.
     path: Arc<str>,
     kind: MirrorKind,
-    /// Lazily-populated cache of `host.format_authority(port)` when the result
-    /// is owned (i.e. requires allocation: an IPv6 host or a non-empty port).
-    /// Skipped from `Hash`/`Eq`/`Clone` impls because it is purely derived
-    /// from `host` + `port`.
+    /// Cache of `host.format_authority(port)` when that allocates (an IPv6
+    /// host or a port).  Derived, so left out of `Hash`/`Eq`/`Clone`.
     cached_authority: OnceLock<Box<str>>,
 }
 
@@ -226,9 +220,7 @@ pub(crate) struct Origin {
 }
 
 /// The `(distribution, component, architecture)` triple that, together with a
-/// [`Mirror`], names an `origins` row.  Carried on its own by `RequestClass`
-/// and `ConnectionDetails`, which already hold the mirror; `None` there for
-/// every request that mints no origin row.
+/// [`Mirror`], names an `origins` row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OriginFields {
     pub(crate) distribution: String,
@@ -282,12 +274,6 @@ pub(crate) enum OriginSighting {
 /// cleanup fetches `<slot>/Packages` for every active origin, and that 404
 /// bails the mirror's whole sweep. (`debian-installer/binary-<arch>` sits a
 /// segment deeper than the three-segment scope both callers accept.)
-///
-/// Single source of truth, applied in the two places that can mint the
-/// triple — the `Packages` and `ByHash` arms of
-/// `cache_layout::classify_request`, which [`Origin::from_path`] runs too —
-/// and in the per-component `Release` parser, which accepts the same form
-/// (or `source`).
 #[must_use]
 pub(crate) fn is_binary_arch(arch: &str) -> bool {
     arch.strip_prefix("binary-")
@@ -318,24 +304,14 @@ impl Origin {
     /// The [`Origin`] a request for `path` on `host`/`port` would register
     /// if it were cached: `path` is parsed, normalised, percent-decoded and
     /// validated exactly as `request_dispatch::decide_request` does it for
-    /// a cache request ([`parse_request_path`] and
-    /// [`crate::cache_layout::classify_request`], its unsafe-path gate and
-    /// cache-name length cap), and only the two index shapes that mint an
-    /// origin there do so here:
-    ///
-    /// * `dists/<dist>/<comp>/binary-<arch>/Packages{,.gz,.xz}` — the
-    ///   canonical per-architecture index path.
-    /// * `dists/<dist>/<comp>/binary-<arch>/by-hash/<ALGO>/<hex>` — the
-    ///   content-addressed sibling (algorithm and digest length
-    ///   cross-checked).
+    /// a cache request, so only `binary-<arch>` `Packages*` and `by-hash`
+    /// URLs yield one.
     ///
     /// For the passthrough relays, which forward what the classifier
     /// declined: an origin row names a mirror, feeds cleanup's index fetches
     /// and can disable flat caching for a whole host
-    /// ([`crate::flat_blocklist`]), so it must never come from a shape - a
-    /// trailing slash, a reserved or undecoded segment, a `_`-joined field,
-    /// a structured mirror path under `flat` - the cache itself refuses.
-    /// `client` only labels trace lines.
+    /// ([`crate::flat_blocklist`]), so it must never come from a shape the
+    /// cache itself refuses.  `client` only labels trace lines.
     #[must_use]
     pub(crate) fn from_path(
         path: &str,
@@ -372,8 +348,6 @@ fn format_origin_uri(
     comp: &str,
     arch: &str,
 ) -> String {
-    // deb.debian.org/debian/dists/sid/main/binary-amd64/Packages
-
     let authority = host.format_authority(port);
     format!("http://{authority}/{mirror_path}/dists/{dist}/{comp}/{arch}/Packages")
 }
@@ -425,7 +399,6 @@ pub(crate) enum FlatKind {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ResourceFile<'a> {
-    /// A pool file
     Pool {
         mirror_path: &'a str,
         /// The raw `[updates/]<component>/<prefix>/<package>` run between
@@ -437,7 +410,7 @@ pub(crate) enum ResourceFile<'a> {
         dirs: &'a str,
         filename: &'a str,
     },
-    /// A dists file
+    /// The archive-level `Release` / `InRelease` / `Release.gpg`.
     Release {
         mirror_path: &'a str,
         distribution: &'a str,
@@ -455,7 +428,6 @@ pub(crate) enum ResourceFile<'a> {
         architecture: &'a str,
         filename: &'a str,
     },
-    /// A packages file
     Packages {
         mirror_path: &'a str,
         distribution: &'a str,
@@ -484,14 +456,12 @@ pub(crate) enum ResourceFile<'a> {
         /// row a literal `Packages*` request would.
         scope: Option<ByHashScope<'a>>,
     },
-    /// An icons file
     Icon {
         mirror_path: &'a str,
         distribution: &'a str,
         component: &'a str,
         filename: &'a str,
     },
-    /// A sources file
     Sources {
         mirror_path: &'a str,
         distribution: &'a str,
@@ -514,24 +484,15 @@ pub(crate) enum ResourceFile<'a> {
     },
 }
 
-/// Collapse runs of consecutive ASCII forward-slashes in a URL path to a
-/// single `/`.
+/// Collapse `//` runs and strip standalone `.` segments (RFC 3986 §5.2.4)
+/// in a URL path.
 ///
 /// APT clients with a trailing slash in their `sources.list` mirror URI
 /// produce request paths like `/debian//dists/...`; flat-repo entries of
 /// the form `deb URI /` cause apt to emit `/./` between the base URI and
-/// the filename (e.g. NVIDIA's CUDA repos).  Without normalisation either
-/// artefact pollutes the parsed `mirror_path` and trips
-/// `valid_path_segment`.  Collapses `//` runs and strips standalone `.`
-/// segments per RFC 3986 §5.2.4 — `..` is intentionally preserved so
-/// `is_unsafe_proxy_path` can still reject real traversal attempts.
-///
-/// The fast path returns `Cow::Borrowed` (zero allocation) when neither
-/// `//` nor a bare `.` segment is present; the slow path allocates a
-/// single normalised `String`.  Idempotent and safe to call twice.
-/// Non-ASCII codepoints are preserved verbatim; later percent-decoding
-/// and non-ASCII rejection in `decode_validate` / `is_unsafe_proxy_path`
-/// get the original byte sequence.
+/// the filename (e.g. NVIDIA's CUDA repos).  `..` is intentionally
+/// preserved so `is_unsafe_proxy_path` can still reject real traversal
+/// attempts.  Idempotent; borrows when nothing changes.
 #[must_use]
 pub(crate) fn normalize_uri_path(path: &str) -> Cow<'_, str> {
     if !needs_normalization(path) {
@@ -562,8 +523,6 @@ pub(crate) fn normalize_uri_path(path: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Whether `normalize_uri_path` would change `path`. Triggers on either
-/// a `//` run or a standalone `.` segment.
 #[must_use]
 fn needs_normalization(path: &str) -> bool {
     if path.contains("//") {
@@ -637,14 +596,9 @@ fn byhash_scope<'a>(parts: &mut impl Iterator<Item = &'a str>) -> Option<ByHashS
 /// The directory name "pool" is not supported as part of the mirror path.
 /// The directory name "dists" should be avoided as part of the mirror path.
 ///
-/// **Trailing slash:** rejected.  A request like
-/// `dists/sid/main/binary-amd64/Packages/` returns `None` because the
-/// right-to-left `rsplit('/')` used inside the per-filename arms yields
-/// the trailing empty segment first, failing the literal filename match
-/// (`"Packages" | "Packages.gz" | ...`).  Strictness keeps the cache
-/// keyspace clean — APT never sends a trailing-slash URL, so accepting
-/// one would let an oddly-shaped client request alias to a cached file.
-/// [`Origin::from_path`] parses through here and so rejects it too.
+/// A trailing slash is rejected (the empty last segment matches no
+/// filename): APT never sends one, so accepting it would let an
+/// oddly-shaped client request alias to a cached file.
 #[must_use]
 pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
     let path = path.trim_start_matches('/');
@@ -774,10 +728,9 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
             let dirs = dists_path.rsplitn(4, '/').nth(3).unwrap_or_default();
 
             // Exactly three directories are the `<dist>/<comp>/<arch>` scope
-            // an `Origin` is made of - the acceptance `Origin::from_path`
-            // applies here too.  Any other depth yields no scope rather than
-            // rejecting the request: the object is still cacheable by its
-            // digest.
+            // an `Origin` is made of.  Any other depth yields no scope
+            // rather than rejecting the request: the object is still
+            // cacheable by its digest.
             let scope = byhash_scope(&mut dirs.rsplit('/'));
 
             return Some(ResourceFile::ByHash {
@@ -797,10 +750,8 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
 
 /// Parse the canonical Debian-archive pool layout
 /// `pool/<component>/<letter>/<source>/<file>` (optionally with a leading
-/// `updates/` segment for security archives). `mirror_path` is the segment
-/// before `/pool/`, `pool_path` the segment after it. Returns `None` for any
-/// path not matching that exact convention; the caller then falls back to the
-/// flat handler.
+/// `updates/` segment for security archives). `mirror_path` is the part
+/// before `/pool/`, `pool_path` the part after it.
 fn parse_structured_pool<'a>(mirror_path: &'a str, pool_path: &'a str) -> Option<ResourceFile<'a>> {
     let (dirs, filename) = pool_path.rsplit_once('/')?;
 
@@ -830,9 +781,8 @@ fn parse_structured_pool<'a>(mirror_path: &'a str, pool_path: &'a str) -> Option
 }
 
 /// Parse a flat (trivial) repository resource from an already
-/// leading-slash-trimmed `path`. Reached when neither `/pool/` (canonically)
-/// nor `/dists/` matched, and as the fall-through target for non-canonical
-/// `/pool/` paths. A mirror namespace prefix is required even for flat repos:
+/// leading-slash-trimmed `path`. A mirror namespace prefix is required even
+/// for flat repos:
 /// the host root has no namespace to disambiguate a root-served flat repo from
 /// the structured `dists/` / `flat/` siblings, so the spec's empty-directory
 /// form is declined.
@@ -931,10 +881,6 @@ pub(crate) fn valid_filename(name: &str) -> bool {
 /// - `http://deb.debian.org/debian/dists/unstable/main/i18n/Translation-en.diff/T-2024-10-03-0804.49-F-2024-10-02-2011.04.gz`
 /// - `http://deb.debian.org/debian/dists/unstable/main/i18n/Translation-de.diff/T-2024-10-03-0804.49-F-2024-10-02-2011.04.gz`
 /// - `http://deb.debian.org/debian/dists/sid/main/source/Sources.diff/T-2024-10-03-1409.04-F-2024-10-03-1409.04.gz`
-///
-/// A regex-based implementation was considered but rejected: the linear-scan
-/// contains/segment approach avoids pulling in the `regex` crate solely for this
-/// check and stays linear in the path length with no allocation.
 #[must_use]
 pub(crate) fn is_diff_request_path(uri_path: &str) -> bool {
     uri_path.contains("/Packages.diff/T-")
@@ -955,9 +901,7 @@ fn contains_translation_diff(uri_path: &str) -> bool {
             .and_then(|rest| rest.strip_suffix(".diff"))
         {
             // Language tags in Debian translations are of the form `en`, `de`,
-            // `zh_CN`, `pt_BR` - alphanumeric with optional underscore.  Reject
-            // arbitrary separator runs (e.g. `---`) that the previous matcher
-            // accepted.
+            // `zh_CN`, `pt_BR` - alphanumeric with optional underscore.
             if !lang.is_empty()
                 && lang.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
                 && segments.peek().is_some_and(|next| next.starts_with("T-"))
@@ -979,7 +923,6 @@ fn contains_translation_diff(uri_path: &str) -> bool {
 pub(crate) fn is_unsafe_proxy_path(raw_path: &str) -> bool {
     let decoded = match percent_encoding::percent_decode_str(raw_path).decode_utf8() {
         Ok(d) => d,
-        // Failed to decode — reject as unsafe
         Err(_err @ std::str::Utf8Error { .. }) => return true,
     };
 
@@ -1017,10 +960,8 @@ fn is_unsafe_segment(seg: &str) -> bool {
     seg == "." || seg == ".." || seg.bytes().any(|b| b.is_ascii_control())
 }
 
-/// Whether `s` has the shape of a by-hash digest tail: a hex string of one
-/// of the supported digest lengths. Used as the fast disambiguator in the
-/// parser, where the algorithm directory has not been read yet; the
-/// cross-check against it lives in [`byhash_pair`].
+/// Whether `s` is a hex string of one of the supported digest lengths.  The
+/// cross-check against the algorithm directory is [`byhash_pair`].
 #[must_use]
 fn is_byhash_digest_shape(s: &str) -> bool {
     HashAlgo::for_digest(s).is_some()
@@ -1044,18 +985,10 @@ fn is_release_filename(name: &str) -> bool {
 }
 
 /// The `Packages` index in every compression this proxy recognises.
-///
-/// One of the three index-family predicates ([`is_sources_filename`],
-/// [`is_translation_filename`]) that pin down which compression suffixes
-/// exist as far as the parser is concerned: the structured `dists/` arm
-/// (which [`Origin::from_path`] parses through) and the flat-repository
-/// metadata allowlist both ask here, so a new suffix (e.g. `.zst`) is one
-/// edit rather than two that can drift apart.
 #[must_use]
 fn is_packages_filename(name: &str) -> bool {
     // `limits::PackagesCompression` is the enum of the compressions the
     // decode ladder supports, i.e. exactly the `Packages*` leaves that exist.
-    // Adding `.zst` there must not need a second edit here.
     crate::limits::PackagesCompression::from_filename(name).is_some()
 }
 
@@ -1067,9 +1000,8 @@ fn is_sources_filename(name: &str) -> bool {
 
 /// Recognise any of: `Translation-LANG`, `Translation-LANG.bz2`,
 /// `Translation-LANG.gz`, `Translation-LANG.xz`. The language code is
-/// not validated beyond non-empty -- matches the existing arm's trust
-/// posture, and Debian language codes carry tags like `sr@Latn` that
-/// don't fit a simple alpha/underscore allowlist.
+/// not validated beyond non-empty: Debian language codes carry tags like
+/// `sr@Latn` that don't fit a simple alpha/underscore allowlist.
 #[must_use]
 fn is_translation_filename(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("Translation-") else {
@@ -1084,10 +1016,8 @@ fn is_translation_filename(name: &str) -> bool {
     }
 }
 
-/// Valid Debian package extensions (`.deb`, `.udeb`, `.ddeb`).
 const VALID_DEB_EXTENSIONS: &[&str] = &["deb", "udeb", "ddeb"];
 
-/// Whether the filename represents a Debian binary package (`.deb`, `.udeb`, `.ddeb`).
 #[must_use]
 pub(crate) fn is_deb_package(filename: &str) -> bool {
     let extension = filename.rsplit_once('.').map(|(_, ext)| ext);
@@ -1145,9 +1075,6 @@ const MAX_SEGMENT_LEN: usize = 128;
 /// (`PassthroughReason::FlatAnchoredMirror`), and such a mirror row from
 /// before that rule still disables flat caching for its host through the
 /// per-host collision blocklist (`flat_blocklist`: "structured wins").
-///
-/// Shared with the startup migration scan in `main.rs`, which warns about
-/// pre-existing `mirrors_v2` rows that would now fail validation.
 pub(crate) const RESERVED_MIRROR_PATH_SEGMENTS: &[&str] = &[SUBDIR_TMP, SUBDIR_FLAT_BYHASH];
 
 /// Path-segment names reserved in a *structured* mirror path on top of
@@ -1159,7 +1086,6 @@ pub(crate) const RESERVED_MIRROR_PATH_SEGMENTS: &[&str] = &[SUBDIR_TMP, SUBDIR_F
 /// `linux/debian/dists/<codename>/pool/stable/<arch>/`).
 pub(crate) const RESERVED_STRUCTURED_MIRROR_PATH_SEGMENTS: &[&str] = &[SUBDIR_DISTS];
 
-/// Whether `segment` is reserved in a mirror path of `kind`.
 #[must_use]
 fn is_reserved_mirror_path_segment(segment: &str, kind: MirrorKind) -> bool {
     RESERVED_MIRROR_PATH_SEGMENTS.contains(&segment)
@@ -1169,9 +1095,7 @@ fn is_reserved_mirror_path_segment(segment: &str, kind: MirrorKind) -> bool {
         }
 }
 
-/// Whether `path` is invalid as a mirror path of `kind` because some
-/// `/`-separated segment is reserved.  Used by the startup migration
-/// warning so the daemon can flag pre-existing DB rows that the validator
+/// For the startup warning about pre-existing DB rows that the validator
 /// would now reject on insertion.
 #[must_use]
 pub(crate) fn mirror_path_has_reserved_segment(path: &str, kind: MirrorKind) -> bool {
@@ -1193,9 +1117,7 @@ fn is_strict_path_descendant(path: &str, ancestor: &str) -> bool {
 }
 
 /// Whether `path` equals `prefix` or is a strict descendant of it,
-/// segment-aligned.  Useful when a scan wants to treat a registered
-/// nested-mirror path as a *boundary* — either at the boundary itself
-/// or inside it.
+/// segment-aligned.
 #[must_use]
 fn path_starts_with_segment(path: &str, prefix: &str) -> bool {
     path == prefix || is_strict_path_descendant(path, prefix)
@@ -1214,10 +1136,7 @@ fn path_starts_with_segment(path: &str, prefix: &str) -> bool {
 /// interleave non-segment-aligned siblings (e.g. `debian-security` between
 /// `debian` and `debian/...` since `-` < `/` in ASCII), so segment alignment
 /// is enforced via `is_strict_path_descendant`; the surrounding `take_while`
-/// is a safe termination optimisation, since entries sharing the byte prefix
-/// are contiguous in lexicographic order.
-///
-/// Callers go through [`nested_paths_per_row`].
+/// only ends the scan, since entries sharing the byte prefix are contiguous.
 #[must_use]
 fn derive_nested_paths(mirror_path: &str, host_paths_sorted: &[&str]) -> Vec<String> {
     if mirror_path.is_empty() {
@@ -1227,11 +1146,6 @@ fn derive_nested_paths(mirror_path: &str, host_paths_sorted: &[&str]) -> Vec<Str
             .map(|p| (*p).to_owned())
             .collect();
     }
-    // `take_while` terminates the scan once we leave the contiguous
-    // byte-prefix region.  Within that region the byte prefix alone is too
-    // loose - `debian-security` starts with `debian` but is not a
-    // segment-aligned descendant - so `is_strict_path_descendant` filters
-    // out non-aligned siblings.
     let start = host_paths_sorted.partition_point(|p| *p <= mirror_path);
     host_paths_sorted[start..]
         .iter()
@@ -1244,10 +1158,8 @@ fn derive_nested_paths(mirror_path: &str, host_paths_sorted: &[&str]) -> Vec<Str
 /// The [`derive_nested_paths`] of every row of `mirrors`, in row order: the
 /// paths of the other rows nested inside it, which bound its walks.
 ///
-/// Rows are bucketed by `(host, port)` and each bucket sorted once, so a
-/// row's derivation is O(k) over its host's siblings instead of O(n) over
-/// every row.  Rows are canonical (alias-resolved at dispatch, legacy rows
-/// folded at startup), so the row host *is* the `<cache>/<host>/` tree the
+/// Rows are canonical (alias-resolved at dispatch, legacy rows folded at
+/// startup), so the row host *is* the `<cache>/<host>/` tree the per-host
 /// bucket must follow.
 ///
 /// The startup cache scan and cleanup both derive their boundaries here and
@@ -1441,10 +1353,9 @@ mod tests {
 
     use super::*;
 
-    /// Regression (the `Acquire-By-Hash` origin gap): the scope has to
-    /// survive the parse for `classify_request` to mint an `Origin` from it.
-    /// Acceptance matches [`Origin::from_path`]: exactly
-    /// `<dist>/<comp>/<arch>` before `by-hash`, nothing else.
+    /// The scope has to survive the parse for `classify_request` to mint an
+    /// `Origin` from it: exactly `<dist>/<comp>/<arch>` before `by-hash`,
+    /// nothing else.
     #[test]
     fn byhash_carries_the_origin_scope_at_exactly_three_segments() {
         const SHA256: &str = "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba";
@@ -1891,7 +1802,7 @@ mod tests {
             })
         );
 
-        // The reporter's exact request path.
+        // With a leading slash.
         assert_eq!(
             parse_request_path("/apt/InRelease"),
             Some(ResourceFile::Flat {
@@ -1918,7 +1829,7 @@ mod tests {
          * failures
          */
 
-        // Wrong-letter pool is no longer rejected: it caches as flat (issue
+        // A wrong-letter pool is not rejected: it caches as flat (issue
         // #162 uniform fall-through). APT never emits wrong-letter URLs, so
         // this only widens what gets cached.
         assert_eq!(
@@ -2043,8 +1954,7 @@ mod tests {
         );
 
         // SHA512 (128-char hex) paired with the `SHA512` algorithm directory:
-        // accepted.  Confirms the new length cross-check accepts the canonical
-        // SHA512 form.
+        // accepted.
         assert_eq!(
             parse_request_path(
                 "apt/by-hash/SHA512/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
@@ -2495,16 +2405,15 @@ mod tests {
         );
     }
 
-    /// Regression: depth alone does not make a segment an architecture.
-    /// Ubuntu's `dists/<dist>/<comp>/cnf/by-hash/...` sits at `binary-<arch>`
-    /// depth and escaped the old pseudo-arch denylist; the row it minted made
-    /// cleanup fetch a `cnf/Packages` whose 404 bails the mirror's sweep.
+    /// Depth alone does not make a segment an architecture.  Ubuntu's
+    /// `dists/<dist>/<comp>/cnf/by-hash/...` sits at `binary-<arch>` depth; a
+    /// row minted from it makes cleanup fetch a `cnf/Packages` whose 404
+    /// bails the mirror's sweep.
     #[test]
     fn non_binary_directories_mint_no_origin() {
         const DIGEST: &str = "84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83";
         let host = || ClientHost::new("archive.ubuntu.com").unwrap();
-        // `binary-` with an empty suffix names no architecture either; the
-        // per-component `Release` parser has always rejected it.
+        // `binary-` with an empty suffix names no architecture either.
         for dir in ["cnf", "uefi", "signed", "binary-"] {
             let path = format!("/ubuntu/dists/noble/main/{dir}/by-hash/SHA256/{DIGEST}");
             assert_eq!(
@@ -2605,8 +2514,7 @@ mod tests {
     fn test_origin_from_path_rejects_trailing_junk() {
         let host = || ClientHost::new("deb.debian.org").unwrap();
 
-        // Trailing non-empty segment after `Packages`: rejected.  Previously
-        // silently accepted, masking unrecognised URL shapes as valid origins.
+        // Trailing non-empty segment after `Packages`: rejected.
         assert_eq!(
             Origin::from_path(
                 "/debian/dists/sid/main/binary-amd64/Packages/extra",
@@ -2663,10 +2571,10 @@ mod tests {
         );
     }
 
-    /// Regression: a passthrough minted origins from shapes the cache itself
-    /// refuses. `flat/dists/a/b/binary-x/Packages/` registered a structured
-    /// mirror named `flat`, which disables flat caching for the host.
-    /// `from_path` now accepts exactly what `classify_request` caches.
+    /// `from_path` accepts exactly what `classify_request` caches: a
+    /// passthrough of `flat/dists/a/b/binary-x/Packages/` must not register
+    /// a structured mirror named `flat`, which disables flat caching for the
+    /// host.
     #[test]
     fn test_origin_from_path_validates_like_the_classifier() {
         let host = || ClientHost::new("deb.debian.org").unwrap();

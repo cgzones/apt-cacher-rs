@@ -25,23 +25,20 @@ pub(crate) fn connected_clients() -> usize {
     CONNECTED_CLIENTS.load(Ordering::Relaxed)
 }
 
-/// The most connections any single source IP holds right now, the live
-/// figure `max_connections_per_client_ip` is compared against (0 while that
-/// cap is disabled: the per-IP map is then not maintained).
+/// The most connections any single source IP holds right now; 0 while
+/// `max_connections_per_client_ip` is disabled (the per-IP map is then not
+/// maintained).
 #[must_use]
 pub(crate) fn busiest_client_connections() -> usize {
     CONNECTIONS_PER_IP.busiest()
 }
 
-/// Smallest global connection cap the derived default settles on.
 const MIN_DERIVED_MAX_CONNECTIONS: NonZero<usize> = NonZero::new(64).expect("non-zero");
 
-/// The default `max_connections` for a soft `RLIMIT_NOFILE` of `soft_limit`:
-/// three quarters of it, leaving the rest for cache files, upstream
-/// sockets, the database and the listener, with a floor of
-/// [`MIN_DERIVED_MAX_CONNECTIONS`] so a tiny limit still admits clients.
-/// Pure so the formula is unit-testable; [`default_max_connections`] reads
-/// the live limit.
+/// The default `max_connections`: three quarters of the soft
+/// `RLIMIT_NOFILE`, leaving the rest for cache files, upstream sockets, the
+/// database and the listener, with a floor so a tiny limit still admits
+/// clients.
 #[must_use]
 fn derive_max_connections(soft_limit: u64) -> NonZero<usize> {
     let derived = usize::try_from(soft_limit / 4 * 3).unwrap_or(usize::MAX);
@@ -50,8 +47,7 @@ fn derive_max_connections(soft_limit: u64) -> NonZero<usize> {
     })
 }
 
-/// [`derive_max_connections`] of the process's soft `RLIMIT_NOFILE`.  An
-/// unreadable limit falls back to the classic 1024 descriptors.
+/// An unreadable limit falls back to the classic 1024 descriptors.
 #[must_use]
 pub(crate) fn default_max_connections() -> NonZero<usize> {
     let soft = match nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE) {
@@ -61,36 +57,30 @@ pub(crate) fn default_max_connections() -> NonZero<usize> {
     derive_max_connections(soft)
 }
 
-/// Which cap refused a connection in [`ClientCounter::try_new`].
+/// Which cap refused a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectionCap {
-    /// `max_connections_per_client_ip` for the connecting IP.
+    /// `max_connections_per_client_ip`
     PerIp(NonZero<usize>),
-    /// `max_connections` across all clients.
+    /// `max_connections`
     Global(NonZero<usize>),
 }
 
 pub(crate) struct ClientCounter {
-    /// `Some` iff `max_connections_per_client_ip` is configured and this
-    /// connection was admitted against it. `None` - the no-cap deployment
-    /// path - releases with a single atomic decrement and never touches the
-    /// per-IP mutex.
+    /// `Some` iff `max_connections_per_client_ip` is configured.
     per_ip: Option<PerIpPermit>,
 }
 
 impl ClientCounter {
-    /// Admit a connection from `client_ip` against both caps, or say which
-    /// one refused it.  The global cap is checked first (it is the cheaper,
-    /// lock-free one and the one an fd-exhaustion flood exercises); the
-    /// per-IP map is only touched when that cap is configured.
+    /// The global cap is checked first (it is the cheaper, lock-free one
+    /// and the one an fd-exhaustion flood exercises); the per-IP map is
+    /// only touched when that cap is configured.
     pub(crate) fn try_new(
         client_ip: IpAddr,
         max_per_ip: Option<NonZero<usize>>,
         max_global: Option<NonZero<usize>>,
         ipv6_prefix_len: u8,
     ) -> Result<Self, ConnectionCap> {
-        // Reserve the global slot atomically: bump, and back out when that
-        // pushed the count past the cap.
         let current = CONNECTED_CLIENTS.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(max) = max_global
             && current > max.get()
@@ -137,9 +127,7 @@ pub(crate) fn active_client_downloads() -> usize {
 }
 
 /// A live count of something in progress across all clients, and the peak
-/// gauge it feeds: the unconditional activity counts the dashboard shows
-/// (client downloads here, CONNECT tunnels in `connect_tunnel`), kept
-/// whether or not any cap applies to them.
+/// gauge it feeds.
 pub(crate) struct ActiveCount {
     count: AtomicUsize,
     peak: &'static metrics::Peak,
@@ -159,8 +147,6 @@ impl ActiveCount {
         self.count.load(Ordering::Relaxed)
     }
 
-    /// Count one more for the lifetime of the returned guard, sampling the
-    /// peak gauge.
     pub(crate) fn enter(&'static self) -> ActiveGuard {
         let current = self.count.fetch_add(1, Ordering::Relaxed) + 1;
         self.peak.update(current as u64);
@@ -168,7 +154,6 @@ impl ActiveCount {
     }
 }
 
-/// One unit of an [`ActiveCount`], released on drop.
 #[must_use = "dropping the guard right away leaves the count untouched"]
 pub(crate) struct ActiveGuard {
     count: &'static ActiveCount,
@@ -192,8 +177,6 @@ pub(crate) struct ClientDownload {
 }
 
 impl ClientDownload {
-    /// Count an active client download for the lifetime of the returned
-    /// guard; dropping it right away would leave the counter untouched.
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
@@ -215,7 +198,7 @@ mod tests {
     fn per_ip_cap_refuses_and_releases() {
         let _serial = CONNECTION_TEST.lock();
         // `CONNECTIONS_PER_IP` is process-wide: use an address no other test
-        // touches, and compare the global count against its starting value.
+        // touches.
         let ip: IpAddr = "192.0.2.21".parse().expect("test address");
         let before = connected_clients();
 
@@ -244,8 +227,6 @@ mod tests {
         assert_eq!(connected_clients(), before);
     }
 
-    /// A connection the per-IP cap refuses never counted as connected, so it
-    /// cannot raise the connected-clients peak.
     #[test]
     fn per_ip_refusal_does_not_raise_the_connected_peak() {
         let _serial = CONNECTION_TEST.lock();
@@ -263,9 +244,6 @@ mod tests {
         drop(admitted);
     }
 
-    /// Without `max_connections_per_client_ip` the per-IP map is never
-    /// touched, so an unconfigured deployment pays one atomic per connection
-    /// and keeps no per-IP state at all.
     #[test]
     fn no_per_ip_cap_keeps_no_per_ip_state() {
         let _serial = CONNECTION_TEST.lock();

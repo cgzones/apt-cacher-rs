@@ -1,11 +1,6 @@
 //! Process-wide upstream-scheme cache and the shared HTTP-vs-HTTPS decision
 //! logic used by both the hyper and splice backends.
 //!
-//! The retry/revert machinery (hyper `inner_loop`) and the connect-with-fallback
-//! flow (splice `connect_upstream`) stay backend-specific — this module owns the
-//! scheme types, the decision (`resolve`/`decide`), and the cache read/insert/evict
-//! (`record_success`/`record_failure`).
-//!
 //! A learned HTTPS scheme is kept until a terminal failure evicts it; a
 //! rejected certificate never does, as the entry is what makes that rejection
 //! terminal under `Auto` ([`https_verified_before`]). A learned
@@ -30,7 +25,6 @@ use crate::metrics;
 use crate::permitted_host_cache::port_permitted;
 use crate::uri_authority;
 
-/// Upstream URI scheme we support proxying.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Scheme {
     Http,
@@ -56,7 +50,6 @@ impl From<Scheme> for http::uri::Scheme {
 }
 
 impl Scheme {
-    /// Map an HTTP(S) URI scheme back to a `Scheme`; `None` for any other scheme.
     pub(crate) fn from_uri_scheme(s: &http::uri::Scheme) -> Option<Self> {
         if *s == http::uri::Scheme::HTTPS {
             Some(Self::Https)
@@ -68,7 +61,6 @@ impl Scheme {
     }
 }
 
-/// Owned `(host, port)` key for the scheme cache.
 #[derive(Debug, Eq, Hash, PartialEq)]
 struct SchemeKey {
     host: String,
@@ -181,7 +173,6 @@ impl Equivalent<SchemeKey> for SchemeKeyRef<'_> {
 /// aged.
 const HTTP_SCHEME_TTL: coarsetime::Duration = coarsetime::Duration::from_secs(60 * 60);
 
-/// A cache entry: the scheme and when it was learned.
 #[derive(Clone, Copy, Debug)]
 struct CachedScheme {
     scheme: Scheme,
@@ -200,8 +191,7 @@ impl CachedScheme {
     }
 }
 
-/// Process-wide cache of the scheme last known good for each upstream host.
-/// Module-private: reach it only through [`cache`] and the functions below.
+/// The scheme last known good for each upstream host.
 static SCHEME_CACHE: OnceLock<RwLock<HashMap<SchemeKey, CachedScheme>>> = OnceLock::new();
 
 fn cache() -> &'static RwLock<HashMap<SchemeKey, CachedScheme>> {
@@ -209,7 +199,7 @@ fn cache() -> &'static RwLock<HashMap<SchemeKey, CachedScheme>> {
 }
 
 /// Hosts cached and the heap they take: the table and each key's host
-/// text. Walks the table, which holds one entry per upstream host.
+/// text.
 pub(crate) fn footprint() -> Footprint {
     let map = cache().read();
     let hosts: usize = map.keys().map(|key| key.host.capacity()).sum();
@@ -219,7 +209,6 @@ pub(crate) fn footprint() -> Footprint {
     }
 }
 
-/// Debug-format the current cache contents, for the startup warm-up trace.
 #[cfg(feature = "hyper")]
 pub(crate) fn debug_contents() -> String {
     format!("{:?}", *cache().read())
@@ -227,11 +216,7 @@ pub(crate) fn debug_contents() -> String {
 
 /// The scheme decision for one upstream request, richer than a bare `Scheme` so
 /// a backend can tell an HTTPS *upgrade attempt* (which bumps
-/// `HTTPS_UPGRADE_ATTEMPTED` and may revert) apart from a fixed HTTPS scheme,
-/// while splice collapses it back to its `Option<Scheme>` view via
-/// [`fixed_scheme`].
-///
-/// [`fixed_scheme`]: SchemeDecision::fixed_scheme
+/// `HTTPS_UPGRADE_ATTEMPTED` and may revert) apart from a fixed HTTPS scheme.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SchemeDecision {
     /// Cached Http, `Never` mode, or an `http_only_mirrors` host.
@@ -246,8 +231,7 @@ pub(crate) enum SchemeDecision {
 
 impl SchemeDecision {
     /// The concrete scheme to connect with; `None` means [`AutoUpgrade`](Self::AutoUpgrade)
-    /// (try HTTPS, fall back to HTTP). Reproduces splice's `Option<Scheme>` view:
-    /// `Https` and `AlwaysUpgrade` both map to `Some(Https)`.
+    /// (try HTTPS, fall back to HTTP).
     pub(crate) fn fixed_scheme(self) -> Option<Scheme> {
         match self {
             Self::Http => Some(Scheme::Http),
@@ -256,19 +240,16 @@ impl SchemeDecision {
         }
     }
 
-    /// Is this an HTTPS-upgrade attempt rather than a fixed scheme?  splice
-    /// reads it for its upgrade accounting; hyper folds the same distinction
-    /// into its own `UpgradeProbe`.
+    /// Only splice reads this, for its upgrade accounting; hyper folds the
+    /// same distinction into its own `UpgradeProbe`.
     #[cfg(any(test, feature = "splice"))]
     pub(crate) fn is_upgrade_attempt(self) -> bool {
         matches!(self, Self::AlwaysUpgrade | Self::AutoUpgrade)
     }
 }
 
-/// The single scheme-decision truth table. Pure — no globals — so it is fully
-/// unit-testable (both backends' inline resolvers call `global_config()` and are
-/// not). `https_permitted` is whether `allowed_mirror_ports` lets the mirror
-/// be dialled over https at all (see [`resolve`]); without it the mirror
+/// `https_permitted` is whether `allowed_mirror_ports` lets the mirror be
+/// dialled over https at all (see `https_permitted`); without it the mirror
 /// stays on http whatever was cached.
 fn decide(
     cached: Option<Scheme>,
@@ -328,8 +309,6 @@ pub(crate) const fn no_fallback_reason(mode: HttpsUpgradeMode) -> &'static str {
     }
 }
 
-/// Resolve the upstream scheme for `key` from the cache and config — the single
-/// entry point both backends use to decide HTTP vs HTTPS.
 pub(crate) fn resolve(key: SchemeKeyRef<'_>, config: &Config) -> SchemeDecision {
     if !https_permitted(key, config) {
         return SchemeDecision::Http;
@@ -345,9 +324,7 @@ pub(crate) fn resolve(key: SchemeKeyRef<'_>, config: &Config) -> SchemeDecision 
 /// An upgrade keeps an explicit port and dials 443 for a mirror named
 /// without one, which the list may refuse: such a mirror stays on http
 /// (`Config::validate` refuses `Always` in that case and warns under
-/// `Auto`). An explicit port was checked with the request. The one gate
-/// [`resolve`] and [`verdict_for`] share, so the dashboard explains the
-/// scheme the backends dial.
+/// `Auto`). An explicit port was checked with the request.
 fn https_permitted(key: SchemeKeyRef<'_>, config: &Config) -> bool {
     key.port.is_some() || port_permitted(&config.allowed_mirror_ports, None, true)
 }
@@ -369,7 +346,6 @@ fn live_entry(key: SchemeKeyRef<'_>) -> Option<LiveScheme> {
     live_entry_at(key, Instant::now())
 }
 
-/// [`live_entry`] at the given clock reading.
 fn live_entry_at(key: SchemeKeyRef<'_>, now: Instant) -> Option<LiveScheme> {
     let entry = *cache().read().get(&key)?;
     let scheme = entry.live_at(now)?;
@@ -462,7 +438,6 @@ fn verdict(
     }
 }
 
-/// [`verdict`] for `key` from the global cache and `config`.
 #[must_use]
 pub(crate) fn verdict_for(key: SchemeKeyRef<'_>, config: &Config) -> SchemeVerdict {
     verdict(
@@ -490,7 +465,6 @@ pub(crate) fn record_success(key: SchemeKeyRef<'_>, scheme: Scheme) -> bool {
     record_success_at(key, scheme, Instant::now())
 }
 
-/// [`record_success`] at the given clock reading.
 fn record_success_at(key: SchemeKeyRef<'_>, scheme: Scheme, now: Instant) -> bool {
     if cached_scheme_at(key, now).is_some() {
         return false;
@@ -529,7 +503,6 @@ pub(crate) fn record_failure(key: SchemeKeyRef<'_>) -> Option<Scheme> {
     record_failure_at(key, Instant::now())
 }
 
-/// [`record_failure`] at the given clock reading.
 fn record_failure_at(key: SchemeKeyRef<'_>, now: Instant) -> Option<Scheme> {
     let removed = cache()
         .write()
@@ -624,8 +597,6 @@ mod tests {
         }
     }
 
-    /// An `http` URI's explicit `:80` is no port, as in a proxied request;
-    /// any other scheme's `:80`, and any other port, stays.
     #[cfg(feature = "hyper")]
     #[test]
     fn canonical_upstream_authority_drops_the_http_default_port() {
@@ -672,7 +643,6 @@ mod tests {
         let host = key("record-success.test.invalid");
         assert!(record_success(host, Scheme::Https));
         assert_eq!(cached_scheme_at(host, Instant::now()), Some(Scheme::Https));
-        // Vacant-only: an existing entry is never overwritten.
         assert!(!record_success(host, Scheme::Http));
         assert_eq!(cached_scheme_at(host, Instant::now()), Some(Scheme::Https));
     }
@@ -697,12 +667,9 @@ mod tests {
         record_success(host, Scheme::Https);
         assert_eq!(record_failure(host), Some(Scheme::Https));
         assert_eq!(cached_scheme_at(host, Instant::now()), None);
-        // Evicting an absent entry is a no-op returning None.
         assert_eq!(record_failure(host), None);
     }
 
-    /// An Auto-mode HTTP fallback is only remembered for `HTTP_SCHEME_TTL`;
-    /// then the host is treated as uncached again, so Auto probes HTTPS.
     #[test]
     fn http_entry_expires_after_ttl() {
         let host = key("http-ttl.test.invalid");
@@ -738,8 +705,6 @@ mod tests {
         );
     }
 
-    /// Vacant-only applies to live entries: an expired HTTP entry is
-    /// replaced by the outcome of the next probe, and dated afresh.
     #[test]
     fn expired_http_entry_is_replaced() {
         let host = key("http-replace.test.invalid");
@@ -762,8 +727,6 @@ mod tests {
         assert_eq!(cached_scheme_at(host, expired_again), Some(Scheme::Https));
     }
 
-    /// Evicting an expired entry reports nothing: it no longer decided how
-    /// the host was dialled.
     #[test]
     fn record_failure_ignores_expired_entry() {
         let host = key("http-evict-expired.test.invalid");
@@ -773,8 +736,6 @@ mod tests {
         assert_eq!(cached_scheme_at(host, t0), None, "the entry is gone");
     }
 
-    /// A live HTTP entry reports the time until Auto probes HTTPS again; an
-    /// HTTPS one does not age.
     #[test]
     fn a_live_entry_carries_its_remaining_lifetime() {
         let http = key("live-http.test.invalid");
@@ -962,8 +923,6 @@ mod tests {
         );
     }
 
-    /// Without https permitted (443 outside `allowed_mirror_ports` for a
-    /// port-less mirror) the mirror stays on http, even with https cached.
     #[test]
     fn a_refused_https_port_keeps_the_mirror_on_http() {
         for mode in [HttpsUpgradeMode::Auto, HttpsUpgradeMode::Always] {

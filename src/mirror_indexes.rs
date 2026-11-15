@@ -13,22 +13,16 @@
 //! is unconfirmed, as that suite may well have moved on. Expiry is still
 //! judged at each suite's own confirmation: it means served expired.
 //!
-//! Fed by the registry ingest of a structured `Release`/`InRelease`
-//! (`integrity::ingest_release_file`, on commit or on a touch of a cached
-//! copy the registry lacks), last parsed wins, with the file's mtime as the
-//! confirmation time; and by an upstream 304 revalidating one
-//! (`integrity::note_release_revalidated`, both backends). A 304 for a suite
-//! not recorded yet (the first revalidation after a restart, whose touch
-//! ingest is still running) is held as a pending confirmation the ingest
-//! applies, so the revalidation time wins over the file's mtime whichever
-//! lands first. So nothing is known before the first `apt update` after a
-//! restart, and nothing at all without `verify_checksums`, which gates the
-//! ingest. Not covered: signatures,
-//! per-component `Release` files, flat repositories, cleanup's own `Release`
-//! reads.
-//!
-//! Stored in a [`MirrorRegistry`]; each mirror keeps at most
-//! [`MAX_SUITES`].
+//! Fed by the registry ingest of a structured `Release`/`InRelease` (last
+//! parsed wins, with the file's mtime as the confirmation time) and by an
+//! upstream 304 revalidating one. A 304 for a suite not recorded yet (the
+//! first revalidation after a restart, whose touch ingest is still running)
+//! is held as a pending confirmation the ingest applies, so the revalidation
+//! time wins over the file's mtime whichever lands first. So nothing is
+//! known before the first `apt update` after a restart, and nothing at all
+//! without `verify_checksums`, which gates the ingest. Not covered:
+//! signatures, per-component `Release` files, flat repositories, cleanup's
+//! own `Release` reads.
 
 use hashbrown::HashMap;
 
@@ -69,8 +63,7 @@ fn lag_between(date: i64, confirmed_at: i64) -> u64 {
 
 impl SuiteIndex {
     /// How old the index was when the mirror last served it, in seconds;
-    /// `None` without a `Date:`. A date after the confirmation (clock skew)
-    /// reads as no lag.
+    /// `None` without a `Date:`.
     #[must_use]
     pub(crate) fn lag(self) -> Option<u64> {
         self.header
@@ -88,7 +81,6 @@ impl SuiteIndex {
     }
 }
 
-/// One mirror's suites.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MirrorIndexes {
     suites: Vec<(Box<str>, SuiteIndex)>,
@@ -104,7 +96,6 @@ impl MirrorIndexes {
         &self.suites
     }
 
-    /// The suite's entry, if tracked.
     #[must_use]
     pub(crate) fn suite(&self, suite: &str) -> Option<SuiteIndex> {
         self.suites
@@ -265,8 +256,7 @@ pub(crate) fn confirm(mirror: &Mirror, release_dir: &str, at: u64) {
     INDEXES.update(mirror, |indexes| indexes.confirm(suite, at));
 }
 
-/// Every tracked mirror's suites, keyed by its `host[:port]/path`, for one
-/// dashboard render.
+/// Keyed by the mirror's `host[:port]/path`.
 #[must_use]
 pub(crate) fn snapshot() -> HashMap<Box<str>, MirrorIndexes> {
     INDEXES.snapshot()
@@ -323,8 +313,6 @@ mod tests {
         assert_eq!(suite_of("debian", "debian/dists/"), None);
     }
 
-    /// A release pocket frozen at its original date does not make a mirror
-    /// behind while another suite of it is fresh; all suites old does.
     #[test]
     fn a_mirror_is_judged_by_its_freshest_suite() {
         let frozen_and_fresh = indexes(&[
@@ -427,8 +415,6 @@ mod tests {
         );
     }
 
-    /// Serving an index past its Valid-Until is the worst reading, whatever
-    /// the dates; a Valid-Until still ahead at confirmation is fine.
     #[test]
     fn an_index_served_past_its_valid_until_is_expired() {
         let expired = indexes(&[
@@ -460,8 +446,6 @@ mod tests {
         assert_eq!(assess(&future).and_then(|age| age.freshest_lag), Some(0));
     }
 
-    /// Last parsed wins; a 304 only moves the confirmation forward, and
-    /// records no suite of its own.
     #[test]
     fn a_suite_is_replaced_by_the_next_parse_and_confirmed_by_a_304() {
         let mut indexes = indexes(&[("sid", index(Some(NOW - DAY), None, NOW - 10))]);
@@ -477,9 +461,6 @@ mod tests {
         );
     }
 
-    /// A 304 for a suite the ingest has not recorded yet (the first
-    /// revalidation after a restart) is not lost: the ingest recording the
-    /// suite later takes the confirmation over its own, older mtime.
     #[test]
     fn a_confirmation_before_the_first_record_is_applied_by_it() {
         let mut indexes = MirrorIndexes::default();
@@ -500,8 +481,6 @@ mod tests {
         assert_eq!(indexes.suite("sid").map(|i| i.confirmed_at), Some(NOW + 5));
     }
 
-    /// A re-read of the same index (a touch ingest reading an mtime from
-    /// before the 304 that confirmed it) keeps the later confirmation.
     #[test]
     fn a_reread_of_the_same_index_keeps_its_later_confirmation() {
         let mut indexes = indexes(&[("sid", index(Some(NOW - DAY), Some(NOW + DAY), NOW - 100))]);

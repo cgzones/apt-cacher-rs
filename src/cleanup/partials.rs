@@ -20,21 +20,17 @@ use crate::partial_file::PARTIAL_SUFFIX;
 
 use super::scan::{remove_non_regular, remove_stray_dir};
 
-/// Consequence clause of every foreign-entry report in `tmp/`, whether the
-/// walker raises it (symlink / FIFO / socket / device) or the loop below does
-/// (stray directory): both are reaped on the same `FOREIGN_MAX_AGE` schedule,
-/// which this sentence spells out.
+/// Consequence clause of every foreign-entry report in `tmp/`; spells out
+/// `FOREIGN_MAX_AGE`.
 const FOREIGN_CONSEQUENCE: &str = "removing it once it is older than a week";
 
 /// Age before a zero-byte `.partial` is reaped. A download creates its
 /// partial before the first body byte lands, so an empty one may belong to
 /// a download still waiting on its upstream -- at most `http_timeout` (capped
-/// at six minutes) per read. An hour is far past that, and still far below
-/// the partial span that governs partials with resume state.
+/// at six minutes) per read.
 ///
 /// A download's claim on its path already keeps the reap off a partial it
-/// uses; this age is the second line of defence, should a path ever escape
-/// its claim.
+/// uses; this age is the second line of defence.
 const EMPTY_PARTIAL_MIN_AGE: Duration = Duration::from_hours(1);
 
 /// When a `.partial` counts as stale: judged once by the walk and again,
@@ -72,23 +68,15 @@ static TMP_WALK: WalkContext = WalkContext {
 
 /// Remove stale entries from a single `tmp/` directory.
 ///
-/// `.partial` files are deleted when zero-byte (no useful resume state) and
-/// older than `EMPTY_PARTIAL_MIN_AGE`, or older
-/// than `partial_max_age` — the `PartialsUnit` span, so tuning it in
-/// `model.rs` actually moves this threshold. A partial a download claims is
-/// never deleted, however old ([`reap_partial`]). Any other artifact
-/// (defensive — current code only writes `.partial` here) is deleted once it has
-/// aged past `FOREIGN_MAX_AGE`, the longer threshold acknowledging that we don't
-/// know what produced it; a stray directory or non-regular entry is reported
-/// on every cycle it is seen and reaped on the same schedule.
+/// `.partial` files go when zero-byte and older than `EMPTY_PARTIAL_MIN_AGE`,
+/// or older than `partial_max_age`; a partial a download claims is never
+/// deleted, however old. Anything else (current code only writes `.partial`
+/// here) goes once past the longer `FOREIGN_MAX_AGE`, since we don't know
+/// what produced it.
 ///
-/// Called by the engine's `Partials` unit arm once per mirror per layout
-/// (structured `<cache>/<cache_path>/tmp` and flat `<cache>/flat/<flat_root>/tmp`
-/// — see `model::classify_mirror`'s two `Partials` units). The entry count
-/// is logged only; the unlinked regular files' bytes feed the quota
-/// reconcile (the cache scan counts every regular file in `tmp/`), never
-/// `UnitStats::removed`/`bytes_removed`: partial-download scratch files are
-/// not cached content.
+/// The unlinked regular files' bytes feed the quota reconcile (the cache scan
+/// counts every regular file in `tmp/`), never
+/// `UnitStats::removed`/`bytes_removed`: scratch files are not cached content.
 pub(super) async fn cleanup_tmp_dir(
     cache_root: &Path,
     tmp_dir: &Path,
@@ -122,16 +110,13 @@ pub(super) async fn cleanup_tmp_dir(
                 SystemTime::UNIX_EPOCH
             }
         };
-        // The tmp/ producer (`download_file`) only writes regular files, so
-        // a directory here is anomalous however young it is; the walker
-        // already reported a non-regular entry.
+        // Anomalous however young it is; the walker already reported a
+        // non-regular entry.
         if entry.kind() == EntryKind::Dir {
             entry.report_unexpected(FOREIGN_CONSEQUENCE);
         }
-        // Apply the per-suffix `.partial` policy only to regular files: a
-        // symlink-to-dir or a stray directory named `*.partial` should not
-        // be measured by `len()` (zero for a symlink) and should be reaped
-        // under the longer foreign cutoff instead.
+        // Only regular files are partials: a symlink or stray directory named
+        // `*.partial` is reaped under the longer foreign cutoff instead.
         let is_partial = entry.kind() == EntryKind::File
             && entry
                 .name()
@@ -190,7 +175,6 @@ pub(super) async fn cleanup_tmp_dir(
     reaped
 }
 
-/// What became of one stale `tmp/` entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reaped {
     /// Unlinked, freeing a regular file of this length (zero for anything
@@ -199,12 +183,11 @@ enum Reaped {
     /// Left in place on purpose: a download claims it, or it changed since
     /// the walk judged it.
     Kept,
-    /// Left in place on a cache I/O failure, logged where it failed.
+    /// Left in place on a cache I/O failure, already logged.
     Failed,
 }
 
 impl Reaped {
-    /// A non-file removal's outcome: `removed` says whether the entry is gone.
     const fn unless_failed(removed: bool) -> Self {
         if removed {
             Self::Removed(0)
@@ -276,9 +259,7 @@ pub(super) struct TmpReap {
     /// Sizes of the regular files among them.
     pub(super) bytes: u64,
     /// Entries left in place, or a directory left unread, on a cache I/O
-    /// failure, each logged where it failed (see [`UnitStats::io_failures`]).
-    ///
-    /// [`UnitStats::io_failures`]: super::engine::UnitStats::io_failures
+    /// failure, each already logged.
     pub(super) io_failures: u64,
 }
 
@@ -298,25 +279,18 @@ mod tests {
     const PARTIAL_MAX_AGE: Duration = Duration::from_hours(1);
     const ONE_DAY: Duration = Duration::from_hours(24);
 
-    /// Create `name` under `tmp` holding `content`, with its mtime backdated
-    /// by `age` relative to `now`.
     fn plant_file(tmp: &Path, name: &str, content: &[u8], now: SystemTime, age: Duration) {
         let path = tmp.join(name);
         std::fs::write(&path, content).expect("write tmp entry");
         set_times(&path, FileTimes::new().set_modified(now - age)).expect("backdate mtime");
     }
 
-    /// Create the directory `name` under `tmp` with its mtime backdated by
-    /// `age` relative to `now`.
     fn plant_dir(tmp: &Path, name: &str, now: SystemTime, age: Duration) {
         let path = tmp.join(name);
         std::fs::create_dir(&path).expect("create stray dir");
         set_times(&path, FileTimes::new().set_modified(now - age)).expect("backdate mtime");
     }
 
-    /// A `tmp/` reached through a symlinked mirror directory is not reaped:
-    /// the stale partials of the tree the symlink points at stay put, and
-    /// the symlink is reported as a non-regular entry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn a_tmp_dir_behind_a_symlink_is_not_reaped() {
         let cache = tempfile::tempdir().expect("tempdir");
@@ -355,7 +329,6 @@ mod tests {
         let tmp = dir.path();
         let now = SystemTime::now();
 
-        // Non-empty partials follow the injected `partial_max_age`.
         plant_file(tmp, "young.partial", b"resume", now, PARTIAL_MAX_AGE / 2);
         plant_file(tmp, "old.partial", b"resume", now, PARTIAL_MAX_AGE * 2);
 
@@ -371,9 +344,6 @@ mod tests {
         assert!(!tmp.join("old.partial").exists(), "aged partial reaped");
     }
 
-    /// A partial a download claims is left alone however stale -- the
-    /// download may be resuming it or about to measure it for its quota
-    /// reservation -- and goes with the first cycle after the claim ends.
     // A partial is reaped through `block_in_place`, which needs the
     // multi-thread runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -401,8 +371,6 @@ mod tests {
         assert!(!tmp.join("resumed.partial").exists());
     }
 
-    /// The walk's verdict is re-checked right before the unlink: a partial
-    /// written to since, or replaced by a new file at the same path, stays.
     // `reap_partial` runs `block_in_place`, which needs the multi-thread
     // runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -447,10 +415,6 @@ mod tests {
         assert!(!path.exists());
     }
 
-    /// A zero-byte partial carries no resume state, so it goes long before
-    /// `partial_max_age` -- but not while young: a download creates its
-    /// partial before the first body byte arrives, and reaping it then made
-    /// the finished download's rename fail with `ENOENT`.
     // A partial is reaped through `block_in_place`, which needs the
     // multi-thread runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -499,8 +463,6 @@ mod tests {
         let tmp = dir.path();
         let now = SystemTime::now();
 
-        // Non-`.partial` regular files ignore `partial_max_age` (an hour here)
-        // and only go once older than `FOREIGN_MAX_AGE` (a week).
         plant_file(tmp, "fresh.bin", b"", now, Duration::ZERO);
         plant_file(tmp, "six-days.bin", b"x", now, ONE_DAY * 6);
         plant_file(tmp, "eight-days.bin", b"x", now, ONE_DAY * 8);
@@ -555,8 +517,6 @@ mod tests {
         );
     }
 
-    /// A stale partial that cannot be unlinked stays, and the pass reports
-    /// the failure, so cleanup's last-run result names the failed step.
     // A partial is reaped through `block_in_place`, which needs the
     // multi-thread runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

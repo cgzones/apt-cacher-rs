@@ -6,19 +6,17 @@
 //! Verifying` flip and the watch sender's drop, none of which touch the disk
 //! -- and everything after that (`fsync`, verify + rename, the `Download`
 //! and `Delivery` rows, the completion line) is the [`CommitTail`] that step
-//! returns. Its three callers are the three ways a download finishes:
+//! returns:
 //!
-//! - [`CommitTail::spawn`]: the streaming drive, which hands the tail to its
-//!   own task as soon as upstream finishes. The returned [`ClientSettlement`]
+//! - [`CommitTail::spawn`]: the streaming drive hands the tail to its own
+//!   task as soon as upstream finishes. The returned [`ClientSettlement`]
 //!   awaits any demoted writer on the connection task and sends its verdict
 //!   for reporting; neither the commit nor the client waits for the other.
-//! - [`CommitTail::spawn_before_serving`]: the buffered volatile path
-//!   ([`super::volatile`]), which spawns the same task *before* it writes the
-//!   response -- its body is already on disk, so the commit must not depend
-//!   on the client write -- and hands the client's fate to the returned
-//!   [`ClientVerdict`] once it has served it from memory.
-//! - [`CommitTail::finish`]: the detached download ([`super::detached`]),
-//!   already off the connection, which runs the same steps in place.
+//! - [`CommitTail::spawn_before_serving`]: the buffered volatile path spawns
+//!   the same task *before* it writes the response and hands the client's
+//!   fate to the returned [`ClientVerdict`] once it has served it.
+//! - [`CommitTail::finish`]: the detached download, already off the
+//!   connection, runs the same steps in place.
 //!
 //! A demoted client (`body::PreparedFileServe::spawn`) is still writing this
 //! response through a `dup(2)` of the connection's socket, so the connection
@@ -74,7 +72,7 @@ pub(super) struct CompletionBytes {
 }
 
 /// What the client's response promised, for a client that received all of
-/// it: the payload of [`CompletionClient::Served`].
+/// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Served {
     /// The response's `Content-Length`.
@@ -86,8 +84,6 @@ pub(super) struct Served {
 
 /// What became of the client a completed download was fetched for: a
 /// [`ClientEnd`] once settled, with any demoted writer's verdict folded in.
-/// Selects the event wording and the client rate segment of the completion
-/// line, and on the `Served` arm the `partial` flag of the `Delivery` row.
 #[derive(Debug)]
 pub(super) enum CompletionClient {
     /// The client received the whole response body.
@@ -96,24 +92,22 @@ pub(super) enum CompletionClient {
     /// demoted file-serve -- and the owner that ended it concluded it.
     Aborted(ReportedDelivery),
     /// No client was ever attached: the parallel-hack nudge answered the
-    /// request and the download ran detached ([`super::detached`]). Reports
-    /// the upstream side only, in hyper's "Finished download of ..." wording
-    /// plus the splice mechanism token -- there is no fused serve to name.
+    /// request and the download ran detached. Reports the upstream side
+    /// only, in hyper's "Finished download of ..." wording.
     Absent,
 }
 
 impl CacheTarget {
     /// End the download on the calling task: the `Download -> Verifying`
     /// flip that drops the `max_upstream_downloads` slot and the watch sender
-    /// (`DownloadBarrier::begin_rename`, which also flushes the final ping).
-    /// Finalization drains any pending cache writes before this flip. It
-    /// belongs on the connection task: the slot goes back at the same point
-    /// as in the hyper backend, and a demoted file-serve task parked on the
-    /// sender is awake before anyone can await it.
+    /// (`DownloadBarrier::begin_rename`, which also flushes the final ping),
+    /// after draining any pending cache writes. It belongs on the connection
+    /// task: the slot goes back at the same point as in the hyper backend,
+    /// and a demoted file-serve task parked on the sender is awake before
+    /// anyone can await it.
     ///
     /// The only constructor of [`CommitTail`], so nothing can commit a
-    /// download that has not been through the flip. `start` opens the
-    /// download window the `Download` and `Delivery` rows share.
+    /// download that has not been through the flip.
     pub(super) async fn begin_rename(
         self,
         conn_details: ConnectionDetails,
@@ -148,15 +142,11 @@ impl CacheTarget {
     }
 }
 
-/// A finished download's commit, owned rather than borrowed so it can
-/// outlive the connection task: the sync, the verify + rename, the
-/// `Download` row, and -- through [`Committed`] -- the completion line and
-/// the `Delivery` row.
-///
-/// Built only by [`CacheTarget::begin_rename`]: every body byte is in the
-/// temp file, the registry entry says `Verifying`, the watch sender and the
-/// `max_upstream_downloads` slot are gone, and the [`RenameBarrier`] is what
-/// is left to commit.
+/// A finished download's commit, owned so it can outlive the connection
+/// task. Built only by [`CacheTarget::begin_rename`]: every body byte is in
+/// the temp file, the registry entry says `Verifying`, the watch sender and
+/// the `max_upstream_downloads` slot are gone, and the [`RenameBarrier`] is
+/// what is left to commit.
 #[must_use = "the download is only committed once the tail is spawned, finished or committed"]
 pub(super) struct CommitTail {
     tempfile: FinishedCacheFile,
@@ -222,11 +212,9 @@ struct ClientReport {
 
 impl ClientSettlement {
     /// Await the demoted writer before the connection reads its next request:
-    /// that writer owns a dup of the same socket. Reporting the verdict is a
-    /// synchronous send, so a slow or failed commit cannot delay the client.
+    /// that writer owns a dup of the same socket.
     ///
-    /// Returns whether the client was fully served; the verdict itself
-    /// belongs to the completion line, which the tail reports.
+    /// Returns whether the client was fully served.
     pub(super) async fn settle(self) -> bool {
         let Self {
             end,
@@ -259,21 +247,18 @@ async fn receive_client_report(
 }
 
 impl CommitTail {
-    /// Fire-and-forget, like `DetachedDownload::spawn` and the hyper
-    /// backend's `download_file`: the connection task returns to its next
-    /// request while this one commits. A request arriving meanwhile still
-    /// late-joins the `Verifying` entry rather than missing the cache -- the
-    /// entry only retires inside the commit.
+    /// Fire-and-forget: the connection task returns to its next request
+    /// while this one commits. A request arriving meanwhile still late-joins
+    /// the `Verifying` entry rather than missing the cache -- the entry only
+    /// retires inside the commit.
     ///
-    /// Nothing bounds how many of these run at once, deliberately and unlike
-    /// the download they follow: the slot this download held went back in
-    /// `begin_rename`, exactly where the hyper backend gives its own back, so
-    /// a burst of simultaneous completions can queue an unbounded number of
-    /// tails, each holding an open temp-file fd, a `TempPath` and a
-    /// `QuotaReservation` until its `fsync` + verify + rename drains. That is
-    /// the exposure the hyper backend has always had, and capping it would
-    /// only push the wait back onto whatever holds the cap -- but do not
-    /// read the released slot as a bound that is still in force.
+    /// Nothing bounds how many of these run at once, deliberately: the slot
+    /// this download held went back in `begin_rename`, so a burst of
+    /// simultaneous completions can queue an unbounded number of tails, each
+    /// holding an open temp-file fd, a `TempPath` and a `QuotaReservation`
+    /// until its `fsync` + verify + rename drains. The hyper backend has the
+    /// same exposure, and capping it would only push the wait back onto
+    /// whatever holds the cap.
     pub(super) fn spawn(
         self,
         rates: RateTimestamps,
@@ -304,26 +289,20 @@ impl CommitTail {
         ClientVerdict { report }
     }
 
-    /// Commit, then report: the completion line and, for a client that got
-    /// everything, the `Delivery` row. A commit failure already logged its
-    /// cause (the rename ERROR, or the mismatch / verify failure inside
-    /// `RenameBarrier::commit`) and dropped the barrier; nothing is cached,
-    /// so nothing is reported.
+    /// Commit, then report. A commit failure already logged its cause and
+    /// dropped the barrier; nothing is cached, so nothing is reported.
     pub(super) async fn finish(self, rates: RateTimestamps, client: CompletionClient) {
         if let Some(committed) = self.commit().await {
             committed.report(&rates, client).await;
         }
     }
 
-    /// Sync and commit the fully written download into the cache --
-    /// `RenameBarrier::commit`, whose single blocking job runs
-    /// [`sync_cache_file`], then the verify + rename -- then record the
-    /// `Download` transfer.
+    /// Sync and commit the fully written download into the cache, then
+    /// record the `Download` transfer.
     ///
-    /// `Some` when the file landed in the cache. `None` means the commit
-    /// failed: it logged the cause and dropped the barrier, the temp-file
-    /// guard removed the partial, and nothing is cached (future requests
-    /// re-download), so no DB row is written.
+    /// `None` means the commit failed: it logged the cause and dropped the
+    /// barrier, the temp-file guard removed the partial, and nothing is
+    /// cached, so no DB row is written.
     async fn commit(self) -> Option<Committed> {
         let Self {
             tempfile,
@@ -341,7 +320,6 @@ impl CommitTail {
             return None;
         }
 
-        // Record download in database (mirrors download_file() in hyper_conn.rs).
         let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
             mirror: conn_details.mirror.clone(),
             debname: conn_details.debname.clone(),
@@ -353,9 +331,8 @@ impl CommitTail {
         send_db_command(cmd).await;
 
         // No `Origin` row here: the request earned it at the upstream-head
-        // site (`ConnectionDetails::record_origin` in `splice_proxy`,
-        // the same point as in the hyper backend), with its cleanup-synthetic
-        // exemption. A second send from the tail was only ever a duplicate.
+        // site (`ConnectionDetails::record_origin` in `splice_proxy`), with
+        // its cleanup-synthetic exemption.
 
         Some(Committed {
             conn_details,
@@ -425,13 +402,8 @@ fn sync_cache_file(file: &std::fs::File, path: &Path) {
 }
 
 impl Committed {
-    /// The completion line, then the `Delivery` row.
-    ///
-    /// Kept together on purpose: which arms write a `Delivery` row is a
-    /// decision that must not drift between the tail's callers. A `Delivery`
-    /// row is exactly "this client received the whole body", which is
-    /// exactly the `Served` arm: `Aborted` did not receive it and `Absent`
-    /// never had a client.
+    /// The completion line, then the `Delivery` row, which records exactly
+    /// "this client received the whole body": the `Served` arm only.
     async fn report(self, rates: &RateTimestamps, client: CompletionClient) {
         let Self {
             conn_details,
@@ -596,8 +568,6 @@ mod tests {
         assert_eq!(rates.client_bytes_sent, 0);
     }
 
-    /// A demoted client's fate is the file-serve task's, and its bytes count
-    /// towards the client rate segment either way.
     #[tokio::test]
     async fn demoted_client_settles_on_the_file_serve_verdict() {
         let mut rates = rates();

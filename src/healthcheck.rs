@@ -1,24 +1,9 @@
 //! Readiness checks backing the `GET /healthcheck` web-interface endpoint.
 //!
-//! Four checks: a `Ping` round-trip through the bounded DB channel, a
-//! create-write-unlink probe at the cache-directory root, disk-quota
-//! headroom, and free disk space on the cache filesystem. Results are
-//! memoized for one second with single-flight semantics so probe spam
-//! cannot amplify disk writes or DB-channel traffic (see
-//! `cached_health_report`). Each blocking probe runs through a [`ProbeSlot`],
-//! so one the kernel never returns from is reported by later checks, not
-//! started again; [`probe_filesystem_space`] offers the same bounded
-//! `statvfs(3)` to the dashboard's free-space figure, through a slot of its
-//! own.
-//!
-//! [`fs_space_from`] is the single reading of a `statvfs(3)` result, for the
-//! disk-space and inode checks (which run the call through their slot) and
-//! for [`filesystem_space`], the main loop's periodic disk-free check and the
-//! download admission's `min_disk_free` floor in
-//! `cache_quota::CacheQuota::refresh_disk_headroom`, which keeps its own
-//! sample (`inodes: None` means a filesystem without
-//! an inode limit, not "none left"). Probing runs even without
-//! `min_disk_free`: inode exhaustion is invisible to that setting.
+//! Results are memoized for one second with single-flight semantics so probe
+//! spam cannot amplify disk writes or DB-channel traffic. Each blocking probe
+//! runs through a [`ProbeSlot`], so one the kernel never returns from is
+//! reported by later checks, not started again.
 
 use std::io::Write as _;
 use std::num::NonZero;
@@ -39,9 +24,9 @@ use crate::{
     global_cache_quota, global_config, swrite, warn_once_or_debug, warn_once_or_info,
 };
 
-/// Filename of the transient cache-writability probe, created and unlinked
-/// at the cache-directory root. `task_cache_scan` skips it by name so a
-/// scan racing the probe window does not flag `CACHE_UNEXPECTED_REGULAR`.
+/// Transient cache-writability probe at the cache-directory root.
+/// `task_cache_scan` skips it by name so a scan racing the probe window does
+/// not flag `CACHE_UNEXPECTED_REGULAR`.
 pub(crate) const PROBE_FILENAME: &str = ".apt-cacher-rs.healthprobe";
 
 /// Upper bound for each individual check, and for the dashboard's
@@ -52,14 +37,10 @@ pub(crate) const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// A check's timeout only stops the *waiting*: the `open(2)` or
 /// `statvfs(3)` it gave up on keeps its blocking-pool thread until the
-/// kernel returns (a hung network filesystem, a FIFO a writer open waits
-/// on). Starting a fresh job on every check would strand one more thread
-/// per probe until the pool is exhausted and every file operation of the
-/// daemon stalls; instead a check whose previous job has not returned
-/// reports that without starting another.
+/// kernel returns (a hung network filesystem). Starting a fresh job on every
+/// check would strand one more thread per probe until the pool is exhausted.
 pub(crate) struct ProbeSlot(AtomicBool);
 
-/// What became of a job submitted through [`ProbeSlot::run`].
 enum Bounded<T> {
     Done(T),
     /// The blocking task panicked or was cancelled.
@@ -70,8 +51,8 @@ enum Bounded<T> {
     Busy,
 }
 
-/// Frees its slot when the job ends, however it ends: dropped by the job's
-/// closure, or with the closure if the pool never ran it.
+/// Frees its slot when the job ends, or with the closure if the pool never
+/// ran it.
 struct SlotRelease(&'static ProbeSlot);
 
 impl Drop for SlotRelease {
@@ -108,61 +89,46 @@ impl ProbeSlot {
     }
 }
 
-/// The cache-writability probe's slot.
 static WRITE_PROBE: ProbeSlot = ProbeSlot::new();
 
-/// The health check's `statvfs(3)` slot. Only the health check's own probe:
-/// the main loop's periodic sample and the download admission's headroom
-/// refresh call [`filesystem_space`] directly.
+/// Only the health check's own probe; a slot shared with another caller
+/// would make that one's probe in flight read as a blocked one.
 static STATVFS_PROBE: ProbeSlot = ProbeSlot::new();
 
 /// One `statvfs(3)` snapshot of a filesystem's remaining capacity.
-///
-/// Both figures are what an unprivileged process may still consume. They
-/// fail independently in practice: a cache can be byte-rich and inode-poor
-/// (a mirror of many tiny index files on a small-inode ext4) and then
-/// `ENOSPC` arrives with gigabytes still free.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FsSpace {
     /// Bytes available to unprivileged processes.
     pub(crate) free_bytes: u64,
-    /// Inode accounting. `None` when the filesystem reports no inode limit
-    /// at all (btrfs and other dynamically-allocating filesystems report a
-    /// total of 0), which is not the same as "none left".
+    /// `None` when the filesystem reports no inode limit at all (btrfs and
+    /// other dynamically-allocating filesystems report a total of 0), which
+    /// is not the same as "none left".
     pub(crate) inodes: Option<InodeSpace>,
 }
 
-/// Inode accounting of a filesystem that has a fixed inode table.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InodeSpace {
     /// Inodes available to unprivileged processes.
     pub(crate) free: u64,
-    /// Inodes the filesystem was created with.
     pub(crate) total: NonZero<u64>,
 }
 
 impl InodeSpace {
     /// Whether fewer than `1/divisor` of all inodes are still available.
-    /// Integer math: no rounding surprises near the boundary.
     #[must_use]
     fn free_below_fraction(self, divisor: u64) -> bool {
         self.free.saturating_mul(divisor) < self.total.get()
     }
 }
 
-/// Remaining capacity of the filesystem holding `path`, via `statvfs(3)`.
-/// Returns `None` when the blocking task is lost or the probe fails.
-/// Free-byte accounting saturates at `u64::MAX` if the `statvfs` product
-/// does not fit in `u64`. The blocking pool keeps a slow filesystem from
-/// wedging a Tokio worker.
+/// Remaining capacity of the filesystem holding `path`, via an unbounded
+/// `statvfs(3)` on the blocking pool. `None` when the probe fails.
 pub(crate) async fn filesystem_space(path: &Path) -> Option<FsSpace> {
     let owned = path.to_path_buf();
     let joined = tokio::task::spawn_blocking(move || nix::sys::statvfs::statvfs(&owned)).await;
     fs_space_from(path, joined)
 }
 
-/// [`filesystem_space`]'s reading of a finished `statvfs(3)` job, shared
-/// with the health check's bounded probe.
 fn fs_space_from(path: &Path, joined: Result<nix::Result<Statvfs>, JoinError>) -> Option<FsSpace> {
     let result = match joined {
         Ok(result) => result,
@@ -194,7 +160,6 @@ fn fs_space_from(path: &Path, joined: Result<nix::Result<Statvfs>, JoinError>) -
     })
 }
 
-/// Outcome of a single readiness check.
 #[derive(Clone)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 enum CheckResult {
@@ -207,14 +172,12 @@ impl CheckResult {
         matches!(self, Self::Pass)
     }
 
-    /// The verdict every check reports when it outran [`CHECK_TIMEOUT`];
-    /// shared so the three probes cannot drift apart in wording.
     fn timed_out() -> Self {
         Self::Fail(format!("timed out after {}s", CHECK_TIMEOUT.as_secs()))
     }
 
     /// The verdict of a check whose previous probe is still blocked (see
-    /// [`ProbeSlot`]): unhealthy, like the timeout that preceded it.
+    /// [`ProbeSlot`]).
     fn still_blocked() -> Self {
         Self::Fail(format!(
             "still blocked: the probe started by an earlier check has not returned (timed out after {}s)",
@@ -235,7 +198,6 @@ impl CheckResult {
     }
 }
 
-/// Aggregated result of all readiness checks.
 #[derive(Clone)]
 pub(crate) struct HealthReport {
     database: CheckResult,
@@ -295,9 +257,8 @@ impl HealthReport {
     }
 }
 
-/// Append `s` to `out` with JSON string escaping (quote, backslash, control
-/// characters). Detail strings are our own error Displays, so this is shape
-/// correctness, not attacker-input sanitization.
+/// Detail strings are our own error Displays, so this is shape correctness,
+/// not attacker-input sanitization.
 fn json_escape_into(out: &mut String, s: &str) {
     for c in s.chars() {
         match c {
@@ -311,9 +272,8 @@ fn json_escape_into(out: &mut String, s: &str) {
     }
 }
 
-/// Disk-quota headroom: healthy when no quota is configured or the cache is
-/// strictly below it — at or above the limit every new download is already
-/// rejected with 503 "Disk quota reached".
+/// Strictly below: at the limit every new download is already rejected with
+/// 503 "Disk quota reached".
 fn check_quota(current_size: u64, limit: Option<NonZero<u64>>) -> CheckResult {
     match limit {
         None => CheckResult::Pass,
@@ -324,12 +284,8 @@ fn check_quota(current_size: u64, limit: Option<NonZero<u64>>) -> CheckResult {
     }
 }
 
-/// Free-disk-space headroom on the cache filesystem: healthy when no
-/// minimum is configured or the available space is at or above it. Unlike
-/// the quota check this also fires on default installs — a full disk breaks
-/// every new download regardless of quota configuration. `free = None`
-/// (statvfs failed) fails the check: a healthcheck that cannot measure a
-/// required signal must not claim health.
+/// `free = None` (statvfs failed) fails the check: a healthcheck that cannot
+/// measure a required signal must not claim health.
 fn check_disk_free(free: Option<u64>, min_free: NonZero<u64>) -> CheckResult {
     match free {
         Some(free) if free >= min_free.get() => CheckResult::Pass,
@@ -341,24 +297,18 @@ fn check_disk_free(free: Option<u64>, min_free: NonZero<u64>) -> CheckResult {
 }
 
 /// Free inodes below which the cache filesystem is reported unhealthy.
-/// Deliberately a constant rather than a config knob: unlike free bytes,
-/// where the operator picks a policy floor, a filesystem this close to inode
-/// exhaustion cannot create cache files at all -- the daemon is broken
-/// regardless of policy, and the failure arrives as `ENOSPC` with plenty of
-/// bytes still free.
+/// A constant rather than a config knob: a filesystem this close to inode
+/// exhaustion cannot create cache files at all, regardless of policy.
 const MIN_FREE_INODES: u64 = 1000;
 
-/// Second inode floor, relative to the filesystem's inode table: a big
+/// Second inode floor, as a fraction (`1/N`) of the inode table: a big
 /// filesystem can hold far more than [`MIN_FREE_INODES`] and still be one
-/// large mirror sync away from exhaustion, so anything under this fraction
-/// of the total counts as unhealthy too.
+/// large mirror sync away from exhaustion.
 const MIN_FREE_INODE_FRACTION: u64 = 10;
 
-/// Free-inode headroom on the cache filesystem. Passes when the filesystem
-/// reports no inode limit (btrfs and friends report a total of 0) or when
-/// the probe produced no sample: `disk_free` already owns the
-/// "cannot measure" verdict wherever a minimum is configured, and inode
-/// accounting has no configured minimum to make it required.
+/// Passes when the filesystem reports no inode limit or when the probe
+/// produced no sample: `disk_free` already owns the "cannot measure" verdict
+/// wherever a minimum is configured.
 fn check_inodes_free(inodes: Option<InodeSpace>) -> CheckResult {
     match low_inodes_detail(inodes) {
         Some(detail) => CheckResult::Fail(detail),
@@ -366,10 +316,7 @@ fn check_inodes_free(inodes: Option<InodeSpace>) -> CheckResult {
     }
 }
 
-/// Returns the operator-facing detail when either inode floor
-/// ([`MIN_FREE_INODES`], [`MIN_FREE_INODE_FRACTION`]) is breached, `None`
-/// otherwise. The floors live here only: `main_loop`'s startup warn calls
-/// this too, so both verdicts always agree.
+/// The operator-facing detail when either inode floor is breached.
 #[must_use]
 pub(crate) fn low_inodes_detail(inodes: Option<InodeSpace>) -> Option<String> {
     let inodes = inodes?;
@@ -388,11 +335,8 @@ pub(crate) fn low_inodes_detail(inodes: Option<InodeSpace>) -> Option<String> {
     None
 }
 
-/// What a bounded `statvfs(3)` through a [`ProbeSlot`] found
-/// ([`probe_filesystem_space`]).
 pub(crate) enum ProbedSpace {
-    /// The call returned: the sample, or `None` where it failed (warned
-    /// about in [`fs_space_from`]).
+    /// The call returned: the sample, or `None` where it failed.
     Measured(Option<FsSpace>),
     /// Still running at the deadline; the slot stays taken until it returns.
     TimedOut,
@@ -401,14 +345,9 @@ pub(crate) enum ProbedSpace {
 }
 
 /// One `statvfs(3)` of the filesystem holding `path` through `slot`, waited
-/// for at most `limit`: the health check's probe and the dashboard's
-/// free-space figure, each through a slot of its own. A slot shared by two
-/// callers would make one's ordinary probe in flight read as a blocked one
-/// to the other; each caller also coalesces its own concurrent requests
-/// under a memo lock held across this call, so `StillBlocked` means a probe
-/// outran its deadline. [`filesystem_space`] stays the unbounded entry for
-/// callers with a single-flight guard of their own (the download admission's
-/// headroom refresh) or none needed (the startup sample).
+/// for at most `limit`. Each caller needs a slot of its own and must
+/// coalesce its concurrent requests (a memo lock held across this call):
+/// otherwise an ordinary probe in flight reads as `StillBlocked`.
 pub(crate) async fn probe_filesystem_space(
     slot: &'static ProbeSlot,
     limit: Duration,
@@ -426,11 +365,9 @@ pub(crate) async fn probe_filesystem_space(
     }
 }
 
-/// One statvfs feeding both filesystem checks, through `slot` (the daemon's
-/// is [`STATVFS_PROBE`]; a test owns its own) with deadline `limit`
-/// ([`CHECK_TIMEOUT`] like the other probes). Returns
-/// `(disk_free, inodes_free)`. The probe runs even without a configured
-/// `min_disk_free`, because inode exhaustion is invisible to that setting.
+/// Returns `(disk_free, inodes_free)`. The probe runs even without a
+/// configured `min_disk_free`, because inode exhaustion is invisible to that
+/// setting.
 async fn probe_filesystem(
     slot: &'static ProbeSlot,
     limit: Duration,
@@ -459,9 +396,6 @@ async fn probe_filesystem(
     (disk_free, check_inodes_free(space.and_then(|s| s.inodes)))
 }
 
-/// Cache-directory writability: create, write, and unlink a small probe
-/// file at the cache root, as one blocking job through `slot` (the daemon's
-/// is [`WRITE_PROBE`]; a test owns its own) with deadline `limit`.
 async fn check_cache_write(
     slot: &'static ProbeSlot,
     limit: Duration,
@@ -477,13 +411,12 @@ async fn check_cache_write(
     }
 }
 
-/// The probe itself, on a blocking-pool thread. `O_NOFOLLOW` means a planted
-/// symlink fails the check - correct, since that indicates a compromised
-/// cache directory. `O_NONBLOCK` (inert for a regular file) keeps a FIFO
-/// planted at the path from parking the open until a reader appears: with
-/// none it fails with `ENXIO`, with one it opens and the type check refuses
-/// it. `.create(true)` (not `create_new`) so an orphaned probe from a crashed
-/// run is reopened and truncated.
+/// `O_NOFOLLOW` means a planted symlink fails the check - correct, since that
+/// indicates a compromised cache directory. `O_NONBLOCK` (inert for a regular
+/// file) keeps a FIFO planted at the path from parking the open until a
+/// reader appears: with none it fails with `ENXIO`, with one it opens and the
+/// type check refuses it. `.create(true)` (not `create_new`) so an orphaned
+/// probe from a crashed run is reopened and truncated.
 fn probe_write(probe: &Path) -> std::io::Result<()> {
     let mut file = nofollow_nonblock_options()
         .create(true)
@@ -512,11 +445,9 @@ fn probe_write(probe: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Database readiness: a `Ping` round-trip through the bounded DB channel.
-/// Proves the DB task is alive and draining its queue AND that the pool
-/// answers queries - not merely that the channel accepts sends. Only
-/// callable inside a running daemon (`DB_TASK_QUEUE_SENDER` is initialized
-/// in `main_loop()`), hence integration-tested, not unit-tested.
+/// A `Ping` round-trip proves the DB task is draining its queue and that the
+/// pool answers queries, not merely that the channel accepts sends. Only
+/// callable inside a running daemon, hence not unit-tested.
 async fn check_database() -> CheckResult {
     let round_trip = async {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -531,10 +462,8 @@ async fn check_database() -> CheckResult {
     }
 }
 
-/// Memoized report + timestamp. A `tokio::sync::Mutex` (held across the
-/// checks) gives single-flight semantics: concurrent requests coalesce
-/// into one probe run, capping cost at one disk probe + one DB ping per
-/// `CACHE_TTL` regardless of request rate.
+/// A `tokio::sync::Mutex` (held across the checks) gives single-flight
+/// semantics: concurrent requests coalesce into one probe run.
 static HEALTH_CACHE: tokio::sync::Mutex<Option<(Instant, HealthReport)>> =
     tokio::sync::Mutex::const_new(None);
 
@@ -542,8 +471,6 @@ static HEALTH_CACHE: tokio::sync::Mutex<Option<(Instant, HealthReport)>> =
 /// that a 5s-interval orchestrator probe never sees stale state.
 const CACHE_TTL: coarsetime::Duration = coarsetime::Duration::from_secs(1);
 
-/// Run all readiness checks concurrently; wall-clock is bounded by the
-/// slowest single check timeout, not the sum.
 async fn run_healthcheck(
     quota: &CacheQuota,
     cache_dir: &Path,
@@ -564,10 +491,7 @@ async fn run_healthcheck(
     }
 }
 
-/// Daemon-facing entry: serve the memoized report, refreshing it when
-/// older than [`CACHE_TTL`]. Reaches for the globals, so only callable in
-/// a running daemon; the pure pieces live in [`run_healthcheck`] and the
-/// individual checks.
+/// Serve the memoized report, refreshing it when older than [`CACHE_TTL`].
 ///
 /// The memoized entry's timestamp is captured after the checks complete,
 /// not before, so slow checks (up to ~5s each) don't pre-expire the entry.
@@ -579,8 +503,6 @@ pub(crate) async fn cached_health_report() -> HealthReport {
     {
         return report.clone();
     }
-    // Captured for the recovery line: naming what had been failing is the
-    // difference between "it is fine now" and an actionable record.
     let previous_failure = cache
         .as_ref()
         .filter(|(_at, prev)| !prev.healthy())
@@ -598,8 +520,6 @@ pub(crate) async fn cached_health_report() -> HealthReport {
             report.to_json()
         );
     } else if let Some(previous) = previous_failure {
-        // Without this the log records only that the daemon went unhealthy,
-        // never that it came back -- leaving the failure looking open-ended.
         info!("Health check recovered, was: {}", previous.to_json());
     }
     *cache = Some((Instant::now(), report.clone()));
@@ -693,8 +613,8 @@ mod tests {
         }
     }
 
-    /// The production deadline through a slot of the test's own, so tests
-    /// running in one process cannot find each other's job in flight.
+    /// Each test passes a slot of its own, so tests running in one process
+    /// cannot find each other's job in flight.
     async fn probe_fs(
         slot: &'static ProbeSlot,
         dir: &Path,
@@ -712,8 +632,6 @@ mod tests {
         let (disk_free, inodes_free) = probe_fs(&SLOT, dir.path(), Some(nonzero!(1_u64))).await;
         assert_eq!(disk_free, CheckResult::Pass);
         assert_eq!(inodes_free, CheckResult::Pass);
-        // A missing directory must fail the disk-free probe, not silently
-        // pass; the inode check fails open on the same failed sample.
         let (disk_free, inodes_free) = probe_fs(
             &SLOT,
             &dir.path().join("nonexistent"),
@@ -731,8 +649,6 @@ mod tests {
     async fn filesystem_probe_checks_inodes_without_configured_minimum() {
         static SLOT: ProbeSlot = ProbeSlot::new();
         let dir = tempfile::tempdir().expect("tempdir");
-        // Without `min_disk_free` the byte check is skipped, but the statvfs
-        // still runs so inode exhaustion stays visible.
         let (disk_free, inodes_free) = probe_fs(&SLOT, dir.path(), None).await;
         assert_eq!(disk_free, CheckResult::Pass);
         assert_eq!(inodes_free, CheckResult::Pass);
@@ -751,8 +667,6 @@ mod tests {
         }
     }
 
-    /// [`check_cache_write`] through a slot of the test's own (see
-    /// [`probe_fs`]).
     async fn write_probe(slot: &'static ProbeSlot, dir: &Path) -> CheckResult {
         check_cache_write(slot, CHECK_TIMEOUT, dir).await
     }
@@ -789,10 +703,6 @@ mod tests {
         assert!(!r.ok(), "O_NOFOLLOW must refuse a planted symlink");
     }
 
-    /// A FIFO planted at the probe path fails the check at once instead of
-    /// parking the open, which no timeout could reclaim: without a reader the
-    /// nonblocking open fails (`ENXIO`), with one it opens and the type check
-    /// refuses it. Either way the probe returns, so its slot is free again.
     #[tokio::test]
     async fn cache_write_probe_refuses_a_fifo_without_blocking() {
         static SLOT: ProbeSlot = ProbeSlot::new();
@@ -817,7 +727,6 @@ mod tests {
         );
     }
 
-    /// Wait until `slot`'s job has returned and released it.
     async fn wait_for_release(slot: &'static ProbeSlot) {
         let deadline = Duration::from_secs(5);
         tokio::time::timeout(deadline, async {
@@ -829,9 +738,6 @@ mod tests {
         .expect("the released job frees its slot");
     }
 
-    /// A job still blocked past its deadline keeps its slot: the next check
-    /// reports it without starting a second job, and once the first returns
-    /// the slot runs jobs again.
     #[tokio::test]
     async fn a_blocked_probe_is_not_started_again_until_it_returns() {
         static SLOT: ProbeSlot = ProbeSlot::new();
@@ -863,9 +769,6 @@ mod tests {
         assert!(matches!(third, Bounded::Done(7)));
     }
 
-    /// A blocked statvfs keeps the byte check failing (without inventing an
-    /// inode verdict), now naming the earlier probe, and passes it where no
-    /// minimum is configured.
     #[tokio::test]
     async fn filesystem_probe_reports_a_blocked_statvfs() {
         static SLOT: ProbeSlot = ProbeSlot::new();

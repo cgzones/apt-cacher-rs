@@ -20,7 +20,6 @@ use sha2::{Digest as _, Sha256};
 
 use super::response::{Caching, WebResponse};
 
-/// One embedded asset.
 pub(super) struct Asset {
     /// The path it is served at, without the version query.
     path: &'static str,
@@ -62,7 +61,6 @@ impl Asset {
     }
 }
 
-/// See [`Asset::url`].
 pub(super) struct AssetUrl<'a>(&'a Asset);
 
 impl Display for AssetUrl<'_> {
@@ -111,10 +109,8 @@ pub(super) static SCRIPT: Asset = Asset::new(
     ),
 );
 
-/// Every asset, for the route handler.
 static ALL: [&Asset; 2] = [&STYLESHEET, &SCRIPT];
 
-/// The asset served at `path`, if any.
 pub(super) fn find(path: &str) -> Option<&'static Asset> {
     ALL.iter().copied().find(|asset| asset.path == path)
 }

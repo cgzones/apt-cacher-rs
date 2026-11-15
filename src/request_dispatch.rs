@@ -1,20 +1,14 @@
-//! Unified request pre-flight and URI dispatch entry point shared by the
-//! hyper backend in `hyper_conn.rs` and the sendfile backend in
-//! `sendfile_conn.rs`.
+//! Request pre-flight and URI dispatch shared by the hyper backend in
+//! `hyper_conn.rs` and the sendfile backend in `sendfile_conn.rs`.
 //!
-//! The pre-flight ([`preflight_headers`], [`preflight_method`] and
-//! [`preflight_target`]) is the backend-independent part of "is this a
-//! request we serve at all": framing and HTTP/1.1 `Host` requirements, method
-//! gate, URI scheme and target-form gates, the proxy-client ACL (for
-//! `CONNECT` and absolute-form `GET` alike), the web-interface ACL and `Host`
-//! name gate, and the port sanity check. These gates take explicit parameters
-//! (no `global_config()`); the backends feed them the parsed headers and
-//! request line and map refusals onto their response type. The host allowlist stays in
+//! The pre-flight gates ([`preflight_headers`], [`preflight_method`] and
+//! [`preflight_target`]) take explicit parameters (no `global_config()`); the
+//! backends feed them the parsed headers and request line and map refusals
+//! onto their response type. The host allowlist stays in
 //! `permitted_host_cache::authorize_cache_access`, which the backends call on
 //! the returned [`RequestTarget::Proxy`] host.
 //!
-//! Owns the request-classification pipeline that previously appeared inline
-//! in both dispatchers:
+//! The request-classification pipeline, in order:
 //!
 //!   1. diff-request gate          - reject (410) pdiff URLs when configured,
 //!      else fall through silently as `Unrecognized`
@@ -28,11 +22,9 @@
 //!
 //! Backends translate the returned [`DispatchOutcome`] into their response
 //! type.  Classification logging, metric bumping and `record_uncacheable`
-//! happen here, so the two parallel paths cannot drift
-//! apart.  [`dispatch_request`] runs exactly once per client request: the
-//! sendfile backend's `NotApplicable` handoff carries its outcome to hyper
-//! (`hyper_conn::HandoffPlan`) instead of letting hyper re-dispatch, so every
-//! side-effect in here is exactly-once by construction.
+//! happen here.  [`dispatch_request`] runs exactly once per client request:
+//! the sendfile backend's `NotApplicable` handoff carries its outcome to
+//! hyper (`hyper_conn::HandoffPlan`) instead of letting hyper re-dispatch.
 //!
 //! [`classify_request`]: crate::cache_layout::classify_request
 //! [`normalize_uri_path`]: crate::deb_mirror::normalize_uri_path
@@ -63,12 +55,8 @@ use crate::{
 };
 
 /// Reason the pre-flight or the dispatcher refused a request with a fixed
-/// 4xx response.
-///
-/// Backends call [`Self::response_parts`] to materialise the `(status, body)`
-/// pair - the single status/body table for every shared rejection; logging
-/// and metric bumping have already been done by the function that returned
-/// the reason.
+/// response.  Logging and metric bumping have already been done by the
+/// function that returned the reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RejectReason {
     /// A method HTTP defines (RFC 9110 §9, `PATCH` from RFC 5789) other than
@@ -144,7 +132,6 @@ impl RejectReason {
         }
     }
 
-    /// Fixed `(status, body)` pair associated with this reason.
     #[must_use]
     pub(crate) const fn response_parts(self) -> (StatusCode, &'static str) {
         match self {
@@ -233,14 +220,11 @@ pub(crate) enum RequestKind {
     Connect,
 }
 
-/// Method gate shared by both backends: `GET` and `CONNECT` are the only
-/// methods served, and `CONNECT` additionally passes the proxy-client ACL
-/// here (a `GET` passes it in [`preflight_target`]).  Any
+/// `GET` and `CONNECT` are the only methods served, and `CONNECT` passes the
+/// proxy-client ACL here (a `GET` passes it in [`preflight_target`]).  Any
 /// other method HTTP defines is refused with 405, an unrecognized one with
-/// 501 (RFC 9110 §15.5.6, §15.6.2).
-///
-/// Logs and bumps metrics for every rejection; the caller only maps the
-/// [`RejectReason`] onto its response type.
+/// 501 (RFC 9110 §15.5.6, §15.6.2).  Logs and bumps metrics for every
+/// rejection.
 pub(crate) fn preflight_method(
     method: &str,
     client: &ClientInfo,
@@ -270,9 +254,6 @@ pub(crate) fn preflight_method(
     }
 }
 
-/// Refuse a client outside `allowed_proxy_clients`: the one log line, metric
-/// and trouble record of both proxy-client gates (`CONNECT` in
-/// [`preflight_method`], absolute-form `GET` in [`preflight_target`]).
 fn refuse_proxy_client(client: &ClientInfo) -> RejectReason {
     warn_once_or_info!("Unauthorized proxy client {client}; returning 403");
     metrics::AUTHZ_REJECTED_CLIENT.increment();
@@ -336,10 +317,10 @@ pub(crate) fn preflight_headers<'a>(
     Ok(())
 }
 
-/// Loop gate shared by both backends: a `Via` element whose received-by
-/// token is this proxy's pseudonym means the request has already passed
-/// through here (RFC 9110 §7.6.3).  `via_values` are the raw `Via` header
-/// values of the request, comma lists included.
+/// Loop gate: a `Via` element whose received-by token is this proxy's
+/// pseudonym means the request has already passed through here (RFC 9110
+/// §7.6.3).  `via_values` are the raw `Via` header values of the request,
+/// comma lists included.
 pub(crate) fn preflight_via<'a>(
     via_values: impl IntoIterator<Item = &'a str>,
     client: &ClientInfo,
@@ -374,12 +355,10 @@ pub(crate) enum RequestTarget<'a> {
     },
 }
 
-/// Target gate shared by both backends for a `GET`: scheme check, the
-/// absolute-path requirement, web-interface ACL and `Host` name gate for
-/// origin-form requests, and the proxy-client ACL and then the port sanity
-/// check for absolute-form ones (a refused client gets its 403 whatever port
-/// it named). [`preflight_headers`] has already checked protocol framing,
-/// including the HTTP/1.1 `Host` requirement.
+/// Target gate for a `GET`.  For an absolute-form request the proxy-client
+/// ACL runs before the port sanity check, so a refused client gets its 403
+/// whatever port it named.  [`preflight_headers`] has already checked
+/// protocol framing, including the HTTP/1.1 `Host` requirement.
 ///
 /// `host_header` yields the raw value of the request's `Host` header, if
 /// any.  It is only consulted for origin-form requests, so the sendfile
@@ -392,7 +371,6 @@ pub(crate) fn preflight_target<'a, 'h>(
     acls: &ClientAcls<'_>,
 ) -> Result<RequestTarget<'a>, RejectReason> {
     // Proxy GET requests always use http://, HTTPS goes through CONNECT.
-    // Reject any other scheme (e.g. ftp://, file://).
     if let Some(scheme) = uri.scheme()
         && *scheme != http::uri::Scheme::HTTP
     {
@@ -505,7 +483,6 @@ pub(crate) enum PassthroughReason {
 }
 
 impl PassthroughReason {
-    /// Short human-readable name for log lines.
     #[must_use]
     pub(crate) const fn label(self) -> &'static str {
         match self {
@@ -521,42 +498,29 @@ impl PassthroughReason {
     }
 }
 
-/// Dispatcher verdict.  Backends own response-type construction; this
-/// module owns classification logging, metrics and `record_uncacheable`.
-/// The backend records `origin_fields` only once the request is answered.
+/// Dispatcher verdict.  Logging, metric bumping and `record_uncacheable`
+/// are already done by [`dispatch_request`]; the backend records
+/// `origin_fields` only once the request is answered.
 #[derive(Debug)]
 pub(crate) enum DispatchOutcome {
-    /// Route through the cache pipeline; the request's `ConnectionDetails`
-    /// are complete (the dispatcher already holds `client`), so the backend
-    /// hands them straight to its cache pipeline.
+    /// Route through the cache pipeline.
     Cache(ConnectionDetails),
-    /// Refuse with a fixed 4xx response.  Logging and metric bumping
-    /// already done.
     Reject(RejectReason),
-    /// Forward to upstream uncached.  Logging, metric bumping and
-    /// `record_uncacheable` done by [`dispatch_request`].
+    /// Forward to upstream uncached.
     Passthrough(PassthroughRequest),
 }
 
-/// A request the cache pipeline declined, on its way to a simple proxy:
-/// what either forwarding tail needs, so no backend re-derives it and a
+/// A request the cache pipeline declined, on its way to a simple proxy.  A
 /// sendfile handoff (`HandoffPlan::Passthrough`) carries it to hyper as is.
 #[derive(Debug)]
 pub(crate) struct PassthroughRequest {
-    /// Named in the "Proxying (without caching)" line by both backends and
-    /// in sendfile's `NotApplicable` handoff.
     pub(crate) reason: PassthroughReason,
     /// The host the client named, which the upstream is dialled at.
     pub(crate) requested_host: ClientHost,
     /// The alias' main host, or `requested_host` when it names none: the
-    /// host a passthrough's `Origin` row is recorded under
-    /// (`Origin::from_path` in both relays), resolved here like a cached
-    /// request's `ConnectionDetails::mirror`.
+    /// host a passthrough's `Origin` row is recorded under.
     pub(crate) canonical_host: ClientHost,
     pub(crate) requested_port: Option<NonZero<u16>>,
-    /// Consumed by both relays' completion lines: `splice_simple_proxy`
-    /// (`splice/simple_proxy.rs`, via the sendfile dispatch) and hyper's
-    /// `Subject::Passthrough`.
     pub(crate) request_received_at: PreciseInstant,
 }
 
@@ -574,8 +538,7 @@ pub(crate) fn split_query(path_and_query: &str) -> (&str, Option<&str>) {
 /// `path_and_query` is the **raw** request-line path (not yet normalised)
 /// with its query string, if any; the dispatcher normalises the path
 /// internally for parsing while keeping the raw form for logs and the
-/// uncacheables ring.  `client` is borrowed for log inclusion only; nothing
-/// about the classification depends on caller identity.
+/// uncacheables ring.
 pub(crate) fn dispatch_request(
     path_and_query: &str,
     requested_host: ClientHost,
@@ -605,14 +568,9 @@ pub(crate) fn dispatch_request(
     decision
 }
 
-/// Routing decision without `RUNTIMEDETAILS`/DB dependencies or recording
-/// uncacheables (it does bump reject metrics and the `warn_once` state).
-///
-/// The two real-world side-effects that surround it -
-/// `flat_blocklist::is_blocked` and the deferred `Origin` DB write - are
-/// expressed as a closure and a return-value field respectively, so unit
-/// tests can drive every branch without standing up the DB task channel or
-/// the `RUNTIMEDETAILS`/`BLOCKLIST` `OnceLock`s.
+/// Routing decision without the global config, the flat blocklist or the
+/// uncacheables store, so unit tests can drive every branch (it does bump
+/// reject metrics and the `warn_once` state).
 #[expect(
     clippy::too_many_arguments,
     reason = "single production call site; grouping the params would not aid clarity"
@@ -630,12 +588,10 @@ fn decide_request(
     let (uri_path, query) = split_query(path_and_query);
     trace!("Dispatching request from client {client} (host=`{requested_host}` path=`{uri_path}`)");
 
-    // pdiff URLs have a known shape (`/Packages.diff/T-...`, `/Sources.diff/T-...`,
-    // `/Translation-XX.diff/T-...`) that `parse_request_path` deliberately does
-    // not match — they are uncacheable in this proxy.  Detect them here so we
-    // either refuse with 410 (the default) or fall through to a silent
-    // passthrough, in both cases avoiding a misleading "Unrecognized resource
-    // path" warning for a URL shape we actually do recognise.
+    // pdiff URLs are uncacheable here and `parse_request_path` deliberately
+    // does not match them.  Detect them first, to refuse with 410 (the
+    // default) or to pass them through without a misleading "Unrecognized
+    // resource path" warning.
     let is_diff = LazyCell::new(|| is_diff_request_path(uri_path));
 
     if reject_pdiff_requests && *is_diff {
@@ -777,11 +733,7 @@ fn decide_request(
         },
     };
 
-    // The cache pipeline declined.  Before forwarding upstream uncached,
-    // run the safety gate that applies to all passthrough requests: refuse
-    // traversal/control-byte paths.  (The pdiff gate already fired above,
-    // before parsing, so we don't repeat it here.)
-
+    // The safety gate that applies to all passthrough requests.
     if is_unsafe_proxy_path(uri_path) {
         warn_once_or_info!(
             "Rejecting unsafe passthrough path {uri_path} ({}) for client {client} with 400",
@@ -791,8 +743,6 @@ fn decide_request(
         return DispatchOutcome::Reject(RejectReason::UnsafePath);
     }
 
-    // `record_uncacheable` happens in the wrapper (`dispatch_request`)
-    // so unit tests do not need the global uncacheables store.
     DispatchOutcome::Passthrough(PassthroughRequest {
         reason: passthrough_reason,
         canonical_host: canonical_host(),
@@ -920,7 +870,7 @@ mod tests {
             Ok(RequestKind::Connect)
         );
         // The proxy-client ACL only gates CONNECT here; GET is checked later
-        // by authorize_cache_access.
+        // by preflight_target.
         assert_eq!(
             preflight_method("GET", &local_client(), &OTHER_HOST_ACLS),
             Ok(RequestKind::Get)
@@ -998,9 +948,6 @@ mod tests {
         ));
     }
 
-    /// DNS rebinding: an origin-form request naming a host the daemon does
-    /// not answer to is misdirected, whatever the client ACL says; an
-    /// HTTP/1.0 request without `Host` has no name to check.
     #[test]
     fn preflight_target_origin_form_refuses_unrecognized_host() {
         let uri: Uri = "/logs".parse().unwrap();
@@ -1056,8 +1003,6 @@ mod tests {
 
     #[test]
     fn preflight_target_absolute_form_yields_host_and_port() {
-        /// The host and port of a `Proxy` target; anything else fails the
-        /// test.
         fn expect_proxy<'a>(
             target: &Result<RequestTarget<'a>, RejectReason>,
         ) -> (&'a str, Option<NonZero<u16>>) {
@@ -1131,9 +1076,6 @@ mod tests {
         );
     }
 
-    /// The proxy-client ACL runs before the port check: a refused client
-    /// gets its 403 whatever port it named, never the 400 that would tell
-    /// it the request was malformed.
     #[test]
     fn preflight_target_refuses_an_unauthorized_client_before_the_port_check() {
         for port in ["0", "65536", "nonsense", "8080"] {
@@ -1267,7 +1209,6 @@ mod tests {
         )
     }
 
-    /// The details of a `Cache` decision; any other decision fails the test.
     fn expect_cache(decision: DispatchOutcome) -> ConnectionDetails {
         assert!(
             matches!(decision, DispatchOutcome::Cache(_)),

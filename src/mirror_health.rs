@@ -5,21 +5,12 @@
 //! so an operator knows where to look, whom to report a bug to, or which
 //! mirror to drop. No failure text is kept -- the log has it.
 //!
-//! Each class is recorded once per failed transfer, at the one place the
-//! transfer's failure is concluded with its canonical mirror in scope:
-//! `DownloadFailure::conclude` for every registered download (both
-//! backends, cleanup's hyper index fetches included), `UpstreamError::conclude`
-//! for splice's cleanup fetches, `RejectReason::record_metrics` for an
-//! upstream answer the planner refuses (an unsolicited 206, missing
-//! framing), and the commit (`guards::RenameBarrier::commit`) and cleanup
-//! verify for checksum mismatches. Passthrough relays -- and the body of a
-//! cached route's answer relayed uncached -- are not attributed: a
-//! passthrough's path is not split into mirror and resource, and hyper's
-//! relay has no mirror at all, so attributing splice's alone would make the
-//! backends disagree.
-//!
-//! Stored in a [`MirrorRegistry`] (keying, the snapshot's `host[:port]/path`
-//! rendering, the cap); the map only grows on failure paths.
+//! Each class is recorded once per failed transfer, where the transfer's
+//! failure is concluded with its canonical mirror in scope. Passthrough
+//! relays -- and the body of a cached route's answer relayed uncached -- are
+//! not attributed: a passthrough's path is not split into mirror and
+//! resource, and hyper's relay has no mirror at all, so attributing splice's
+//! alone would make the backends disagree.
 
 use hashbrown::HashMap;
 
@@ -47,7 +38,6 @@ pub(crate) enum MirrorFault {
     Slow,
 }
 
-/// One mirror's failure counts since process start.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MirrorHealth {
     pub(crate) unreachable: u64,
@@ -96,8 +86,7 @@ pub(crate) fn record(mirror: &Mirror, fault: MirrorFault) {
     HEALTH.update(mirror, |health| health.bump(fault));
 }
 
-/// Every tracked mirror's counts, keyed by its `host[:port]/path`, for one
-/// dashboard render.
+/// Keyed by the mirror's `host[:port]/path`.
 #[must_use]
 pub(crate) fn snapshot() -> HashMap<Box<str>, MirrorHealth> {
     HEALTH.snapshot()

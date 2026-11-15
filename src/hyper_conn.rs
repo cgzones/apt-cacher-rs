@@ -117,28 +117,22 @@ pub(crate) type HttpClient = hyper_util::client::legacy::Client<
     Empty<bytes::Bytes>,
 >;
 
-/// Box `Empty` into a [`ProxyCacheBody`].
 fn empty_body() -> ProxyCacheBody {
     let body = Empty::new().map_err(|never| match never {});
     ProxyCacheBody::new(body)
 }
 
-/// The canonical `500` for a cache-file access failure.  The failure itself
-/// is logged (and `CACHE_IO_FAILURE`/`CACHE_NON_REGULAR`-counted) at the site
-/// that detected it; this only fixes the one status/body pair every such site
-/// answers with.
+/// The `500` for a cache-file access failure. The failure itself is logged
+/// and counted at the site that detected it.
 #[must_use]
 fn cache_access_failure() -> Response<ProxyCacheBody> {
     quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure")
 }
 
-/// Why a [`request_with_retry`] call failed.
 #[derive(Debug, thiserror::Error)]
 enum RequestError {
-    /// The client's transport error.
     #[error(transparent)]
     Transport(#[from] hyper_util::client::legacy::Error),
-    /// A scheme rewrite produced parts `Uri::from_parts` refuses.
     #[error("failed to rebuild the request URI for a scheme change")]
     InvalidUri(#[source] http::uri::InvalidUriParts),
     /// A response head hyper's client accepted but whose body framing
@@ -166,15 +160,12 @@ struct FailedRequest {
     limit: Option<RetryStop>,
 }
 
-/// A terminal [`request_with_retry`] failure carrying the retry context and
-/// the request identity its report needs. `limit` is `Some` only when the
-/// connect-retry loop ran out of budget, which is exactly what separates a
-/// connect-phase failure from a head-phase transport failure — so the
-/// phase is derived here once instead of being guessed at every call site.
+/// A terminal [`request_with_retry`] failure. `limit` is `Some` only when
+/// the connect-retry loop ran out of budget, which is what separates a
+/// connect-phase failure from a head-phase transport failure.
 ///
 /// The payload is boxed because it is well past `clippy::result_large_err`'s
-/// threshold and would otherwise widen every `request_with_retry` `Result`,
-/// success path included.
+/// threshold.
 #[derive(Debug)]
 pub(crate) struct RequestFailure(Box<FailedRequest>);
 
@@ -209,10 +200,10 @@ impl RequestFailure {
     }
 
     /// A scheme rewrite produced parts `Uri::from_parts` refuses.  The
-    /// pre-flight admits only targets with an absolute path, so this is a
-    /// defensive answer rather than a reachable one: it fails the request
-    /// instead of panicking the task, which the release profile's
-    /// `panic = 'abort'` turns into a daemon exit.
+    /// pre-flight admits only targets with an absolute path, so this is not
+    /// expected to be reachable: it fails the request instead of panicking
+    /// the task, which the release profile's `panic = 'abort'` turns into a
+    /// daemon exit.
     fn invalid_uri(error: http::uri::InvalidUriParts, uri: Uri, attempts: u32) -> Self {
         Self::new(FailedRequest {
             error: RequestError::InvalidUri(error),
@@ -222,7 +213,6 @@ impl RequestFailure {
         })
     }
 
-    /// The URI of the attempt that failed, after any scheme rewrite.
     fn uri(&self) -> &Uri {
         &self.0.uri
     }
@@ -230,10 +220,8 @@ impl RequestFailure {
     /// An exhausted connect budget is a connect-phase failure; anything else
     /// happened once a connection was up, so it is a head-phase transport
     /// failure -- or a head-phase protocol failure for a refused framing,
-    /// as splice reports the same head. Both phases are once-gated by the
-    /// download runner. A URI this proxy failed to rebuild never reached
-    /// the mirror: an internal failure, which blames neither the mirror nor
-    /// the head phase.
+    /// as splice reports the same head. A URI this proxy failed to rebuild
+    /// never reached the mirror: an internal failure.
     fn into_failure(self, operation: &'static str) -> DownloadFailure {
         let FailedRequest {
             error,
@@ -269,12 +257,10 @@ fn is_head_parse_error(err: &hyper_util::client::legacy::Error) -> bool {
 }
 
 /// Whose exchange [`request_with_retry`] runs. Only a proxied request moves
-/// the upstream metrics it touches (status classes, HTTPS upgrades, retries,
-/// timeouts, protocol violations): the startup scheme-cache warm-up's
-/// `HEAD /` probes are no client request, and a hyper-less build sends none,
-/// so counting them would light the upstream 5xx row at every restart for a
-/// mirror that answers `HEAD /` with a 503, with no client traffic at all.
-/// The scheme cache itself still learns from them; that is their purpose.
+/// the upstream metrics: the startup scheme-cache warm-up's `HEAD /` probes
+/// are no client request, and a hyper-less build sends none, so counting
+/// them would light the upstream 5xx row at every restart for a mirror that
+/// answers `HEAD /` with a 503. The scheme cache still learns from them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Traffic {
     /// A request made on a client's behalf, cleanup's index fetches included.
@@ -284,7 +270,6 @@ pub(crate) enum Traffic {
 }
 
 impl Traffic {
-    /// Run the metric `bump` for proxied traffic only.
     fn count(self, bump: impl FnOnce()) {
         match self {
             Self::Proxied => bump(),
@@ -302,12 +287,9 @@ pub(crate) struct UpstreamExchange {
     framing: BodyFraming,
 }
 
-/// On success the request `Parts` are handed back alongside the response —
-/// they were consumed by the request anyway, and returning them lets the
-/// rare redirect-follow path rebuild a request without the caller cloning
-/// the whole `HeaderMap` up front — together with the [`HeadTiming`] of the
-/// attempt that answered (`mirror_perf`'s time to first byte). `traffic`
-/// says whether the exchange moves the upstream metrics ([`Traffic`]).
+/// On success the request `Parts` are handed back alongside the response,
+/// so the rare redirect-follow path can rebuild a request without the caller
+/// cloning the whole `HeaderMap` up front.
 pub(crate) async fn request_with_retry(
     client: &HttpClient,
     request: Request<Empty<bytes::Bytes>>,
@@ -317,14 +299,12 @@ pub(crate) async fn request_with_retry(
     // has crossed this threshold; below it, transient connect errors
     // retry without reverting the scheme.
     const HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS: u32 = 2;
-    // The Always-mode terminal-failure HTTPS_UPGRADE_FAILED bump below
-    // (gated on an exhausted retry budget while still probing) relies on the
-    // Auto-mode revert firing first. If MAX_ATTEMPTS were ever
-    // <= HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS, Auto mode would also fall
-    // through there still probing and bump HTTPS_UPGRADE_FAILED
-    // instead of HTTPS_UPGRADE_REVERTED. (A wall-clock `upstream_retry_budget`
-    // spent before the third attempt has the same effect; the
-    // ATTEMPTED == SUCCEEDED + REVERTED + FAILED identity holds either way.)
+    // If MAX_ATTEMPTS were ever <= HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS, Auto
+    // mode would exhaust its retries still probing and bump
+    // HTTPS_UPGRADE_FAILED instead of HTTPS_UPGRADE_REVERTED. (A wall-clock
+    // `upstream_retry_budget` spent before the third attempt has the same
+    // effect; the ATTEMPTED == SUCCEEDED + REVERTED + FAILED identity holds
+    // either way.)
     static_assert!(upstream_retry::MAX_ATTEMPTS > HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS);
 
     debug_assert_eq!(
@@ -343,8 +323,7 @@ pub(crate) async fn request_with_retry(
     // miss an http-only entry and grow one cache entry per spelling. An
     // explicit `:80` on an `http` URI goes too, as dispatch drops it from the
     // mirror: kept, it would be a scheme-cache key of its own and the HTTPS
-    // upgrade below would dial TLS on port 80. This is the single choke point
-    // every hyper upstream request passes.
+    // upgrade below would dial TLS on port 80.
     if let Some(canonical) = canonical_upstream_authority(&parts.uri) {
         let mut uri_parts = parts.uri.into_parts();
         uri_parts.authority = Some(canonical);
@@ -384,7 +363,6 @@ pub(crate) async fn request_with_retry(
         };
         let mut uri_parts = parts.uri.clone().into_parts();
         uri_parts.scheme = Some(scheme);
-        // `auth` is last used above; NLL ends its borrow so `parts.uri` can be replaced.
         parts.uri = match Uri::from_parts(uri_parts) {
             Ok(uri) => uri,
             Err(err) => return Err(RequestFailure::invalid_uri(err, parts.uri, 0)),
@@ -488,11 +466,8 @@ pub(crate) async fn request_with_retry(
                         err.into()
                     };
                     if probe.is_probing() {
-                        // Non-connect transport error (e.g. read timeout,
-                        // request framing) terminates the request without
-                        // retry. Count the upgrade attempt as failed so the
-                        // ATTEMPTED == SUCCEEDED + REVERTED + FAILED identity
-                        // holds.
+                        // A non-connect transport error ends the request
+                        // without retry; the attempted upgrade failed.
                         traffic.count(|| metrics::HTTPS_UPGRADE_FAILED.increment());
                     }
                     return Err(RequestFailure::new(FailedRequest {
@@ -536,7 +511,6 @@ pub(crate) async fn request_with_retry(
                             );
                         }
 
-                        // reset https upgrade
                         let mut uri_parts = parts.uri.clone().into_parts();
                         uri_parts.scheme.clone_from(&orig_scheme);
                         parts.uri = match Uri::from_parts(uri_parts) {
@@ -567,12 +541,8 @@ pub(crate) async fn request_with_retry(
                         Ok(delay) => delay,
                         Err(limit) => {
                             if probe.is_probing() {
-                                // Terminal connect failure while still probing:
-                                // in Always mode the revert branch above is gated
-                                // off, so the only outcome of an attempted upgrade
-                                // is failure here. Keep the
-                                // ATTEMPTED == SUCCEEDED + REVERTED + FAILED
-                                // identity.
+                                // Always mode never reverts, so an
+                                // attempted upgrade ends as a failure here.
                                 traffic.count(|| metrics::HTTPS_UPGRADE_FAILED.increment());
                             }
                             if certificate_rejected {
@@ -703,9 +673,7 @@ fn upstream_error_response(err: RequestFailure) -> Response<ProxyCacheBody> {
 }
 
 /// Whether an upstream request is an HTTPS-upgrade probe, and whether it may
-/// fall back to the original scheme.  "Revertible" is only meaningful for a
-/// probe, so the two live in one value instead of two booleans that can
-/// disagree.
+/// fall back to the original scheme.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UpgradeProbe {
     /// Not an upgrade attempt: the scheme is fixed (cached, configured, or
@@ -723,7 +691,6 @@ enum UpgradeProbe {
 }
 
 impl UpgradeProbe {
-    /// The probe a resolved scheme decision starts its request with.
     const fn of(decision: SchemeDecision) -> Self {
         match decision {
             SchemeDecision::Http | SchemeDecision::Https => Self::NotProbing,
@@ -750,8 +717,8 @@ where
     ProxyCacheBody::new(AccountedBody::new(rated, subject))
 }
 
-/// Cache reading establishes both the I/O source and the promised-length
-/// contract before the body reaches generic delivery accounting.
+/// A cached file as a body of exactly the promised length; a file that ends
+/// early is an error, not a clean end of stream.
 struct CachedFileBody {
     reader: tokio_util::io::ReaderStream<tokio::io::Take<tokio::fs::File>>,
     path: PathBuf,
@@ -835,14 +802,13 @@ impl Body for CachedFileBody {
     }
 }
 
-/// Hyper is the only source of these erased transport errors. Restore upstream
-/// provenance here; library error-chain inspection never reaches a delivery logger.
+/// Restore the upstream provenance of an error hyper has erased.
 fn upstream_body_error(error: hyper::Error) -> UpstreamError {
     // Hyper's body decoder reports short reads and malformed chunk framing
     // as I/O errors; is_parse()/is_incomplete_message() cover the head.
     // TLS may also report InvalidData, so only an untagged error with a
-    // decoder kind is a protocol violation. Keep the existing EOF policy:
-    // an upstream EOF before the promised body is complete is a short body.
+    // decoder kind is a protocol violation. An upstream EOF before the
+    // promised body is complete is a short body.
     if std::error::Error::source(&error)
         .and_then(|source| source.downcast_ref::<std::io::Error>())
         .is_some_and(|source| {
@@ -900,9 +866,7 @@ impl Body for UpstreamCountedBody {
 
 /// Finish an uncached passthrough: drop the upstream lines a relay must not
 /// forward ([`RelayedHeaders`]), account the upstream body, apply the client
-/// rate check and append our `Via`.  The three passthrough sites (a fetch the
-/// cache pipeline declined, and the simple proxy with and without a followed
-/// redirect) differ only in the [`Subject`].
+/// rate check and append our `Via`.
 ///
 /// The upstream's framing lines go too: hyper's server frames the body
 /// itself from its size hint (`Content-Length` for a known length, chunked
@@ -1172,11 +1136,9 @@ async fn serve_cached_file_buf(
     let content_type = content_type_for_cached_file(&conn_details.debname);
 
     // Bound the reader to the (possibly range-trimmed) content length: an
-    // unbounded stream over-reads past a closed range's end, and the surplus
-    // makes AccountedBody's Drop accounting see transferred != size —
-    // logging a spurious "Aborted serving" warn and skipping the SERVED_*
-    // metrics and delivery DB row for a request that was actually served
-    // fully.
+    // unbounded stream over-reads past a closed range's end, and
+    // AccountedBody would then see transferred != size and account a fully
+    // served request as aborted.
     let body = rated_client_body(
         CachedFileBody::new(file, content_length, config.buffer_size, file_path),
         Subject::Cached {
@@ -1200,9 +1162,7 @@ async fn serve_cached_file_buf(
 /// `req` is borrowed, not consumed: this call sits at the tail of
 /// [`serve_new_file_worker`], whose future is already close to
 /// `clippy::large_futures` (see its definition). Moving the request in would
-/// store it inline in that future for the whole upstream exchange -- measured
-/// at 864 bytes -- for a value only `serve_cached_file` ever reads, and by
-/// reference. The other two callers own their request and simply lend it.
+/// store it inline in that future -- measured at 864 bytes.
 #[must_use]
 async fn serve_downloading_file(
     conn_details: ConnectionDetails,
@@ -1296,9 +1256,7 @@ async fn serve_volatile_file(
 
     let reason = match check_volatile_hit(&file_path, &mdata) {
         Ok(()) => {
-            // Lookup-site accounting (see `process_cache_request`);
-            // cleanup-synthetic probes (task_cleanup's `.xz -> .gz -> raw`
-            // walk) count nothing.
+            // Lookup-site accounting (see `process_cache_request`).
             conn_details.count_lookup(LookupOutcome::Hit);
 
             note_cached_index_touch(&conn_details, req.uri().path(), &file_path);
@@ -1308,8 +1266,7 @@ async fn serve_volatile_file(
     };
 
     // Lookup-site parent refetch bump; dominates the revalidation outcome
-    // `serve_new_file` records. Cleanup-synthetic probes are operator
-    // bookkeeping, not user traffic, and count nothing.
+    // `serve_new_file` records.
     let miss = CacheMiss::StaleVolatile {
         reason,
         file,
@@ -1324,9 +1281,7 @@ async fn serve_volatile_file(
 /// produced `miss`.
 ///
 /// Hit/miss/refetch accounting is the lookup site's job and has already
-/// happened - in [`process_cache_request`] / [`serve_volatile_file`] for
-/// requests hyper looked up itself, in `sendfile_conn::try_sendfile_request`
-/// for a `HandoffPlan::CacheMiss` - so nothing is bumped here.
+/// happened, so nothing is bumped here.
 ///
 /// A joiner the originator's decline does not bind
 /// ([`JoinFailure::exempts`]: cleanup behind a verify-throttled client)
@@ -1392,7 +1347,6 @@ async fn serve_cache_miss(
     }
 }
 
-/// Cache operation adapter shared by the worker and its salvage path.
 struct DownloadWriter<'a> {
     writer: tokio::io::BufWriter<tokio::fs::File>,
     path: &'a Path,
@@ -1556,9 +1510,9 @@ async fn download_file(
         let rbarrier = dbarrier.begin_rename().await;
 
         /* Should only happen for concurrent downloads from aliased mirrors */
-        // A `stat` of a hot directory entry, inline like the cache-hit open
-        // (`open_cached_file_inline`): through `tokio::fs` it was a
-        // blocking-pool round trip on every fresh permanent download.
+        // A `stat` of a hot directory entry, done inline: through
+        // `tokio::fs` it is a blocking-pool round trip on every fresh
+        // permanent download.
         if warn_on_override {
             match dest_file_path.try_exists() {
                 Ok(true) => {
@@ -1579,9 +1533,8 @@ async fn download_file(
             }
         }
 
-        // No streamed digest and no prepare step
-        // (`FinishedCacheFile::flush`): the commit re-reads and hashes the
-        // finished file.
+        // No streamed digest and no prepare step: the commit re-reads and
+        // hashes the finished file.
         if rbarrier
             .commit(outfile, outpath, dest_file_path)
             .await
@@ -1636,8 +1589,7 @@ async fn download_file(
 /// The other reasons a redirect is not followed (relative target, unsupported
 /// scheme, host not permitted) are named by [`redirect_permitted`]; a
 /// `Location` that does not parse -- or is missing entirely -- would otherwise
-/// leave nothing but a bare "failed with code 302" further down. `source` and
-/// `what` only name the mirror and resource for the log line.
+/// leave nothing but a bare "failed with code 302" further down.
 #[must_use]
 fn followed_redirect_location<B>(
     response: &Response<B>,
@@ -1674,8 +1626,8 @@ fn followed_redirect_location<B>(
     parsed
 }
 
-/// Evaluate and explain redirect permission once, shared by cache fetches
-/// and passthroughs. Parsing has already checked explicit port validity.
+/// Logs why a redirect is not followed. `followed_redirect_location` has
+/// already checked explicit port validity.
 fn redirect_permitted(moved_uri: &Uri) -> bool {
     let Some(scheme) = moved_uri.scheme() else {
         debug!("Moved URI `{moved_uri}` is relative; not following the redirect");
@@ -1810,8 +1762,6 @@ async fn serve_new_file(
     }
 }
 
-/// `revalidate` carries the stored upstream validators of a stale
-/// volatile copy; `None` is an unconditional fetch.
 #[must_use]
 fn build_fwd_request(
     uri: Uri,
@@ -1907,12 +1857,11 @@ async fn fetch_upstream(
     }
 }
 
-/// Runs inline in the connection future (`InitBarrier::run` no longer boxes
-/// it), which puts it within roughly 2 KiB of clippy's 16 KiB `large_futures`
-/// threshold. Hence the by-reference parameters below: growing this body, or
-/// taking a large value by move, will trip the lint at
-/// `process_cache_request`. Box the offending inner future -- as
-/// `splice/volatile.rs` does for `read_to_vec` -- rather than the runner.
+/// Runs inline in the connection future, which puts it within roughly 2 KiB
+/// of clippy's 16 KiB `large_futures` threshold. Hence the by-reference
+/// parameters below: growing this body, or taking a large value by move, will
+/// trip the lint at `process_cache_request`. Box the offending inner future
+/// rather than the runner.
 async fn serve_new_file_worker(
     conn_details: &ConnectionDetails,
     ibarrier: &mut InitBarrier,
@@ -2035,8 +1984,6 @@ async fn serve_new_file_worker(
         debug!("Requested URI: {}, Moved URI: {moved_uri:?}", req.uri());
 
         if redirect_permitted(&moved_uri) {
-            // Derive the Host header from the redirect target so it matches
-            // the URI we're actually sending the request to.
             host = host_header_from_uri(&moved_uri);
             req_uri = Cow::Owned(moved_uri);
 
@@ -2110,10 +2057,8 @@ async fn serve_new_file_worker(
             partial.discard_resume().await;
 
             if anomaly.needs_refetch() {
-                // Deliberately no validators here: the partial file has been
-                // discarded, so from the upstream's perspective this is a
-                // fresh unconditional fetch (no If-Modified-Since, no
-                // If-None-Match, no Range).
+                // Deliberately no validators and no Range: the partial file
+                // has been discarded.
                 let retry_request = build_fwd_request(
                     Uri::clone(&req_uri),
                     Some(&host),
@@ -2151,12 +2096,13 @@ async fn serve_new_file_worker(
         mirror_perf::record_ttfb(conn_details, head_timing);
     }
 
-    // Validate before dispatch so a 304 update follows the same rules as a fresh body.
-    // Wording mirrors `splice/http.rs::UpstreamResponse::discard_invalid_validators`
-    // modulo the subsystem prefix. The raw values are read the way splice's
-    // `find_header` reads them, as UTF-8 rather than through `to_str` (visible
-    // ASCII only): an obs-text value then reaches the check and its warn
-    // instead of vanishing silently, so both backends log it alike.
+    // Validate before dispatch so a 304 update follows the same rules as a
+    // fresh body. The warn's wording mirrors
+    // `splice/http.rs::UpstreamResponse::discard_invalid_validators` modulo
+    // the subsystem prefix. The raw values are read the way splice's
+    // `find_header` reads them, as UTF-8 rather than through `to_str`
+    // (visible ASCII only): an obs-text value then reaches the check and its
+    // warn instead of vanishing silently, so both backends log it alike.
     let (upstream_etag, upstream_last_modified) = check_upstream_validators(
         fwd_response
             .headers()
@@ -2233,12 +2179,9 @@ async fn serve_new_file_worker(
                 .decline(Declined::Passthrough(fwd_response.status()))
                 .await;
 
-            // Demote routine 4xx for cleanup-synthetic clients to DEBUG:
-            // `cleanup::fetch` deliberately walks `.xz → .gz → raw`,
-            // and on S3-hosted flat repos every miss surfaces as 403 (not
-            // 404). At WARN that's three loud lines per cleanup cycle for
-            // a benign probe sequence — the cleanup's own DEBUG line on
-            // each miss is the operator-visible record.
+            // Routine 4xx for cleanup-synthetic clients go to DEBUG:
+            // `cleanup::fetch` deliberately walks `.xz -> .gz -> raw`, and
+            // on S3-hosted flat repos every miss surfaces as 403 (not 404).
             if fwd_response.status() == StatusCode::NOT_FOUND || cleanup_probe {
                 debug!(
                     "Request for file {} from mirror {} with URI `{req_uri}` failed with status {}",
@@ -2375,9 +2318,8 @@ async fn serve_new_file_worker(
     let (outfile, outpath) = partial.into_target(filename).await?;
     // Persist the validators (and the expected total, so a resume can detect
     // an upstream change) early, so they survive an interrupted download.
-    // Only a permanent `.partial` is ever resumed
-    // (`partial_file::prepare_partial_resume`, the size's one reader); a
-    // volatile temp file is removed on failure, so it skips that write.
+    // Only a permanent `.partial` is ever resumed; a volatile temp file is
+    // removed on failure, so it skips the size.
     let expected_size = match (conn_details.cached_flavor(), total_content_length) {
         (CachedFlavor::Permanent, ContentLength::Exact(total)) => Some(total.get()),
         (CachedFlavor::Volatile, _) | (CachedFlavor::Permanent, ContentLength::Unknown(_)) => None,
@@ -2432,7 +2374,7 @@ async fn serve_new_file_worker(
 
     // The parallel-download hack: hand the client a `Retry-After` nudge and
     // let the spawned `download_file` above finish on its own; the retry
-    // late-joins it. `splice/mod.rs` gates on the same three functions.
+    // late-joins it. `splice/mod.rs` gates on the same `should_nudge`.
     if should_nudge(
         config,
         conn_details.cached_flavor(),
@@ -2461,11 +2403,10 @@ async fn serve_new_file_worker(
 /// Cache lookup plus hit/miss accounting for a request hyper classified
 /// itself (or cleanup's synthetic index fetches), then serve or fetch.
 ///
-/// This is the lookup site: `ConnectionDetails::count_lookup` counts a
-/// permanent hit or any miss here (a volatile hit or refetch in
-/// [`serve_volatile_file`]), exactly where the lookup decides.  Requests the sendfile backend
-/// already looked up never come here - their `HandoffPlan::CacheMiss`
-/// enters [`serve_cache_miss`] directly, so no bump can repeat.
+/// This is the lookup site: a permanent hit or any miss is counted here, a
+/// volatile hit or refetch in [`serve_volatile_file`]. Requests the sendfile
+/// backend already looked up enter [`serve_cache_miss`] directly, so no bump
+/// can repeat.
 #[must_use]
 pub(crate) async fn process_cache_request(
     conn_details: ConnectionDetails,
@@ -2523,10 +2464,10 @@ pub(crate) async fn process_cache_request(
 /// runs.
 ///
 /// hyper finishes serving a connection as soon as it has handed the upgraded
-/// socket to the tunnel task, so without this the slot was released while
-/// the tunnel still held the client socket, and every hyper tunnel escaped
-/// `max_connections` and `max_connections_per_client_ip`. Each tunnel task
-/// holds a clone; the handler waits until every clone is gone.
+/// socket to the tunnel task; without this the slot would be released while
+/// the tunnel still holds the client socket, and every hyper tunnel would
+/// escape `max_connections` and `max_connections_per_client_ip`. Each tunnel
+/// task holds a clone; the handler waits until every clone is gone.
 #[derive(Clone)]
 struct ConnectionHold {
     /// Never sends: the receiver only waits for every clone to drop.
@@ -2542,11 +2483,10 @@ async fn connect_response(
     req: Request<Incoming>,
     hold: ConnectionHold,
 ) -> Response<ProxyCacheBody> {
-    // Shared with the sendfile/splice backend so tunnel policy stays identical
-    // across backends; logs and policy metrics are bumped inside the validator.
-    // Every refusal below closes the connection, as sendfile's
-    // `handle_connect` does: a refused client gets no keep-alive connection
-    // to probe further targets on.
+    // `authorize` is shared with the sendfile/splice backend so tunnel policy
+    // stays identical across backends. Every refusal below closes the
+    // connection, as sendfile's `handle_connect` does: a refused client gets
+    // no keep-alive connection to probe further targets on.
     let (target, tunnel_guard) = match authorize(config, &client, req.uri()) {
         Ok(authorized) => authorized,
         Err(ConnectReject { status, msg }) => return quick_response_closing(status, msg),
@@ -2598,14 +2538,12 @@ async fn connect_response(
 /// Work the sendfile backend already did for the first request hyper parses
 /// on a handed-off connection (`sendfile_conn::handle_sendfile_connection`).
 ///
-/// Sendfile parses the request, runs the shared pre-flight,
-/// `authorize_cache_access` and `dispatch_request`, and - for a `Cache`
-/// outcome - the cache lookup or late-joiner attach, before deciding it
-/// cannot answer the request itself.  The plan carries those results so
-/// [`pre_process_client_request`] enters the pipeline exactly where sendfile
-/// left it: pre-flight and dispatch run once per request, the deferred
-/// `Origin` write and `record_uncacheable` fire once, and every
-/// hit/miss/refetch bump belongs to the one lookup that ran.
+/// Sendfile runs the shared pre-flight, `authorize_cache_access` and
+/// `dispatch_request`, and - for a `Cache` outcome - the cache lookup or
+/// late-joiner attach, before deciding it cannot answer the request itself.
+/// The plan carries those results so [`pre_process_client_request`] enters
+/// the pipeline where sendfile left it, and none of that work or its
+/// accounting repeats.
 ///
 /// Pairing invariant: the bytes prepended to hyper's stream are exactly the
 /// request sendfile parsed (plus any pipelined successors it has not looked
@@ -2860,8 +2798,8 @@ async fn pre_process_client_request(
 
     let mut fwd_request_sent = PreciseInstant::now();
     // The returned parts serve the origin extraction and the rare
-    // redirect-follow below — no up-front HeaderMap clone per request.
-    // A passthrough records no time to first byte (`mirror_perf`).
+    // redirect-follow below. A passthrough records no time to first byte
+    // (`mirror_perf`).
     let UpstreamExchange {
         response: mut fwd_response,
         request_parts: mut parts,
@@ -2997,8 +2935,6 @@ pub(crate) fn client_max_buf_size(buffer_size: usize) -> usize {
     CLIENT_HEAD_ALLOWANCE.max(buffer_size.saturating_add(CLIENT_HEAD_ALLOWANCE))
 }
 
-/// The client-facing HTTP/1 server settings every hyper-served connection
-/// shares.
 fn client_http1_builder() -> http1::Builder {
     let mut builder = http1::Builder::new();
     builder
@@ -3022,13 +2958,10 @@ pub(crate) async fn handle_hyper_connection<T>(
 ) where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // The plan pairs with the first service invocation only: the stream's
-    // prepended bytes are exactly the request sendfile parsed (with any
-    // pipelined successors behind it), hyper invokes the service once per
-    // parsed request in stream order, and a request hyper cannot parse ends
-    // the connection with hyper's own 400 rather than skipping to the next
-    // one - so the first invocation is that request, and `take()` makes
-    // every later invocation run the full pipeline.
+    // The plan pairs with the first service invocation only (see
+    // `HandoffPlan`): a request hyper cannot parse ends the connection with
+    // hyper's own 400 rather than skipping to the next one, and `take()`
+    // makes every later invocation run the full pipeline.
     let handoff = parking_lot::Mutex::new(handoff);
 
     // Lent to every tunnel this connection upgrades into; see
@@ -3195,7 +3128,6 @@ fn response_keeps_alive(response: &Response<ProxyCacheBody>) -> bool {
         })
 }
 
-/// Log how a hyper-served client connection ended in error.
 fn log_client_connection_error(client: ClientInfo, err: &hyper::Error) {
     #[must_use]
     fn hyper_io_error(err: &hyper::Error) -> Option<&std::io::Error> {
@@ -3208,13 +3140,10 @@ fn log_client_connection_error(client: ClientInfo, err: &hyper::Error) {
             ErrorReport(failure)
         );
     } else if err.is_incomplete_message() || hyper_io_error(err).is_some_and(is_peer_disconnect) {
-        // Hyper does not expose per-frame write errors, so we cannot
+        // Hyper does not expose per-frame write errors, so this cannot
         // tell whether the disconnect happened mid-body, between
-        // pipelined requests, or before any response was started. Bump
-        // on the full outer guard — both peer-disconnect and incomplete-
-        // message framing breaks indicate the client went away — since
-        // the alternative (silently dropping these) gives the operator
-        // a worse signal. See the docstring on
+        // pipelined requests, or before any response was started; all of
+        // them are counted. See the docstring on
         // CLIENT_DISCONNECTED_MID_BODY for the scope caveat.
         metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
         client_trouble::record(&client, Trouble::Disconnect);
@@ -3235,10 +3164,9 @@ fn log_client_connection_error(client: ClientInfo, err: &hyper::Error) {
         );
     } else if err.is_timeout() {
         // hyper's `header_read_timeout` (driven by `client_idle_timeout`)
-        // fires on idle keep-alive and slowloris-shaped clients. This is
-        // benign disconnect behaviour, not a server fault — log at debug
-        // and leave HTTP_TIMEOUT_CLIENT_HEADER untouched (the sendfile
-        // backend is the sole owner of that counter).
+        // fires on idle keep-alive and slowloris-shaped clients: benign,
+        // not a server fault. HTTP_TIMEOUT_CLIENT_HEADER stays untouched
+        // (the sendfile backend is the sole owner of that counter).
         debug!("Client {client} idle-timed out before sending request headers");
     } else {
         error!(
@@ -3314,8 +3242,6 @@ mod tests {
         config
     }
 
-    /// A successful CONNECT retains pipelined bytes, relays both ways and
-    /// holds the connection until the upgraded tunnel ends.
     #[tokio::test]
     async fn connect_dials_before_success_and_relays_pipelined_bytes() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -3356,8 +3282,6 @@ mod tests {
         );
     }
 
-    /// A refused upstream produces a real 502 and releases admission without
-    /// ever entering Hyper's upgrade path or announcing a successful tunnel.
     #[tokio::test]
     async fn connect_refusal_returns_502_and_releases_the_tunnel() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -3433,8 +3357,7 @@ mod tests {
             4,
             "only proxy-owned headers are sent"
         );
-        // hyper writes the fields in map order: `Host` right after
-        // `User-Agent`, as the cache fetch always sent it.
+        // hyper writes the fields in map order.
         assert_eq!(
             fresh.headers().keys().collect::<Vec<_>>(),
             [USER_AGENT, HOST, VIA, ACCEPT_ENCODING]
@@ -3740,8 +3663,6 @@ mod tests {
         assert!(body.frame().await.is_none());
     }
 
-    /// A body up to `SINGLE_FRAME_MAX` goes out as one frame (one read);
-    /// a bigger one in `buffer_size` frames, so its reads overlap the writes.
     #[tokio::test]
     async fn cached_file_body_frames_small_files_whole() {
         use super::{CachedFileBody, SINGLE_FRAME_MAX};

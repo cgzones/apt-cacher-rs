@@ -1,13 +1,8 @@
 //! One-time cache-directory preparation, run from `main` before the tokio
-//! runtime starts: create the directory, take the single-instance
-//! `flock(2)`, probe for the timestamp and extended-attribute support the
-//! cache relies on, purge the scratch directory an unclean shutdown left
-//! behind, and remove the empty scratch directory of a pre-rename version.
+//! runtime starts.
 //!
-//! The returned lock is held for the process lifetime; dropping it early
-//! would admit a second instance onto the same cache. [`task_setup`] is the
-//! thin wrapper that reads the global configuration, [`prepare_cache_dir`]
-//! the testable body.
+//! The returned lock must be held for the process lifetime; dropping it early
+//! would admit a second instance onto the same cache.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -22,8 +17,6 @@ use crate::{
     xattr_helpers::disable_xattr_support,
 };
 
-/// Failure while preparing the cache directory at startup.
-///
 /// `Display` renders this error only; the underlying cause hangs off
 /// [`std::error::Error::source`], so log it via [`crate::error::ErrorReport`].
 #[derive(Debug, thiserror::Error)]
@@ -55,18 +48,15 @@ impl SetupError {
     }
 }
 
-/// Name of the instance lock file at the cache-directory root. Unlike the
-/// healthcheck probe it persists for the process lifetime, so the cache
-/// scan skips it alongside `healthcheck::PROBE_FILENAME`.
+/// Instance lock file at the cache-directory root. It persists for the
+/// process lifetime, so the cache scan has to skip it.
 pub(crate) const LOCK_FILENAME: &str = ".apt-cacher-rs.lock";
 
-/// Take an exclusive advisory `flock(2)` on the cache-directory lock file,
-/// refusing startup when another instance holds it: a second instance
-/// sharing the cache would purge `.apt-cacher-rs.tmp/` under live downloads, double-count
-/// the quota, and run cleanup against files the other is serving.
+/// A second instance sharing the cache would purge `.apt-cacher-rs.tmp/`
+/// under live downloads, double-count the quota, and run cleanup against
+/// files the other is serving.
 fn lock_cache_dir(cache_path: &Path) -> Result<Flock<std::fs::File>, SetupError> {
     let lock_path = cache_path.join(LOCK_FILENAME);
-    // `.create(true)` so the lock file from a previous run is reused.
     let file = nofollow_options()
         .read(true)
         .write(true)
@@ -135,7 +125,6 @@ fn remove_dir_contents(path: &Path) -> Result<usize, SetupError> {
     Ok(removed)
 }
 
-/// Prepare the configured cache directory; see the module documentation.
 pub(crate) fn task_setup() -> Result<Flock<std::fs::File>, SetupError> {
     prepare_cache_dir(&global_config().cache_directory)
 }
@@ -143,7 +132,6 @@ pub(crate) fn task_setup() -> Result<Flock<std::fs::File>, SetupError> {
 fn prepare_cache_dir(cache_path: &Path) -> Result<Flock<std::fs::File>, SetupError> {
     std::fs::create_dir_all(cache_path).map_err(SetupError::io("create directory", cache_path))?;
 
-    // Check for creation and modification timestamp support
     let mdata =
         std::fs::metadata(cache_path).map_err(SetupError::io("inspect directory", cache_path))?;
     if !mdata.file_type().is_dir() {
@@ -162,16 +150,12 @@ fn prepare_cache_dir(cache_path: &Path) -> Result<Flock<std::fs::File>, SetupErr
         );
     }
 
-    // Check for extended attribute support
     {
-        // Probe the same namespace the runtime uses (`user.apt_cacher_rs.*` —
-        // every `xattr_helpers::XattrValue::KEY`) so a filesystem or LSM
-        // policy that allows the generic `user.*` namespace but restricts
-        // custom prefixes does not pass the probe while still blocking real
-        // reads/writes at runtime. This is a capability probe, so it uses the
-        // raw `xattr::FileExt` calls on purpose: the typed `xattr_helpers`
-        // layer short-circuits on the very `XATTR_SUPPORTED` flag this probe
-        // decides, and its degradation warns would misreport a probe failure.
+        // Probe the namespace the runtime uses (`user.apt_cacher_rs.*`): a
+        // filesystem or LSM policy may allow generic `user.*` but restrict
+        // custom prefixes. Raw `xattr::FileExt` calls on purpose: the typed
+        // `xattr_helpers` layer short-circuits on the very `XATTR_SUPPORTED`
+        // flag this probe decides.
         const XATTR_PROBE: &str = "user.apt_cacher_rs.probe";
         const XATTR_PROBE_VALUE: &[u8] = b"probe";
 
@@ -226,9 +210,7 @@ fn prepare_cache_dir(cache_path: &Path) -> Result<Flock<std::fs::File>, SetupErr
     std::fs::create_dir_all(&cache_tmp_path)
         .map_err(SetupError::io("create directory", &cache_tmp_path))?;
 
-    // Leftovers here are partial downloads from a previous run that never
-    // committed; a non-empty purge is the one startup-visible trace of an
-    // unclean shutdown.
+    // Leftovers are partial downloads of a previous run that never committed.
     let purged = remove_dir_contents(&cache_tmp_path)?;
     if purged > 0 {
         info!(
@@ -256,11 +238,8 @@ const LEGACY_SCRATCH_DIR: &str = "tmp";
 /// cache scan would otherwise report as an unregistered host on every run.
 ///
 /// Only an empty directory is removed: `tmp` is also a valid host name, so a
-/// non-empty one may hold cached files and is left for the scan to report and
-/// the operator to inspect.  An empty one holds nothing either way, and a
-/// host named `tmp` recreates it on its next download.  Runs under the
-/// instance lock before any download starts, so nothing races the removal.
-/// Failures only warn: the leftover is cosmetic and must not block startup.
+/// non-empty one may hold cached files.  Runs under the instance lock before
+/// any download starts, so nothing races the removal.
 ///
 /// An operator may have pointed `SQLITE_TMPDIR` (`sqlite_tmpdir`) at the old
 /// directory; it is kept then, as SQLite would otherwise lose its only
@@ -361,7 +340,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let legacy = tmp.path().join(LEGACY_SCRATCH_DIR);
 
-        // Missing: nothing to do.
+        // Missing: must not panic.
         remove_legacy_scratch_dir(tmp.path(), None);
 
         std::fs::create_dir(&legacy).expect("create legacy dir");

@@ -23,19 +23,13 @@ use crate::limits::RETENTION_TIME;
 const UNREFERENCED_KEEP_SPAN: Duration = Duration::from_hours(3 * 24);
 
 /// Retention span for volatile index metadata (`Release`/`InRelease`/`Packages*`
-/// /...) in a structured `dists/` directory. Unlike per-`.deb` files these are
-/// refreshed while a distribution is in use (replaced on an upstream change,
-/// hence a fresh birthtime; mtime-touched on an unchanged revalidation), so
-/// aging past this span marks the distribution as
-/// retired. Nothing else reclaims these files, and while a retired dist's
-/// `Release` lingers, reference-mode by-hash cleanup keeps every digest it lists
-/// pinned; removing the metadata bounds the growth and unblocks that reclaim.
-/// See `sweep::sweep_aged_metadata`.
+/// /...). These are refreshed while a distribution is in use (replaced on an
+/// upstream change, mtime-touched on an unchanged revalidation), so aging
+/// past this span marks the distribution as retired. While a retired dist's
+/// `Release` lingers, by-hash cleanup keeps every digest it lists pinned.
 const METADATA_KEEP_SPAN: Duration = Duration::from_hours(90 * 24);
 
-/// Age threshold for a `.partial` scratch file, carried as the [`PartialsUnit`]
-/// span and applied by `partials::cleanup_tmp_dir` (which keeps its own, longer
-/// backstop for foreign entries).
+/// Age threshold for a `.partial` scratch file.
 ///
 /// One day: a kept partial only pays off for a client retrying soon, while
 /// every failed download leaves one behind that an unreliable (or hostile)
@@ -43,10 +37,7 @@ const METADATA_KEEP_SPAN: Duration = Duration::from_hours(90 * 24);
 /// counts against the quota until it is reaped.
 const PARTIALS_KEEP_SPAN: Duration = Duration::from_hours(24);
 
-/// Which candidate-reconcile tree a [`ReconcileUnit`] targets. Both shapes run
-/// the same engine and differ only in where they anchor and how their
-/// completion summary reads — the other three unit shapes need no such
-/// discriminator, their [`CleanupUnit`] variant *is* the shape.
+/// Which candidate-reconcile tree a [`ReconcileUnit`] targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReconcileFacet {
     /// Structured pool tree: `{host}/{path}/`, depth-1, basename-keyed.
@@ -56,10 +47,8 @@ pub(super) enum ReconcileFacet {
 }
 
 impl ReconcileFacet {
-    /// The layout this facet's tree is anchored under: it *places* the tree
-    /// (`CachePaths::entry_dir`) and is the key its sweep invalidates
-    /// `cache_metadata` on. Derived here rather than carried alongside the facet so the root the
-    /// classifier builds and the key the engine invalidates on cannot disagree.
+    /// The layout that places this facet's tree and keys its `cache_metadata`
+    /// invalidation.
     pub(super) const fn cache_layout(self) -> CacheLayout {
         match self {
             Self::StructuredPool => CacheLayout::StructuredPool,
@@ -68,20 +57,13 @@ impl ReconcileFacet {
     }
 }
 
-/// One independently-cleaned tree, in the shape its executor consumes.
-///
-/// The variant *is* the retention rule: each payload carries exactly the inputs
-/// its `engine.rs` arm needs and nothing else, so a tree paired with a rule that
-/// cannot execute it — a by-hash tree with an age-only span, a `tmp/` reap with
-/// a `Release` digest set — is unrepresentable rather than guarded against at
-/// runtime.
+/// One independently-cleaned tree; the variant is its retention rule.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum CleanupUnit {
     /// Scan a tree into a candidate map, reduce it against ordered index
-    /// sources, sweep what survives. The only shape carrying [`IndexSource`]s.
+    /// sources, sweep what survives.
     Reconcile(ReconcileUnit),
-    /// Sweep a by-hash tree against an on-disk `Release` digest set. Fetches
-    /// nothing and reduces nothing.
+    /// Sweep a by-hash tree against an on-disk `Release` digest set.
     ByHash(ByHashUnit),
     /// Age out stale index metadata in place.
     Metadata(MetadataUnit),
@@ -90,11 +72,9 @@ pub(super) enum CleanupUnit {
 }
 
 impl CleanupUnit {
-    /// Whether running the unit fetches index files from the mirror: only a
-    /// reconcile's [`IndexSource`]s do. Cleanup drops these units for a
-    /// mirror the allow-lists no longer permit, which leaves its package
-    /// trees as they are rather than sweeping them against an index it did
-    /// not fetch.
+    /// Whether running the unit fetches index files from the mirror. Cleanup
+    /// drops these units for a mirror the allow-lists no longer permit,
+    /// leaving its package trees as they are.
     #[must_use]
     pub(super) const fn fetches_indexes(&self) -> bool {
         match self {
@@ -104,8 +84,6 @@ impl CleanupUnit {
     }
 }
 
-/// A [`CleanupUnit::Reconcile`] unit: the tree to scan, the ordered index
-/// sources that reduce its candidate map, and how leftovers are retained.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ReconcileUnit {
     pub facet: ReconcileFacet,
@@ -114,16 +92,12 @@ pub(super) struct ReconcileUnit {
     pub policy: ReconcilePolicy,
 }
 
-/// A [`CleanupUnit::ByHash`] unit. `release_dir`/`dist_gate` name the on-disk
-/// `Release` set that *defines* "referenced" — the by-hash counterpart of a
-/// reconcile unit's [`IndexSource`]s, except nothing is fetched. A complete
-/// reference set keeps referenced digests and sweeps unreferenced-but-covered
-/// ones past `grace`; anything uncovered (or the whole tree, when the reference
-/// set is incomplete) sweeps past `backstop`.
+/// `release_dir`/`dist_gate` name the on-disk `Release` set that defines
+/// "referenced". A complete reference set keeps referenced digests and sweeps
+/// unreferenced-but-covered ones past `grace`; anything uncovered (or the
+/// whole tree, when the reference set is incomplete) sweeps past `backstop`.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ByHashUnit {
-    /// Places the tree (`CachePaths::entry_dir`) and keys its `cache_metadata`
-    /// invalidation.
     pub layout: CacheLayout,
     pub root: PathBuf,
     pub release_dir: PathBuf,
@@ -132,38 +106,29 @@ pub(super) struct ByHashUnit {
     pub backstop: Duration,
 }
 
-/// A [`CleanupUnit::Metadata`] unit: a pure age sweep of `root`, with no
-/// reference source at all.
+/// A pure age sweep of `root`.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct MetadataUnit {
-    /// Places the tree (`CachePaths::entry_dir`) and keys its `cache_metadata`
-    /// invalidation.
     pub layout: CacheLayout,
     pub root: PathBuf,
     pub span: Duration,
 }
 
-/// A [`CleanupUnit::Partials`] unit: a pure age reap of one `tmp/` directory.
-/// Carries no [`CacheLayout`] — the layout only ever placed the root, and `tmp/`
-/// scratch files never enter the metadata store.
+/// A pure age reap of one `tmp/` directory. Carries no [`CacheLayout`]:
+/// `tmp/` scratch files never enter the metadata store.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct PartialsUnit {
     pub root: PathBuf,
     pub span: Duration,
 }
 
-/// Where a [`ReconcileUnit`] scans on disk and how the walk is bounded. Consumed
-/// verbatim by [`scan::scan_candidates`](crate::cleanup::scan::scan_candidates);
-/// the three non-reconcile shapes scan nothing and carry a plain root instead.
+/// Where a [`ReconcileUnit`] scans on disk and how the walk is bounded.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct TreeSpec {
-    /// On-disk root of the tree to scan.
     pub root: PathBuf,
-    /// How far below `root` the scan reaches.
     pub walk: Walk,
 }
 
-/// Recursion policy of a [`TreeSpec`].
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Walk {
     /// Depth-1 walk with basename keys - the structured pool's shape, where
@@ -175,17 +140,13 @@ pub(super) enum Walk {
         /// `tmp/` for flat mirrors).
         skip_subdirs: &'static [&'static str],
         /// Mirror paths of registered siblings that live *inside* this
-        /// mirror's path (`deb_mirror::nested_paths_per_row`). When the walk
-        /// reaches a directory whose mirror-path equivalent is at or inside
-        /// one of these, the subtree is skipped (the nested mirror owns it
-        /// and runs its own cleanup).
+        /// mirror's path. A directory at or inside one of these is not
+        /// entered: the nested mirror owns it and runs its own cleanup.
         boundaries: Vec<String>,
     },
 }
 
 impl TreeSpec {
-    /// A depth-1, unbounded walk of `root` - the structured pool's shape;
-    /// [`ReconcileFacet::FlatTree`] is the only recursive tree.
     fn shallow(root: PathBuf) -> Self {
         Self {
             root,
@@ -194,9 +155,7 @@ impl TreeSpec {
     }
 }
 
-/// A reference-set source that reduces a *reconcile* unit's candidate map. The
-/// by-hash facets carry their `Release` digest source on their retention policy
-/// instead, so every variant here is one `resolve_group` can actually dispatch.
+/// A reference-set source that reduces a reconcile unit's candidate map.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum IndexSource {
     /// Active origins of the row being cleaned, keyed by package basename.
@@ -239,25 +198,20 @@ pub(super) enum DistGate {
 }
 
 /// How a [`ReconcileUnit`] retains leftovers once its ordered [`IndexSource`]s
-/// have run. The only policy [`decide_sweep`] takes: the by-hash and age-only
-/// shapes carry their retention on their own payloads and never reach it.
+/// have run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReconcilePolicy {
     /// Structured pool: any group fetch/parse failure bails the whole unit
-    /// (no sweep this cycle); otherwise sweep past `grace`
-    /// (`UNREFERENCED_KEEP_SPAN`).
+    /// (no sweep this cycle); otherwise sweep past `grace`.
     ReferencedOrBail { grace: Duration },
-    /// Flat: sweep past `grace` when the reference set is usable per the
-    /// `decide_sweep` truth table (note the quirk: a co-located parse error
-    /// forces the fallback even when the root group completed); otherwise
-    /// fall back to age-based `fallback` (`RETENTION_TIME`).
+    /// Flat: sweep past `grace` when the reference set is usable per
+    /// `decide_sweep` (note the quirk: a co-located parse error forces the
+    /// fallback even when the root group completed); otherwise fall back to
+    /// age-based `fallback`.
     ReferencedOrAge { grace: Duration, fallback: Duration },
 }
 
 impl ReconcilePolicy {
-    /// The short span leftovers are reaped past once the reference set proved
-    /// usable. Also the window the structured resolver names in its
-    /// no-active-origins diagnostics.
     pub(super) const fn grace(self) -> Duration {
         match self {
             Self::ReferencedOrBail { grace } | Self::ReferencedOrAge { grace, fallback: _ } => {
@@ -294,8 +248,6 @@ pub(super) enum SkipReason {
     NoActiveOrigins,
 }
 
-/// Result of running one [`IndexSource`] in a unit, carrying the context
-/// `decide_sweep` needs to build a diagnostic warn suffix.
 #[derive(Debug)]
 pub(super) struct GroupResult {
     /// Set for [`FlatFetch::RootSegment`] groups — feeds the warn suffix.
@@ -303,9 +255,6 @@ pub(super) struct GroupResult {
     pub outcome: GroupOutcome,
 }
 
-/// Final sweep decision for a unit, derived from its policy and the group
-/// results. Carries the spans, so the engine never re-derives them from the
-/// policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SweepAction {
     /// Sweep leftover candidates on `spans`; `reason` selects the engine's
@@ -314,21 +263,18 @@ pub(super) enum SweepAction {
         spans: SpanTable,
         reason: SweepReason,
     },
-    /// Bail: no sweep this cycle.
+    /// No sweep this cycle.
     Bail,
 }
 
-/// Why a [`SweepAction::Sweep`] is happening, and on what evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SweepReason {
     /// At least one source reconciled (or none needed to): leftovers are
     /// genuinely unreferenced and reaped past the policy's short grace span.
     Grace,
     /// Every index source failed, so the reference set is incomplete and
-    /// leftovers age out on the long fallback span instead. Carries the primary
-    /// fetch failure and, when the root fallback was attempted and fetch-failed,
-    /// the root-segment failure (the warn site only renders it when its status
-    /// differs from the primary).
+    /// leftovers age out on the long fallback span instead. `root_failed` is
+    /// set when the root fallback was attempted and its fetch failed.
     AgeFallback {
         primary: FetchFailure,
         root_failed: Option<(String, FetchFailure)>,
@@ -336,8 +282,7 @@ pub(super) enum SweepReason {
 }
 
 /// Final sweep decision for a unit from its policy and the ordered results of
-/// the groups that ran. The whole flat-cascade fallback table lives here —
-/// replacing the ad-hoc state threading of the previous implementation.
+/// the groups that ran.
 pub(super) fn decide_sweep(policy: ReconcilePolicy, groups: &[GroupResult]) -> SweepAction {
     let grace_sweep = || SweepAction::Sweep {
         spans: SpanTable::uniform(policy.grace()),
@@ -385,9 +330,8 @@ pub(super) fn decide_sweep(policy: ReconcilePolicy, groups: &[GroupResult]) -> S
             };
             match &colocated.outcome {
                 GroupOutcome::Complete | GroupOutcome::NotApplicable(_) => grace_sweep(),
-                // A parse error falls back to age retention even when the
-                // root index reduced fine — quirk preserved from the previous
-                // implementation. See truth-table test.
+                // Quirk: a parse error falls back to age retention even when
+                // the root index reduced fine.
                 GroupOutcome::ParseError => age_sweep(
                     FetchFailure {
                         status: StatusCode::BAD_GATEWAY,
@@ -439,29 +383,21 @@ fn flat_root_split(mirror_path: &str) -> Option<(&str, String)> {
     Some((head, prefix))
 }
 
-/// Classify one `mirrors_v2` row into the ordered [`CleanupUnit`]s the engine
-/// will probe and sweep this cycle.
+/// Classify one `mirrors_v2` row into the [`CleanupUnit`]s the engine runs
+/// this cycle, in execution order.
 ///
-/// Pure: no I/O, no DB — an absent on-disk tree just means the engine's unit
-/// finds nothing to remove. Units are emitted in the exact order the engine
-/// executes them: `[Partials(structured tmp), Partials(flat tmp),
-/// Reconcile(StructuredPool)?, Reconcile(FlatTree), Metadata(Dists)?,
-/// Metadata(Flat), ByHash(DistsByHash)?, ByHash(FlatByHash)]`. The three `?`
-/// units are omitted for a `MirrorKind::Flat` row: `kind` latches one-way to
-/// `Structured` (see `Database::upsert_mirror_id`), so a `Flat` row is guaranteed to
-/// have no structured pool tree, dists tree, or dists by-hash tree on disk.
+/// The Metadata units precede the `ByHash` ones, so a `Release` retired this
+/// cycle unpins its digests in the same cycle. The structured units are
+/// omitted for a `MirrorKind::Flat` row: `kind` latches one-way to
+/// `Structured`, so a `Flat` row has no structured pool, dists or dists
+/// by-hash tree on disk.
 ///
-/// `nested` is the caller's pre-computed list of sibling mirror paths nested
-/// under `entry.path` (`deb_mirror::nested_paths_per_row`); it becomes the
-/// [`ReconcileFacet::FlatTree`] unit's walk boundaries.
+/// `nested` holds the sibling mirror paths nested under `entry.path`; it
+/// becomes the flat tree's walk boundaries.
 ///
-/// Every unit root is a [`CachePaths::entry_dir`] / [`CachePaths::tmp_dir`]
-/// of the mirror's site - the same derivation the serve path writes through
-/// (`ConnectionDetails::cache_file_path`), so a layout whose on-disk position
-/// moved cannot leave cleanup scanning the old one (finding nothing, reaping
-/// nothing, and saying nothing).  Paths are computed from `config` rather
-/// than `global_config()`, which panics outside a running daemon: this
-/// function must stay callable from a plain unit test.
+/// Every unit root comes from [`CachePaths`], the same derivation the serve
+/// path writes through.  Paths are computed from `config` rather than
+/// `global_config()`, which panics outside a running daemon (unit tests).
 pub(super) fn classify_mirror(
     entry: &MirrorEntry,
     nested: Vec<String>,
@@ -476,9 +412,6 @@ pub(super) fn classify_mirror(
 
     let mut units = Vec::with_capacity(8);
 
-    // Structured `tmp/` first, then flat `tmp/`. `tmp/` hangs off each anchor
-    // rather than off a layout subdirectory, so it is the one root not fully
-    // derived from the layout.
     for layout in [CacheLayout::StructuredPool, CacheLayout::Flat] {
         units.push(CleanupUnit::Partials(PartialsUnit {
             root: paths.tmp_dir(layout, site),
@@ -557,8 +490,6 @@ pub(super) fn classify_mirror(
         units.push(CleanupUnit::ByHash(ByHashUnit {
             layout,
             root: paths.entry_dir(layout, site),
-            // The dists metadata tree -- the same root the structured
-            // `Metadata` unit sweeps.
             release_dir: paths.entry_dir(CacheLayout::Dists, site),
             dist_gate: DistGate::ActiveOriginDists,
             grace: UNREFERENCED_KEEP_SPAN,
@@ -570,7 +501,6 @@ pub(super) fn classify_mirror(
     units.push(CleanupUnit::ByHash(ByHashUnit {
         layout,
         root: paths.entry_dir(layout, site),
-        // The flat root -- the same root the flat `Metadata` unit sweeps.
         release_dir: paths.entry_dir(CacheLayout::Flat, site),
         dist_gate: DistGate::None,
         grace: UNREFERENCED_KEEP_SPAN,
@@ -741,10 +671,6 @@ mod tests {
             .expect("FlatTree unit present")
     }
 
-    /// The classifier's whole contract for a structured row, asserted as one
-    /// value: shape, order, layout, root, sources and retention together. Every
-    /// payload is a struct literal, so a new field on any unit shape is a
-    /// compile error here rather than an untested default.
     #[test]
     fn structured_row_emits_all_eight_units_in_order() {
         let entry = test_entry("deb.debian.org", "debian", MirrorKind::Structured);
@@ -754,9 +680,7 @@ mod tests {
         let units = classify_mirror(&entry, Vec::new(), &config);
 
         // The roots are spelled out rather than derived so this test pins the
-        // on-disk positions themselves; `classify_mirror` derives them from
-        // `CachePaths::entry_dir`, the same helper the serve path uses, so a
-        // layout that moves on disk moves cleanup's scan with it.
+        // on-disk positions themselves.
         assert_eq!(
             units,
             vec![
@@ -828,9 +752,8 @@ mod tests {
 
     #[test]
     fn unit_roots_are_the_serve_path_entry_dirs_of_the_site() {
-        // Every root cleanup scans is `CachePaths::entry_dir`/`tmp_dir` of
-        // the same `MirrorSite` the serve path writes through. Rows are
-        // canonical (the alias' main host) by the time cleanup reads them.
+        // Rows are canonical (the alias' main host) by the time cleanup reads
+        // them.
         let entry = test_entry("deb.debian.org", "debian", MirrorKind::Structured);
         let config = test_config("/cache");
         let paths = CachePaths::new(&config.cache_directory);
@@ -941,8 +864,6 @@ mod tests {
             [true, false, false],
         );
 
-        // The full cascade: the owning hybrid group first, then the flat-root
-        // fallback, then the always-last co-located probe `decide_sweep` reads.
         assert_eq!(
             flat_tree.groups,
             vec![

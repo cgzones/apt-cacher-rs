@@ -1,24 +1,13 @@
-//! Memory figures for the dashboard's Memory section: the process's
-//! resident set from `/proc/self/status`, the allocator's own account of
-//! the heap (glibc builds), SQLite's heap, and the estimated footprint of
-//! each process-local store.
+//! Memory figures for the dashboard's Memory section.
 //!
 //! A store's [`Footprint`] is an estimate computed from capacities and
-//! element sizes, never a measurement: no allocator attributes its blocks to
-//! a table. It counts a table's allocation as hashbrown reports it (the
-//! bucket count rounded up to a power of two, a control byte per bucket,
-//! and the buckets deletions leave behind until the next rebuild), a ring
-//! or deque's whole capacity, and the heap blocks the entries own, and
-//! ignores the allocator's per-block rounding and headers, so it reads
-//! somewhat under the truth. The process figures beside it are measured,
-//! which is what makes the gap between them readable: the heap the stores
-//! do not account for is connection buffers, TLS sessions, SQLite, the
-//! runtime and allocator slack.
+//! element sizes, never a measurement: it ignores the allocator's per-block
+//! rounding and headers, so it reads somewhat under the truth. The process
+//! figures beside it are measured.
 //!
 //! Every reader here runs on a dashboard render only, never on a request
 //! path; the store footprints take each store's lock briefly, so none of
-//! them may iterate a large table (the checksum registry's reads only its
-//! per-scope capacities for that reason).
+//! them may iterate a large table.
 
 use std::ops::{Add, AddAssign};
 
@@ -78,7 +67,6 @@ pub(crate) struct ProcessMemory {
 
 const PROC_SELF_STATUS: &str = "/proc/self/status";
 
-/// The process's memory now, `None` when `/proc` cannot say.
 #[must_use]
 pub(crate) fn process_memory() -> Option<ProcessMemory> {
     match std::fs::read_to_string(PROC_SELF_STATUS) {
@@ -93,9 +81,8 @@ pub(crate) fn process_memory() -> Option<ProcessMemory> {
     }
 }
 
-/// The memory lines of a `/proc/<pid>/status` listing; `None` without a
-/// `VmRSS` line. The per-kind `Rss*` lines exist since Linux 4.5 and read
-/// as zero before that.
+/// `None` without a `VmRSS` line. The per-kind `Rss*` lines exist since
+/// Linux 4.5 and read as zero before that.
 fn parse_status(status: &str) -> Option<ProcessMemory> {
     let mut memory = ProcessMemory::default();
     let mut saw_resident = false;
@@ -145,8 +132,7 @@ pub(crate) struct AllocatorStats {
     pub(crate) mmapped: u64,
 }
 
-/// The allocator's figures now. Walks every arena under its lock, so this
-/// is a dashboard reader, not a hot-path one.
+/// Walks every arena under its lock, so not for a hot path.
 #[cfg(target_env = "gnu")]
 #[must_use]
 pub(crate) fn allocator_stats() -> AllocatorStats {
@@ -215,9 +201,6 @@ impl AllocatorTuning {
     }
 }
 
-/// The pin for a process whose largest per-connection buffer is
-/// `largest_buffer` bytes: [`BUFFER_HEADROOM`] above it, within glibc's
-/// range.
 #[cfg(target_env = "gnu")]
 const fn pinned_threshold(largest_buffer: usize) -> usize {
     let threshold = largest_buffer.saturating_add(BUFFER_HEADROOM);
@@ -237,25 +220,18 @@ const fn pinned_threshold(largest_buffer: usize) -> usize {
 /// every larger block freed, up to 32 MiB: the first freed 8 MiB LZMA
 /// dictionary moves every later dictionary, every `Packages` buffer and
 /// every reallocation of a growing table into the arenas, where a freed
-/// block only leaves if it sits at the arena's top. Measured on nine Debian
-/// indexes: 85 MB freed but retained next to 85 MB in use, the retained
-/// part never returned. Pinned, those blocks are mapped on their own and
-/// unmapped on free; the arenas keep the small blocks they are good at.
+/// block only leaves if it sits at the arena's top (measured on nine Debian
+/// indexes: 85 MB freed but retained next to 85 MB in use). Pinned, those
+/// blocks are mapped on their own and unmapped on free.
 ///
-/// The per-connection buffers stay below the pin whatever `buffer_size`
-/// says (up to glibc's ceiling, past which the dynamic threshold would have
-/// mapped them too): a buffer per connection through `mmap(2)` would be a
-/// mapping and a round of page faults per transfer.
+/// The per-connection buffers stay below the pin: a buffer per connection
+/// through `mmap(2)` would be a mapping and a round of page faults per
+/// transfer.
 ///
-/// Call it once the configuration is loaded and before the process starts
-/// a second thread: glibc lists `mallopt(3)` as MT-unsafe, its parameter
-/// writes being unsynchronised with allocations on other threads. The
-/// outcome is returned for logging because logging is not up yet at that
-/// point. It overrides a `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=` the
-/// operator may have set.
-///
-/// mimalloc (the musl build's allocator) returns freed memory itself, so
-/// there is nothing to tune there.
+/// Call it before the process starts a second thread: glibc lists
+/// `mallopt(3)` as MT-unsafe. The outcome is returned for logging because
+/// logging is not up yet at that point. It overrides a
+/// `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=` the operator may have set.
 #[cfg(target_env = "gnu")]
 #[must_use]
 pub(crate) fn tune_allocator(largest_buffer: usize) -> AllocatorTuning {
@@ -316,8 +292,6 @@ mod tests {
         );
     }
 
-    /// A kernel without the per-kind lines (before 4.5) still yields the
-    /// total; a listing without `VmRSS` yields nothing.
     #[test]
     fn missing_lines_read_as_zero_but_the_resident_set_is_required() {
         let parsed = parse_status("VmRSS:\t 2048 kB\n").expect("VmRSS suffices");
@@ -336,8 +310,6 @@ mod tests {
         assert!(memory.anonymous + memory.file_backed + memory.shared <= memory.resident + 4096);
     }
 
-    /// The estimate follows hashbrown's bucket rounding: the reported
-    /// capacity is 7/8 of a power-of-two bucket count.
     #[cfg(target_env = "gnu")]
     #[test]
     fn the_allocator_accounts_for_a_live_block() {
@@ -366,10 +338,8 @@ mod tests {
         assert_eq!(pinned_threshold(usize::MAX), MAX_MMAP_THRESHOLD);
     }
 
-    /// The pin exists so that a per-connection buffer is never a mapping of
-    /// its own; one of exactly the largest size must come from the arena
-    /// while a larger block is mapped and returned on free. Runs in its own
-    /// process under nextest, so the pin affects no other test.
+    /// Runs in its own process under nextest, so the pin affects no other
+    /// test.
     #[cfg(all(target_env = "gnu", target_pointer_width = "64"))]
     #[test]
     fn a_block_of_the_largest_buffer_s_size_stays_in_the_arena() {

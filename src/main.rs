@@ -139,19 +139,17 @@ mod sticky {
     pub(crate) struct Bool(bool);
 
     impl Bool {
-        /// Create a new `Bool` with the value `false`.
         #[inline]
         pub(crate) const fn new() -> Self {
             Self(false)
         }
 
-        /// Return the value of this `Bool`.
         #[inline]
         pub(crate) const fn get(self) -> bool {
             self.0
         }
 
-        /// Set the value of this `Bool` to `true` and return the old value.
+        /// Returns the old value.
         #[inline]
         pub(crate) const fn set(&mut self) -> bool {
             let old = self.0;
@@ -323,7 +321,6 @@ static RUNTIMEDETAILS: OnceLock<RuntimeDetails> = OnceLock::new();
 static LOGSTORE: OnceLock<logstore::LogStore> = OnceLock::new();
 static OUTPUT_LOG_REOPEN: OnceLock<Arc<LogReopen>> = OnceLock::new();
 
-/// The process-wide state `main()` sets before anything reads it.
 #[must_use]
 #[inline]
 pub(crate) fn runtime_details() -> &'static RuntimeDetails {
@@ -362,7 +359,6 @@ pub(crate) fn global_verify_throttle() -> &'static verify_throttle::VerifyThrott
     &runtime_details().verify_throttle
 }
 
-/// Why the native root CA store could not be assembled.
 #[cfg(all(feature = "tls_rustls", not(feature = "webpki-roots")))]
 #[derive(Debug, thiserror::Error)]
 enum RootStoreError {
@@ -659,9 +655,6 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
     debug!("Logger initialized");
     trace!("Tracing enabled");
 
-    // First line of every log: which build is talking. Feature flags decide
-    // which backend serves a request (sendfile/splice/hyper) and which TLS
-    // stack is used, so a log without them cannot be read confidently.
     info!(
         "apt-cacher-rs {APP_VERSION} ({}) starting...",
         FEATURES_ONE_LINE
@@ -745,8 +738,7 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
         // the whole budget before the next one is tried.
         tcp_connector.set_connect_timeout(Some(config_http_timeout));
         // Race IPv6 and IPv4 like `upstream_dial` does for the splice backend
-        // and the CONNECT relays (the value is hyper-util's default, pinned so
-        // the backends cannot drift apart).
+        // and the CONNECT relays.
         tcp_connector.set_happy_eyeballs_timeout(Some(upstream_dial::FALLBACK_DELAY));
 
         #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]

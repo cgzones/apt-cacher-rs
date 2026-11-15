@@ -11,26 +11,19 @@
 //! cryptographic root of trust.
 //!
 //! Scope: verification gates *caching*, not in-flight *delivery*. A client
-//! served concurrently from the same download -- a late joiner streaming the
-//! growing partial file, or one attaching during the post-download `Verifying`
-//! hash window (`ActiveDownloadStatus::Verifying`) -- receives its bytes before
-//! the digest is known. A mismatch then blocks the `rename` (nothing enters the
-//! cache) but cannot unsend what was already streamed; such readers hold an open
-//! FD and finish serving even after the temp file is unlinked. That is
-//! acceptable precisely because this is defence in depth: the concurrent
-//! client's own APT GPG check is the backstop. So a reader path serving an
-//! unverified `Verifying`/`Download` file is by design, not a bug to "fix".
+//! served concurrently from the same download (a late joiner streaming the
+//! growing partial file, or one attaching during the post-download
+//! `Verifying` hash window) receives its bytes before the digest is known. A
+//! mismatch then blocks the `rename` but cannot unsend what was already
+//! streamed. That is by design: the concurrent client's own APT GPG check is
+//! the backstop.
 //!
 //! The registry learns an index's digests when the index is committed, and
 //! again whenever a request for it is answered without a commit (a cache
 //! hit, a client or upstream 304) while its digests are missing: after a
 //! restart, an eviction from its scope, or a skipped or transiently failed
-//! ingest. `ingest_ledger` records which cache files are ingested (or failed
-//! for good), so a warm index costs `schedule_ingest` classifying the file
-//! and reading its registry scope's eviction epoch under the registry mutex,
-//! then one `ingest_ledger` map lookup that finds it already marked and
-//! returns; every backend calls [`note_cached_index_touch`] where it answers
-//! an index from cache.
+//! ingest. Every backend calls [`note_cached_index_touch`] where it answers
+//! an index from cache; `ingest_ledger` keeps that cheap for a warm index.
 
 use std::borrow::Cow;
 use std::collections::{BinaryHeap, VecDeque};
@@ -80,29 +73,22 @@ use crate::{
 /// so report it through [`ErrorReport`].
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CommitError {
-    /// The downloaded content did not match its expected digest.
     #[error("checksum mismatch")]
     ChecksumMismatch,
     /// Reading the temp file back for verification, or the `fstat` that ties
-    /// the rename to the verified file, failed. Fail-closed: a file that
-    /// cannot be verified does not enter the cache. Counted
+    /// the rename to the verified file, failed. Fail-closed. Counted
     /// (`CACHE_IO_FAILURE`) and logged where it arises.
     #[error("verification I/O error")]
     VerifyIo(#[source] std::io::Error),
-    /// [`rename_into_cache`] of the verified temp file failed — either the
-    /// `rename(2)` itself, or the `create_dir_all` it falls back to when the
-    /// destination directory turns out to be missing — or the path no longer
-    /// named the verified file, or the job died while renaming. Counted and
-    /// logged once, in [`verify_and_rename`]'s tail.
+    /// The `rename(2)` (or the `create_dir_all` it falls back to) failed, the
+    /// path no longer named the verified file, or the job died while
+    /// renaming. Counted and logged once, in [`verify_and_rename`]'s tail.
     #[error("rename failed")]
     Rename(#[source] std::io::Error),
 }
 
-/// Input for [`verify_temp_file`]. Holds everything the decision needs as
-/// plain values/borrows so the decision logic is global-free (no `global_config()`, no
-/// process-wide registry) and therefore unit-testable. Note: `verify_temp_file`
-/// performs file I/O (it reads and hashes `file`) - it is not a pure
-/// function, but it is free of process-global state.
+/// Input for [`verify_temp_file`]: plain values/borrows, so the decision is
+/// free of process-global state and unit-testable.
 struct VerifyInput<'a> {
     /// [`VerifyKind::Unverifiable`] when verification is disabled
     /// ([`digest_source`] yields no digest then).
@@ -113,37 +99,27 @@ struct VerifyInput<'a> {
     /// client's `sendfile` -- uses explicit offsets
     /// (`splice/body.rs::prepare_file_serve`).
     file: &'a std::fs::File,
-    /// `file`'s `fstat`, taken by the commit job before verifying (it also
-    /// ties the rename to this file). Nothing moves the file's size or mtime
-    /// after it: the writer has finished, hashing only reads and the marker's
-    /// xattr write leaves the mtime alone. So it serves the streamed-digest
-    /// size check, the read-ahead hint and the marker's identity, with no
-    /// stat of their own.
+    /// `file`'s `fstat`, taken by the commit job before verifying. Nothing
+    /// moves the file's size or mtime after it (the writer has finished,
+    /// hashing only reads and the marker's xattr write leaves the mtime
+    /// alone), so it also serves as the marker's identity.
     meta: &'a Metadata,
     /// `file`'s path, for log context and the verified marker only; never
     /// reopened.
     temp_path: &'a Path,
     /// The digest the body loop computed as it wrote the file, when it could
-    /// (the splice-only `stream_hash_algo_for_download` picked an algorithm,
-    /// the download did not resume onto a pre-existing prefix, and the bytes
-    /// passed through userspace).
-    /// Used only if its algorithm is the one the expected digest needs *and*
-    /// it covered as many bytes as the finished file holds; otherwise, and
-    /// when `None`, the file is re-read and hashed.
+    /// (splice only, no resume onto a pre-existing prefix, bytes passed
+    /// through userspace). Used only if its algorithm is the one the expected
+    /// digest needs *and* it covered as many bytes as the finished file
+    /// holds; otherwise the file is re-read and hashed.
     streamed: Option<StreamedDigest>,
 }
 
-/// What the downloaded temp file is verified against. The resource-kind ->
-/// expected-digest mapping is resolved at construction (in
-/// `verify_and_rename`), so the pure decision never re-derives it and no
-/// half-resolved combination - a by-hash algorithm whose digest did not
-/// decode, a registry-backed kind carrying no digest - is representable.
+/// What the downloaded temp file is verified against.
 enum VerifyKind {
-    /// The expected digest is known: hash the temp file with `algo` and
-    /// compare. For a by-hash resource `algo` is the authoritative algorithm
-    /// the parser validated for the `<algo>` URL path segment
-    /// (`SHA256`/`SHA512`) and carried on the `ResourceKind`, never inferred
-    /// from the digest length; for a registry-backed one it is always SHA256.
+    /// For a by-hash resource the algorithm is the one from the `<algo>` URL
+    /// path segment, never inferred from the digest length; for a
+    /// registry-backed one it is always SHA256.
     Expected(Digest),
     /// The resource *could* have been verified but no expected digest is
     /// known - a registry miss, or a by-hash URL whose algorithm segment and
@@ -156,22 +132,14 @@ enum VerifyKind {
     Unverifiable,
 }
 
-/// Resolve a by-hash URL's `(algo, leaf)` pair into a [`VerifyKind`].
-///
-/// `algo` is the authoritative algorithm the parser took from the URL's
-/// `<algo>` segment (the one directly before the digest, never re-read from
-/// the raw path, where an earlier decoy `by-hash` segment could name another)
-/// and the digest length is cross-checked against it inside
-/// [`index_parser::byhash_digest_for_algo`], so a pair that disagrees
-/// degrades to [`VerifyKind::Unknown`] instead of hashing with a guessed
-/// algorithm.
+/// `algo` is the one the parser took from the URL's `<algo>` segment (never
+/// re-read from the raw path, where an earlier decoy `by-hash` segment could
+/// name another). A digest length that disagrees with it degrades to
+/// [`VerifyKind::Unknown`] instead of hashing with a guessed algorithm.
 fn byhash_verify_kind(algo: HashAlgo, filename: &str) -> VerifyKind {
     let Some(digest) = index_parser::byhash_digest_for_algo(algo, filename) else {
-        // Defence in depth: the URL parser already rejects anything other
-        // than `SHA256/<64-hex>` or `SHA512/<128-hex>` with the algorithm
-        // segment cross-checked against the digest length, so reaching this
-        // branch indicates a future divergence between the parser and the
-        // digest decoder. Keep the warning visible.
+        // The URL parser already rejects this, so reaching here means the
+        // parser and the digest decoder diverged.
         warn_once_or_info!(
             "By-hash digest did not decode for its URL algorithm; caching `{}` unverified",
             filename.escape_debug()
@@ -181,22 +149,16 @@ fn byhash_verify_kind(algo: HashAlgo, filename: &str) -> VerifyKind {
     VerifyKind::Expected(digest)
 }
 
-/// Verification decision. Covers by-hash self-verification plus
-/// registry-backed lookups for `Pool` (.deb) and `Packages` resources.
-///
-/// Global-free (no `global_config()`, no registry): all inputs arrive via
-/// [`VerifyInput`], making this unit-testable. It performs file I/O (reads
-/// and hashes `file`) only for [`VerifyKind::Expected`]; callers on an async
-/// worker must wrap that case in `spawn_blocking` (`verify_and_rename` runs it
-/// inside its commit job).
+/// Performs file I/O (reads and hashes `file`) only for
+/// [`VerifyKind::Expected`]; callers on an async worker must wrap that case
+/// in `spawn_blocking`.
 ///
 /// `Ok` when verification passed or was skipped (disabled / non-verifiable /
-/// unknown digest): the caller proceeds with the `rename`. `Err`: it must not.
+/// unknown digest).
 fn verify_temp_file(input: &VerifyInput<'_>) -> Result<(), CommitError> {
     let VerifyKind::Expected(expected) = &input.kind else {
-        // Best-effort: no known digest -> cache unverified. Only count the
-        // kinds that *could* have been verified, so the metric reflects a real
-        // coverage gap rather than every metadata / flat-pool file.
+        // Only count the kinds that *could* have been verified, so the metric
+        // reflects a real coverage gap.
         if matches!(input.kind, VerifyKind::Unknown) {
             metrics::CHECKSUM_UNVERIFIED.increment();
         }
@@ -251,33 +213,24 @@ fn verify_temp_file(input: &VerifyInput<'_>) -> Result<(), CommitError> {
         Ok(())
     } else {
         metrics::CHECKSUM_MISMATCH.increment();
-        // WARN (not ERROR): can also be a third-party repo that replaced a
-        // file in place. The async wrapper logs once per mismatch with host
-        // and path in scope; each event is potentially security-relevant so
-        // they are not rate-limited.
+        // Logged by the async wrapper, with host and path in scope. WARN (not
+        // ERROR): can also be a third-party repo that replaced a file in
+        // place. Not rate-limited: each event is potentially
+        // security-relevant.
         Err(CommitError::ChecksumMismatch)
     }
 }
 
-/// The body loop's incremental digest, when that digest can be trusted for
-/// `algo` — the stream-verified counterpart of [`hash_file`]: same fd, none
-/// of the reading, and no `hint_sequential_read` because nothing is read.
+/// The body loop's incremental digest, when it can be trusted for `algo`.
 ///
-/// Two things have to hold, and neither is checked anywhere else. The
-/// algorithm must be the one the expected digest uses; a mismatch (the stream
-/// guessed SHA-256 for a registry hit that turned out to be by-hash SHA-512,
-/// say) is an ordinary outcome and falls back silently. And the byte count the
-/// hasher consumed must equal the size of the file about to be renamed in:
-/// without that, a file diverging from the stream — a future write site that
-/// bypasses the two hashing ones, a mis-accounted short write — would be
+/// An algorithm mismatch is an ordinary outcome and falls back silently. The
+/// byte count the hasher consumed must equal the size of the file about to
+/// be renamed in: otherwise a file diverging from the stream would be
 /// committed as verified *and* have that digest stamped into the cleanup
-/// marker, which makes cleanup trust it forever. A divergence is a bug rather
-/// than a condition to tolerate, so it is logged loudly, but the fallback is
-/// the re-read: hashing what is actually on disk answers the verification
-/// question correctly either way, and rejecting outright would discard a
-/// download that may well be intact.
-///
-/// `on_disk` is the size from the commit job's `fstat` ([`VerifyInput::meta`]).
+/// marker, which makes cleanup trust it forever. A divergence is a bug, so
+/// it is logged loudly, but the fallback is the re-read rather than a
+/// reject: hashing what is on disk answers the question correctly either
+/// way.
 fn reuse_streamed_digest<'a>(
     streamed: Option<&'a StreamedDigest>,
     algo: HashAlgo,
@@ -301,11 +254,9 @@ fn reuse_streamed_digest<'a>(
     Some(streamed.digest.as_slice())
 }
 
-/// Rewind the already-open temp file, hint sequential read, and hash it --
-/// the download's own descriptor, so no reopen of `path` (which is for log
-/// context only). The writer's cursor sits wherever its last write left it;
-/// the rewind is what makes the read start at byte 0. `size` is the file's
-/// length, for the read-ahead hint and the read buffer.
+/// Hashes through the download's own descriptor (`path` is for log context
+/// only). The writer's cursor sits wherever its last write left it, hence
+/// the rewind.
 fn hash_file(
     file: &std::fs::File,
     size: u64,
@@ -320,29 +271,21 @@ fn hash_file(
     index_parser::hash_open_file(algo, &mut reader, size)
 }
 
-/// Rename paths and resource identity for `verify_and_rename`. Built in
-/// exactly one place, `RenameBarrier::commit` (`guards.rs`), from the identity
-/// the barrier chain carries since `InitBarrier::new` - no download backend
-/// assembles one.
+/// Rename paths and resource identity for `verify_and_rename`.
 pub(crate) struct RenamePlan {
-    /// The final cache path to rename into.
     pub(crate) dest_path: PathBuf,
-    /// Precise resource kind, from `ConnectionDetails::resource_kind`.
     pub(crate) resource_kind: ResourceKind,
     /// The download's cache entry, shared with its write lease.
     ///
     /// `debname` is the on-disk leaf name. For a by-hash resource this is the
-    /// hex digest, used by `verify_temp_file` to decode the expected hash;
-    /// for `Pool` it is the basename used directly as the registry-lookup
-    /// key; for other kinds it is kept only for log context.
+    /// hex digest; for `Pool` it is the basename used directly as the
+    /// registry-lookup key; for other kinds it is kept only for log context.
     ///
-    /// `mirror` is the canonical mirror. Its authority (host and port,
-    /// `Mirror::format_authority()`) and repo-prefix path (`Mirror::path()`)
-    /// are the registry key, so two distinct mirrors served from the same
-    /// host (e.g. `host/m1/pool/...` vs `host/m2/pool/...`, or one repository
-    /// per port) cannot poison each other's expected digests via
-    /// same-named packages; the whole mirror names it in the
-    /// `mirror_indexes` a committed `Release` records.
+    /// `mirror` is the canonical mirror. Its authority (host and port) and
+    /// repo-prefix path are the registry key, so two distinct mirrors served
+    /// from the same host (e.g. `host/m1/pool/...` vs `host/m2/pool/...`, or
+    /// one repository per port) cannot poison each other's expected digests
+    /// via same-named packages.
     pub(crate) key: Arc<CacheEntryKey>,
     /// The raw request URI path (pre-normalisation). Used for `Release`
     /// relative-path resolution and as the relative-key component of the
@@ -350,28 +293,21 @@ pub(crate) struct RenamePlan {
     pub(crate) raw_uri_path: String,
 }
 
-/// Owned `(authority, mirror_path, relpath)` registry key, `authority` being
-/// the mirror's `host[:port]` ([`Mirror::format_authority`]). `relpath` is the
-/// resource's agreed lookup key, NOT uniformly "repo-relative": for a pool
-/// `.deb` (layer B) it is the bare basename, for an index file (layer C) it is
-/// the full host-relative URI path (e.g.
-/// `debian/dists/sid/main/binary-amd64/Packages.xz`). `mirror_path`
-/// discriminates same-`relpath` entries that two mirrors on the same host can
-/// otherwise overwrite — see `RenamePlan::mirror`.  The port is part of the
-/// scope because `allowed_mirrors` permits a host on every port: without it,
-/// a client fetching an index from `host:8080` would replace the digests the
-/// default port's downloads are checked against. (For layer-C keys
-/// `mirror_path` is a redundant prefix of `relpath`; for layer-B basenames it
-/// is the sole discriminator.)
+/// Registry scope: the mirror's `host[:port]` and repo-prefix path. The
+/// per-scope lookup key (`relpath`) is NOT uniformly "repo-relative": for a
+/// pool `.deb` (layer B) it is the bare basename, for an index file (layer
+/// C) the full host-relative URI path (e.g.
+/// `debian/dists/sid/main/binary-amd64/Packages.xz`). The port is part of
+/// the scope because `allowed_mirrors` permits a host on every port: without
+/// it, a client fetching an index from `host:8080` would replace the digests
+/// the default port's downloads are checked against.
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct RegistryScope {
     authority: String,
     mirror_path: String,
 }
 
-/// Borrowed lookup key paired with `RegistryScope` via
-/// `hashbrown::Equivalent`, so `lookup` does not allocate per call. Mirrors
-/// the pattern of `cache_layout::CacheEntryKeyRef`.
+/// Borrowed form of `RegistryScope`, so `lookup` does not allocate.
 #[derive(Hash)]
 struct RegistryScopeRef<'a> {
     authority: &'a str,
@@ -397,39 +333,24 @@ impl Equivalent<Arc<RegistryScope>> for RegistryScopeRef<'_> {
 }
 
 /// Bounded in-memory map from `(authority, mirror_path)` scope and per-scope
-/// resource lookup key to an expected SHA256 digest, populated by parsing
-/// `Packages` / `Release` index files as they flow through. In-memory only
-/// (lost on restart; an index answered from cache is re-ingested when its
-/// digests are missing, see the module doc). FIFO bulk eviction at the
+/// lookup key to an expected SHA256 digest, populated from `Packages` /
+/// `Release` index files. Lost on restart. FIFO bulk eviction at the
 /// configured cap, checked once per insert batch (so the count may pass the
-/// cap by up to one batch while that batch holds the lock).
+/// cap by up to one batch).
 ///
-/// Two-level layout: essentially all entries of one mirror share the same
-/// `(authority, mirror_path)` pair, so the scope is allocated once per
-/// mirror. An entry holds no key text at all: a 128-bit fingerprint of its
-/// relpath (the first half of its SHA-256), the digest and its family, 49
-/// bytes in an insertion-ordered slot log ([`Slot`]) indexed by an 8-byte
-/// sequence number. Measured on nine Debian indexes (385k entries): ~70
-/// bytes per entry, 26 MB; keying on the relpath as an `Arc<str>` with a
-/// separate order log cost ~200, 76 MB, and the daemon sat at 172 MB
-/// resident. The fingerprint stands in for the
-/// key because nothing reads a key back (a miss is explained by counts) and
-/// a collision between two names a mirror actually publishes is a 2^-128
-/// event; an upstream that could craft a colliding name controls the index,
-/// and with it the digest, already. What that upstream must not be able to
-/// steer is where a slot lands in the index: it is filed under a hash of
-/// the fingerprint from a per-scope randomly seeded hasher, never under the
-/// fingerprint's own bits, which are public (a `Packages` whose names all
-/// share the low bits of their SHA-256 would otherwise make every insert
-/// walk one probe sequence, quadratic work under the lock each digest
-/// lookup takes).
+/// An entry holds no key text: a 128-bit fingerprint of its relpath (the
+/// first half of its SHA-256), the digest and its family, in an
+/// insertion-ordered slot log ([`Slot`]); ~70 bytes per entry against ~200
+/// when keyed on the relpath text. Nothing reads a key back, and an upstream
+/// that could craft a colliding name controls the index, and with it the
+/// digest, already. What that upstream must not be able to steer is where a
+/// slot lands in the index: it is filed under a hash of the fingerprint from
+/// a per-scope randomly seeded hasher, never under the fingerprint's own
+/// (public) bits, or a crafted `Packages` could make every insert walk one
+/// probe sequence under the lock each digest lookup takes.
 ///
-/// `insert` and `lookup` are module-private on purpose: the only writers are
-/// the ingests `schedule_ingest` runs (on commit or on a cache-hit touch)
-/// and the only reader is `verify_and_rename`, so nothing outside this
-/// module can seed or consult expected digests.
-/// `new` (from `main`), `len` and `footprint` (the dashboard's gauge and
-/// memory row) are the whole crate-visible surface.
+/// `insert` and `lookup` are module-private on purpose, so nothing outside
+/// this module can seed or consult expected digests.
 #[derive(Debug)]
 pub(crate) struct ChecksumRegistry {
     inner: Mutex<RegistryInner>,
@@ -441,8 +362,7 @@ pub(crate) struct ChecksumRegistry {
     cap: usize,
 }
 
-/// A registry key's 128-bit fingerprint, the first half of its SHA-256:
-/// what a scope stores and compares in place of the key text.
+/// The first half of the key's SHA-256, stored in place of the key text.
 type Fingerprint = [u8; 16];
 
 fn fingerprint(key: &str) -> Fingerprint {
@@ -463,21 +383,15 @@ fn fingerprint_joined<'a>(parts: impl IntoIterator<Item = &'a str>) -> Fingerpri
         .expect("a SHA-256 holds 16 bytes")
 }
 
-/// The hash a fingerprint's slot is filed under in a scope's `index`, from
-/// the scope's seeded hasher. Not the fingerprint's own bits: those are
-/// public, and the names behind them come from the upstream (see the
-/// [`ChecksumRegistry`] doc).
+/// Seeded per scope rather than the fingerprint's own bits; see the
+/// [`ChecksumRegistry`] doc.
 fn fingerprint_hash(hasher: &DefaultHashBuilder, key: &Fingerprint) -> u64 {
     hasher.hash_one(key)
 }
 
-/// One registered digest: its key's fingerprint, the digest and the key's
-/// family (so an eviction knows which count it lowers without the key
-/// text). 49 bytes, nothing on the heap. Built by the ingest that read the
-/// digest, outside the registry lock: the family is fixed per writer
-/// (`Packages` registers [`KeyKind::Package`], `Release`
-/// [`KeyKind::Index`]), and the fingerprint is the SHA-256 the lock would
-/// otherwise run once per entry.
+/// One registered digest. The family is stored so an eviction knows which
+/// count it lowers without the key text. Built by the ingest, outside the
+/// registry lock, so the fingerprint's SHA-256 does not run under it.
 #[derive(Clone, Copy, Debug)]
 struct Slot {
     key: Fingerprint,
@@ -487,7 +401,6 @@ struct Slot {
 
 #[cfg(test)]
 impl Slot {
-    /// The slot of `key`, its family read off the text as a lookup does.
     fn for_key(key: &str, digest: [u8; 32]) -> Self {
         Self {
             key: fingerprint(key),
@@ -497,8 +410,6 @@ impl Slot {
     }
 }
 
-/// One `(authority, mirror_path)` scope: its slots in insertion order and
-/// the index of the live ones.
 #[derive(Debug, Default)]
 struct ScopeState {
     /// Every insert appends a slot; the slot at position `i` has sequence
@@ -511,9 +422,8 @@ struct ScopeState {
     /// no sequence is ever handed out twice.
     base: u64,
     /// The sequence of each live key's slot, filed under `fingerprint_hash`
-    /// of its key: one entry per live key.
+    /// of its key.
     index: HashTable<u64>,
-    /// Seeds `index`'s placement; one random seed per scope.
     hasher: DefaultHashBuilder,
     /// Per `Release` directory, the `Date:` (unix seconds; `None` when the
     /// file had none) of the newest `Release`/`InRelease` whose entries were
@@ -527,7 +437,6 @@ struct ScopeState {
     packages: usize,
 }
 
-/// The slot of sequence `seq` in `slots` whose front has sequence `base`.
 /// Free-standing (not a `ScopeState` method) so a closure over the slots
 /// can run while the scope's `index` is borrowed mutably.
 fn slot_in(slots: &VecDeque<Slot>, base: u64, seq: u64) -> Option<&Slot> {
@@ -535,12 +444,9 @@ fn slot_in(slots: &VecDeque<Slot>, base: u64, seq: u64) -> Option<&Slot> {
     slots.get(position)
 }
 
-/// Which of the two digest families a registry key belongs to. One scope
-/// holds both, and the key alone tells them apart ([`Self::of`], for the
-/// lookup side, which has the text): a package's key is its bare basename
-/// (`index_parser::structured_lookup_key`), an index's the host-relative
-/// path `ingest_release_file` fingerprints (`<release_dir>/<rel>`, so it
-/// always holds a `/`).
+/// Which of the two digest families a registry key belongs to. The key
+/// alone tells them apart: a package's key is its bare basename, an index's
+/// the host-relative path `<release_dir>/<rel>`, which always holds a `/`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KeyKind {
     /// A `.deb`, registered by a `Packages` index.
@@ -559,10 +465,8 @@ impl KeyKind {
     }
 }
 
-/// Why a lookup came up empty: what the scope holds of the missed key's
-/// family. A cold registry (nothing ingested since startup, or not yet) and
-/// a populated one that does not list the key call for different reactions,
-/// and the miss line is the only place either is visible.
+/// Why a lookup came up empty: a cold registry and a populated one that
+/// does not list the key call for different reactions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RegistryMiss {
     kind: KeyKind,
@@ -597,7 +501,6 @@ impl fmt::Display for RegistryMiss {
 }
 
 impl ScopeState {
-    /// The live slot of `key`, if it has one.
     fn live(&self, key: &Fingerprint) -> Option<&Slot> {
         self.index
             .find(fingerprint_hash(&self.hasher, key), |&seq| {
@@ -606,12 +509,10 @@ impl ScopeState {
             .and_then(|&seq| slot_in(&self.slots, self.base, seq))
     }
 
-    /// The sequence the next appended slot gets.
     fn next_seq(&self) -> u64 {
         self.base + self.slots.len() as u64
     }
 
-    /// Live entries.
     fn len(&self) -> usize {
         self.index.len()
     }
@@ -619,12 +520,9 @@ impl ScopeState {
 
 #[derive(Debug)]
 struct RegistryInner {
-    /// `(authority, mirror_path)` scope to its slots and index. The scope
-    /// `Arc` is shared with the eviction epochs, so a scope's strings are
-    /// allocated once.
+    /// The scope `Arc` is shared with the eviction epochs.
     map: HashMap<Arc<RegistryScope>, ScopeState>,
-    /// Total live entry count across all scopes (the outer map's `len`
-    /// counts scopes, not entries).
+    /// Live entries across all scopes.
     len: usize,
 }
 
@@ -705,16 +603,13 @@ impl ChecksumRegistry {
         }
     }
 
-    /// Insert (or refresh) an expected digest: a batch of one.
     #[cfg(test)]
     fn insert(&self, authority: &str, mirror_path: &str, relpath: &str, digest: [u8; 32]) {
         self.insert_many(authority, mirror_path, &[Slot::for_key(relpath, digest)]);
     }
 
-    /// Insert (or refresh) a batch of one scope's digests under one lock,
-    /// then evict if the batch pushed the registry past its cap
-    /// ([`Self::evict_over_cap`]). Re-inserting an existing key refreshes
-    /// its eviction-order position to most-recent.
+    /// Re-inserting an existing key refreshes its eviction-order position to
+    /// most-recent.
     fn insert_many(&self, authority: &str, mirror_path: &str, slots: &[Slot]) {
         let mut inner = self.inner.lock();
         let _scope = inner.insert(authority, mirror_path, slots);
@@ -725,15 +620,13 @@ impl ChecksumRegistry {
     /// Register a `Release`/`InRelease`'s `Packages` entries unless a newer
     /// source for the same directory already did; `false` when superseded.
     /// Decided and written under one lock, so a concurrently ingested
-    /// sibling cannot interleave its inserts. Ordering: a dated source
-    /// beats an undated one; between dated ones the later `Date:` wins
-    /// (equal dates overwrite, harmlessly); two undated ones keep
-    /// last-writer-wins. An archive whose `Date:` legitimately goes
-    /// backwards (restored from backup) is therefore pinned to the newer
-    /// date already recorded until this process restarts or the scope
-    /// drains from eviction -- `date` here has already been clamped by
-    /// [`clamp_future_release_date`], so this rule only ever sees a date
-    /// that was not implausibly far in the future when ingested.
+    /// sibling cannot interleave its inserts. A dated source beats an
+    /// undated one; between dated ones the later `Date:` wins; two undated
+    /// ones keep last-writer-wins. An archive whose `Date:` legitimately
+    /// goes backwards (restored from backup) is therefore pinned to the
+    /// newer date already recorded until this process restarts or the scope
+    /// drains from eviction. `date` is already clamped
+    /// ([`clamp_future_release_date`]).
     fn insert_release(
         &self,
         authority: &str,
@@ -766,9 +659,6 @@ impl ChecksumRegistry {
         true
     }
 
-    /// Look up an expected digest by `(authority, mirror_path, relpath)`.
-    /// Allocation-free: the scope through `hashbrown::Equivalent`, the key
-    /// through its fingerprint.
     fn lookup(&self, authority: &str, mirror_path: &str, relpath: &str) -> Option<[u8; 32]> {
         let key = fingerprint(relpath);
         let inner = self.inner.lock();
@@ -778,10 +668,9 @@ impl ChecksumRegistry {
             .map(|slot| slot.digest)
     }
 
-    /// What the scope holds of `relpath`'s family, for the line reporting
-    /// that [`Self::lookup`] missed it. A second lock round trip, taken on
-    /// the miss path only; an ingest landing in between makes the figure
-    /// newer than the miss, never wrong about the scope.
+    /// A second lock round trip, taken on the miss path only; an ingest
+    /// landing in between makes the figure newer than the miss, never wrong
+    /// about the scope.
     fn explain_miss(&self, authority: &str, mirror_path: &str, relpath: &str) -> RegistryMiss {
         let kind = KeyKind::of(relpath);
         let held = self
@@ -800,15 +689,13 @@ impl ChecksumRegistry {
         }
     }
 
-    /// Current entry count (for the web dashboard).
     pub(crate) fn len(&self) -> usize {
         self.inner.lock().len
     }
 
-    /// Entries and the heap they take: every scope's slot log, index and
-    /// release dates, the scope table, and the eviction epochs, whose table
-    /// keeps a scope's name alive after its last entry went. Reads only
-    /// capacities, so a 500k-entry scope costs nothing to account for.
+    /// Includes the eviction epochs, whose table keeps a scope's name alive
+    /// after its last entry went. Reads only capacities, so a 500k-entry
+    /// scope costs nothing to account for.
     pub(crate) fn footprint(&self) -> Footprint {
         let inner = self.inner.lock();
         let scopes: usize = inner
@@ -873,19 +760,10 @@ impl ChecksumRegistry {
         self.inner.lock().map.values().map(|s| s.slots.len()).sum()
     }
 
-    /// The eviction epoch of `(authority, mirror_path)`: bumped by every
-    /// eviction that takes entries from the scope, so an ingest ledger mark
-    /// taken under an older epoch knows its digests may be gone.
     fn scope_epoch(&self, authority: &str, mirror_path: &str) -> u64 {
         self.epochs.lock().get(authority, mirror_path)
     }
 
-    /// Evict once a batch left the registry past its cap. The check runs
-    /// per batch, not per entry, so the registry may hold up to one batch
-    /// over the cap until the end of the batch's lock, and the pass then
-    /// frees what the batch overshot as well ([`evict`]). Taken from the
-    /// *largest* scope first so one oversized (or hostile) index cannot
-    /// drain the digests of every other mirror.
     fn evict_over_cap(&self, inner: &mut RegistryInner) {
         let cap = self.cap;
         if inner.len > cap {
@@ -945,7 +823,7 @@ impl RegistryInner {
 }
 
 impl ScopeState {
-    /// Insert (or refresh) one slot; whether its key is new to the scope.
+    /// Whether the slot's key is new to the scope.
     fn insert(&mut self, slot: Slot) -> bool {
         let Slot {
             key,
@@ -956,8 +834,7 @@ impl ScopeState {
         if self.slots.len() == self.slots.capacity() {
             // Grow in eighths, not by doubling: at 49 bytes a slot, a log
             // of half a million entries would otherwise reserve 25 MB it
-            // never fills. A reallocation per eighth is one memmove of the
-            // log; an insert is a hash and a probe anyway.
+            // never fills.
             self.slots.reserve_exact(self.slots.len() / 8 + 16);
         }
         self.slots.push_back(slot);
@@ -990,22 +867,21 @@ impl ScopeState {
     }
 }
 
-/// The hash of the slot an index entry points at, for the index's own
-/// rehashes. Every index entry points at a present slot: a slot leaves
-/// `slots` only after its index entry is removed (`evict`) or the index is
-/// rebuilt (`compact_slots`).
+/// For the index's own rehashes. Every index entry points at a present
+/// slot: a slot leaves `slots` only after its index entry is removed
+/// (`evict`) or the index is rebuilt (`compact_slots`).
 fn index_hash(hasher: &DefaultHashBuilder, slots: &VecDeque<Slot>, base: u64, seq: u64) -> u64 {
     let slot = slot_in(slots, base, seq).expect("every index entry points at a present slot");
     fingerprint_hash(hasher, &slot.key)
 }
 
-/// Eviction: free `cap / 4` live entries, plus however far past `cap + 1`
-/// a batch took the registry -- so every pass leaves the `cap + 1 - cap / 4`
-/// a single insert crossing the cap does -- always from the scope currently
-/// holding the most entries, oldest first. A scope that drains empty is
-/// removed and the next-largest scope pays the remainder. Within a scope,
-/// slots pop from the front; stale ones (re-inserted keys, whose live slot
-/// is newer) are skipped and do not count against the quota.
+/// Free `cap / 4` live entries, plus however far past `cap + 1` a batch
+/// took the registry, oldest first and always from the scope currently
+/// holding the most entries, so one oversized (or hostile) index cannot
+/// drain the digests of every other mirror. A scope that drains empty is
+/// removed and the next-largest scope pays the remainder. Stale slots
+/// (re-inserted keys, whose live slot is newer) are skipped and do not count
+/// against the quota.
 fn evict(inner: &mut RegistryInner, cap: usize, epochs: &Mutex<EvictionEpochs>) {
     let quota = (cap / 4).max(1) + inner.len.saturating_sub(cap + 1);
     // A selected scope is drained or finishes the pass, so the remaining
@@ -1082,13 +958,10 @@ fn stale_allowance(live: usize) -> usize {
     live / 4 + 16
 }
 
-/// Give back the memory an eviction freed. Neither the index nor the slot
-/// log shrinks on its own, so a scope that once held most of the cap (a
-/// hostile index, which is what eviction hits first) would keep its peak
-/// footprint after losing most of its entries. Shrinking the index only
-/// past twice its live size, and the log only past its stale allowance,
-/// keeps the rehash and copy costs amortised over the evictions that
-/// caused them.
+/// Neither the index nor the slot log shrinks on its own, so a scope that
+/// once held most of the cap (a hostile index, which is what eviction hits
+/// first) would keep its peak footprint. The thresholds keep the rehash and
+/// copy costs amortised over the evictions that caused them.
 fn shrink_scope(state: &mut ScopeState) {
     let ScopeState {
         slots,
@@ -1115,9 +988,7 @@ fn scope_bytes(scope: &RegistryScope) -> usize {
 }
 
 /// Rebuild a scope's slot log keeping only the live slots, in their order,
-/// re-sequenced past every sequence handed out so far. Triggered from
-/// `ScopeState::insert` when the log outgrows the live count by
-/// [`stale_allowance`], so amortized O(1) per insert.
+/// re-sequenced past every sequence handed out so far.
 fn compact_slots(state: &mut ScopeState) {
     // Room for the next growth step too, or the insert that triggered the
     // compaction reallocates the fresh log at once.
@@ -1156,15 +1027,11 @@ fn compact_slots(state: &mut ScopeState) {
     }
 }
 
-/// Report a registry lookup that came up empty: this download is cached
-/// unverified. Expected while the registry is still cold (the first
-/// `apt install` after startup), but a *persistent* miss means the key
-/// derived here disagrees with the key ingest inserted, and the only symptom
-/// otherwise is `CHECKSUM_UNVERIFIED` climbing with no identity attached.
-///
-/// `miss` says which of the two it is, and each has its own once-gate: the
-/// cold miss nearly every start produces must not spend the one WARN of the
-/// miss worth looking into, a key a populated registry does not list.
+/// A miss is expected while the registry is still cold (the first
+/// `apt install` after startup), but a *persistent* one means the key
+/// derived here disagrees with the key ingest inserted. Each case has its
+/// own once-gate: the cold miss nearly every start produces must not spend
+/// the one WARN of the miss worth looking into.
 fn log_registry_miss(plan: &RenamePlan, key: &str, miss: RegistryMiss) {
     static COLD: AtomicBool = AtomicBool::new(false);
     static UNLISTED: AtomicBool = AtomicBool::new(false);
@@ -1179,9 +1046,6 @@ fn log_registry_miss(plan: &RenamePlan, key: &str, miss: RegistryMiss) {
     );
 }
 
-/// Look the resource's expected SHA-256 up in the checksum registry,
-/// degrading to [`VerifyKind::Unknown`] (and logging the miss) when it holds
-/// no digest for `key`.
 fn registry_verify_kind(plan: &RenamePlan, key: &str) -> VerifyKind {
     let registry = global_checksum_registry();
     let mirror = &plan.key.mirror;
@@ -1197,20 +1061,12 @@ fn registry_verify_kind(plan: &RenamePlan, key: &str) -> VerifyKind {
 }
 
 /// `rename(2)` the finished temp file into the cache, creating the
-/// destination directory only when it turns out to be missing.
-///
-/// Same shape as `partial_file::create_partial_file`'s parent handling, and
-/// for the same reason: the eager `create_dir_all` both download backends
-/// used to run per download was a blocking-pool round trip whose `mkdir` +
-/// `stat` answered `EEXIST` for every download after the first into a given
-/// directory. The steady state now costs no `mkdir` at all.
+/// destination directory only when it turns out to be missing, so the
+/// steady state costs no `mkdir`.
 ///
 /// `rename(2)` reports `ENOENT` for a missing *source* too, so a lost temp
-/// file costs one wasted `mkdir` before failing with the same errno it would
-/// have failed with anyway. A `create_dir_all` failure is returned as-is and
-/// surfaces through `CommitError::Rename` — [`verify_and_rename`]'s "Failed to
-/// rename temp file `…` to `…`" ERROR carries its errno, which names
-/// the real cause; no separate error variant.
+/// file costs one wasted `mkdir` before failing with the same errno. A
+/// `create_dir_all` failure surfaces through `CommitError::Rename`.
 fn rename_into_cache(temp_path: &Path, dest_path: &Path) -> std::io::Result<()> {
     match std::fs::rename(temp_path, dest_path) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -1316,28 +1172,21 @@ pub(crate) struct CommitFailure {
 ///
 /// Everything that touches the disk runs as **one** blocking job owning the
 /// descriptor, the write lease and the reservation, in order: the
-/// [`PrepareStep`], an `fstat` for the size the reservation is finalised with
-/// (which the verification reuses), the verification (on the open
-/// descriptor, never a reopen of the path), a
-/// check that the path still names that descriptor's file
-/// ([`check_path_names_file`]), then the `rename(2)`. One blocking-pool round
-/// trip per commit instead of one per step.
+/// [`PrepareStep`], an `fstat`, the verification (on the open descriptor,
+/// never a reopen of the path), [`check_path_names_file`], then the
+/// `rename(2)`.
 ///
 /// `reservation` is finalised inside that job, right after the `rename(2)`
 /// succeeds: a `spawn_blocking` closure runs to completion even when the
-/// awaiting future is dropped, so a cancelled commit can never leave the file
-/// in the cache with its reservation reverted. On every failure path the
-/// reservation is dropped, which reverts it. Because the job starts before
-/// the verification rather than after it, a commit cancelled at any point
-/// after the job was spawned still verifies and lands the file (or rejects
-/// it) -- it never leaves a verified download behind as a `.partial`. What
-/// such a cancellation skips is only the async tail: the checksum-mismatch
-/// warn, the rename-failure report and the post-commit ingest scheduling (the
-/// ledger invalidation that makes a later touch re-ingest runs in the job).
+/// awaiting future is dropped, so a cancelled commit can never leave the
+/// file in the cache with its reservation reverted, nor a verified download
+/// behind as a `.partial`. A cancellation skips only the async tail: the
+/// checksum-mismatch warn, the rename-failure report and the post-commit
+/// ingest scheduling.
 ///
 /// The job owns the registry lease: cancelling the commit cannot permit a
-/// retry to modify the file while it is read, or to replace the partial before
-/// the queued rename runs.
+/// retry to modify the file while it is read, or to replace the partial
+/// before the queued rename runs.
 pub(crate) async fn verify_and_rename(
     plan: &RenamePlan,
     finished: FinishedCacheFile,
@@ -1355,9 +1204,8 @@ pub(crate) async fn verify_and_rename(
         layout: _,
     } = &*plan.key;
 
-    // Build the verification kind. Layer-B/C registry lookups happen here -
-    // synchronously, before spawn_blocking - so the pure decision stays
-    // global-free. Skipped entirely when verification is disabled.
+    // Registry lookups happen here, before `spawn_blocking`, so the decision
+    // stays global-free.
     let kind = match digest_source(
         plan.resource_kind,
         debname,
@@ -1390,10 +1238,8 @@ pub(crate) async fn verify_and_rename(
             if let Some(prepare) = prepare {
                 prepare(&file, &guard);
             }
-            // The descriptor's identity for `check_path_names_file`, and the
-            // actual on-disk size the reservation is finalised with. Without
-            // it the rename could not be tied to the verified file, so a
-            // failed `fstat` fails the commit closed, like a failed read.
+            // Without it the rename could not be tied to the verified file,
+            // so a failed `fstat` fails the commit closed, like a failed read.
             let verified_meta = match file.metadata() {
                 Ok(meta) => meta,
                 Err(err) => {
@@ -1490,52 +1336,38 @@ pub(crate) async fn verify_and_rename(
     Err(CommitFailure { error, guard })
 }
 
-/// How many `Packages` ingests decode at once. A commit or a touch schedules
-/// one, and by-hash indexes are distinct resources, so an upstream serving
-/// many hostile indexes would otherwise hold one blocking-pool thread each
-/// for a full decode up to the size caps (seconds each) and starve every
-/// other `spawn_blocking` user (`tokio::fs`, verification). Two keep an
+/// How many `Packages` ingests decode at once. An upstream serving many
+/// hostile indexes would otherwise hold one blocking-pool thread each for a
+/// full decode up to the size caps (seconds each) and starve every other
+/// `spawn_blocking` user (`tokio::fs`, verification). Two keep an
 /// `apt update` over several components flowing while bounding that.
 /// `Release` ingest reads a capped, uncompressed file and takes no decode
-/// permit; it is admitted from the separate [`RELEASE_INGEST_SLOTS`] line
-/// instead of [`INGEST_SLOTS`].
+/// permit.
 const PACKAGES_INGEST_CONCURRENCY: usize = 2;
 
 static PACKAGES_INGEST_PERMITS: Semaphore = Semaphore::const_new(PACKAGES_INGEST_CONCURRENCY);
 
-/// `Packages` ingests that may wait for a decode permit at
-/// once. The permits bound the CPU, not the line in front of them: without a
-/// bound, a mirror serving cap-sized indexes would queue one task per
-/// committed or touched index and push every later ingest back by one full
-/// decode each. Sixty-four holds the burst the
-/// first `apt update` after a restart touches (every live index at once:
-/// tens for a multi-suite, multi-arch Debian mirror).
+/// `Packages` ingests that may wait for a decode permit at once. The permits
+/// bound the CPU, not the line in front of them: without a bound, a mirror
+/// serving cap-sized indexes would queue one task per committed or touched
+/// index. Sixty-four holds the burst the first `apt update` after a restart
+/// touches (tens of indexes for a multi-suite, multi-arch Debian mirror).
 const INGEST_QUEUE: usize = 64;
 
-/// One slot per scheduled `Packages` ingest, from before its
-/// spawn to its end: the decode permits plus the line. Taken synchronously
-/// in [`admit`], so a burst of touches can never hold more `Packages`-kind
-/// paths `Running` in the ingest ledger than this (the ledger cap never
-/// drops `Running` entries). `Release` jobs draw from their own pool,
-/// [`RELEASE_INGEST_SLOTS`], so the two pools together bound `Running`
-/// ledger entries at `INGEST_SLOTS` + `RELEASE_INGEST_SLOTS` (66 + 16 = 82).
+/// One slot per scheduled `Packages` ingest, from before its spawn to its
+/// end. Taken synchronously in [`admit`], so together with
+/// [`RELEASE_INGEST_SLOTS`] it bounds the paths `Running` in the ingest
+/// ledger (whose cap never drops `Running` entries).
 static INGEST_SLOTS: Semaphore = Semaphore::const_new(PACKAGES_INGEST_CONCURRENCY + INGEST_QUEUE);
 
 /// How many `Release`/`InRelease` ingests may be admitted at once, in a pool
 /// separate from [`INGEST_SLOTS`]: a hostile permitted mirror committing
-/// cap-sized `.xz` `Packages` indexes can hold every slot of that
-/// shared line, and without a pool of its own every other mirror's
-/// `Release` ingest would then be refused too. `Release` jobs take no
-/// decode permit (a capped, uncompressed read), so this pool only bounds
-/// the line, not CPU; sixteen comfortably covers every live suite's
-/// `Release`/`InRelease` across a multi-suite, multi-arch mirror set.
+/// cap-sized `.xz` `Packages` indexes can hold every slot of that line, and
+/// every other mirror's `Release` ingest would then be refused too.
 const RELEASE_INGEST_QUEUE: usize = 16;
 
 static RELEASE_INGEST_SLOTS: Semaphore = Semaphore::const_new(RELEASE_INGEST_QUEUE);
 
-/// The admission pool a job of `kind` draws its slot from: `Release` jobs
-/// get their own pool ([`RELEASE_INGEST_SLOTS`]); `Packages` jobs share
-/// [`INGEST_SLOTS`] (see both statics' docs for why they are split).
 fn ingest_pool(kind: &IngestKind) -> &'static Semaphore {
     match kind {
         IngestKind::Release { release_dir: _ } => &RELEASE_INGEST_SLOTS,
@@ -1543,7 +1375,6 @@ fn ingest_pool(kind: &IngestKind) -> &'static Semaphore {
     }
 }
 
-/// What [`admit`] decided for one path.
 enum Admission<'l, 's> {
     /// Ingested under the current epoch, failed for good, or already running.
     Nothing,
@@ -1554,8 +1385,7 @@ enum Admission<'l, 's> {
 }
 
 /// Claim `path` in `ledger`, then take a slot. A refused claim is dropped,
-/// which leaves the path unmarked (the `Claim` drop guard). Pure over its
-/// arguments; [`schedule_ingest`] passes the globals.
+/// which leaves the path unmarked.
 fn admit<'l, 's>(
     ledger: &'l IngestLedger,
     slots: &'s Semaphore,
@@ -1574,7 +1404,6 @@ fn admit<'l, 's>(
     }
 }
 
-/// Run `ingest` under a decode permit; production passes [`PACKAGES_INGEST_PERMITS`].
 async fn with_decode_permit<F: Future>(permits: &Semaphore, ingest: F) -> F::Output {
     let _permit = permits
         .acquire()
@@ -1593,7 +1422,6 @@ const INGEST_LEDGER_CAP: usize = 16_384;
 static INGEST_LEDGER: LazyLock<IngestLedger> =
     LazyLock::new(|| IngestLedger::new(INGEST_LEDGER_CAP));
 
-/// The ingest ledger's footprint and cap, for the dashboard.
 #[must_use]
 pub(crate) fn ingest_ledger_footprint() -> (Footprint, usize) {
     (INGEST_LEDGER.footprint(), INGEST_LEDGER_CAP)
@@ -1636,8 +1464,6 @@ fn schedule_ingest(file: &IndexFile<'_>) -> bool {
 
 /// Answer a request for a cached index without a commit (a cache hit, a
 /// client or upstream 304): re-ingest it if the registry lacks its digests.
-/// `raw_uri_path` is the request path as received; `cache_path` the file
-/// served.
 pub(crate) fn note_cached_index_touch(
     conn_details: &ConnectionDetails,
     raw_uri_path: &str,
@@ -1658,8 +1484,7 @@ pub(crate) fn note_cached_index_touch(
 /// with a 304: the mirror still serves it, so its suite counts as confirmed
 /// now (`mirror_indexes`). A suite no ingest recorded yet -- the touch
 /// ingest `note_cached_index_touch` just scheduled may still be running --
-/// takes the confirmation once it is recorded; `raw_uri_path` is the
-/// request path as received.
+/// takes the confirmation once it is recorded.
 pub(crate) fn note_release_revalidated(conn_details: &ConnectionDetails, raw_uri_path: &str) {
     if conn_details.resource_kind != ResourceKind::Release || !global_config().verify_checksums {
         return;
@@ -1675,7 +1500,7 @@ pub(crate) fn note_release_revalidated(conn_details: &ConnectionDetails, raw_uri
 }
 
 /// One claimed path's ingest, run again while commits keep replacing the
-/// file under it. The file is the claim's path.
+/// file under it.
 async fn run_ingest_job(
     mut claim: Claim<'static>,
     // Held for the whole job, reruns included; see `INGEST_SLOTS`.
@@ -1696,8 +1521,6 @@ async fn run_ingest_job(
     }
 }
 
-/// One ingest of `dest`: dispatches on `kind` to the matching parse
-/// (`Packages` or `Release`), under a decode permit for `Packages`.
 async fn ingest_once(
     registry: &ChecksumRegistry,
     kind: &IngestKind,
@@ -1760,15 +1583,11 @@ fn log_ingest_result(
     }
 }
 
-/// How a cached file is ingested into the registry, or no-op for a resource
-/// that feeds no registry entries.
 enum IngestKind {
     Packages {
-        /// `None`: compression unknown (by-hash URL leaf is a hex digest);
-        /// the ingest sniffs magic bytes before parsing. Required because
-        /// modern APT with `Acquire::By-Hash: yes` fetches `Packages.xz`
-        /// (typically) via `/by-hash/SHA256/<hex>` URLs that carry no
-        /// extension, so the filename-based detection used elsewhere fails.
+        /// `None`: unknown, so the ingest sniffs magic bytes. APT with
+        /// `Acquire::By-Hash: yes` fetches `Packages.xz` via
+        /// `/by-hash/SHA256/<hex>` URLs that carry no extension.
         compression: Option<PackagesCompression>,
     },
     Release {
@@ -1808,8 +1627,7 @@ impl<'a> From<&'a RenamePlan> for IndexFile<'a> {
     }
 }
 
-/// How `file` is ingested, or `None` for a resource that feeds no registry
-/// entries. One table for the commit and the touch path.
+/// `None` for a resource that feeds no registry entries.
 fn ingest_kind(file: &IndexFile<'_>) -> Option<IngestKind> {
     #[expect(clippy::match_same_arms, reason = "prefer clarity")]
     let kind = match file.resource_kind {
@@ -1834,8 +1652,7 @@ fn ingest_kind(file: &IndexFile<'_>) -> Option<IngestKind> {
         ResourceKind::Release => release_dir_from_uri_path(file.raw_uri_path)
             .map(|d| IngestKind::Release { release_dir: d }),
         // A per-component Release (`binary-<arch>/Release`) carries no SHA256:
-        // section listing Packages files, so parsing it yields nothing useful.
-        // Route it to the no-op group rather than wasting a file-open + parse.
+        // section listing Packages files.
         ResourceKind::ComponentRelease => None,
         // A by-hash file may be a Packages file. The directory its
         // validated `by-hash/` hangs in, judged once by the classifier,
@@ -1915,15 +1732,13 @@ fn registry_path_from_uri(raw_uri_path: &str) -> Cow<'_, str> {
     }
 }
 
-/// The host-relative directory a `dists/.../Release` file lives in, derived
-/// from the raw URI path (the parent directory of the `Release` leaf),
+/// The host-relative directory a `dists/.../Release` file lives in,
 /// normalized like the cache path (`//` runs and `.` segments collapse), so
-/// every spelling of one `Release` registers the keys
-/// [`digest_source`] looks up.
+/// every spelling of one `Release` registers the keys [`digest_source`]
+/// looks up.
 ///
-/// `Release.gpg` is a detached binary PGP signature with no SHA256 section to
-/// ingest, so it's excluded — routing it here would just waste a file open
-/// and a `read_to_string` of opaque bytes.
+/// `Release.gpg` is a detached signature with no SHA256 section, so it is
+/// excluded.
 fn release_dir_from_uri_path(raw_uri_path: &str) -> Option<String> {
     let normalized = registry_path_from_uri(raw_uri_path);
     let (dir, leaf) = normalized.rsplit_once('/')?;
@@ -1933,8 +1748,7 @@ fn release_dir_from_uri_path(raw_uri_path: &str) -> Option<String> {
     Some(dir.to_owned())
 }
 
-/// Where the digest a download of `resource_kind` is verified against comes
-/// from. See [`digest_source`].
+/// Where the digest a download is verified against comes from.
 #[derive(Debug, PartialEq, Eq)]
 enum DigestSource<'a> {
     /// Self-verifying by-hash URL: the digest is the URL leaf, hashed with
@@ -1949,13 +1763,9 @@ enum DigestSource<'a> {
     Absent,
 }
 
-/// The one `ResourceKind` -> digest-source table, shared by
-/// [`verify_and_rename`]'s commit-time decision and the splice-only
-/// `stream_hash_algo_for_download`'s pre-download one, so the two can never
-/// disagree about which digest decides a download (a new `ResourceKind` is a
-/// compile error here, once). `verify_enabled` is
-/// `global_config().verify_checksums`, passed in so this stays
-/// unit-testable.
+/// Shared by [`verify_and_rename`]'s commit-time decision and the
+/// splice-only `stream_hash_algo_for_download`'s pre-download one, which
+/// must agree about which digest decides a download.
 fn digest_source<'a>(
     resource_kind: ResourceKind,
     debname: &'a str,
@@ -1987,28 +1797,17 @@ fn digest_source<'a>(
     }
 }
 
-/// Which digest, if any, a download of `resource_kind` will be verified
-/// against — decided from the request alone, before the first byte arrives, so
-/// a body loop can hash incrementally and spare
-/// [`verify_temp_file`] its full re-read of the finished file.
+/// Which digest, if any, a download will be verified against, decided from
+/// the request alone so a body loop can hash incrementally and spare
+/// [`verify_temp_file`] its re-read of the finished file.
 ///
-/// A disagreement with the commit-time decision (the registry gained or lost
-/// the digest in between) is safe but wasteful: a digest computed with the
-/// wrong algorithm is ignored ([`verify_temp_file`] compares the algorithm
-/// carried alongside it before trusting it) and falls back to the re-read.
-///
-/// The registry probe is why a [`DigestSource::Registry`] kind is not simply
-/// `Some(Sha256)`. When the lookup misses — no `Packages` index ingested for
-/// that mirror yet, the ordinary state on a cold cache — `verify_temp_file`
-/// returns before it hashes anything. Hashing anyway would not "waste the CPU
-/// the re-read would have spent": there is no re-read to spend it on, so a
-/// several-hundred-megabyte `.deb` would be hashed inline on the worker for a
-/// digest nothing ever compares. The window between this call and the commit
-/// is not a correctness concern in either direction — a registry that gains
-/// the digest meanwhile falls back to the re-read, and one that loses it
-/// discards a digest.
-///
-/// Splice-only, like its one caller `splice::splice_proxy`.
+/// A [`DigestSource::Registry`] kind is not simply `Some(Sha256)`: when the
+/// lookup misses (the ordinary state on a cold cache) `verify_temp_file`
+/// hashes nothing, so a several-hundred-megabyte `.deb` would be hashed
+/// inline on the worker for a digest nothing ever compares. A disagreement
+/// with the commit-time decision (the registry gained or lost the digest in
+/// between) is safe: a registry that gains the digest falls back to the
+/// re-read, and one that loses it discards a digest.
 #[cfg(feature = "splice")]
 #[must_use]
 pub(crate) fn stream_hash_algo_for_download(
@@ -2032,12 +1831,9 @@ pub(crate) fn stream_hash_algo_for_download(
     }
 }
 
-/// Detect Packages compression by reading magic bytes from the file. Used for
-/// by-hash content whose URL leaf is a hex digest and so carries no extension.
-/// Falls back to `Raw` if no recognised magic is found (best-effort: a
-/// genuinely raw Packages file with no magic is parsed normally; a corrupt or
-/// unexpected payload yields zero stanzas, which is the same outcome as the
-/// pre-sniff behaviour for any non-`.xz`/non-`.gz` content).
+/// Detect Packages compression from magic bytes, for by-hash content whose
+/// URL leaf carries no extension. Falls back to `Raw`: a corrupt or
+/// unexpected payload then yields zero stanzas.
 ///
 /// Reads `file` from its start and rewinds it after, so the caller parses
 /// the same descriptor.
@@ -2045,9 +1841,8 @@ async fn sniff_packages_compression(
     file: &mut tokio::fs::File,
 ) -> std::io::Result<PackagesCompression> {
     use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
-    // Fill up to 6 magic bytes, tolerating short reads (a single `read` may
-    // return fewer bytes than requested) and early EOF (a genuinely tiny raw
-    // `Packages` file is valid and classifies as `Raw`, not an error).
+    // Tolerate short reads and early EOF (a tiny raw `Packages` file is
+    // valid and classifies as `Raw`, not an error).
     let mut buf = [0u8; 6];
     let mut n = 0;
     while n < buf.len() {
@@ -2068,17 +1863,13 @@ async fn sniff_packages_compression(
 }
 
 /// Stream a (possibly compressed) `Packages` file and insert every
-/// `(Filename, SHA256)` pair into `registry`. Best-effort: a malformed file
-/// just yields fewer entries; errors are logged and returned. A `None`
-/// `compression` is sniffed from the opened file's magic bytes
-/// ([`sniff_packages_compression`]).
+/// `(Filename, SHA256)` pair into `registry`. A `None` `compression` is
+/// sniffed from the file's magic bytes.
 ///
 /// Guards against decompression bombs: [`crate::limits::decompressed_limit`]
-/// caps total decompressed output using the absolute and expansion-ratio limits
-/// (mirroring `cleanup/packages.rs`).
-/// Per-line length is capped at [`crate::limits::MAX_METADATA_LINE_LEN`].
-/// Hitting either cap stops ingestion gracefully (the registry is just
-/// less-populated).
+/// caps total decompressed output, and line length is capped at
+/// [`crate::limits::MAX_METADATA_LINE_LEN`]. What was read before a cap (or
+/// any other error) stays registered.
 async fn ingest_packages_file(
     registry: &ChecksumRegistry,
     authority: &str,
@@ -2098,8 +1889,6 @@ async fn ingest_packages_file(
         Some(compression) => compression,
         None => sniff_packages_compression(&mut file).await?,
     };
-
-    // The decompressed-output ceiling follows the compressed file size.
     let compressed_size = metadata.len();
     limits::check_packages_file_size(compression, compressed_size)?;
     let reader = limits::packages_reader(
@@ -2130,8 +1919,6 @@ async fn ingest_packages_file(
                 return Ok(());
             }
             Err(err) => {
-                // What was read before the failure registers, as it did
-                // entry by entry.
                 pending.flush(registry, authority, mirror_path);
                 warn_once_or_debug!(
                     "Failed to read `{}` during Packages ingestion (may exceed size/line limits); aborting the ingest of this index:  {}",
@@ -2144,15 +1931,12 @@ async fn ingest_packages_file(
     }
 }
 
-/// Read a cached `Release` / `InRelease` file to a string with the cache's
-/// standard hardening: a nonblocking, symlink-refusing open, a regular-file
-/// check, and a read capped at `MAX_RELEASE_SIZE`, so a hostile or buggy
-/// mirror serving a multi-GB `Release` (which passes the `max_object_size`
-/// admission check) cannot balloon memory unbounded. An over-cap file fails with
+/// Read a cached `Release` / `InRelease` file with the cache's standard
+/// hardening: a nonblocking, symlink-refusing open, a regular-file check,
+/// and a read capped at `MAX_RELEASE_SIZE`, so a hostile or buggy mirror
+/// serving a multi-GB `Release` (which passes the `max_object_size`
+/// admission check) cannot balloon memory. An over-cap file fails with
 /// `io::ErrorKind::InvalidData` rather than truncating silently.
-///
-/// Shared by registry ingest ([`ingest_release_file`]) and the by-hash cleanup
-/// reference-set builder.
 pub(crate) async fn read_release_to_string(path: &Path) -> std::io::Result<String> {
     read_release(path).await.map(|(content, _mtime)| content)
 }
@@ -2160,9 +1944,8 @@ pub(crate) async fn read_release_to_string(path: &Path) -> std::io::Result<Strin
 /// [`read_release_to_string`], with the modification time of the file read
 /// (its `fstat`, so the pair describes one inode).
 ///
-/// One blocking-pool hop for the whole read. Through `tokio::fs` the open,
-/// the `fstat` and every read were a hop each, and `read_to_string` grows an
-/// empty buffer by doubling from 32 bytes: about fifteen hops for the
+/// One blocking-pool hop for the whole read; through `tokio::fs` the open,
+/// the `fstat` and every read are a hop each, about fifteen for the
 /// 50-200 KiB `InRelease` a commit ingests after every index download.
 async fn read_release(path: &Path) -> std::io::Result<(String, std::time::SystemTime)> {
     let path = path.to_owned();
@@ -2209,12 +1992,9 @@ fn read_release_sync(path: &Path) -> std::io::Result<(String, std::time::SystemT
 const FUTURE_RELEASE_DATE_TOLERANCE_SECS: i64 = 24 * 60 * 60;
 
 /// Treat a parsed `Date:` more than [`FUTURE_RELEASE_DATE_TOLERANCE_SECS`]
-/// ahead of now as if the field were absent. APT itself rejects a
-/// future-dated `Release`; here the effect is milder -- an undated source
-/// never overwrites a dated one and is itself overwritten by the next dated
-/// one, which is the recovery this guards: the implausible date registers
-/// its entries (so a cold cache still verifies against them) but can never
-/// pin the directory against a later, honestly-dated `Release`.
+/// ahead of now as if the field were absent: the implausible date still
+/// registers its entries (so a cold cache verifies against them) but can
+/// never pin the directory against a later, honestly-dated `Release`.
 fn clamp_future_release_date(date: Option<i64>) -> Option<i64> {
     let date = date?;
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
@@ -2226,17 +2006,12 @@ fn clamp_future_release_date(date: Option<i64>) -> Option<i64> {
 }
 
 /// Parse a `Release` / `InRelease` file and insert its `Packages*` entries
-/// into the registry. `release_dir` is the host-relative directory the
-/// `Release` file lives in (`Release`'s entry paths are relative to it).
-///
-/// Only entries whose leaf matches a `Packages` file are inserted - those are
-/// the only `Release`-listed resources the proxy verifies (layer C). Other
-/// entries (`Contents-*`, `Translation-*`, ...) are skipped.
+/// (the only `Release`-listed resources the proxy verifies, layer C) into
+/// the registry. `release_dir` is the host-relative directory the file
+/// lives in; its entry paths are relative to it.
 ///
 /// An older `Date:` than the directory's registered one registers nothing
-/// (see `ChecksumRegistry::insert_release`) and still returns `Ok`. A
-/// far-future `Date:` is clamped to absent first (see
-/// [`clamp_future_release_date`]).
+/// and still returns `Ok`.
 ///
 /// Returns what the file said about its age for `mirror_indexes`, with the
 /// file's mtime as the time the mirror last served or confirmed it (a
@@ -2253,7 +2028,6 @@ async fn ingest_release_file(
     let date = clamp_future_release_date(header.date);
     let dir = release_dir.trim_end_matches('/');
     let slots: Vec<Slot> = index_parser::parse_release_checksums(&content, |rel| {
-        // Only Packages files are verified at layer C.
         let leaf = rel.rsplit_once('/').map_or(rel, |(_, leaf)| leaf);
         PackagesCompression::from_filename(leaf).is_some()
     })
@@ -2280,11 +2054,10 @@ async fn ingest_release_file(
     })
 }
 
-/// The digests of one `Packages` ingest not yet registered, as ready
-/// [`Slot`]s. A `Debian` `Packages` holds ~65k stanzas, and taking the
-/// registry lock (which every cache miss's digest lookup also takes) once
-/// per stanza cost as many lock round trips; a batch takes it once per
-/// [`Self::BATCH`], and the fingerprints are computed here, outside it.
+/// The digests of one `Packages` ingest not yet registered. Batched so the
+/// registry lock (which every cache miss's digest lookup also takes) is
+/// taken once per [`Self::BATCH`] rather than once per stanza (~65k for
+/// Debian), with the fingerprints computed outside it.
 #[derive(Default)]
 struct PendingDigests {
     slots: Vec<Slot>,
@@ -2295,11 +2068,9 @@ impl PendingDigests {
     /// microseconds, not the ingest.
     const BATCH: usize = 256;
 
-    /// Queue `stanza`'s `(Filename, SHA256)` pair; whether the batch is
-    /// full. A stanza without a usable SHA256 (a SHA512-only mirror leaves
-    /// every stanza that way, so deb verification stays off for the whole
-    /// archive) was already warned about by [`StanzaStream`] and registers
-    /// nothing.
+    /// Whether the batch is full. A stanza without a usable SHA256 (a
+    /// SHA512-only mirror leaves every stanza that way) was already warned
+    /// about by [`StanzaStream`] and registers nothing.
     fn push_stanza(
         &mut self,
         stanza: &index_parser::Stanza,
@@ -2349,8 +2120,7 @@ mod tests {
         f
     }
 
-    // sha256("hello world") =
-    // b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
+    // sha256("hello world")
     const HELLO_SHA256: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
 
     #[tokio::test]
@@ -2461,10 +2231,6 @@ mod tests {
         }
     }
 
-    /// The one digest-source table both the commit-time decision and the
-    /// pre-download hashing read: by-hash kinds take the algorithm their URL
-    /// named rather than assuming SHA-256, the registry-backed kinds name
-    /// the key the ingests register, and everything else has no digest.
     #[test]
     fn digest_source_table() {
         const POOL: &str = "/debian/pool/main/h/hello/hello_1.0_amd64.deb";
@@ -2592,7 +2358,6 @@ mod tests {
     #[test]
     fn registry_discriminates_mirrors_on_same_host() {
         let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
-        // Same host, same basename, different mirror_path -> distinct entries.
         reg.insert("host", "m1", "foo_1_amd64.deb", [1u8; 32]);
         reg.insert("host", "m2", "foo_1_amd64.deb", [2u8; 32]);
         assert_eq!(reg.lookup("host", "m1", "foo_1_amd64.deb"), Some([1u8; 32]));
@@ -2600,8 +2365,6 @@ mod tests {
         assert_eq!(reg.len(), 2);
     }
 
-    /// The miss line's explanation: what the scope holds of the missed key's
-    /// family, which is what tells a cold registry from an unlisted key.
     #[test]
     fn registry_explains_a_miss_by_what_the_scope_holds() {
         const INDEX: &str = "dists/sid/main/binary-arm64/Packages.xz";
@@ -2723,7 +2486,6 @@ mod tests {
             reg.insert("h", "m", &format!("p{i}"), [i; 32]);
         }
         assert_eq!(reg.len(), 4);
-        // Inserting past the cap evicts the oldest batch.
         reg.insert("h", "m", "p4", [4u8; 32]);
         assert!(reg.len() <= 4, "registry stayed within cap");
         assert_eq!(
@@ -2756,10 +2518,6 @@ mod tests {
         assert!(reg.lookup("b", "m", "b7").is_some(), "b's newest present");
     }
 
-    /// The cap is checked once per batch, not per entry: a batch may take
-    /// the registry past the cap, and the one pass at its end frees the
-    /// overshoot as well, landing where a single insert crossing the cap
-    /// would (`cap + 1 - cap / 4`).
     #[test]
     fn registry_evicts_once_per_batch_including_the_overshoot() {
         let reg = ChecksumRegistry::new(NonZero::new(8).unwrap());
@@ -2817,8 +2575,7 @@ mod tests {
     #[test]
     fn eviction_shrinks_the_scope_it_drains() {
         // One scope fills the cap, then another mirror's inserts make it pay
-        // for the evictions: its index and slot log must give the memory back
-        // instead of keeping the footprint of 1000 entries.
+        // for the evictions.
         let reg = ChecksumRegistry::new(NonZero::new(1000).unwrap());
         for i in 0..1000u32 {
             reg.insert("big", "m", &format!("b{i}"), [0; 32]);
@@ -2958,12 +2715,9 @@ mod tests {
         }
     }
 
-    /// Regression (verification bypass): the algorithm used to be re-read
-    /// from the raw path after its *first* `by-hash` segment, while the
-    /// parser validated the last one. A decoy `by-hash/X/` in front made
-    /// that read come back empty, and the object was cached unverified. The
-    /// algorithm now travels from the parser, so a body that does not hash
-    /// to the digest in the URL is refused.
+    /// Verification bypass: a decoy `by-hash/X/` in front of the validated
+    /// (last) one must not hide the algorithm and get the object cached
+    /// unverified.
     #[test]
     fn byhash_decoy_segment_does_not_disable_verification() {
         use crate::{
@@ -3004,10 +2758,8 @@ mod tests {
 
     #[test]
     fn byhash_length_algo_mismatch_caches_unverified() {
-        // A SHA512 URL segment carrying a 64-hex (SHA256-length) digest is a
-        // length/algo mismatch: it must NOT be hashed as SHA256. It resolves
-        // to `Unknown` -> Proceed (cached unverified), never a spurious
-        // mismatch.
+        // A SHA512 URL segment carrying a 64-hex digest must NOT be hashed as
+        // SHA256: cached unverified, never a spurious mismatch.
         let kind = byhash_verify_kind(HashAlgo::Sha512, HELLO_SHA256);
         assert!(
             matches!(kind, VerifyKind::Unknown),
@@ -3068,8 +2820,7 @@ mod tests {
             );
         }
         assert_eq!(release_dir_from_uri_path("/debian/pool/x/foo.deb"), None);
-        // Release.gpg is a detached binary PGP signature with no SHA256
-        // section, so the ingest dispatcher must not route it here.
+        // Release.gpg has no SHA256 section.
         assert_eq!(
             release_dir_from_uri_path("/debian/dists/sid/Release.gpg"),
             None
@@ -3180,9 +2931,6 @@ mod tests {
         );
     }
 
-    /// The ingest reports what the file said about its age for
-    /// `mirror_indexes`: the (clamped) date, the Valid-Until and the file's
-    /// mtime as the time the mirror served it.
     #[tokio::test]
     async fn a_release_ingest_reports_its_dates_and_mtime() {
         let reg = ChecksumRegistry::new(NonZero::new(64).expect("non-zero"));
@@ -3211,9 +2959,8 @@ mod tests {
         );
     }
 
-    /// A `Release` exactly at `MAX_RELEASE_SIZE` reads whole; one byte more
-    /// fails as `InvalidData` (cleanup's by-hash reconcile counts no cache
-    /// I/O failure for it) rather than being truncated at the cap.
+    /// One byte over fails as `InvalidData` without an OS error (cleanup's
+    /// by-hash reconcile counts no cache I/O failure for it).
     #[tokio::test]
     async fn read_release_refuses_a_file_over_the_cap() {
         let cap = limits::MAX_RELEASE_SIZE.get();
@@ -3360,7 +3107,6 @@ mod tests {
     #[tokio::test]
     async fn ingest_packages_populates_registry() {
         let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
-        // Two minimal Packages stanzas (raw, uncompressed).
         let sha_a = [0xaau8; 32];
         let sha_b = [0xbbu8; 32];
         let packages = format!(
@@ -3392,10 +3138,6 @@ mod tests {
         );
     }
 
-    /// Only the fields the ingest reads must be UTF-8: a Latin-1
-    /// `Description:` in a third-party index registers its digests, while a
-    /// `Filename:` that is not UTF-8 still fails the ingest of the index
-    /// (keeping only what was read before it).
     #[tokio::test]
     async fn ingest_packages_reads_only_tracked_fields_as_utf8() {
         let sha = [0xaau8; 32];
@@ -3439,8 +3181,6 @@ mod tests {
         assert_eq!(registered, Some(sha), "what was read before it registers");
     }
 
-    /// An index of more stanzas than one registry batch registers all of
-    /// them: the full batches as they fill, the rest at the end.
     #[tokio::test]
     async fn ingest_registers_every_stanza_across_batches() {
         let count = 2 * PendingDigests::BATCH + 7;
@@ -3527,8 +3267,7 @@ mod tests {
     async fn ingest_packages_skips_filenames_no_cache_file_can_have() {
         let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
         let digest = index_parser::hex_encode(&[0xaau8; 32]);
-        // A basename up to the 8 KiB line cap: before the length gate it was
-        // retained verbatim, per entry.
+        // A basename up to the 8 KiB line cap.
         let long = "a".repeat(8000);
         let packages = format!(
             "Package: a\nFilename: pool/main/a/a/a_1_amd64.deb\nSHA256: {digest}\n\n\
@@ -3606,9 +3345,7 @@ mod tests {
         );
     }
 
-    /// A by-hash `Packages` (no extension) is sniffed on the descriptor the
-    /// parse then reads: the magic bytes read for the sniff must not be
-    /// lost to the decoder.
+    /// The magic bytes read for the sniff must not be lost to the decoder.
     #[tokio::test]
     async fn ingest_packages_sniffs_the_compression_it_parses() {
         let reg = ChecksumRegistry::new(NonZero::new(100).expect("non-zero"));
@@ -3709,8 +3446,7 @@ mod tests {
         // Every re-insert of a live key appends a stale slot. The compaction
         // trigger is `slots.len() > live + stale_allowance(live)` -- 17 for
         // this one-entry scope -- so 20 further inserts must cross it and
-        // rebuild the log down to the single live slot. Without compaction
-        // the log would hold all 21 slots and this assert would fail.
+        // rebuild the log down to the single live slot.
         for _ in 0..20 {
             reg.insert("h", "m", "a", d);
         }
@@ -3786,9 +3522,6 @@ mod tests {
         assert_eq!(ingest_outcome(&Ok(())), Outcome::Ingested);
     }
 
-    /// Admission happens before the spawn: with every slot taken a claim is
-    /// refused and the path stays claimable; a burst of distinct paths never
-    /// holds more `Running` entries than there are slots.
     #[test]
     fn admission_is_bounded_by_the_slots_and_refusal_is_retryable() {
         let ledger = IngestLedger::new(1024);
@@ -3821,8 +3554,6 @@ mod tests {
         drop(again);
     }
 
-    /// A hostile mirror saturating the shared `Packages` line must not be
-    /// able to refuse every other mirror's `Release` admission too.
     #[test]
     fn release_ingests_use_their_own_admission_pool() {
         let release = IngestKind::Release {

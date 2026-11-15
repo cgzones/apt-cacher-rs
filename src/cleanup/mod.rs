@@ -44,18 +44,15 @@ use crate::{
 
 /// Whether one cache tree of an origin-less mirror row still exists.
 ///
-/// An I/O failure other than "absent" is logged, counted and answered `true`:
-/// the row is the only record of where those files live, so dropping it because
-/// the directory could not be read would orphan the whole tree -- no unit walk
-/// would ever visit it again.
+/// An I/O failure other than "absent" answers `true`: the row is the only
+/// record of where those files live, so dropping it would orphan the tree.
 fn cache_tree_exists(path: &Path) -> bool {
     match path.try_exists() {
         Ok(exists) => exists,
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
-            // Once-gated like `main_loop`'s sibling probe: one unreadable
-            // cache root would otherwise emit two lines per origin-less
-            // mirror row per cleanup run, all naming the same cause.
+            // Once-gated: one unreadable cache root would otherwise emit two
+            // lines per origin-less mirror row per cleanup run.
             warn_once_or_debug!(
                 "Failed to check whether the cache directory `{}` exists; retaining its mirror row:  {}",
                 path.display(),
@@ -68,8 +65,8 @@ fn cache_tree_exists(path: &Path) -> bool {
 
 /// Drop `origins` rows unseen for [`RETENTION_TIME`] and mirror rows that
 /// have neither an origin left nor a cache tree on disk.  Both are minted by
-/// client demand and only ever grew; without this every probed index would
-/// cost a unit walk and an upstream fetch cascade per cleanup run forever.
+/// client demand; without this every probed index would cost a unit walk and
+/// an upstream fetch cascade per cleanup run forever.
 /// A DB failure is logged and skipped -- the per-mirror work must still run.
 async fn prune_stale_rows(database: &Database, config: &Config) {
     let now_secs = coarsetime::Clock::now_since_epoch().as_secs();
@@ -139,15 +136,12 @@ async fn prune_stale_rows(database: &Database, config: &Config) {
     }
 }
 
-/// Delay between daemon startup and the first scheduled cleanup run.
 pub(crate) const FIRST_CLEANUP_DELAY_SECS: u64 = 60 * 60;
 
-/// Interval between recurring cleanup runs.
 pub(crate) const CLEANUP_INTERVAL_SECS: u64 = 24 * 60 * 60;
 
-/// Unix-timestamp of the next scheduled cleanup. Updated by main.rs at startup,
-/// after each scheduled tick, and after a SIGUSR2-triggered reset. A value of
-/// `0` means "not yet initialized".
+/// Unix timestamp of the next scheduled cleanup; `0` means "not yet
+/// initialized".
 static NEXT_CLEANUP_EPOCH: AtomicI64 = AtomicI64::new(0);
 
 pub(crate) fn set_next_cleanup_epoch(epoch: i64) {
@@ -159,13 +153,10 @@ pub(crate) fn next_cleanup_epoch() -> i64 {
     NEXT_CLEANUP_EPOCH.load(Ordering::Relaxed)
 }
 
-/// Whether a cleanup run is in progress; set by [`task_cleanup`], cleared by
-/// its [`ActiveGuard`].
 static TASK_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// RAII guard that releases the `task_cleanup` active flag on drop, so a
-/// panic inside `task_cleanup_impl` cannot leave the flag stuck `true`
-/// (which would block every subsequent scheduled run).
+/// Clears `TASK_ACTIVE` on drop, so a panic inside `task_cleanup_impl` cannot
+/// block every subsequent run.
 struct ActiveGuard;
 
 impl Drop for ActiveGuard {
@@ -201,7 +192,6 @@ fn publish_last_run(
 }
 
 async fn task_cleanup_impl(appstate: &AppState) {
-    // Use buffer_unordered to limit concurrent cleanup tasks and avoid thundering herd
     const MAX_CONCURRENT_CLEANUP_TASKS: usize = 10;
 
     let config = global_config();
@@ -240,14 +230,8 @@ async fn task_cleanup_impl(appstate: &AppState) {
 
     prune_stale_rows(&appstate.database, config).await;
 
-    // The mutating pre-pass (`cleanup_invalid_rows`, `delete_usage_logs`,
-    // `prune_stale_rows`) is done, so drop the dashboard's memoized
-    // aggregates now rather than only at the tail: the mirror lookup below
-    // can abort the run after those deletions have landed, and every future
-    // early return between here and the tail is covered too. Invalidating
-    // mid-run is harmless -- a dashboard load during the per-mirror work
-    // repopulates the slot with mid-run state, which the tail invalidation
-    // clears again.
+    // Invalidate here as well as at the tail: the mirror lookup below can
+    // abort the run after the deletions above have landed.
     crate::web::invalidate_dashboard_aggregates().await;
 
     let mirrors = match appstate.database.get_mirrors().await {
@@ -258,10 +242,7 @@ async fn task_cleanup_impl(appstate: &AppState) {
                 "Failed to look up the mirrors to clean up; aborting this cleanup run:  {}",
                 SqlxErrorReport(&err)
             );
-            // Earlier steps in this task (cleanup_invalid_rows /
-            // delete_usage_logs) may already have run, but no per-mirror
-            // cleanup work was done; record the failed-run state so the
-            // dashboard does not display stale prior-run values.
+            // So the dashboard does not display stale prior-run values.
             publish_last_run(start.elapsed(), 0, 0, metrics::CLEANUP_ABORTED);
             return;
         }
@@ -270,24 +251,16 @@ async fn task_cleanup_impl(appstate: &AppState) {
     trace!("Mirrors ({}): {mirrors:?}", mirrors.len());
     info!("Found {} mirrors for cleanup", mirrors.len());
 
-    // Nested-mirror boundaries: for each mirror, the paths of the other mirrors
-    // registered under the same alias-resolved (cache_host, port) whose path
-    // lives *inside* this mirror's path (segment-aligned).  The flat cleanup
-    // walks the on-disk flat subtree recursively, and these nested mirror roots
-    // bound that walk so a parent mirror's cleanup does not age-evict files
-    // belonging to a nested mirror (which has its own Packages index and its own
-    // cleanup run).  Owned, so `mirrors` can be consumed by the per-future move
-    // below.
+    // For each mirror, the paths of the other mirrors on the same
+    // alias-resolved (cache_host, port) that live inside its path.  They bound
+    // the recursive flat walk so a parent mirror's cleanup does not age-evict
+    // files of a nested mirror, which has its own indexes and cleanup run.
     let nested_per_mirror = nested_paths_per_row(&mirrors);
 
     let cleanup_tasks = mirrors
         .into_iter()
         .zip(nested_per_mirror)
         .map(|(mirror, nested)| {
-            // Every facet (partials, structured pool, flat, metadata, by-hash)
-            // runs on the engine as one ordered per-mirror unit list, in the
-            // order `classify_mirror` documents and emits; `nested` becomes the
-            // FlatTree unit's walk boundaries.
             let mut units = classify_mirror(&mirror, nested, config);
             if !mirror_permitted(config, &mirror.host, mirror.port()) {
                 info!(
@@ -409,10 +382,8 @@ async fn task_cleanup_impl(appstate: &AppState) {
     metrics::CLEANUP_BYHASH_UNREFERENCED.increment_by(removed_unreferenced);
     publish_last_run(elapsed, files_removed, bytes_removed, failures);
 
-    // Second invalidation: the per-mirror units above removed rows of their
-    // own, and the pre-pass one is long stale by now. Cleanup is the only
-    // thing that removes rows, and an operator reloads the page precisely to
-    // confirm the run took effect.
+    // The per-mirror units removed rows of their own since the pre-pass
+    // invalidation.
     crate::web::invalidate_dashboard_aggregates().await;
 
     info!(

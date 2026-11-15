@@ -3,18 +3,16 @@
 //! `splice`) and hands everything else to hyper.
 //!
 //! Handoff contract: `ZeroCopyResult::NotApplicable` gives the current
-//! request to hyper.  The work already done for it travels alongside as
-//! `hyper_conn::HandoffPlan`, so hyper resumes the pipeline
-//! (`serve_cache_miss`, `serve_downloading_file` or the simple proxy) instead
-//! of re-parsing, re-dispatching and re-looking up.  A bodiless HTTP/1.1
-//! keep-alive request is handed over alone: hyper reads only its head
-//! (`MaybePrependedStream::single_request`), and the connection, with any
-//! pipelined requests held back behind it, returns to this loop
-//! (`hyper_conn::serve_handoff_request`).  Any other request takes the
-//! connection with it: the buffered bytes are prepended to hyper's stream
-//! and hyper serves every later request.  Every `NotApplicable` site builds
-//! the plan variant matching what it has already run and accounted for; the
-//! accounting rules are on `HandoffPlan` and `cache_layout::CacheMiss`.
+//! request to hyper, together with the work already done for it
+//! (`hyper_conn::HandoffPlan`), so hyper resumes the pipeline instead of
+//! re-parsing, re-dispatching and re-looking up.  A bodiless HTTP/1.1
+//! keep-alive request is handed over alone: hyper reads only its head, and
+//! the connection, with any pipelined requests held back behind it, returns
+//! to this loop.  Any other request takes the connection with it: the
+//! buffered bytes are prepended to hyper's stream and hyper serves every
+//! later request.  Every `NotApplicable` site builds the plan variant
+//! matching what it has already run and accounted for; the accounting rules
+//! are on `HandoffPlan` and `cache_layout::CacheMiss`.
 
 use std::{
     io::ErrorKind,
@@ -125,26 +123,18 @@ struct HeadersTooLarge;
 /// larger inline completions is a net loss: it disables autotuning, wasting
 /// memory on the dominant localhost/LAN clients while capping WAN throughput.
 const SMALL_SERVE_INLINE_MAX: u64 = 256 * 1024;
-/// Initial size for HTTP request headers buffer.
 const INITIAL_HEADER_SIZE: usize = 2048;
 /// Spare room guaranteed before each request-header read. `BytesMut`
 /// reclaims the space of requests already advanced past only once its spare
-/// capacity is exactly zero, so without this a read on a keep-alive
-/// connection regularly got the few bytes left at the end of the buffer and
-/// cost an extra `recvfrom` and loop pass; `reserve` reclaims in place.
+/// capacity is exactly zero; without this, a read on a keep-alive connection
+/// regularly gets only the few bytes left at the end of the buffer.
 const MIN_HEADER_READ_ROOM: usize = INITIAL_HEADER_SIZE / 2;
 /// Maximum number of HTTP headers to parse (matches hyper's default of 100).
 const MAX_HEADERS: usize = 100;
 
-/// Represents the result of a sendfile operation.
-//
-// Only the `CacheMiss` handoff plan (carrying the stale copy) pushes the
-// variant-size gap over clippy's 200-byte threshold, and that variant is
-// itself `cfg(not(splice))` — with splice, sendfile fetches misses itself and
-// `HandoffPlan` keeps only `JoinDownload` (measured: 392 bytes vs 248, against
-// a ~48-byte `Tunnel`). So the expectation is gated on exactly the condition
-// that creates the large variant; `expect` is an error when unfulfilled, and
-// a looser gate breaks a feature combination the CI powerset covers.
+// The large variant is the `CacheMiss` handoff plan, which exists only
+// without splice; `expect` is an error when unfulfilled, so the gate must
+// match exactly.
 #[cfg_attr(
     all(feature = "hyper", not(feature = "splice")),
     expect(
@@ -155,21 +145,18 @@ const MAX_HEADERS: usize = 100;
     )
 )]
 enum ZeroCopyResult {
-    /// Request was served via sendfile
     Served(ConnectionAction),
 
-    /// Request is not applicable for sendfile, fall back to hyper for this
-    /// and every later request on the connection.  `plan` carries the work
-    /// already done (pre-flight, dispatch, cache lookup / late-joiner
-    /// attach) so hyper resumes the pipeline instead of restarting it; see
-    /// `hyper_conn::HandoffPlan`.  Without hyper the request is refused.
+    /// Not applicable for sendfile: hand the request to hyper, with the
+    /// work already done as `plan` (see `hyper_conn::HandoffPlan`).  Without
+    /// hyper the request is refused.
     NotApplicable {
         reason: &'static str,
         #[cfg(feature = "hyper")]
         plan: HandoffPlan,
         /// What the request asked for the connection: a bodiless HTTP/1.1
         /// keep-alive request is served by hyper alone and the connection
-        /// returns to this backend (`hyper_conn::serve_handoff_request`).
+        /// returns to this backend.
         #[cfg(feature = "hyper")]
         conn_action: ConnectionAction,
     },
@@ -187,9 +174,8 @@ enum ZeroCopyResult {
         msg: &'static str,
     },
 
-    /// Request is a policy-accepted CONNECT: hand the whole connection to
-    /// [`run_connect_tunnel`], which sends `200` and relays bytes bidirectionally.
-    /// The guards are held for the tunnel's lifetime.
+    /// A policy-accepted CONNECT, handed to [`run_connect_tunnel`]. The
+    /// guard is held for the tunnel's lifetime.
     Tunnel {
         target: TunnelTarget,
         tunnel_guard: crate::connect_tunnel::TunnelPermit,
@@ -211,13 +197,6 @@ impl From<SendfileResult> for ZeroCopyResult {
     }
 }
 
-/// Handle a client connection using sendfile(2) for cached file delivery.
-///
-/// For each request on the connection:
-/// - If it's a GET for a cached file (permanent, or volatile within its
-///   freshness window), serve it using sendfile(2)
-/// - Web-interface and splice-proxy-eligible requests are handled in place
-/// - Otherwise, fall back to the standard hyper-based handler
 pub(crate) async fn handle_sendfile_connection(
     mut stream: TcpStream,
     client: ClientInfo,
@@ -299,11 +278,9 @@ pub(crate) async fn handle_sendfile_connection(
             }
         };
 
-        // Proxy entry for every request this backend parsed, including the
-        // ones handed to hyper (which skips its own bump for a handoff).
-        // Counted before the request runs, so REQUESTS_TOTAL >= SERVED_TOTAL
-        // and >= CLIENT_STATUS_* hold at every instant, as on the parse-error
-        // path above, and a long download is a request while it runs.
+        // Counted before the request runs (hyper skips its own bump for a
+        // handoff), so REQUESTS_TOTAL >= SERVED_TOTAL and >= CLIENT_STATUS_*
+        // hold at every instant.
         metrics::REQUESTS_TOTAL.increment();
 
         let result =
@@ -355,9 +332,8 @@ pub(crate) async fn handle_sendfile_connection(
                         continue;
                     }
 
-                    // Fall back to hyper for this and all subsequent requests.
-                    // `buf` starts with the request `plan` describes; any
-                    // pipelined successors behind it are hyper's to parse.
+                    // Fall back to hyper for this and all subsequent requests:
+                    // `buf` starts with the request `plan` describes.
                     debug!(
                         "Falling back to hyper for client {client} on request #{req_num} due to: {reason} ({} bytes buffered)",
                         buf.len()
@@ -430,7 +406,6 @@ pub(crate) async fn handle_sendfile_connection(
                 target,
                 tunnel_guard,
             } => {
-                // CONNECT tunnel consumes the whole connection.
                 run_connect_tunnel(
                     stream,
                     buf,
@@ -444,7 +419,6 @@ pub(crate) async fn handle_sendfile_connection(
                 return;
             }
             ZeroCopyResult::Closed => {
-                // Already logged; the connection must be closed.
                 return;
             }
         };
@@ -469,21 +443,18 @@ async fn write_request_error_response(
     head.write_to(conn, body).await
 }
 
-/// Read HTTP request headers from the stream into the buffer.
-/// Returns when a complete set of headers has been received (terminated by \r\n\r\n) or there is no more data to read.
+/// Read a complete request head into `buf`; `None` on a clean close between
+/// requests.
 ///
 /// Empty lines before the request line are dropped from `buf` as they
 /// arrive, so `buf` starts with the request line and the returned index is
 /// the byte count httparse consumes for it (see
-/// [`find_header_end`](crate::http_helpers::find_header_end)): the
-/// caller's `advance` by that index then moves past the request exactly
-/// once.
+/// [`find_header_end`](crate::http_helpers::find_header_end)).
 ///
 /// The read goes through `AsyncRead`, not `readable()` + `try_read_buf`:
 /// `try_io` clears the socket's readiness only on `EAGAIN`, so that pair
 /// pays one `recvfrom` returning `EAGAIN` before every park, i.e. once per
-/// request. tokio's `poll_read` also clears it after a short read, which on
-/// epoll proves the receive queue drained.
+/// request. tokio's `poll_read` also clears it after a short read.
 async fn read_request_headers(
     stream: &mut TcpStream,
     buf: &mut BytesMut,
@@ -520,10 +491,8 @@ async fn read_request_headers(
                             // Clean close between requests.
                             return Ok(None);
                         }
-                        // Peer closed its write side mid-request, leaving a
-                        // partial header block buffered — a truncated request,
-                        // not a clean close. Surface it as a disconnect (the
-                        // caller's is_peer_disconnect branch handles UnexpectedEof).
+                        // A partial head is buffered: a truncated request,
+                        // not a clean close.
                         return Err(std::io::Error::new(
                             ErrorKind::UnexpectedEof,
                             "connection closed mid-request",
@@ -564,12 +533,10 @@ async fn read_request_headers(
 
 /// Drop the leading empty lines from `buf`, then look for the end of the
 /// head, resuming where the previous call on the same head stopped:
-/// `scanned` is the length of `buf` that call found no terminator in (`0`
-/// for the first). Rescanning from the start on every read would make a
-/// client that dribbles its head one byte per segment cost time quadratic in
-/// the head size. The head is checked against [`MAX_HEADER_SIZE`] here, the
-/// empty lines before it not counted, so the verdict does not depend on how
-/// the head was split across reads.
+/// `scanned` is the length of `buf` that call found no terminator in.
+/// Rescanning from the start on every read would make a client that
+/// dribbles its head one byte per segment cost time quadratic in the head
+/// size. The empty lines do not count against [`MAX_HEADER_SIZE`].
 fn resume_header_end(buf: &mut BytesMut, scanned: &mut usize) -> HeadEnd {
     let skipped = leading_empty_lines(buf);
     buf.advance(skipped);
@@ -580,10 +547,9 @@ fn resume_header_end(buf: &mut BytesMut, scanned: &mut usize) -> HeadEnd {
     capped_header_end(buf, from, MAX_HEADER_SIZE)
 }
 
-/// Log a failed write of a proxy-generated response to the client, taking the
-/// mandatory delivery split (`docs/logging.md`): a peer that hung up or timed
-/// out logs at INFO, every other I/O error at WARN.  `what` names the response
-/// the write belonged to, e.g. `"304 response"`.
+/// A peer that hung up or timed out logs at INFO, every other I/O error at
+/// WARN (`docs/logging.md`).  `what` names the response, e.g.
+/// `"304 response"`.
 fn log_client_write_failure(client: ClientInfo, what: &str, err: &std::io::Error) {
     info_or_warn!(
         is_expected_client_end(err),
@@ -592,14 +558,13 @@ fn log_client_write_failure(client: ClientInfo, what: &str, err: &std::io::Error
     );
 }
 
-/// Best-effort graceful close after writing an error/rejection response on a
-/// connection we are about to drop.  Half-closes the write side (FIN, which
-/// flushes the queued response) then briefly drains pending client input, so
-/// the final `close(2)` emits a FIN rather than an RST.  An RST can make the
-/// peer discard the response it has not read yet — e.g. a request that carried
-/// an unread body, which `compute_conn_action` deliberately does not drain.
-/// Bounded in both time and bytes so a slow or hostile client cannot pin the
-/// task here.
+/// Best-effort graceful close of a connection we are about to drop after
+/// writing a response.  Half-closes the write side, then briefly drains
+/// pending client input, so the final `close(2)` emits a FIN rather than an
+/// RST.  An RST can make the peer discard the response it has not read yet,
+/// e.g. after a request with an unread body, which `compute_conn_action`
+/// deliberately does not drain.  Bounded in both time and bytes so a slow or
+/// hostile client cannot pin the task here.
 async fn graceful_close(stream: &TcpStream) {
     use std::os::fd::AsRawFd as _;
 
@@ -640,13 +605,7 @@ async fn graceful_close(stream: &TcpStream) {
     }
 }
 
-/// Serve a local web-interface request directly from the sendfile path.
-///
 /// The web-interface ACL has already been enforced by `preflight_target`.
-/// The hyper-based handler exists in `web::serve_web_interface`; this
-/// wrapper invokes it and serializes the resulting `WebResponse`
-/// onto the raw `TcpStream` with handwritten headers, so webui responses look
-/// the same regardless of which connection backend served them.
 async fn serve_webui(
     conn: ClientConn<'_>,
     uri: &http::Uri,
@@ -666,12 +625,8 @@ async fn serve_webui(
     ZeroCopyResult::Served(conn.action)
 }
 
-/// Format and write a [`WebResponse`] onto the raw stream.
-///
 /// Deliberately not a `ResponseHead`: web-interface responses are
-/// origin-server responses (no `Via:`), so a single `format!` builds the
-/// status-line + headers block with named substitutions, mirroring the
-/// hyper-side `WebResponse::into_hyper_response` constructor.
+/// origin-server responses (no `Via:`).
 async fn write_webui_response(conn: ClientConn<'_>, response: WebResponse) -> std::io::Result<()> {
     let ClientConn {
         stream,
@@ -707,10 +662,9 @@ async fn write_webui_response(conn: ClientConn<'_>, response: WebResponse) -> st
     write_all_to_stream(stream, &response.body, WritePhase::Body).await
 }
 
-/// Map a shared pre-flight/dispatch rejection onto the sendfile result type,
-/// closing the connection as [`RejectReason::closes_connection`] says.
+/// Map a shared pre-flight/dispatch rejection onto the sendfile result type.
 /// `conn_action` is a closure because `compute_conn_action` logs a warning
-/// for requests carrying a body, which the closing variants never did.
+/// for requests carrying a body, which a closing rejection skips.
 #[must_use]
 fn reject_result(
     reason: RejectReason,
@@ -728,7 +682,6 @@ fn reject_result(
     }
 }
 
-/// Compute the connection action based on the request headers.
 #[must_use]
 fn compute_conn_action(
     req: &httparse::Request<'_, '_>,
@@ -786,7 +739,6 @@ fn compute_conn_action(
         return ConnectionAction::KeepAlive;
     }
 
-    // Use the protocol default
     match version {
         ConnectionVersion::Http10 => ConnectionAction::Close,
         ConnectionVersion::Http11 => ConnectionAction::KeepAlive,
@@ -794,19 +746,12 @@ fn compute_conn_action(
 }
 
 /// Validate a CONNECT request against tunnel policy and, on success, acquire
-/// the concurrency guards. Writes nothing to the socket — the outer connection
-/// loop owns the stream and drives [`run_connect_tunnel`] on the returned
-/// [`ZeroCopyResult::Tunnel`].
-///
-/// The proxy-client ACL (`allowed_proxy_clients`) has already been enforced
-/// by `preflight_method`, which both backends run before reaching here.
+/// the concurrency guards. Writes nothing to the socket.
 #[must_use]
 fn handle_connect(client: ClientInfo, target: &str) -> ZeroCopyResult {
     let config = global_config();
 
-    // A CONNECT request target is authority-form ("host:port"); parse it into a
-    // URI so the shared validator sees the same `authority()` the hyper backend
-    // gets from its pre-parsed request.
+    // A CONNECT request target is authority-form ("host:port").
     let uri = match target.parse::<http::uri::Uri>() {
         Ok(uri) => uri,
         Err(err) => {
@@ -840,9 +785,7 @@ fn handle_connect(client: ClientInfo, target: &str) -> ZeroCopyResult {
     }
 }
 
-/// Write a `502 Bad Gateway` (`"Upstream Error"`) for a CONNECT whose upstream
-/// connect failed *before* `200 Connection Established` was sent, then close.
-/// A write failure is logged and swallowed — the connection is being dropped.
+/// Answer a CONNECT whose upstream connect failed, then close.
 async fn write_tunnel_upstream_error(
     conn: ClientConn<'_>,
     client: ClientInfo,
@@ -858,19 +801,12 @@ async fn write_tunnel_upstream_error(
     graceful_close(conn.stream).await;
 }
 
-/// Drive a policy-accepted CONNECT tunnel to completion.
-///
-/// Consumes the connection. Both backends connect upstream before sending
-/// `200 Connection Established`, so an unreachable, refused or timed-out
-/// upstream receives a real `502 Bad Gateway` instead.
-///
-/// On a successful connect it writes `200 Connection Established`, forwards any
-/// pipelined bytes already buffered past the request header, then relays bytes
-/// bidirectionally. The guards are held for the whole tunnel lifetime.
+/// Drive a policy-accepted CONNECT tunnel to completion, consuming the
+/// connection. The upstream is connected before `200 Connection Established`
+/// is sent, so an unreachable upstream gets a real `502 Bad Gateway`.
 ///
 /// `TUNNEL_CONNECTS_TOTAL` is bumped up front (the CONNECT was accepted), so a
-/// connect failure's `TUNNEL_TRANSFER_FAILED` bump stays a subset of it — the
-/// invariant documented on those counters in `metrics.rs`.
+/// connect failure's `TUNNEL_TRANSFER_FAILED` bump stays a subset of it.
 async fn run_connect_tunnel(
     stream: TcpStream,
     buf: BytesMut,
@@ -898,9 +834,6 @@ async fn run_connect_tunnel(
         }
     };
 
-    // Upstream is connected: send `200 Connection Established` so the client may
-    // begin its TLS handshake. The head is the same `TunnelEstablished` shape
-    // the hyper backend renders for its CONNECT response.
     if let Err(err) = ResponseHead::tunnel_established()
         .write_to(conn, WireBody::None)
         .await
@@ -950,9 +883,6 @@ async fn run_connect_tunnel(
     report_tunnel_outcome(&outcome, &client, &target, start.elapsed());
 }
 
-/// Try to serve a request using sendfile(2).
-/// Returns a [`ZeroCopyResult`] telling the caller how the request was (or
-/// was not) handled.
 async fn try_sendfile_request(
     buf: &[u8],
     stream: &TcpStream,
@@ -1093,12 +1023,9 @@ async fn try_sendfile_request(
     let conn_action = compute_conn_action(&req, *conn_version, &client);
     let conn = ClientConn::new(stream, *conn_version, conn_action);
 
-    // Unified dispatch shared with hyper_conn.rs: diff-reject -> normalize
-    // -> parse -> classify -> flat-blocklist -> unsafe-path gate.
-    // Classification logging, metrics and `record_uncacheable` happen
-    // inside `dispatch_request`, which
-    // runs once per request: a handoff carries its outcome to hyper.  This
-    // match only maps outcomes to ZeroCopyResult.
+    // `dispatch_request` does its own classification logging, metrics and
+    // `record_uncacheable`, and runs once per request: a handoff carries its
+    // outcome to hyper.
     let uri_path = uri.path();
     let path_and_query = uri.path_and_query().map_or(uri_path, PathAndQuery::as_str);
     let conn_details =
@@ -1171,17 +1098,13 @@ async fn try_sendfile_request(
             }
         };
 
-    // sendfile from the growing partial file.  `attach()` atomically records
-    // the late joiner under the same write lock as the lookup; should the
-    // response turn out unframeable here (no Content-Length), the attached
-    // status travels to hyper in the `NotApplicable` plan, so the joiner is
-    // never registered twice.
+    // `attach()` atomically records the late joiner under the same write
+    // lock as the lookup; should the response turn out unframeable here (no
+    // Content-Length), the attached status travels to hyper in the
+    // `NotApplicable` plan, so the joiner is never registered twice.
     if let Some(dl_status) = appstate.active_downloads.attach(conn_details.key()) {
         // Late joiners count like any request of their flavor that found no
-        // usable file: the file was not yet fully on disk, so we would have
-        // fetched upstream if not for the in-flight originator.
-        // `LATE_JOINERS_TOTAL` is the subset that attached; `attach()`
-        // already bumped that counter.
+        // usable file. `attach()` already bumped `LATE_JOINERS_TOTAL`.
         conn_details.count_lookup(LookupOutcome::Miss(MissReason::InFlight));
         conn_details.count_fetch_role(FetchRole::Joiner);
 
@@ -1197,11 +1120,8 @@ async fn try_sendfile_request(
     let cache_path = conn_details.cache_file_path();
 
     // This is the lookup site for every request that gets here, so the
-    // hit/miss/refetch counters are bumped exactly here - whether the miss is
-    // then fetched by splice below or handed to hyper, which enters its
-    // pipeline past its own lookup (`HandoffPlan::CacheMiss`).
-
-    // Try to open the cached file; for volatile resources, treat stale files as cache misses.
+    // hit/miss/refetch counters are bumped exactly here, whether the miss is
+    // then fetched by splice below or handed to hyper.
     let cached_file = 'cache_lookup: {
         let file = match open_cached_file_inline(&cache_path) {
             Ok(f) => f,
@@ -1223,10 +1143,8 @@ async fn try_sendfile_request(
             }
         };
 
-        // Volatile staleness: if file is older than VOLATILE_CACHE_MAX_AGE,
-        // treat as cache miss so splice/hyper can fetch a fresh copy from
-        // upstream. Keep the metadata for the serve path so it doesn't
-        // fstat a second time.
+        // A stale volatile file is a cache miss. Keep the metadata for the
+        // serve path so it doesn't fstat a second time.
         if conn_details.cached_flavor() == CachedFlavor::Volatile {
             match regular_file_metadata(&file, &cache_path) {
                 Ok(md) => {
@@ -1299,13 +1217,9 @@ async fn try_sendfile_request(
             Ok(SpliceProxyOutcome::Concurrent { status: dl_status }) => {
                 // Race-loser path: another connection registered the
                 // download between our earlier `attach()` (which saw
-                // nothing) and `splice_proxy`'s `originate()`. The
-                // existing download's status was handed back by
-                // `originate()` and is held alive by the Arc, so we can
-                // serve from the partial via sendfile directly - no
-                // re-attach, no race-of-races fall-back. The miss was
-                // counted above when the cache lookup found no usable file;
-                // `LATE_JOINERS_TOTAL` was bumped inside `originate()`.
+                // nothing) and `splice_proxy`'s `originate()`, which handed
+                // back its status and bumped `LATE_JOINERS_TOTAL`. The miss
+                // was counted above.
                 serve_unfinished_sendfile(
                     conn,
                     conn_details,
@@ -1356,13 +1270,9 @@ async fn try_sendfile_request(
     }
 }
 
-/// The single outer arm for [`SpliceProxyError`]: maps every variant to its
-/// connection-level outcome and concludes the failures the variants delegate
-/// to it. The policy -- which variants are concluded here, which arrive
-/// already `Reported` and map silently -- is documented on the variants
-/// themselves; this `match` only implements it, and is exhaustive so a new
-/// variant lands here as a compile error. A line written here is the
-/// failure's own `conclude`, which owns its level and counters.
+/// Maps every [`SpliceProxyError`] variant to its connection-level outcome
+/// and concludes the failures the variants delegate to it; the policy is
+/// documented on the variants.
 ///
 /// `prefix` is the registered subsystem prefix,
 /// `subject` names the resource the way that path's other lines do.
@@ -1415,11 +1325,6 @@ pub(crate) enum SendfileResult {
     Closed,
 }
 
-/// Serve a file via sendfile(2), handling conditional requests (304),
-/// range requests, and database delivery tracking.
-///
-/// Shared implementation used for both already-cached files and files
-/// that finished downloading while a joining client was waiting.
 pub(crate) async fn serve_file_via_sendfile(
     conn: ClientConn<'_>,
     conn_details: &ConnectionDetails,
@@ -1468,7 +1373,6 @@ pub(crate) async fn serve_file_via_sendfile(
     .await
 }
 
-/// The file a sendfile serve delivers from.
 struct ServeSource<'a> {
     file: &'a tokio::fs::File,
     path: &'a Path,
@@ -1485,10 +1389,7 @@ struct ServeSource<'a> {
     )>,
 }
 
-/// The serve tail shared by cached files and joined downloads: resolve the
-/// client's conditional and `Range` headers via [`CacheInfo::plan`] and
-/// answer a 304 or 416 head-only, else write the representation head and
-/// the body via sendfile(2) and finish the delivery.
+/// The serve tail shared by cached files and joined downloads.
 async fn serve_planned(
     conn: ClientConn<'_>,
     conn_details: &ConnectionDetails,
@@ -1558,11 +1459,6 @@ async fn serve_planned(
     };
     hint_sequential_read(file, transfer_size, file_path);
 
-    // Headers are sent with MSG_MORE (see
-    // `ClientConn::write_response_headers`), so the kernel coalesces them
-    // with the first sendfile body bytes — no TCP_CORK setsockopt pair
-    // needed.
-
     // The response starts down this path with its head, as `REQUESTS_SPLICE`
     // and hyper's `REQUESTS_*` count it: a failed head write is a request
     // that started and did not complete.
@@ -1617,10 +1513,7 @@ async fn serve_planned(
     }
 }
 
-/// Completion bookkeeping shared by the two sendfile serve loops: turn the
-/// transfer result into a [`ServeOutcome`], run [`finish_cached_serve`] and
-/// enqueue the `deliveries` row it asks for.  Returns whether the body was
-/// fully delivered.
+/// Returns whether the body was fully delivered.
 async fn finish_sendfile_serve(
     conn_details: &ConnectionDetails,
     role: Role,
@@ -1679,7 +1572,6 @@ impl SocketWaitError {
     }
 }
 
-/// Whether the helper waits for read-readiness or write-readiness.
 #[derive(Copy, Clone)]
 enum SocketReadiness {
     #[cfg(feature = "splice")]
@@ -1687,19 +1579,9 @@ enum SocketReadiness {
     Writable,
 }
 
-/// Cadence for the rate-check tick, derived from the configured
-/// `rate_check_timeframe`.  Aim for roughly five samples per window so
-/// `check_fail` fires well within the window on stalled sockets, then
-/// clamp to `[1 s, 5 s]`: the upper bound caps timer churn for the
-/// default 30 s window, and the lower bound preserves the original 1 s
-/// granularity for the warned-but-allowed sub-5 s configurations.
-///
-/// Worst-case detection latency is `timeframe + rate_check_tick`.  For
-/// the default 30 s window that is 35 s (~1.17× the window); the prior
-/// fixed-1 s tick gave 31 s (~1.03×) at the cost of one inner timer
-/// per second on every stalled socket.  Trade is intentional: the
-/// extra ~4 s of detection lag is negligible against a window measured
-/// in tens of seconds, and timer churn on the fast path drops 5×.
+/// Cadence for the rate-check tick: roughly five samples per
+/// `rate_check_timeframe`, clamped to `[1 s, 5 s]` to cap timer churn.
+/// Worst-case detection latency is `timeframe + rate_check_tick`.
 fn rate_check_tick(rc: &RateChecker) -> std::time::Duration {
     let secs = (rc.timeframe().get() / 5).clamp(1, 5);
     std::time::Duration::from_secs(secs as u64)
@@ -1708,14 +1590,12 @@ fn rate_check_tick(rc: &RateChecker) -> std::time::Duration {
 /// Wait for the socket to become readable or writable, bounded by
 /// `http_timeout`.  When a `RateChecker` is supplied, also wakes up
 /// every [`rate_check_tick`] so a stalled socket trips the configured
-/// rate-check window.  `RateChecker::add` back-fills gaps on the next
-/// sample on its own; the `rc.add(0)` calls here only exist to drive
+/// rate-check window; the `rc.add(0)` calls only exist to drive
 /// `check_fail` on each tick.
 ///
 /// One outer `Sleep` (`http_timeout`) and one re-armable inner `Sleep` (the
-/// 1 s tick) are pinned once and driven with `tokio::select!`, so no loop
-/// iteration allocates a timer.  Without a `RateChecker` the tick branch is
-/// disabled and never polled, so its timer is never registered.
+/// tick) are pinned once and driven with `tokio::select!`, so no loop
+/// iteration allocates a timer.
 async fn wait_socket_rated(
     socket: &TcpStream,
     op: SocketReadiness,
@@ -1823,10 +1703,6 @@ pub(crate) async fn wait_readable_rated(
 
 /// Like [`crate::http_helpers::write_all_to_stream`], but additionally enforces
 /// the configured minimum download rate via `rate_checker` (when supplied).
-///
-/// Used for payload-carrying writes; header-only writes should keep using the
-/// non-rated variant since rate-limiting is not meaningful for small fixed
-/// control frames.
 #[cfg(feature = "splice")]
 pub(crate) async fn write_all_to_stream_rated(
     socket: &TcpStream,
@@ -1873,49 +1749,34 @@ pub(crate) async fn write_all_to_stream_rated_counted(
     Ok(())
 }
 
-/// Outcome of [`sendfile_chunk_loop`]: [`ChunkLoopOutcome::Complete`] when
-/// all `amount` bytes were transferred, [`ChunkLoopOutcome::Eof`] if
-/// sendfile(2) reported EOF (returned 0) before completion — the caller
-/// decides whether that is an error.
+/// `Eof` if sendfile(2) returned 0 before all `amount` bytes moved; the
+/// caller decides whether that is an error.
 enum ChunkLoopOutcome {
     Complete,
     Eof { transferred: u64 },
 }
 
-/// Reason the inner blocking sendfile loop returned to async context.
 enum SendfileBatchStop {
-    /// Inner loop transferred all `count` requested bytes.
     Done,
-    /// `sendfile(2)` returned 0 — caller treats as EOF.
     Eof,
-    /// `sendfile(2)` returned `EAGAIN` — caller must wait for the socket
-    /// to become writable before re-entering the blocking loop.
+    /// `EAGAIN`: wait for the socket to become writable before re-entering
+    /// the blocking loop.
     NeedsWritable,
-    /// `sendfile(2)` returned an error other than `EAGAIN`/`EINTR`.
     Error(nix::errno::Errno),
 }
 
 struct SendfileBatch {
-    /// Total bytes transferred during this batch.
     transferred: usize,
-    /// Updated file offset after the last successful sendfile call.
     new_offset: i64,
     stop: SendfileBatchStop,
 }
 
-/// Dup'd socket + file descriptor pair threaded through the blocking
-/// sendfile batches.
-///
-/// The descriptors are dup'd once per transfer and passed by ownership
-/// through each `spawn_blocking`, coming back via the closure return
-/// value.  If the outer future is cancelled mid-batch (client disconnect,
-/// runtime shutdown), tokio cannot abort `spawn_blocking` — it merely
-/// detaches the `JoinHandle`.  The detached closure still owns the
-/// `OwnedFd`s, so the kernel descriptors stay open until it returns and
-/// cannot be reassigned to an unrelated FD by a parent's
-/// `TcpStream`/`File` Drop.  One dup pair per transfer amortises across
-/// many EAGAIN cycles and, for unfinished-file serves, across many
-/// availability windows.
+/// Dup'd socket + file descriptor pair, dup'd once per transfer and passed
+/// by ownership through each `spawn_blocking`.  If the outer future is
+/// cancelled mid-batch, tokio cannot abort `spawn_blocking`; the detached
+/// closure still owns the `OwnedFd`s, so the kernel descriptors stay open
+/// until it returns and cannot be reassigned to an unrelated FD by a
+/// parent's `TcpStream`/`File` Drop.
 struct SendfileFds {
     socket: std::os::fd::OwnedFd,
     file: std::os::fd::OwnedFd,
@@ -1933,9 +1794,7 @@ impl SendfileFds {
 }
 
 /// Transfer up to `amount` bytes from `fds.file` at `*file_offset` to
-/// `fds.socket` using sendfile(2), handling rate checking and writability
-/// polling.  Returns the fd pair for reuse by the next call; on error the
-/// transfer is over and the pair is dropped.
+/// `fds.socket`.  Returns the fd pair for reuse by the next call.
 async fn sendfile_chunk_loop(
     socket: &TcpStream,
     mut fds: SendfileFds,
@@ -1960,13 +1819,10 @@ async fn sendfile_chunk_loop(
 
         wait_writable_rated(socket, rate_checker, config.http_timeout).await?;
 
-        // Hand the entire "transfer up to `count` bytes" loop to one
-        // spawn_blocking so consecutive sendfile() syscalls run on the same
-        // blocking-pool thread without bouncing back through the tokio
-        // scheduler each time.  The blocking task only returns when the
-        // kernel socket buffer fills (EAGAIN), the file ends, or all
-        // requested bytes have moved — sharply reducing the per-request
-        // spawn_blocking count for large cached-file serves.
+        // One spawn_blocking runs the whole "transfer up to `count` bytes"
+        // loop, so consecutive sendfile() syscalls stay on one blocking-pool
+        // thread; it returns only when the socket buffer fills (EAGAIN), the
+        // file ends, or all requested bytes have moved.
         let count: usize = remaining.try_into().unwrap_or(usize::MAX);
         let off_in = *file_offset;
 
@@ -2009,8 +1865,6 @@ async fn sendfile_chunk_loop(
 
         fds = SendfileFds { socket: s, file: f };
 
-        // Apply state changes from whatever progress the batch made before
-        // it stopped (success or EAGAIN both leave us with bytes to credit).
         *file_offset = batch.new_offset;
         remaining = remaining
             .checked_sub(batch.transferred as u64)
@@ -2113,9 +1967,6 @@ fn sendfile_once(
     }
 }
 
-/// Perform an async sendfile(2) operation, transferring `count` bytes from `file`
-/// starting at `offset` to the TCP socket.
-///
 /// The outcome carries the bytes transferred either way; an aborted end is
 /// the typed cause, not yet concluded -- the caller owns the delivery.
 pub(crate) async fn async_sendfile(
@@ -2222,15 +2073,7 @@ async fn sendfile_transfer(
 }
 
 /// Like [`async_sendfile`], but for a file that is still being written to by
-/// a concurrent download task.  Waits for `watch::Receiver` pings to learn
-/// about new data.  The sender batches notifications (see
-/// [`crate::guards::DownloadBarrier::ping_batched`]), so each ping indicates a meaningful
-/// amount of new data on disk.
-///
-/// `content_start` / `content_length` may describe a sub-range (HTTP Range).
-///
-/// The outcome carries the bytes transferred either way; an aborted end is
-/// the typed cause, not yet concluded -- the caller owns the delivery.
+/// a concurrent download task, whose pings announce new data on disk.
 ///
 /// The caller is responsible for bumping the appropriate request-count metric
 /// (`REQUESTS_SENDFILE` for the sendfile late-joiner path, no bump for the
@@ -2295,7 +2138,6 @@ async fn sendfile_unfinished_transfer(
     let mut fds = SendfileFds::dup(socket, file)?;
 
     while remaining > 0 {
-        // Determine how many bytes the file currently has available past our offset.
         let offset_u64: u64 = file_offset
             .try_into()
             .expect("file_offset is non-negative by construction");
@@ -2311,7 +2153,6 @@ async fn sendfile_unfinished_transfer(
 
         let available = file_size.saturating_sub(offset_u64);
 
-        // Clamp to what is actually available on disk and to what we still need.
         let sendable = std::cmp::min(available, remaining);
         if sendable == 0 {
             if finished {
@@ -2346,7 +2187,6 @@ async fn sendfile_unfinished_transfer(
             continue;
         }
 
-        // Transfer what is currently available via the shared sendfile loop.
         let (outcome, fds_back) =
             sendfile_chunk_loop(socket, fds, &mut file_offset, sendable, &mut rate_checker)
                 .await
@@ -2394,9 +2234,6 @@ async fn sendfile_unfinished_transfer(
     Ok(())
 }
 
-/// Serve a file that is currently being downloaded by another task, using
-/// sendfile(2) for zero-copy delivery to the joining client.
-///
 /// Takes `conn_details` by value because an in-flight download without a
 /// known `Content-Length` cannot be framed here and is handed to hyper
 /// together with the attached `dl_status` (`HandoffPlan::JoinDownload`).
@@ -2641,8 +2478,6 @@ impl AsyncWrite for MaybePrependedStream {
     }
 }
 
-/// Rated writer coverage. The shared metadata helper's EINTR and error
-/// attribution tests live in `fs_open`.
 #[cfg(test)]
 mod transfer_tests {
     #[cfg(feature = "splice")]
@@ -2673,8 +2508,6 @@ mod transfer_tests {
     }
 }
 
-/// The resumed head scan finds the terminator the one-shot scan over the
-/// whole (empty-line-stripped) buffer does, however the bytes arrive.
 #[cfg(test)]
 mod header_end_tests {
     use bytes::BytesMut;

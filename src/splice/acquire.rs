@@ -4,10 +4,6 @@
 //! [`discard_partial_and_retry`] replace the exchange on a redirect or a
 //! non-resumable partial. The result is an [`UpstreamExchange`] (connection,
 //! parsed head, header buffer and body-prefix boundary).
-//!
-//! Consumers: the drive in `mod.rs`, `simple_proxy` and `cleanup_bridge`
-//! (`standard_upstream_connect`), plus the drive's reconnect helpers and
-//! `warn_upstream_reject`.
 
 use std::{num::NonZero, time::Duration};
 
@@ -42,16 +38,12 @@ use crate::transfer_error::UpstreamError;
 
 /// One upstream request/response in flight: the pool-guarded connection the
 /// response arrived on, its parsed head, and the bytes read alongside it
-/// (`header_buf[header_end..]` is the body prefix). Built only by
-/// [`standard_upstream_connect`] and replaced wholesale by the reconnect helpers
-/// ([`follow_redirect`], [`discard_partial_and_retry`]), so every field always
-/// describes the same connection.
+/// (`header_buf[header_end..]` is the body prefix).
 pub(super) struct UpstreamExchange {
     pub(super) conn: ResponseBody,
     pub(super) response: UpstreamResponse,
     pub(super) header_buf: BytesMut,
     pub(super) header_end: usize,
-    /// Whether `conn` came out of the pool rather than a fresh connect.
     pub(super) reused: bool,
     /// When the attempt that produced this exchange started: the request
     /// write on a pooled connection, the connect of a fresh one. With the
@@ -60,8 +52,7 @@ pub(super) struct UpstreamExchange {
 }
 
 impl UpstreamExchange {
-    /// Wrap the head [`send_and_read_headers`] returned on `conn` into an
-    /// exchange; dropping it closes the connection until body completion.
+    /// Dropping the exchange before body completion closes the connection.
     fn new(
         conn: UpstreamConn,
         endpoint: UpstreamEndpoint<'_>,
@@ -80,7 +71,6 @@ impl UpstreamExchange {
         }
     }
 
-    /// The time-to-first-byte ends of this exchange.
     #[must_use]
     pub(super) const fn head_timing(&self) -> HeadTiming {
         HeadTiming {
@@ -89,10 +79,9 @@ impl UpstreamExchange {
         }
     }
 
-    /// Consume an abandoned response, returning its connection only if its
-    /// body can be drained within a small byte and total-time budget. The
-    /// caller can then acquire a replacement without leaving a live exchange
-    /// containing an empty connection guard.
+    /// Consume an abandoned response, returning its connection to the pool
+    /// only if its body can be drained within a small byte and total-time
+    /// budget.
     ///
     /// Close-delimited and explicitly closing responses are dropped at once.
     /// Timeout/error cancellation drops the response owner, so a partial drain
@@ -121,12 +110,9 @@ impl UpstreamExchange {
         .await;
         match result {
             Ok(Ok(_body)) => {}
-            // Not drainable (too large, a protocol violation in the body, a
-            // broken connection): the connection is simply not pooled. The
-            // response was abandoned -- a followed 3xx, a discarded resume
-            // answer -- and the request did not fail, so nothing counts and
-            // the mirror is not blamed; hyper never counts dropping a
-            // connection either.
+            // Not drainable: the connection is simply not pooled. The
+            // response was abandoned and the request did not fail, so nothing
+            // counts and the mirror is not blamed.
             Ok(Err(err)) => {
                 debug!(
                     "{log_prefix} not reusing the upstream connection after a {} response, its body could not be drained within {} bytes:  {}",
@@ -164,7 +150,6 @@ impl UpstreamExchange {
     }
 }
 
-/// Update the scheme cache for an endpoint after successful connection.
 fn cache_scheme(endpoint: UpstreamEndpoint<'_>, scheme: Scheme) {
     if scheme_cache::record_success(endpoint.into(), scheme) {
         debug!(
@@ -188,11 +173,9 @@ pub(super) async fn standard_upstream_connect(
         path: upstream_path,
         conditions: _,
     } = request;
-    // Resolve the scheme decision ONCE per connect: it drives the pool-lookup
-    // key, the HTTPS-upgrade accounting, and the connect itself. A forced
-    // scheme (an `https://` redirect target, a refetch keeping its discarded
-    // connection's scheme) carries no decision, and so does none of the
-    // scheme-cache / upgrade-metric bookkeeping below.
+    // A forced scheme (an `https://` redirect target, a refetch keeping its
+    // discarded connection's scheme) carries no decision, and so does none of
+    // the scheme-cache / upgrade-metric bookkeeping below.
     let (resolved_scheme, decision) = if let Some(scheme) = scheme_override {
         (Some(scheme), None)
     } else {
@@ -201,10 +184,8 @@ pub(super) async fn standard_upstream_connect(
         (decision.fixed_scheme(), Some(decision))
     };
 
-    // Try a pooled connection first. In Auto mode without a cached scheme there
-    // is no key to look up by, so account for it as `POOL_MISS_NO_SCHEME` and
-    // fall through to the fresh-connect path — the invariant
-    // `POOL_NEW ≈ sum(POOL_MISS_*)` then holds for first connections too.
+    // In Auto mode without a cached scheme there is no pool key to look up
+    // by; `POOL_MISS_NO_SCHEME` keeps `POOL_NEW == sum(POOL_MISS_*)`.
     if let Some(scheme) = resolved_scheme {
         let is_tls = matches!(scheme, Scheme::Https);
         let port = endpoint_port(endpoint, is_tls);
@@ -265,9 +246,8 @@ pub(super) async fn standard_upstream_connect(
 
     metrics::POOL_NEW.increment();
 
-    // HTTPS-upgrade accounting, read off the decision resolved above. The timing
-    // and the deliberate divergences from hyper are documented on the counters in
-    // metrics.rs.
+    // The timing of the HTTPS-upgrade accounting and its deliberate
+    // divergences from hyper are documented on the counters in metrics.rs.
     if decision.is_some_and(SchemeDecision::is_upgrade_attempt) {
         metrics::HTTPS_UPGRADE_ATTEMPTED.increment();
     }
@@ -287,8 +267,7 @@ pub(super) async fn standard_upstream_connect(
         };
         let attempt = backoff.attempt();
         // A permanent failure repeats identically on every retry, so it skips
-        // the budget and drops straight into the terminal branch below --
-        // sparing 10 pointless TCP connects and TLS handshakes.
+        // the budget.
         let permanent = err.transience == Transience::Permanent;
         let next = if permanent {
             Err(RetryStop::Permanent)
@@ -311,12 +290,12 @@ pub(super) async fn standard_upstream_connect(
                             scheme_cache::no_fallback_reason(global_config().https_upgrade_mode)
                         );
                     } else if let Some(scheme) = scheme_cache::record_failure(endpoint.into()) {
-                        // Evict a stale cached scheme so the next request
-                        // re-resolves, mirroring the hyper backend. A learned
-                        // scheme is sticky, so losing it silently changes
-                        // how every later request to this host is dialled (an
-                        // evicted https entry can hand the host back to plain http
-                        // under Auto mode).
+                        // The stale cached scheme is evicted so the next
+                        // request re-resolves, mirroring the hyper backend.
+                        // Warn: a learned scheme is sticky, so losing it
+                        // changes how every later request to this host is
+                        // dialled (an evicted https entry can hand the host
+                        // back to plain http under Auto mode).
                         warn_once_or_info!(
                             "splice proxy: evicted cached {scheme} scheme for host {} after connect failure; the next request re-decides the scheme",
                             endpoint.format_authority()
@@ -326,13 +305,9 @@ pub(super) async fn standard_upstream_connect(
                         metrics::HTTPS_UPGRADE_FAILED.increment();
                     }
                 }
-                // The failure itself is not logged here: the attempt count and
-                // the reason that ended the loop ride on it. The download callers
-                // hand it to the runner, which logs it once-gated with them; the
-                // two callers that have no runner carry the cause themselves --
-                // `simple_proxy` logs its own once-gated 502 line, and
-                // `cleanup_bridge` passes it on as the cause of its
-                // `FetchFailure` for cleanup's decision log.
+                // Not logged here: the attempt count and the reason that ended
+                // the loop ride on the error, and whoever concludes it logs it
+                // once-gated.
                 return Err(
                     UpstreamError::connect("connect upstream", err.err, attempt, limit)
                         .with_target(format!(
@@ -358,8 +333,6 @@ pub(super) async fn standard_upstream_connect(
     let scheme = up.scheme();
     if let Some(decision) = decision {
         cache_scheme(endpoint, scheme);
-        // Loop-exit upgrade outcome: HTTPS connected → SUCCEEDED; fell back to
-        // HTTP → REVERTED.
         if decision.is_upgrade_attempt() {
             match scheme {
                 Scheme::Https => metrics::HTTPS_UPGRADE_SUCCEEDED.increment(),
@@ -409,9 +382,7 @@ impl RedirectTarget {
 /// Returns the replacement exchange and the [`RedirectTarget`] it landed
 /// on. If the redirect is not followable (invalid URI, disallowed host),
 /// logs and returns the original exchange with `None` so the caller
-/// falls through to the non-200 forwarding path.
-///
-/// Times out after the configured HTTP timeout.
+/// forwards the 3xx as it is.
 ///
 /// `original_path` is the target of the request that drew the redirect;
 /// the target is fetched with the same `conditions`.
@@ -423,9 +394,6 @@ pub(super) async fn follow_redirect(
 ) -> Result<(UpstreamExchange, Option<RedirectTarget>), UpstreamError> {
     let status = exchange.response.status_code;
     let Some(location) = exchange.response.location.as_deref() else {
-        // Every other reject branch below logs; without this one a broken
-        // upstream's 3xx is forwarded to the client with nothing cached and
-        // no explanation anywhere.
         warn_once_or_info!(
             "splice proxy: upstream {} answered {status} for {} without a Location header; forwarding the redirect to the client uncached",
             conn_details.mirror,
@@ -444,8 +412,7 @@ pub(super) async fn follow_redirect(
         // A relative Location (`/pool/...`) is legal per RFC 9110 and common
         // on redirectors, but this backend only follows absolute targets, so
         // the resource is forwarded uncached on every request. Checked before
-        // the scheme branch below, which would otherwise report a relative
-        // target as a non-HTTP scheme.
+        // the scheme branch, which would report it as a non-HTTP scheme.
         warn_once_or_info!(
             "splice proxy: upstream {} sent {status} for {} with relative Location `{}`; not following the redirect and not caching the response",
             conn_details.mirror,
@@ -501,9 +468,8 @@ pub(super) async fn follow_redirect(
         return Ok((exchange, None));
     }
 
-    // Reject self-redirects: if the target (scheme, host, port, path) matches the request
-    // we just made, following it would just repeat the same request and create
-    // unnecessary load (and potentially loop on a misconfigured mirror).
+    // Reject self-redirects: following one would repeat the same request (and
+    // potentially loop on a misconfigured mirror).
     let moved_path = moved_uri
         .path_and_query()
         .map_or("/", http::uri::PathAndQuery::as_str);
@@ -584,9 +550,6 @@ pub(super) async fn follow_redirect(
 }
 
 /// Log the planner's refusal of an upstream response.
-///
-/// The complaint itself lives on [`RejectReason::detail`], shared with the
-/// hyper backend; this owns the `splice proxy:` prefix and the once-gates.
 pub(super) fn warn_upstream_reject(reason: RejectReason, conn_details: &ConnectionDetails) {
     /// One gate per reason: a mirror tripping `max_object_size` must not
     /// mute the first genuine protocol violation.
@@ -603,10 +566,8 @@ pub(super) fn warn_upstream_reject(reason: RejectReason, conn_details: &Connecti
     );
 }
 
-/// Discard a stale partial download file and retry the upstream request from scratch.
-///
-/// Shared by the 416 and invalid-Content-Range recovery paths
-/// (`ResumeAnomaly::needs_refetch`).
+/// Discard a stale partial download file and retry the upstream request from
+/// scratch (the 416 and invalid-Content-Range recovery).
 pub(super) async fn discard_partial_and_retry(
     partial: &mut partial_file::PartialDownload,
     endpoint: UpstreamEndpoint<'_>,
@@ -629,10 +590,8 @@ pub(super) async fn discard_partial_and_retry(
         Some(scheme),
     )
     .await?;
-    // The fresh connect above does not follow redirects; the caller's top-level
-    // redirect handling already ran on the original (now-discarded) response, so
-    // follow one redirect here if the retry also lands on a 3xx (the retry is
-    // always a fresh full request: resume_offset=0, no If-Range/volatile cond).
+    // The caller's redirect handling already ran on the discarded response,
+    // so follow one redirect here if the refetch also lands on a 3xx.
     if exchange.response.is_redirect() {
         (exchange, _) = Box::pin(follow_redirect(
             exchange,

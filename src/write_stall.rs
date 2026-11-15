@@ -1,21 +1,14 @@
 //! A client stream wrapper bounding how long a write may make no progress:
-//! [`WriteStallTimeout`].
-//!
-//! The sendfile and splice writers enforce `http_timeout` on every client
-//! write themselves (`wait_socket_rated`). Two client paths write through a
-//! generic `AsyncWrite` instead and get the same bound from this wrapper:
-//! every hyper-served connection (`hyper_conn`), whose tunnels it keeps
-//! across the upgrade, and the sendfile backend's CONNECT tunnel relay
-//! (`sendfile_conn::run_connect_tunnel`).
+//! [`WriteStallTimeout`]. It gives the client paths that write through a
+//! generic `AsyncWrite` (hyper-served connections, CONNECT tunnel relays) the
+//! `http_timeout` bound the sendfile and splice writers enforce themselves.
 
 use std::{future::Future as _, pin::Pin, task::Poll, time::Duration};
 
 use crate::humanfmt::HumanFmt;
 
-/// Why a [`WriteStallTimeout`] write failed: the client accepted no bytes
-/// for `timeout`. Carried inside the `TimedOut` `io::Error`, so a caller
-/// can tell a stalled client from a socket-level timeout
-/// ([`is_client_write_stall`]).
+/// Carried inside the `TimedOut` `io::Error`, so a caller can tell a stalled
+/// client from a socket-level timeout ([`is_client_write_stall`]).
 #[derive(Debug)]
 struct ClientWriteStalled {
     timeout: Duration,
@@ -34,7 +27,6 @@ impl std::fmt::Display for ClientWriteStalled {
 
 impl std::error::Error for ClientWriteStalled {}
 
-/// Whether `err` is a [`WriteStallTimeout`] firing.
 #[must_use]
 pub(crate) fn is_client_write_stall(err: &std::io::Error) -> bool {
     err.get_ref()
@@ -42,8 +34,7 @@ pub(crate) fn is_client_write_stall(err: &std::io::Error) -> bool {
 }
 
 /// Client stream wrapper failing a write that makes no progress for
-/// `timeout` (`http_timeout`) with `TimedOut` ([`ClientWriteStalled`]), the
-/// bound the sendfile backend's rated writes enforce.
+/// `timeout` (`http_timeout`) with `TimedOut` ([`ClientWriteStalled`]).
 ///
 /// hyper has no write timeout of its own, and once its write queue is full
 /// it only flushes and stops polling the response body, so the body-level
@@ -72,7 +63,6 @@ impl<S> WriteStallTimeout<S> {
         }
     }
 
-    /// The stream back, for the connection a handoff returns.
     #[cfg(all(feature = "hyper", feature = "sendfile"))]
     pub(crate) fn into_inner(self) -> S {
         let Self {
@@ -114,7 +104,6 @@ impl<S> WriteStallTimeout<S> {
         }
     }
 
-    /// Pass a write's outcome through, accounting a stall.
     fn account<T>(
         &mut self,
         cx: &mut std::task::Context<'_>,
@@ -198,8 +187,6 @@ mod tests {
         )));
     }
 
-    /// Every write that makes progress disarms the deadline: a slow reader
-    /// taking far longer than the timeout in total is not cut off.
     #[tokio::test(start_paused = true)]
     async fn a_slowly_reading_client_is_not_timed_out() {
         let (mut client, server) = tokio::io::duplex(64);

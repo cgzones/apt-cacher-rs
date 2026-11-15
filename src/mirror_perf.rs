@@ -7,11 +7,9 @@
 //! was reused -- to its parsed response head. Earlier failed attempts and
 //! the backoff sleeps between them are not part of it; a followed redirect
 //! or a resume-anomaly refetch is measured on the last exchange. Recorded
-//! for cached-route fetches the upstream answered with a body or a 304,
-//! at each fetching backend's upstream-head site (hyper's
-//! `serve_new_file_worker`, splice's `splice_proxy`), the same point
-//! the request earns its `Origin` row. Not recorded: passthroughs, failed
-//! exchanges, other statuses, cleanup's synthetic fetches. One divergence:
+//! for cached-route fetches the upstream answered with a body or a 304.
+//! Not recorded: passthroughs, failed exchanges, other statuses, cleanup's
+//! synthetic fetches. One divergence between the backends:
 //! splice's Auto-mode HTTPS-to-HTTP fallback happens inside one attempt
 //! (`connect_upstream`), so while a host's scheme is undecided its first
 //! splice sample includes the failed handshake; hyper retries it as a
@@ -19,21 +17,16 @@
 //!
 //! **Throughput** is the wire body bytes of one download (a resumed prefix
 //! excluded) over the span from the parsed head to the last body byte,
-//! recorded for committed downloads of at least [`MIN_THROUGHPUT_BYTES`]:
-//! hyper's `download_file` and splice's commit tail, after the commit. A
+//! recorded for committed downloads of at least [`MIN_THROUGHPUT_BYTES`]. A
 //! lower bound while a client is attached: splice paces its upstream reads
 //! to the client until demotion, and hyper's figure includes its buffered
 //! cache writes.
 //!
 //! The peak throughput is also splice's demotion-floor reference
-//! (`peak_throughput`, read by `splice/body.rs`'s `DemotionFloor`): what
-//! the mirror has shown it can deliver, independent of the transfer a slow
-//! client paces. Only the peak serves there, never the latest sample: a
-//! slow client's own paced download records a low latest figure, while no
-//! download can lower the peak.
-//!
-//! Stored in a [`MirrorRegistry`] keyed by the canonical mirror: one short
-//! lock per answered fetch, no allocation after a mirror's first sighting.
+//! (`peak_throughput`): what the mirror has shown it can deliver,
+//! independent of the transfer a slow client paces. Only the peak serves
+//! there, never the latest sample: a slow client's own paced download
+//! records a low latest figure, while no download can lower the peak.
 
 use std::time::Duration;
 
@@ -80,7 +73,6 @@ pub(crate) struct Latest<T> {
     at: u64,
 }
 
-/// One mirror's latency and throughput since process start.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MirrorPerf {
     pub(crate) ttfb: Option<Latest<Duration>>,
@@ -104,7 +96,6 @@ impl MirrorPerf {
     }
 }
 
-/// The newer of two latest samples.
 fn newer<T: Copy>(a: Option<Latest<T>>, b: Option<Latest<T>>) -> Option<Latest<T>> {
     match (a, b) {
         (Some(a), Some(b)) => Some(if b.at > a.at { b } else { a }),
@@ -130,9 +121,7 @@ impl Twin for MirrorPerf {
 
 static PERF: MirrorRegistry<MirrorPerf> = MirrorRegistry::new(MAX_MIRRORS);
 
-/// Record the time to first byte of the answered fetch `details` describes,
-/// under its canonical mirror; see the module doc for which fetches count.
-/// Cleanup's synthetic fetches record nothing.
+/// See the module doc for which fetches count.
 pub(crate) fn record_ttfb(details: &ConnectionDetails, timing: HeadTiming) {
     if details.client.is_cleanup_synthetic() {
         return;
@@ -142,8 +131,7 @@ pub(crate) fn record_ttfb(details: &ConnectionDetails, timing: HeadTiming) {
     PERF.update(&details.mirror, |perf| perf.record_ttfb(ttfb, at));
 }
 
-/// Bytes per second of `wire_bytes` over `window`, `None` below
-/// [`MIN_THROUGHPUT_BYTES`] or for an empty window.
+/// Bytes per second.
 #[must_use]
 fn throughput(wire_bytes: u64, window: Duration) -> Option<u64> {
     if wire_bytes < MIN_THROUGHPUT_BYTES || window.is_zero() {
@@ -153,10 +141,8 @@ fn throughput(wire_bytes: u64, window: Duration) -> Option<u64> {
     Some(u64::try_from(rate).unwrap_or(u64::MAX))
 }
 
-/// Record the throughput of the committed download `details` describes,
-/// under its canonical mirror: `wire_bytes` of body received over `window`,
-/// from the parsed head to the last body byte. Small downloads and
-/// cleanup's synthetic fetches record nothing.
+/// For a committed download: `wire_bytes` of body received over `window`,
+/// from the parsed head to the last body byte.
 pub(crate) fn record_throughput(details: &ConnectionDetails, wire_bytes: u64, window: Duration) {
     if details.client.is_cleanup_synthetic() {
         return;
@@ -177,8 +163,7 @@ pub(crate) fn peak_throughput(mirror: &Mirror) -> Option<std::num::NonZero<u64>>
         .and_then(|perf| std::num::NonZero::new(perf.rate_peak))
 }
 
-/// Every tracked mirror's figures, keyed by its `host[:port]/path`, for one
-/// dashboard render.
+/// Keyed by the mirror's `host[:port]/path`.
 #[must_use]
 pub(crate) fn snapshot() -> HashMap<Box<str>, MirrorPerf> {
     PERF.snapshot()
@@ -224,7 +209,6 @@ mod tests {
         assert_eq!(perf.rate_peak, 900);
     }
 
-    /// Twins fold to the newer latest sample and the more extreme peaks.
     #[test]
     fn twins_merge_to_the_newer_sample() {
         let ms = Duration::from_millis;

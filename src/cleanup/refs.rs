@@ -18,9 +18,7 @@ use crate::{metrics, warn_once_or_debug};
 use super::engine::CleanupUnitError;
 
 /// The set of by-hash digests referenced by a mirror's current
-/// `Release`/`InRelease` files, for one by-hash directory. Built by
-/// [`build_byhash_reference_set`]; consumed to decide which on-disk by-hash
-/// files are still live.
+/// `Release`/`InRelease` files, for one by-hash directory.
 pub(super) struct ByHashReferenceSet {
     pub(super) sha256: HashSet<[u8; 32]>,
     pub(super) sha512: HashSet<[u8; 64]>,
@@ -40,10 +38,9 @@ impl ByHashReferenceSet {
         }
     }
 
-    /// Decode a by-hash filename (a bare lowercase hex digest) and report
+    /// Decode a by-hash filename (a bare hex digest) and report
     /// `(algorithm, whether-referenced)`. `None` when `name` is not a 64- or
-    /// 128-hex digest (such an entry falls to the age backstop, never a
-    /// reference deletion).
+    /// 128-hex digest; such an entry falls to the age backstop.
     pub(super) fn classify(&self, name: &str) -> Option<(HashAlgo, bool)> {
         match name.len() {
             64 => {
@@ -85,22 +82,15 @@ static RELEASE_WALK: WalkContext = WalkContext {
 /// Build the union by-hash digest set for one by-hash directory from every
 /// current `Release`/`InRelease` file in `release_dir`.
 ///
-/// Returns `None` - signalling the caller to fall back to pure age-based
-/// retention for the whole directory - when `release_dir` is absent, holds no
-/// Release files, or ANY Release file fails to read/parse. The `dists/by-hash/`
-/// tree is a union across all distributions, so a partial set (one dist's
-/// `InRelease` missing) would falsely orphan that dist's files; we therefore
-/// bail wholesale rather than reconcile against an incomplete set. An over-size
-/// Release surfaces from [`read_release_to_string`] as `InvalidData` and is
-/// handled here as a read failure.
+/// Returns `None` - the caller falls back to pure age-based retention for the
+/// whole directory - when `release_dir` is absent, holds no Release files, or
+/// ANY Release file fails to read/parse. The `dists/by-hash/` tree is a union
+/// across all distributions, so a partial set would falsely orphan the
+/// missing dist's files.
 ///
-/// `expected_dists` lists the distributions that must be covered for reference
-/// mode to be sound (the mirror's active-origin dists). A dist whose flattened
-/// `<dist>_{In,}Release` is *absent* from `release_dir` - not merely unreadable -
-/// is otherwise invisible here, so without this check its by-hash files would be
-/// orphaned; if any expected dist is missing we bail to age mode. Pass an empty
-/// slice for the flat tree, which has a single root `{In,}Release` and no
-/// per-dist union.
+/// `expected_dists` lists the distributions that must be covered (the
+/// mirror's active-origin dists): a dist whose Release is *absent* is
+/// otherwise invisible here. Pass an empty slice for the flat tree.
 pub(super) async fn build_byhash_reference_set(
     cache_root: &Path,
     release_dir: &Path,
@@ -120,9 +110,6 @@ pub(super) async fn build_byhash_reference_set(
     let mut coverage: HashMap<String, (bool, bool)> = HashMap::new();
 
     while let Some(entry) = walker.next().await {
-        // `by-hash/` (and any flat URL-dir) sits next to the Release files;
-        // a non-regular entry was reported by the walker and is left to the
-        // metadata sweep.
         let Some(name) = entry.name().to_str() else {
             continue;
         };
@@ -139,13 +126,10 @@ pub(super) async fn build_byhash_reference_set(
         let content = match read_release_to_string(&path).await {
             Ok(c) => c,
             Err(err) => {
-                // Conservative: an unreadable or truncated Release means the
-                // reference set would be incomplete, so abandon reference mode
-                // for the whole directory and fall back to age-based retention.
-                // Only a failed syscall counts, in the counter its errno
-                // belongs to: an oversized or non-UTF-8 Release (an errno-less
-                // `InvalidData` from the reader) is a content problem, and one
-                // removed since the walk listed it is a concurrent removal.
+                // Only a failed syscall counts: an oversized or non-UTF-8
+                // Release (an errno-less `InvalidData` from the reader) is a
+                // content problem, and one removed since the walk listed it
+                // is a concurrent removal.
                 if err.raw_os_error().is_some() && err.kind() != std::io::ErrorKind::NotFound {
                     count_cache_failure(&err);
                 }
@@ -157,7 +141,6 @@ pub(super) async fn build_byhash_reference_set(
                 return None;
             }
         };
-        // A parse error drops this whole local aggregate, including a valid prefix.
         let parsed = match parse_release_byhash_digests(&content, |digest| match digest {
             ByHashRef::Sha256(d) => {
                 set.sha256.insert(d);
@@ -190,15 +173,11 @@ pub(super) async fn build_byhash_reference_set(
     }
     match walker.finish() {
         WalkOutcome::Complete => {}
-        // An absent directory has no Release files by definition; an
-        // unreadable one was logged by the walker.  Neither is a reason to
-        // warn about a Release-less tree.
+        // Returned before the Release-less warn below: an unreadable
+        // directory was already logged by the walker.
         WalkOutcome::RootMissing | WalkOutcome::Aborted { .. } => return None,
     }
 
-    // Reference mode reconciles the whole union `by-hash/` tree at once, so an
-    // expected dist with no Release present would have its files orphaned. Bail
-    // to age-based retention rather than reconcile against an incomplete union.
     for &dist in expected_dists {
         if !coverage.contains_key(dist) {
             debug!(
@@ -211,9 +190,7 @@ pub(super) async fn build_byhash_reference_set(
 
     if coverage.is_empty() {
         // The by-hash tree exists but no Release names it, so the whole tree
-        // drops to the age backstop instead of the 3-day grace. That is a
-        // deliberate degradation, hence warn on first sight; repeats are
-        // per-mirror environmental noise, hence debug after that.
+        // drops to the age backstop instead of the 3-day grace.
         warn_once_or_debug!(
             "No Release files in `{}` for by-hash reconciliation; falling back to age-based retention",
             release_dir.display()
@@ -225,18 +202,13 @@ pub(super) async fn build_byhash_reference_set(
     Some(set)
 }
 
-/// Distinct distributions of the mirror's *active* origins (seen within
-/// `RETENTION_TIME`), used as the `expected_dists` completeness gate for
-/// structured by-hash reconciliation. Stale dists are excluded so their by-hash
-/// files age out normally.
+/// Distinct distributions of the mirror's *active* origins, the
+/// `expected_dists` completeness gate for structured by-hash reconciliation.
+/// Stale dists are excluded so their by-hash files age out normally.
 ///
-/// `origins` is the mirror's own rows, read once per cycle by the engine and
-/// shared with the structured-pool reconcile. `None` there means the read failed;
-/// it propagates to `None` here so the caller forces age-based retention for the
-/// structured tree this cycle rather than reconciling against a possibly
-/// incomplete origin set (a missing still-active dist would otherwise let
-/// reference mode orphan its by-hash files). `Some(vec![])` is a genuine "no
-/// active origins", distinct from the error case.
+/// `None` origins means the read failed; it propagates so the caller forces
+/// age-based retention rather than reconciling against a possibly incomplete
+/// origin set. `Some(vec![])` is a genuine "no active origins".
 #[must_use]
 pub(super) fn active_origin_distributions(origins: Option<&[OriginEntry]>) -> Option<Vec<&str>> {
     let now: Duration = Clock::now_since_epoch().into();
@@ -251,12 +223,9 @@ pub(super) fn active_origin_distributions(origins: Option<&[OriginEntry]>) -> Op
 }
 
 /// Whether a per-layout by-hash tree exists as a real directory, by `lstat`
-/// so a hostile symlink cannot redirect the walk outside the cache tree. An
-/// absent root is silently absent (a fresh mirror has none); a symlinked or
-/// non-directory one is absent with a warning, the symlink also counted
-/// (`CACHE_NON_REGULAR`) like every symlink a cache walk meets. A hard I/O
-/// error is logged (and counted) here and abandons the unit, so the tree is
-/// left unswept this cycle and the run reports the failed step.
+/// so a hostile symlink cannot redirect the walk outside the cache tree. A
+/// symlinked or non-directory root is absent with a warning; a hard I/O
+/// error abandons the unit.
 pub(super) async fn byhash_dir_present(path: &Path) -> Result<bool, CleanupUnitError> {
     match tokio::fs::symlink_metadata(path).await {
         Ok(md) if md.file_type().is_dir() => Ok(true),
@@ -319,9 +288,6 @@ mod tests {
 
     #[test]
     fn active_origin_distributions_distinguishes_unread_from_empty() {
-        // `None` (the read failed) must NOT collapse to "no active origins":
-        // the caller uses it to force age mode instead of reconciling against
-        // an origin set it never saw.
         assert_eq!(active_origin_distributions(None), None);
         assert_eq!(active_origin_distributions(Some(&[])), Some(Vec::new()));
     }
@@ -382,7 +348,6 @@ mod tests {
         };
         set.sha256.insert(referenced);
 
-        // 64-hex referenced / unreferenced.
         assert_eq!(
             set.classify(&hex_encode(&referenced)),
             Some((HashAlgo::Sha256, true))
@@ -391,17 +356,15 @@ mod tests {
             set.classify(&hex_encode(&[0x22u8; 32])),
             Some((HashAlgo::Sha256, false))
         );
-        // Uppercase hex decodes to the same bytes -> still a hit.
+        // Uppercase hex decodes to the same bytes.
         assert_eq!(
             set.classify(&hex_encode(&referenced).to_uppercase()),
             Some((HashAlgo::Sha256, true))
         );
-        // 128-hex classifies as SHA512 (never in this set).
         assert_eq!(
             set.classify(&hex_encode(&[0x33u8; 64])),
             Some((HashAlgo::Sha512, false))
         );
-        // Non-hex / wrong length -> None (routes to age backstop).
         assert_eq!(set.classify("not-a-digest"), None);
         assert_eq!(set.classify(&"z".repeat(64)), None);
 
@@ -504,7 +467,6 @@ mod tests {
             release_with_sha256(&[b]),
         )
         .expect("write trixie");
-        // A non-Release sibling is ignored.
         std::fs::write(dir.path().join("sid_main_binary-amd64_Packages.xz"), b"x")
             .expect("write pkg");
 
@@ -520,10 +482,6 @@ mod tests {
 
     #[tokio::test]
     async fn build_reference_set_bails_when_expected_dist_absent() {
-        // Regression (#4): the structured `by-hash/` tree is a union across
-        // dists, so an expected dist whose Release is *absent* (not unreadable)
-        // would silently orphan its files. With `sid` present but `trixie`
-        // expected-yet-absent, the builder must bail to age mode (None).
         let dir = tempfile::tempdir().expect("tempdir");
         let a = [0xaau8; 32];
         std::fs::write(dir.path().join("sid_InRelease"), release_with_sha256(&[a]))
@@ -537,7 +495,6 @@ mod tests {
             "missing `trixie` Release must force age-based retention"
         );
 
-        // With only `sid` expected -- the one present -- reference mode holds.
         let only_sid = ["sid"];
         let set =
             build_byhash_reference_set(dir.path(), dir.path(), CacheLayout::DistsByHash, &only_sid)
@@ -549,13 +506,11 @@ mod tests {
     #[tokio::test]
     async fn build_reference_set_empty_or_missing_is_none() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // Empty dir: no Release files.
         assert!(
             build_byhash_reference_set(dir.path(), dir.path(), CacheLayout::DistsByHash, &[])
                 .await
                 .is_none()
         );
-        // Missing dir.
         assert!(
             build_byhash_reference_set(
                 dir.path(),
@@ -568,8 +523,6 @@ mod tests {
         );
     }
 
-    /// A Release whose content cannot be read as text bails like an
-    /// unreadable one, but it is a content problem, not a failed syscall.
     #[tokio::test]
     async fn build_reference_set_bails_on_a_non_utf8_release_uncounted() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -586,8 +539,7 @@ mod tests {
     #[tokio::test]
     async fn build_reference_set_bails_on_oversized_release() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // A regular but oversized Release must reject the whole set even
-        // when another Release provides usable references.
+        // A valid sibling must not rescue the set.
         std::fs::write(
             dir.path().join("stable_InRelease"),
             release_with_sha256(&[[0xcc; 32]]),
@@ -606,8 +558,6 @@ mod tests {
         );
     }
 
-    /// A by-hash root that is not a real directory is absent; a symlink
-    /// there counts as non-regular, like every symlink a cache walk meets.
     #[tokio::test]
     async fn byhash_dir_present_counts_a_symlinked_root() {
         let dir = tempfile::tempdir().expect("tempdir");

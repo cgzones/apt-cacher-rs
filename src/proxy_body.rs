@@ -1,7 +1,3 @@
-//! [`ProxyCacheBody`], the response body every hyper-served response is built
-//! from (hyper builds only): a boxed dynamic body. [`full_body`] and
-//! [`quick_response`] wrap small, fully buffered payloads.
-
 use http::{Response, StatusCode};
 use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
 
@@ -16,8 +12,7 @@ pub(crate) fn quick_response<T: Into<bytes::Bytes>>(
     ResponseHead::error(status).into_hyper(full_body(message))
 }
 
-/// [`quick_response`] that also ends the connection
-/// ([`ResponseHead::into_hyper_closing`]).
+/// [`quick_response`] that also ends the connection.
 #[must_use]
 pub(crate) fn quick_response_closing<T: Into<bytes::Bytes>>(
     status: StatusCode,
@@ -26,8 +21,6 @@ pub(crate) fn quick_response_closing<T: Into<bytes::Bytes>>(
     ResponseHead::error(status).into_hyper_closing(full_body(message))
 }
 
-/// Box `Full<Bytes>` into a [`ProxyCacheBody`] for
-/// small, fully-buffered responses (status pages, HTML, static assets).
 pub(crate) fn full_body<T: Into<bytes::Bytes>>(content: T) -> ProxyCacheBody {
     let body = Full::new(content.into()).map_err(|never| match never {});
     ProxyCacheBody::new(body)

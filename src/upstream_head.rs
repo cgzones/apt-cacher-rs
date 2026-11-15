@@ -5,32 +5,12 @@
 //! (status, resume state, `Content-Range`, `Content-Length`, cached flavor)
 //! truth table: 304 revalidation, non-2xx relay, resume anomalies, the
 //! unsolicited-206 cache-poisoning guard, the `max_object_size` cap and
-//! missing body framing.  Each backend used to hand-write that table, and the
-//! 502 bodies and precedence had drifted.  This module owns the table once.
+//! missing body framing.
 //!
-//! - [`UpstreamHead`] is the projection of a response head the table reads:
-//!   status, the length-delimited `Content-Length` (already resolved against
-//!   chunked framing, RFC 9112 section 6.1), the parsed `Content-Range` and
-//!   the well-formed `ETag`.  Constructors: `UpstreamHead::from_response` for
-//!   hyper's `http::Response` and `splice::http::UpstreamResponse::head` for
-//!   splice's httparse-based parser; both drop a malformed `ETag` themselves
-//!   (`is_valid_etag`), so the table sees the same input whether or not the
-//!   backend has already discarded it.  The `ETag` is read by one decision
-//!   only, the resumed-206 identity check against [`ResumeState::if_range`];
-//!   `Last-Modified` and `Content-Type` stay absent, and each backend still
-//!   validates its validators for storage on its own schedule.
-//! - [`plan_download`] and [`plan_fresh_download`] are pure: no I/O, no
-//!   `global_config()`, no metric bumps, no logging.  The backends own how to
-//!   discard a partial, how to re-fetch, how to write the 502 and the log
-//!   line, and bump metrics through [`RejectReason::record_metrics`].
-//! - The 502 bodies are consts behind [`RejectReason::body`].
-//! - [`resolve_body_framing`] is the one rule for which upstream heads are
-//!   framed unambiguously enough to relay, and [`RelayedHeaders`] the one
-//!   rule for which upstream header lines a relay drops. Both backends apply
-//!   them to every upstream head (`splice::http::parse_upstream_response`,
-//!   `hyper_conn.rs::request_with_retry`) and every relayed one
-//!   (`splice::simple_proxy::rewrite_simple_proxy_headers`,
-//!   `hyper_conn.rs::passthrough_response`), so they refuse and strip alike.
+//! [`plan_download`] and [`plan_fresh_download`] are pure: no I/O, no
+//! `global_config()`, no metric bumps, no logging.  The backends own how to
+//! discard a partial, how to re-fetch, how to write the 502 and the log
+//! line, and bump metrics through [`RejectReason::record_metrics`].
 //!
 //! Backend contract: call [`plan_download`] once with the resume state.
 //! <code>Err([ResumeAnomaly])</code> means "discard the partial file"; then either
@@ -117,10 +97,8 @@ pub(crate) const fn is_followed_redirect(status: StatusCode) -> bool {
     )
 }
 
-/// The `ETag` value an [`UpstreamHead`] constructor may carry: the one
-/// filter both backends' constructors apply, so a malformed tag is absent to
-/// the table in either -- splice discards it before planning, hyper only
-/// after.
+/// The filter both backends' [`UpstreamHead`] constructors apply, so a
+/// malformed tag is absent to the planner in either.
 #[must_use]
 pub(crate) fn well_formed_etag(etag: Option<&str>) -> Option<&str> {
     etag.filter(|etag| is_valid_etag(etag))
@@ -131,10 +109,7 @@ pub(crate) fn well_formed_etag(etag: Option<&str>) -> Option<&str> {
 /// Resolved once per head by [`resolve_body_framing`], which refuses an
 /// ambiguous head, with chunked-takes-precedence semantics (RFC 9112 §6.1):
 /// when `Transfer-Encoding: chunked` is present its framing wins and any
-/// accompanying `Content-Length` is ignored. Modelling the two as one sum
-/// type means "both at once" is no longer representable, so every consumer
-/// reads a single, already-disambiguated framing -- and a splice-relayed head
-/// announces exactly this one (`BodyFraming::header_line`, `splice/http.rs`).
+/// accompanying `Content-Length` is ignored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BodyFraming {
     /// `Content-Length: N` and not chunked. Splice-eligible when `N > 0`.
@@ -167,10 +142,8 @@ pub(crate) enum ContentLengthError {
 /// Fold one `Content-Length` field line into `prev`, the length its earlier
 /// lines resolved to: every element of its comma list must be the same
 /// `1*DIGIT`, and agree with `prev` (RFC 9110 §8.6 allows collapsing
-/// identical duplicates). The one rule for both directions -- a client's
-/// request (`request_dispatch::preflight_headers`) and an upstream's head
-/// ([`resolve_body_framing`]) -- so request-smuggling rules cannot drift
-/// between them; each caller words the refusal itself.
+/// identical duplicates). Applied to a client's request and to an upstream's
+/// head alike; each caller words the refusal itself.
 pub(crate) fn parse_content_length_list(
     value: &[u8],
     prev: Option<u64>,
@@ -451,10 +424,8 @@ impl ResumeAnomaly {
     /// backends' resume-anomaly line; `partial` is the size of the partial
     /// file the resume started from.
     ///
-    /// Rendered after the backend's own subject (which file, which mirror)
-    /// and its subsystem prefix, so it starts lowercase; it carries the
-    /// consequence clause, which differs per anomaly. The once-gates are the
-    /// backend's own ([`ResumeGates`]).
+    /// Rendered after the backend's own subject (which file, which mirror),
+    /// so it starts lowercase; it carries the consequence clause.
     #[must_use]
     pub(crate) const fn detail(self, partial: u64) -> ResumeDetail {
         ResumeDetail {
@@ -465,12 +436,11 @@ impl ResumeAnomaly {
 }
 
 /// One flood-control gate per warned [`ResumeAnomaly`], owned by a backend's
-/// resume call site, and the level choice that goes with it.
+/// resume call site.
 ///
-/// Per anomaly, like [`RejectGates`]: one mirror's habit of answering 416
-/// must not demote the first `ETag` mismatch of another to INFO.
-/// [`ResumeAnomaly::RangeIgnored`] has no gate: its 200 body is used as is,
-/// a normal fresh download, so it always logs at INFO.
+/// Per anomaly: one mirror's habit of answering 416 must not demote the
+/// first `ETag` mismatch of another to INFO. [`ResumeAnomaly::RangeIgnored`]
+/// has no gate: its 200 body is a normal fresh download, always INFO.
 pub(crate) struct ResumeGates {
     range_not_satisfiable: AtomicBool,
     content_range_mismatch: AtomicBool,
@@ -489,10 +459,8 @@ impl ResumeGates {
         }
     }
 
-    /// Log `line`, the backend's sentence around [`ResumeAnomaly::detail`],
-    /// at the level `anomaly` takes: INFO for
-    /// [`ResumeAnomaly::RangeIgnored`], otherwise WARN the first time this
-    /// table sees the anomaly and INFO after.
+    /// Log `line`, the backend's sentence around [`ResumeAnomaly::detail`]:
+    /// WARN the first time this table sees a gated anomaly, INFO otherwise.
     pub(crate) fn log(&'static self, anomaly: ResumeAnomaly, line: fmt::Arguments<'_>) {
         let gate = match anomaly {
             ResumeAnomaly::RangeIgnored => {
@@ -564,10 +532,7 @@ pub(crate) enum RejectReason {
     /// what it decompressed, while that URL and its by-hash twin answer 404
     /// and apt fetches the non-empty `.xz`/`.gz`.  An empty 200 is therefore
     /// an upstream fault, neither cached nor relayed.  An unknown-length body
-    /// that turns out empty gets the same rule where it is detected: splice's
-    /// buffered volatile path answers 502 `zero-length body`, hyper's download
-    /// worker fails the download at the end of the body, and the hyper-less
-    /// cleanup bridge (`splice/cleanup_bridge.rs`) fails cleanup's index fetch.
+    /// that turns out empty gets the same rule where it is detected.
     ZeroContentLength,
     /// The body bytes that arrived in the same read as the head already
     /// exceed the declared `Content-Length`.  Relaying them would hand the
@@ -588,7 +553,7 @@ pub(crate) enum RejectReason {
 }
 
 impl RejectReason {
-    /// The 502 response body.  One string per condition across all backends.
+    /// The 502 response body.
     #[must_use]
     pub(crate) const fn body(self) -> &'static str {
         match self {
@@ -608,12 +573,7 @@ impl RejectReason {
     ///
     /// Rendered mid-sentence, so it starts lowercase and carries neither the
     /// subject (which file, which mirror) nor the `; returning 502`
-    /// consequence clause -- those belong to the backend's own sentence,
-    /// which also owns its subsystem prefix and its once-gate. This is the
-    /// half that used to be spelled out per variant in both
-    /// `hyper_conn.rs` and `splice/acquire.rs`, i.e. the half that could
-    /// drift; `docs/logging.md`'s cross-backend parity rule now holds by
-    /// construction for it.
+    /// consequence clause -- those belong to the backend's own sentence.
     #[must_use]
     pub(crate) fn detail(self) -> RejectDetail {
         RejectDetail(self)
@@ -657,9 +617,7 @@ impl RejectReason {
 /// The gate has to be per reason, not per call site.  `Oversize` is a
 /// config-threshold refusal a well-behaved mirror can trigger, so a single
 /// shared gate would let it demote the *first* occurrence of every genuine
-/// protocol violation to INFO for the life of the process -- off the web
-/// interface's important-log page, which `docs/logging.md` makes the
-/// operator's evidence trail.
+/// protocol violation to INFO for the life of the process.
 pub(crate) struct RejectGates {
     unsolicited_206: AtomicBool,
     inconsistent_content_range: AtomicBool,
@@ -708,8 +666,7 @@ impl RejectGates {
     }
 }
 
-/// [`RejectReason::detail`]'s renderer: a mid-sentence phrase naming what was
-/// wrong with the upstream response.
+/// [`RejectReason::detail`]'s renderer.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RejectDetail(RejectReason);
 
@@ -791,7 +748,6 @@ impl<C> DownloadPlan<C> {
 ///
 /// `mode` records the request that was sent: an unconditional fetch,
 /// volatile revalidation carrying its cached copy, or a permanent resume.
-/// Revalidation and resume cannot be represented together.
 ///
 /// `Err` reports a resume anomaly: discard the partial, then re-plan through
 /// [`plan_fresh_download`] (see [`ResumeAnomaly::needs_refetch`]).
@@ -939,7 +895,6 @@ mod tests {
     use super::*;
     use crate::nonzero;
 
-    /// Marker for the cached-copy evidence in tests.
     #[derive(Debug, PartialEq, Eq)]
     struct Cached;
 
@@ -1321,9 +1276,6 @@ mod tests {
         assert_eq!(well_formed_etag(Some(IF_RANGE)), Some(IF_RANGE));
     }
 
-    /// A 206 whose remainder is chunked or close-delimited carries no usable
-    /// `Content-Length`: the partial is discarded and the file re-fetched,
-    /// never the `Content-Range` span of raw framing appended to it.
     #[test]
     fn resume_206_without_content_length_needs_refetch() {
         assert_eq!(
@@ -1570,9 +1522,6 @@ mod tests {
         assert_eq!(well_formed_etag(Some("\"caffe\u{e9}\"")), None);
     }
 
-    /// Identical `Content-Length` duplicates, in one comma list or across
-    /// lines, collapse to the one length (RFC 9110 §8.6), as splice's parser
-    /// collapses them.
     #[cfg(feature = "hyper")]
     #[test]
     fn from_response_collapses_identical_content_lengths() {
@@ -1603,10 +1552,6 @@ mod tests {
         assert_eq!(project_response(&response), head(200, None, None));
     }
 
-    /// Every [`RejectReason`] must own its gate. Sharing one would let a
-    /// `max_object_size` refusal -- a config threshold, not a protocol fault
-    /// -- permanently demote the first occurrence of every genuine violation
-    /// to INFO, keeping it off the web interface's important-log page.
     #[test]
     fn reject_gates_fire_once_per_reason() {
         static GATES: RejectGates = RejectGates::new();
@@ -1643,8 +1588,6 @@ mod tests {
         }
     }
 
-    /// The phrase both backends interpolate after their own subject, with
-    /// its consequence clause.
     #[test]
     fn resume_anomaly_detail_names_the_fault_and_the_consequence() {
         let cases = [
@@ -1674,8 +1617,6 @@ mod tests {
         }
     }
 
-    /// A 200 for a resume is always INFO; every other anomaly warns once per
-    /// gate table and kind, so one kind never demotes another's first line.
     #[test]
     fn resume_gates_warn_once_per_anomaly() {
         use tracing::Level;

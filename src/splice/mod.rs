@@ -2,17 +2,12 @@
 //! mirror (HTTP or HTTPS), moves the response body to the client socket via
 //! tee+splice fan-out while caching it to disk, and commits the download
 //! through `RenameBarrier` -- the `Download -> Verifying` flip on the
-//! connection task (`CacheTarget::begin_rename`), everything with I/O in it
-//! on a task of its own ([`commit::CommitTail`]), so the connection returns to its
-//! request loop with the client's last body byte rather than behind an
-//! `fsync`, a hash and three DB writes.
+//! connection task, everything with I/O in it on a task of its own
+//! ([`commit::CommitTail`]), so the connection returns to its request loop
+//! with the client's last body byte rather than behind an `fsync`, a hash and
+//! three DB writes.
 //!
-//! This file owns the entry point the sendfile backend calls
-//! ([`splice_proxy`], the request drive, and its phase functions), the types
-//! it matches on ([`SpliceProxyOutcome`], [`SpliceProxyError`]) and the
-//! per-request state structs ([`CacheTarget`], [`RateTimestamps`]); the
-//! client side is the sendfile backend's [`ClientConn`], extended here by its
-//! splice-only answers. The mechanics live in submodules:
+//! Submodules:
 //!
 //! - [`upstream`]: the `UpstreamConn` enum, the idle pool and `ResponseBody`,
 //!   TCP/TLS connect and connect-error classification.
@@ -118,16 +113,13 @@ use simple_proxy::rewrite_simple_proxy_headers;
 use upstream::{ConnLabel, ResponseBody};
 use volatile::handle_volatile_buffered_download;
 
-// On Linux, EAGAIN and EWOULDBLOCK share the same numeric value, so matching
-// one variant is equivalent to matching both. The nix crate models EWOULDBLOCK
-// as a const alias of EAGAIN, which would make `EAGAIN | EWOULDBLOCK` an
-// unreachable-pattern error. This assertion documents the equivalence once,
-// so the individual `Err(Errno::EAGAIN)` arms throughout this module do not
-// need to repeat it.
+// On Linux, EAGAIN and EWOULDBLOCK share the same numeric value, and nix
+// models EWOULDBLOCK as a const alias of EAGAIN, which would make
+// `EAGAIN | EWOULDBLOCK` an unreachable-pattern error: the
+// `Err(Errno::EAGAIN)` arms throughout this module cover both.
 static_assert!(nix::errno::Errno::EAGAIN as i32 == nix::errno::Errno::EWOULDBLOCK as i32);
 
-/// Conditional headers for volatile resource revalidation.
-/// Sent to upstream when a cached volatile file is stale (>30s).
+/// Conditional headers for revalidating a stale cached volatile file.
 /// `if_modified_since` is the stored upstream `Last-Modified`, absent when
 /// none was stored.
 struct VolatileCondHeaders {
@@ -161,17 +153,13 @@ impl ClientConn<'_> {
 const VOLATILE_BODY_MAX: usize = 1024 * 1024;
 
 /// Serve a cached volatile file after an upstream `304 Not Modified`: refresh
-/// the freshness window via `touch_volatile_mtime_with`, release the init
-/// barrier, then deliver the file with `sendfile(2)`. The file is the
-/// descriptor [`read_volatile_validators`] opened and stat-ed for the
-/// conditional request, so this opens and stats nothing: the registry entry
-/// held since `register()` keeps any commit of the same key -- the only way
-/// a cache file is replaced -- from renaming a newer copy in meanwhile. The
-/// per-path bits (status recording, upstream-connection pooling, `debug!`
-/// wording) stay at the call site. A failed delivery (already
-/// logged by the sendfile serve) is [`SpliceProxyOutcome::ClientLost`], so the
-/// connection closes instead of waiting for a next request the client, still
-/// owed the rest of this body, will never send.
+/// the freshness window, release the init barrier, then deliver the file with
+/// `sendfile(2)`. The file is the descriptor [`read_volatile_validators`]
+/// opened and stat-ed for the conditional request, so this opens and stats
+/// nothing (`StaleCopy` says why that is safe). A failed delivery is
+/// [`SpliceProxyOutcome::ClientLost`], so the connection closes instead of
+/// waiting for a next request the client, still owed the rest of this body,
+/// will never send.
 async fn serve_volatile_304_via_sendfile(
     client: ClientConn<'_>,
     conn_details: &ConnectionDetails,
@@ -253,20 +241,15 @@ async fn resolve_client_range(
     Ok(None)
 }
 
-/// The `200 OK` / `206 Partial Content` head of a splice-served body, for the
-/// streaming drive and the buffered volatile path alike: the
+/// The `200 OK` / `206 Partial Content` head of a splice-served body: the
 /// [`ResponseHead::representation`] every backend's cache hit answers with,
 /// so a client sees the same header set, in the same order, whichever
 /// backend served it and whether or not the file was cached yet.
 ///
 /// The validators are the download's settled ones ([`HeadValidators`]), not
-/// the upstream head's: `Last-Modified` is always sent -- the same value
-/// every later cache hit of this file carries, so the first client gets the
-/// same `If-Modified-Since` validator as the next (hyper's
-/// `serve_unfinished_file`, reached through `serve_downloading_file`, does
-/// the same through `CacheInfo::with_meta`). `Age: 0` is a constant: a fresh
-/// response streamed straight from the origin has spent no time in a cache
-/// (RFC 9111 section 4.2.3).
+/// the upstream head's. `Age: 0` is a constant: a fresh response streamed
+/// straight from the origin has spent no time in a cache (RFC 9111 section
+/// 4.2.3).
 fn splice_response_head<'a>(
     range: &'a ServeParams,
     content_type: &'static str,
@@ -280,15 +263,11 @@ fn splice_response_head<'a>(
 }
 
 /// Write the response head of a splice-served body to the client. The
-/// caller has corked the socket, so the head, written plainly
-/// ([`WireBody::None`]), coalesces with the body bytes written right after.
-/// Records the client status and the per-response `REQUESTS_SPLICE` bump,
-/// and returns the instant the first byte headed to the client (start of the
-/// client-rate window). `phase` tags a failed write, which can only ever be a
-/// client failure -- the caller decides what that ends. `splice_proxy` does
-/// not end the download with it: it hands the failure to
-/// [`lost_prefix_client`], which reports it, half-closes the socket and keeps
-/// the download running cache-only.
+/// caller has corked the socket, so the head coalesces with the body bytes
+/// written right after. Returns the instant the first byte headed to the
+/// client (start of the client-rate window). `phase` tags a failed write,
+/// which can only ever be a client failure -- the caller decides what that
+/// ends.
 async fn write_splice_response_headers(
     client: ClientConn<'_>,
     conn_details: &ConnectionDetails,
@@ -307,7 +286,6 @@ async fn write_splice_response_headers(
     // ends up flowing through `splice_proxy_body{,_tls}`, the body-prefix
     // direct write, or the buffered volatile write.
     metrics::REQUESTS_SPLICE.increment();
-    // Start of the client-rate window: the first byte heading to the client.
     let t_client_first = PreciseInstant::now();
     splice_response_head(range, content_type, validators)
         .write_to(client, WireBody::None)
@@ -341,9 +319,7 @@ async fn write_client_bytes(
 
 /// Everything a download writes into: the open temp/partial file with its
 /// path guard, the final cache path, and the barrier the download reports
-/// progress on. Built by [`prepare_cache_target`], consumed by
-/// `CacheTarget::begin_rename` (in [`commit`]), which turns it into the
-/// [`commit::CommitTail`].
+/// progress on.
 struct CacheTarget {
     writer: CacheWriter,
     dbarrier: DownloadBarrier,
@@ -411,10 +387,9 @@ struct HeadValidators {
 }
 
 /// Reserve the cache quota and open the file the body is written into: the
-/// cache directory, the quota reservation, the temp/partial file per
-/// `partial`, the validator xattrs (plus the expected size on a permanent
-/// file), and the `InitBarrier -> DownloadBarrier` transition. Shared by the streaming drive and the
-/// buffered volatile path (which always passes `PartialDownload::Scratch`).
+/// quota reservation, the temp/partial file per `partial`, the validator
+/// xattrs (plus the expected size on a permanent file), and the
+/// `InitBarrier -> DownloadBarrier` transition.
 ///
 /// `prev_file_size` is the size of the cached copy the commit replaces (the
 /// bytes the overwrite frees), `0` when there is none: the size
@@ -695,12 +670,10 @@ struct StaleCopy {
     metadata: std::fs::Metadata,
 }
 
-/// Volatile revalidation: read the cached file's metadata for the
-/// conditional headers. When a stale volatile file exists in cache, prepare
-/// If-Modified-Since / If-None-Match headers so the upstream can respond
-/// with 304 Not Modified if the content hasn't changed. Returns the headers
-/// and the open cached copy; `None` for a permanent file and for a volatile
-/// file that is not in the cache yet.
+/// Volatile revalidation: build the conditional headers from the stale
+/// cached copy's stored validators. Returns the headers and the open cached
+/// copy; `None` for a permanent file and for a volatile file that is not in
+/// the cache yet.
 fn read_volatile_validators(
     conn_details: &ConnectionDetails,
 ) -> Result<Option<(VolatileCondHeaders, StaleCopy)>, DownloadFailure> {
@@ -724,11 +697,10 @@ fn read_volatile_validators(
     // check and the size and timestamps the `StaleCopy` carries on.
     let mdata = regular_file_metadata_typed(&file, &cache_path, "stat volatile cached file")?;
 
-    // The stored upstream `Last-Modified`, never the local mtime, matching
-    // the hyper backend: the mtime only dates the last fetch or
-    // revalidation (`touch_volatile_mtime`), so a copy replayed or lagging
-    // behind the upstream would keep drawing 304s. Without a stored date,
-    // `If-None-Match` alone asks.
+    // The stored upstream `Last-Modified`, never the local mtime: the mtime
+    // only dates the last fetch or revalidation (`touch_volatile_mtime`), so
+    // a copy replayed or lagging behind the upstream would keep drawing
+    // 304s. Without a stored date, `If-None-Match` alone asks.
     let key = conn_details.key();
     let cache_metadata::UpstreamMetadata {
         etag,
@@ -750,16 +722,12 @@ fn read_volatile_validators(
 }
 
 /// Settle the upstream response into a [`DownloadPlan`]. Follows one 3xx
-/// redirect (301/302/307/308) if the target host is allowed -- no loops,
-/// matching hyper -- and does so first, before the resume/304/passthrough
-/// handling, so those all operate on the (possibly redirected) response,
-/// mirroring `hyper_conn.rs` which follows the redirect before its
-/// `NOT_MODIFIED` check. Then discards malformed validators, counts a fresh
-/// volatile body, and classifies the head; a resume anomaly discards the
-/// partial (re-fetching without `Range` when the response is unusable, and
-/// discarding the refetched response's malformed validators in turn) and
-/// re-plans the fresh head. No reconnect helper runs past this point, so
-/// the exchange is final on return.
+/// redirect if the target host is allowed (no loops), and does so first, so
+/// the resume/304/passthrough handling all operates on the (possibly
+/// redirected) response. A resume anomaly discards the partial (re-fetching
+/// without `Range` when the response is unusable) and re-plans the fresh
+/// head. No reconnect helper runs past this point, so the exchange is final
+/// on return.
 async fn plan_upstream_response(
     exchange: UpstreamExchange,
     conn_details: &ConnectionDetails,
@@ -825,10 +793,8 @@ async fn plan_upstream_response(
                     conn_details,
                 ))
                 .await?;
-                // A new response: its validators reach the client head, the
-                // xattrs and the published metadata just like the first
-                // one's, so they get the same filter (hyper validates its
-                // final response too).
+                // A new response: its validators get the same filter as the
+                // first one's.
                 exchange.response.discard_invalid_validators(conn_details);
             } else {
                 resume.discard_resume().await;
@@ -845,10 +811,8 @@ async fn plan_upstream_response(
     }
 }
 
-/// Forward a non-200/non-206 response directly to the client instead of
-/// falling back to hyper (which would open a redundant second connection).
-/// Nothing is cached, so the caller's `InitBarrier` fires on its return.
-/// The body reader consumes the response and releases it only on success.
+/// Forward a non-200/non-206 response directly to the client. Nothing is
+/// cached, so the caller's `InitBarrier` fires on its return.
 ///
 /// Returns what becomes of the client connection: `client.action`, unless
 /// the body was relayed close-delimited (a close-delimited upstream body, or
@@ -874,10 +838,6 @@ async fn relay_passthrough(
             .map(|()| client.action);
     }
 
-    // Rewrite the response headers before forwarding: strip hop-by-hop
-    // headers, emit a single `Connection:` matching our keep-alive
-    // decision (a body relayed close-delimited overrides it), announce the
-    // framing the relay applies instead of the upstream's, and append `Via:`.
     // Nothing has been written to the client yet, so a malformed-header
     // error can safely bail to a 502 via the outer arm.
     let (passthrough_headers, conn_action) = match rewrite_simple_proxy_headers(
@@ -908,16 +868,11 @@ async fn relay_passthrough(
     // arm, which records that status itself.
     metrics::REQUESTS_PASSTHROUGH.increment();
     metrics::record_client_status(upstream_resp.status_code);
-    // The relay ships bytes to the client synchronously in this frame, so it
-    // holds its own `ACTIVE_CLIENT_DOWNLOADS` count until it ends, like the
-    // simple proxy's relay and hyper's passthrough body.
     let _client_count = client_counter::ClientDownload::new();
     write_all_to_stream(client.stream, &passthrough_headers, WritePhase::Header)
         .await
         .map_err(SpliceProxyError::client("passthrough headers"))?;
 
-    // Forward the body that arrived with the headers plus the rest,
-    // framed per the upstream's (precedence-resolved) framing.
     upstream_resp
         .framing
         .relay_to_client(
@@ -1028,9 +983,6 @@ fn lost_prefix_client(
     phase: &'static str,
     failure: impl EndsDelivery,
 ) -> BodyClient<'static> {
-    // Nothing further is written to this socket, and the download runs on
-    // cache-only: release the peer now instead of leaving it waiting for the
-    // promised length until the connection task drops the socket.
     shutdown_client_write(client);
     BodyClient::Aborted(failure.conclude(Some(&conn_details.client), format_args!(
         "splice proxy: failed to write {phase} to client {} for {} from mirror {}; continuing cache-only",
@@ -1074,14 +1026,10 @@ async fn send_resumed_prefix<'a>(
 }
 
 /// Write the body bytes upstream sent in the same read as the headers to the
-/// cache file and notify the late joiners. The cache half of
-/// [`write_body_prefix`], split out so the client-less detached download
-/// ([`detached::DetachedDownload`]) shares exactly these bytes and this one
-/// error line -- `consequence` is what differs between the callers: the
-/// connected drive closes its connection, while the detached download
-/// abandons the download (as does the buffered volatile path, which serves
-/// its client from memory either way, through the owned-buffer sibling
-/// [`write_buffered_body_to_cache`]).
+/// cache file and notify the late joiners. `consequence` is what differs
+/// between the callers: the connected drive closes its connection, while the
+/// detached download abandons the download (as does the buffered volatile
+/// path, which serves its client from memory either way).
 ///
 /// The owning download runner concludes any failure before return, and the
 /// failed download publishes it; the target is gone with it.
@@ -1134,8 +1082,7 @@ async fn land_in_cache(
 }
 
 /// Cache the new prefix even when an earlier client write failed. Only an
-/// attached client receives its range slice; the returned state flows directly
-/// into the tee loop, with no separate failure flag to keep in sync.
+/// attached client receives its range slice.
 async fn write_body_prefix<'a>(
     client: BodyClient<'a>,
     conn_details: &ConnectionDetails,
@@ -1213,20 +1160,12 @@ async fn transfer_body(
         });
     }
 
-    // splice_file_start is the file offset where the splice region begins.
+    // Clamp the client's range to the splice region: whatever part of it
+    // lies before `splice_file_start` already went out with the prefixes.
     let splice_file_start = target.writer.position();
     let client_range_end = range_plan.content_end();
     let splice_file_end = splice_file_start + splice_count;
-    // How many bytes to skip at the start of the splice region before sending to client.
-    // Worked example: total file = 1000, resume_offset = 0, splice_file_start = 0,
-    // splice_file_end = 1000, client Range: bytes=200-499 → client_range_start = 200,
-    // client_range_len = 300, client_range_end = 500.
-    //   client_skip = 200 - 0 = 200 (drop leading bytes before the range)
-    //   client_send = min(500, 1000) - (0 + 200) = 300 (send exactly the range)
-    // If the range ends past the splice region (e.g. due to a body prefix already
-    // consumed), the min() clamps to splice_file_end and saturating_sub clamps at 0.
     let client_skip = range_plan.content_start().saturating_sub(splice_file_start);
-    // How many bytes to send to client from within the splice region.
     let client_send = client_range_end
         .min(splice_file_end)
         .saturating_sub(splice_file_start + client_skip);
@@ -1267,22 +1206,19 @@ async fn transfer_body(
     // readers learn that from `begin_rename`, which every caller reaches
     // next: its flush of the last sub-`PING_BATCH_THRESHOLD` chunk and its
     // drop of the watch sender.
-    // The splice body block ran: the upstream-rate and client-rate windows
-    // both end here. The demoted-client case reassigns `t_client_done`
-    // again after the file-serve task completes.
+    // Both rate windows end here; a demoted client reassigns `t_client_done`
+    // after its file-serve task completes.
     rates.t_upstream_done = PreciseInstant::now();
     rates.t_client_done = rates.t_upstream_done;
     rates.client_bytes_sent += client_bytes;
     Ok(BodyTransferred { target, client })
 }
 
-/// Splice-based proxy: connects to upstream (HTTP or HTTPS), transfers the response body
-/// to the client socket via tee+splice fan-out while caching to disk. The
-/// request drive: the download as a sequence of phases.
+/// The request drive: the download as a sequence of phases.
 ///
 /// For plain TCP upstreams, the entire path is zero-copy (splice from socket).
-/// For TLS upstreams, the upstream read goes through userspace (decryption), but the
-/// fan-out to client + cache still benefits from tee+splice.
+/// For TLS upstreams, the upstream read goes through userspace (decryption),
+/// but the fan-out to client + cache still benefits from tee+splice.
 pub(crate) async fn splice_proxy(
     client: ClientConn<'_>,
     conn_details: &ConnectionDetails,
@@ -1290,12 +1226,10 @@ pub(crate) async fn splice_proxy(
     appstate: &AppState,
     client_range: RangeRequestHeaders<'_>,
 ) -> Result<SpliceProxyOutcome, SpliceProxyError> {
-    // Register with active downloads to coordinate with concurrent clients.
     // A `LateJoiner` admission means another download for this key won the race
-    // between sendfile's earlier `attach()` and our `register()` here. It is
-    // an alternate success — the caller retries as a sendfile late joiner
-    // instead of falling all the way back to hyper. No late-joiner double
-    // count, since `attach()` and `register()` are mutually exclusive paths.
+    // between sendfile's earlier `attach()` and our `register()` here: the
+    // caller retries as a sendfile late joiner. No late-joiner double count,
+    // since `attach()` and `register()` are mutually exclusive paths.
     let origination = match appstate.active_downloads.register(conn_details.key()) {
         Admission::Originator(origination) => {
             conn_details.count_fetch_role(FetchRole::Originator);
@@ -1380,8 +1314,6 @@ pub(crate) async fn splice_proxy(
         .await
         .map_err(SpliceProxyError::ReportedBeforeHeader)?;
 
-    // The exchange is final: split it into the locals the rest of the
-    // download uses.
     let conn_label = exchange.label();
     let head_timing = exchange.head_timing();
     let UpstreamExchange {
@@ -1395,7 +1327,7 @@ pub(crate) async fn splice_proxy(
 
     // Answered by the upstream (fresh body or a 304): this is the point the
     // request's Origin row is earned, and the mirror's time to first byte
-    // measured (hyper records it at the same point).
+    // measured.
     if plan.is_answered() {
         conn_details.record_origin();
         mirror_perf::record_ttfb(conn_details, head_timing);
@@ -1405,8 +1337,6 @@ pub(crate) async fn splice_proxy(
         DownloadPlan::NotModified(stale) => {
             note_cached_index_touch(conn_details, upstream_path, &stale.path);
             note_release_revalidated(conn_details, upstream_path);
-            // Upstream confirms the cached copy is still current: refresh the
-            // freshness window and serve the cached file via sendfile.
             debug!(
                 "splice proxy: upstream returned 304 for {} from mirror {}, serving cached file",
                 conn_details.debname, conn_details.mirror
@@ -1582,9 +1512,8 @@ pub(crate) async fn splice_proxy(
     // be late-joined by its own retry. Hand the client a `Retry-After` and
     // let a detached, client-less task finish the download; the retry
     // attaches to it through `attach()` on the same keep-alive connection.
-    // The gate, the head and the wording are shared with the hyper backend
-    // (`parallel_hack.rs`). Range and resumed requests are nudged too, for
-    // that parity: the retry's Range is honoured by the late-joiner path.
+    // Range and resumed requests are nudged too, as on the hyper backend:
+    // the retry's Range is honoured by the late-joiner path.
     let bytes = CompletionBytes {
         total: total_content_length,
         upstream: body_content_length.get(),
@@ -1625,8 +1554,7 @@ pub(crate) async fn splice_proxy(
 
     let start = PreciseInstant::now();
 
-    // Per-request rate-logging timestamps; the upstream-rate window ends
-    // here in case the splice loop never runs.
+    // The upstream-rate window ends here in case the splice loop never runs.
     let mut rates = RateTimestamps::new(upstream_resp.request_sent_at, upstream_resp.head_at);
 
     log_download_start(
@@ -1766,8 +1694,8 @@ pub(crate) enum SpliceProxyOutcome {
     /// delivery failed after the response headers went out -- the body
     /// prefix write, the splice loop, or the demoted file-serve task -- or
     /// the sendfile serve of a 304-revalidated copy failed at its head or
-    /// body, and that source logged it. The caller closes the connection without a new
-    /// status and without logging again.
+    /// body, and that source logged it. The caller closes the connection
+    /// without a new status and without logging again.
     ClientLost,
     Concurrent {
         status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
@@ -1828,9 +1756,6 @@ impl SpliceProxyError {
 mod tests {
     use super::*;
 
-    /// The head splice streams a download under is the one sendfile's (and
-    /// hyper's) cache hit of the finished file answers with: same headers,
-    /// same values, same order, with `Age: 0` for the fresh response.
     #[test]
     fn splice_response_head_is_the_cache_hit_head() {
         use crate::cache_conditional::CacheInfo;

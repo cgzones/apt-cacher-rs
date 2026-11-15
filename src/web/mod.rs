@@ -1,21 +1,5 @@
 //! Local web interface: the dashboard (`/`), the log tail (`/logs`), the
-//! healthcheck JSON (`/healthcheck`) and the static assets. This file
-//! owns the route handler ([`serve_web_interface`]) both backends call and
-//! re-exports the response type they render ([`WebResponse`]). The
-//! rendering lives in submodules:
-//!
-//! - [`fmt`]: the `Display` newtypes cells are rendered through.
-//! - [`host_gate`]: the `Host` names the web interface answers to.
-//! - [`table`]: `Table`/`DetailsList`, the `tr!` row macro, section wrappers.
-//! - [`page`]: query options, theme, the `<html>` skeleton and `<nav>`, the
-//!   favicon.
-//! - [`assets`]: the embedded stylesheet and script bundle under their
-//!   content-hashed URLs.
-//! - [`response`]: `WebResponse`, its header table and the hyper body wrapper.
-//! - [`dashboard`]: `DashboardData` gathering and the details sections.
-//! - [`metrics_page`]: the Metrics section.
-//! - [`tables`]: the row tables and the per-mirror directory walk.
-//! - [`logs`]: the `/logs` page.
+//! healthcheck JSON (`/healthcheck`) and the static assets.
 //!
 //! # Scripts are optional
 //!
@@ -99,10 +83,6 @@ use self::{
     page::{FAVICON_SVG, parse_query},
     response::Caching,
 };
-
-// ---------------------------------------------------------------------------
-// Route handler
-// ---------------------------------------------------------------------------
 
 #[must_use]
 pub(crate) async fn serve_web_interface(uri: &http::Uri, appstate: &AppState) -> WebResponse {

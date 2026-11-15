@@ -1,13 +1,10 @@
 //! Bounded FIFO buffers that evict their oldest entry when full.
 //!
-//! [`RingBuffer`] is the `VecDeque`-backed buffer behind the web interface's
-//! log store and uncacheables list. [`SumRingBuffer`] is the rate checker's
-//! per-second sample window: it keeps a running sum and stores its samples
-//! in an inline array sized for `DEFAULT_RATE_CHECK_TIMEFRAME`, so the
-//! `RateChecker` built for every rate-checked body allocates nothing. A
-//! non-default `rate_check_timeframe` above that size spills the window to
-//! the heap -- correct, one allocation per checker, but it forfeits the
-//! saving; the `static_assert!` below pins the inline size to the default.
+//! [`SumRingBuffer`] is the rate checker's per-second sample window: it
+//! stores its samples in an inline array sized for
+//! `DEFAULT_RATE_CHECK_TIMEFRAME`, so the `RateChecker` built for every
+//! rate-checked body allocates nothing. A larger `rate_check_timeframe`
+//! spills the window to the heap.
 
 use std::{
     collections::VecDeque,
@@ -32,7 +29,6 @@ impl<T> RingBuffer<T> {
         }
     }
 
-    /// Append `item`, evicting the oldest entry when the buffer is full.
     pub(crate) fn push(&mut self, item: T) {
         if self.is_full() {
             self.inner.pop_front();
@@ -61,7 +57,6 @@ impl<T> RingBuffer<T> {
         self.inner.len()
     }
 
-    /// The slots the ring holds at most, which it has reserved up front.
     #[must_use]
     pub(crate) const fn capacity(&self) -> NonZero<usize> {
         self.capacity
@@ -72,8 +67,7 @@ impl<T> RingBuffer<T> {
         self.inner.iter()
     }
 
-    /// Remove and return the entry at `index` (0 is the oldest), shifting
-    /// the newer entries down.
+    /// Index 0 is the oldest entry.
     #[must_use]
     pub(crate) fn remove(&mut self, index: usize) -> Option<T> {
         self.inner.remove(index)
@@ -91,25 +85,16 @@ enum Slots<T, const N: usize> {
     Heap(Box<[T]>),
 }
 
-/// Fixed-capacity FIFO ring (O(1) `push_back` with oldest-slot overwrite
-/// when full) over [`Slots`] pre-filled with `T::default()`.  Entries are
-/// addressed through a `head` index plus `len`, so `push_back` when the
-/// buffer is full overwrites the oldest slot without the memmove a
-/// `Vec`-backed FIFO would do and without the per-instance heap allocation
-/// a `VecDeque` does.
-///
-/// Capacities above the inline `N` still work through the heap variant.
-/// In that case the only regression vs a fresh `VecDeque` is the up-front
-/// `T::default()` fill of unused slots, which is cheap for trivially-default
-/// `Copy` types (the only ones we use this with).
+/// Fixed-capacity FIFO ring over [`Slots`] pre-filled with `T::default()`:
+/// a full `push_back` overwrites the oldest slot, without the per-instance
+/// heap allocation a `VecDeque` does.
 #[derive(Debug)]
 struct Ring<T, const N: usize> {
     /// Only the slots referenced by `head`/`len` are live, the rest hold
     /// leftover `T::default()` fill values.
     slots: Slots<T, N>,
-    /// Index of the oldest live entry.  Wraps modulo `capacity`.
+    /// Index of the oldest live entry.
     head: usize,
-    /// Number of live entries.  Bounded by `capacity`.
     len: usize,
     capacity: NonZero<usize>,
 }
@@ -150,9 +135,7 @@ where
         }
     }
 
-    /// Append `item` to the back.  Returns `Some(evicted)` when the
-    /// buffer was full and the oldest entry had to be dropped to make
-    /// room; returns `None` otherwise.
+    /// Returns the evicted oldest entry when the buffer was full.
     fn push_back(&mut self, item: T) -> Option<T> {
         let cap = self.capacity.get();
         if self.len == cap {
@@ -170,8 +153,6 @@ where
         }
     }
 
-    /// Mutable reference to the most recently pushed entry, or `None`
-    /// if the buffer is empty.
     #[must_use]
     fn back_mut(&mut self) -> Option<&mut T> {
         if self.len == 0 {
@@ -193,9 +174,8 @@ where
         self.capacity
     }
 
-    /// Live entries split across at most two contiguous slices --
-    /// `(head..head+n)` and a possibly-empty wrap-around `(0..m)`.
-    /// Cheap because it just borrows the existing storage.
+    /// Live entries, oldest first: `(head..head+n)` and a possibly-empty
+    /// wrap-around `(0..m)`.
     fn as_slices(&self) -> (&[T], &[T]) {
         let cap = self.capacity.get();
         let slots = self.slots();
@@ -217,8 +197,7 @@ where
 }
 
 /// Fixed-capacity ring buffer that also tracks a running sum of its
-/// contents.  Built on [`Ring`] for the index-based ring storage (no
-/// per-push memmove, inline at the default capacity).
+/// contents.
 #[derive(Debug)]
 pub(crate) struct SumRingBuffer<T> {
     inner: Ring<T, SUM_RING_INLINE>,
@@ -237,8 +216,6 @@ where
         }
     }
 
-    /// Append `item`; if the buffer is full, the oldest entry is
-    /// evicted (and subtracted from the running sum) in O(1).
     pub(crate) fn push(&mut self, item: T) {
         if let Some(evicted) = self.inner.push_back(item) {
             self.sum -= evicted;
@@ -252,8 +229,7 @@ where
         if let Some(last) = self.inner.back_mut() {
             *last += item;
         } else {
-            // back_mut returned None => buffer is empty; push_back's
-            // eviction path can't fire here.
+            // The buffer is empty, so nothing is evicted.
             let _evicted: Option<T> = self.inner.push_back(item);
         }
         self.sum += item;
@@ -301,7 +277,6 @@ mod tests {
         assert!(ring.is_full());
         assert_eq!(ring.as_slices(), (&[1, 2, 3][..], &[][..]));
 
-        // Full: the oldest slot is overwritten and the head advances.
         assert_eq!(ring.push_back(4), Some(1));
         assert_eq!(ring.as_slices(), (&[2, 3][..], &[4][..]));
         assert_eq!(ring.push_back(5), Some(2));
@@ -350,11 +325,9 @@ mod tests {
         assert!(buf.is_full());
         assert_eq!(buf.sum(), 6);
 
-        // Evicting 1 and pushing 4.
         buf.push(4);
         assert_eq!(buf.sum(), 9);
 
-        // add_back folds into the newest sample.
         buf.add_back(5);
         assert_eq!(buf.sum(), 14);
         assert_eq!(collect(&buf.inner), [2, 3, 9]);

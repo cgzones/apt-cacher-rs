@@ -4,8 +4,7 @@
  * Light theme by default, dark via `prefers-color-scheme: dark`. The palette
  * is declared once via the `light-dark()` CSS function; the `color-scheme`
  * property keys the resolution: `light dark` follows the OS, `light`/`dark`
- * pin a side. Each `data-theme` attribute just overrides `color-scheme`, so
- * there are no per-attribute variable lists to drift out of sync.
+ * pin a side. Each `data-theme` attribute just overrides `color-scheme`.
  *
  * The pages' Content-Security-Policy (`style-src 'self'`) admits only this
  * file: no <style> block, no style="" attribute.
@@ -75,8 +74,8 @@ h3.group:first-of-type { margin-top: 4px; }
 .section { background: var(--section-bg); border: 1px solid var(--section-border); border-radius: 4px;
            box-shadow: var(--section-shadow); padding: 10px 14px; margin-bottom: 10px; }
 
-/* The flow the whole daemon exists to produce: upstream in, clients out,
-   the difference kept. One bold figure; everything around it stays quiet. */
+/* Upstream in, clients out, the difference kept: one bold figure,
+   everything around it stays quiet. */
 .hero { background: var(--section-bg); border: 1px solid var(--section-border); border-radius: 4px;
         box-shadow: var(--section-shadow); padding: 14px 16px; margin-bottom: 10px;
         display: flex; flex-wrap: wrap; gap: 12px 40px; align-items: flex-end; }

@@ -1,13 +1,10 @@
 //! The daemon proper, once `main` has parsed the configuration and started
-//! the tokio runtime: database open plus its startup migrations, the
-//! initial cache scan, the accept loop, and the signal handling that drives
-//! cleanup runs, log-file reopen and shutdown.
+//! the tokio runtime.
 //!
-//! Startup order is load-bearing rather than incidental. `flat_blocklist`
-//! has to be seeded before any request can pick a cache layout, and the
-//! cache scan is awaited *before* the listener binds so the disk quota is
-//! enforced against a complete total (see `cache_quota`) instead of an
-//! empty one.
+//! Startup order is load-bearing. `flat_blocklist` has to be seeded before
+//! any request can pick a cache layout, and the cache scan is awaited
+//! *before* the listener binds so the disk quota is enforced against a
+//! complete total instead of an empty one.
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -70,12 +67,8 @@ use crate::{
     scheme_cache,
 };
 
-/// One-line accounting emitted on every shutdown path: what the process did
-/// over its lifetime, and what it is dropping on the floor. Without it a
-/// stopped daemon leaves no record of whether it was in the middle of
-/// serving anything when the signal arrived, which is the first question
-/// after an unexpected restart -- and the counters behind the dashboard die
-/// with the process.
+/// What the process did over its lifetime and what it is dropping: the
+/// counters behind the dashboard die with the process.
 fn log_shutdown_summary(signal: &str, active_downloads: &ActiveDownloads) {
     let rd = runtime_details();
     let uptime = (time::OffsetDateTime::now_utc() - rd.start_time).unsigned_abs();
@@ -105,8 +98,6 @@ fn log_shutdown_summary(signal: &str, active_downloads: &ActiveDownloads) {
     );
 }
 
-/// Push the displayed "Next Cleanup" epoch one interval out and run a
-/// cleanup now, detached so the accept loop keeps serving while it works.
 fn spawn_cleanup(appstate: &AppState) {
     set_next_cleanup_epoch(
         time::OffsetDateTime::now_utc().unix_timestamp()
@@ -118,14 +109,11 @@ fn spawn_cleanup(appstate: &AppState) {
     });
 }
 
-/// Why [`main_loop`] gave up.  Every throw site has already logged the cause
-/// with its context, so `Display` only re-renders the wrapped error (through
-/// [`SqlxErrorReport`] or [`ErrorReport`], with no `source()`) for `main`'s
-/// final `Failed to run apt-cacher-rs` line.
+/// Every throw site has already logged the cause with its context, so
+/// `Display` only re-renders the wrapped error (with no `source()`) for
+/// `main`'s final `Failed to run apt-cacher-rs` line.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum MainLoopError {
-    /// Startup-time database access (open, schema init, row cleanup, mirror
-    /// reads) failed.
     #[error("{}", SqlxErrorReport(.0))]
     Database(sqlx::Error),
     /// Signal registration, listener bind, or accept failed.
@@ -189,7 +177,7 @@ pub(crate) async fn main_loop(
 
     // Fold mirror rows an earlier version wrote under an alias host into
     // their main row before anything reads them: the startup scan, the
-    // flat blocklist and cleanup all key on the canonical host now.
+    // flat blocklist and cleanup all key on the canonical host.
     match database.merge_alias_rows(&config.aliases).await {
         Ok(0) => {}
         Ok(merged) => {
@@ -204,16 +192,8 @@ pub(crate) async fn main_loop(
         }
     }
 
-    // Seed the per-host flat-layout collision blocklist from any
-    // pre-existing structured mirrors whose `mirror_path` starts with
-    // `flat/` (or equals `flat`).  Those hosts get flat caching disabled
-    // — see `flat_blocklist` for the rationale.
-    //
-    // Both failure modes here are startup-fatal: a DB read error would
-    // leave the blocklist empty and silently re-allow flat caching at
-    // collision sites (propagated via `?` after logging), and a double-
-    // init is a programmer error in main-loop ordering (the `.expect`
-    // inside `flat_blocklist::init` panics).
+    // Startup-fatal: a DB read error would leave the blocklist empty and
+    // silently re-allow flat caching at collision sites.
     flat_blocklist::init(&database)
         .await
         .inspect_err(|err| {
@@ -224,7 +204,6 @@ pub(crate) async fn main_loop(
         })
         .map_err(MainLoopError::Database)?;
 
-    // Database background task
     let (db_task_tx, db_task_rx) = tokio::sync::mpsc::channel(config.db_channel_capacity.get());
     let (db_shutdown_tx, db_shutdown_rx) = tokio::sync::watch::channel(false);
     let db_join = {
@@ -243,15 +222,11 @@ pub(crate) async fn main_loop(
         .set(db_task_tx)
         .expect("DB task queue sender initialized once");
 
-    // Migration warning: scan the existing `mirrors_v2` rows for paths
-    // containing a segment reserved for their kind
-    // (`RESERVED_MIRROR_PATH_SEGMENTS`, plus
-    // `RESERVED_STRUCTURED_MIRROR_PATH_SEGMENTS` for a structured row).
-    // Pre-existing rows still load via `get_mirrors`, but the validator now rejects
-    // them on insert — flag them once at startup so an operator can
-    // investigate (cleanup walks against e.g. `<host>/by-hash` would
-    // otherwise collide with the layout plumbing for that mirror's
-    // sibling).
+    // Migration warning: pre-existing mirror rows with a reserved path
+    // segment still load via `get_mirrors`, though the validator rejects
+    // them on insert. Flag them so an operator can investigate (cleanup
+    // walks against e.g. `<host>/by-hash` would collide with the layout
+    // plumbing for that mirror's sibling).
     let mirrors = database
         .get_mirrors()
         .await
@@ -275,13 +250,12 @@ pub(crate) async fn main_loop(
         }
     }
 
-    // Migration warning: the pre-fix flat layout cached every flat-repo
-    // file under `<cache>/<host>/<mirror_path>/flat/...`.  Post-fix lookups
-    // go to `<cache>/<host>/flat/<mirror_path>/...`, so those legacy
-    // directories are now unreachable disk waste.  Probe each registered
-    // mirror's legacy flat dir and warn so the operator can reclaim
-    // space; we deliberately do not remove anything automatically because
-    // a misconfigured alias change could otherwise wipe live cache.
+    // Migration warning: the legacy flat layout cached flat-repo files
+    // under `<cache>/<host>/<mirror_path>/flat/...`; lookups go to
+    // `<cache>/<host>/flat/<mirror_path>/...`, so those directories are
+    // unreachable disk waste.  Only warned about, never removed
+    // automatically: a misconfigured alias change could otherwise wipe
+    // live cache.
     let paths = CachePaths::new(&config.cache_directory);
     for mirror in &mirrors {
         let legacy_flat = paths.legacy_flat_dir(mirror.site());
@@ -292,8 +266,7 @@ pub(crate) async fn main_loop(
                     legacy_flat.display(),
                 );
             }
-            // A non-directory there is a stray the cache walk reports; only
-            // the probe's own failure is this loop's business.
+            // A non-directory there is a stray the cache walk reports.
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
@@ -309,7 +282,6 @@ pub(crate) async fn main_loop(
         }
     }
 
-    // The migration checks are the last users of this startup snapshot.
     drop(mirrors);
 
     // Initial cache scan. Awaited before the listener binds: the quota is
@@ -327,12 +299,8 @@ pub(crate) async fn main_loop(
 
                 rd.cache_quota.record_startup_scan(cache_size);
 
-                // The quota is only the bound this daemon enforces; what
-                // actually runs out is the filesystem -- and it can run
-                // out of inodes long before it runs out of bytes, which
-                // is exactly the ENOSPC an operator cannot explain from
-                // a byte figure alone. A failed statvfs is already
-                // warned about inside `filesystem_space`.
+                // A failed statvfs is already warned about inside
+                // `filesystem_space`.
                 let space = filesystem_space(&rd.config.cache_directory).await;
                 // Seeds the `min_disk_free` admission check, so the first
                 // download needs no probe of its own.
@@ -373,8 +341,6 @@ pub(crate) async fn main_loop(
                     }
                 }
 
-                // Inode exhaustion produces an ENOSPC that no byte
-                // figure explains; same floors as the readiness check.
                 if let Some(detail) = healthcheck::low_inodes_detail(space.and_then(|s| s.inodes)) {
                     warn!(
                         "Cache filesystem `{}` is running out of inodes ({detail}); cache writes will fail with ENOSPC while disk space still looks free",
@@ -408,7 +374,6 @@ pub(crate) async fn main_loop(
         let client = https_client.clone();
 
         tokio::task::spawn(async move {
-            // Use buffer_unordered to limit concurrent requests and avoid thundering herd
             const MAX_CONCURRENT_REQUESTS: usize = 10;
             // Do not initialize stale mirrors
             const STALE_THRESHOLD: Duration = Duration::from_hours(30 * 24);
@@ -499,10 +464,9 @@ pub(crate) async fn main_loop(
     let mut usr2_signal =
         tokio::signal::unix::signal(SignalKind::user_defined2()).map_err(MainLoopError::Io)?;
 
-    // The displayed "Next Cleanup" epoch is advanced from now() on each tick;
-    // the underlying Tokio interval schedules from the original baseline
-    // instead, so under sustained backpressure the displayed value can drift
-    // a few seconds ahead of the real next tick. Accepted limitation.
+    // The displayed "Next Cleanup" epoch is advanced from now() on each tick,
+    // the Tokio interval from the original baseline, so the displayed value
+    // can drift a few seconds ahead of the real next tick. Accepted.
     let first_cleanup = tokio::time::Instant::now() + Duration::from_secs(FIRST_CLEANUP_DELAY_SECS);
     let mut cleanup_interval =
         tokio::time::interval_at(first_cleanup, Duration::from_secs(CLEANUP_INTERVAL_SECS));
@@ -512,12 +476,8 @@ pub(crate) async fn main_loop(
                 .expect("FIRST_CLEANUP_DELAY_SECS fits in i64"),
     );
 
-    // The open-descriptor peak for the dashboard's Capacity section, sampled
-    // here rather than per accept.
     tokio::task::spawn(fd_usage::sampler());
 
-    // The splice upstream pool's idle sweep, so sockets of a host that sees
-    // no more traffic do not wait for the next return to some host.
     #[cfg(feature = "splice")]
     tokio::task::spawn(crate::splice::pool_reaper());
 
@@ -638,10 +598,8 @@ pub(crate) async fn main_loop(
         if !ClientAcls::new(config, global_webif_hosts()).admits(&client) {
             metrics::CONNECTION_REJECTED_ACL.increment();
             client_trouble::record(&client, Trouble::Unauthorized);
-            // Unlike the per-request authorization refusals, repeats drop to
-            // debug: nothing but the connect reaches the daemon, so a connect
-            // flood would be one info line per connection, and the counter
-            // above already carries every repeat.
+            // Repeats drop to debug: a connect flood would otherwise be one
+            // info line per connection.
             warn_once_or_debug!(
                 "Unauthorized client {client} (permitted by neither `allowed_proxy_clients` nor \
                  `allowed_webif_clients`); closing the socket without a response"
@@ -658,7 +616,6 @@ pub(crate) async fn main_loop(
         ) {
             Ok(counter) => counter,
             Err(cap) => {
-                // Per rejected connection, on exactly the path a flood exercises.
                 match cap {
                     client_counter::ConnectionCap::PerIp(max) => warn_once_or_debug!(
                         "Rejecting connection from client {client}, \
@@ -723,9 +680,6 @@ pub(crate) static LISTEN_ADDR: OnceLock<SocketAddr> = OnceLock::new();
 /// std's) `TcpListener::bind` uses.
 const LISTEN_BACKLOG: u32 = 128;
 
-/// Bind the proxy listener to `bind_addr`:`port`, returning it with the
-/// address it is bound to.
-///
 /// An IPv6 socket is made dual-stack explicitly (`IPV6_V6ONLY` off): whether
 /// the default `::` also accepts IPv4 clients (as IPv4-mapped peers, which
 /// `ClientInfo::ip` folds back to IPv4) must not hinge on the host's
@@ -797,7 +751,6 @@ pub(crate) fn is_missing_ipv6(err: &std::io::Error) -> bool {
         .is_some_and(|errno| errno == nix::libc::EAFNOSUPPORT || errno == nix::libc::EADDRNOTAVAIL)
 }
 
-/// Pause after a transient `accept(2)` failure before retrying.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Whether an `accept(2)` error is a passing condition worth retrying
@@ -899,8 +852,6 @@ mod error_tests {
 mod listener_tests {
     use super::*;
 
-    /// Only a host without IPv6 lets `::` fall back to IPv4; a port in use or
-    /// a missing privilege is reported instead.
     #[test]
     fn only_missing_ipv6_falls_back() {
         for errno in [nix::libc::EAFNOSUPPORT, nix::libc::EADDRNOTAVAIL] {
@@ -912,8 +863,6 @@ mod listener_tests {
         assert!(!is_missing_ipv6(&std::io::Error::other("x")));
     }
 
-    /// The `::` listener is dual-stack whatever `net.ipv6.bindv6only` says:
-    /// an IPv4 client reaches it, as an IPv4-mapped peer.
     #[tokio::test]
     async fn an_ipv6_listener_accepts_ipv4_clients() {
         let listener = match bind_socket(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))) {

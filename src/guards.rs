@@ -6,33 +6,31 @@
 //!
 //! - [`InitBarrier`] (registered, nothing fetched) ends at one sink:
 //!   [`InitBarrier::finished`] (the file on disk stays valid),
-//!   [`InitBarrier::decline`] (answered without downloading; joiners answer
-//!   what the originator answered) or [`InitBarrier::download`] (takes the
-//!   `QuotaReservation` by value). One merely dropped publishes `Cancelled`,
-//!   which joiners report as a failure of unknown cause -- so hyper's
-//!   single-worker setup (`InitBarrier::run_settled`) must return the
-//!   [`Settled`] proof of a sink, and splice's `InitBarrier::run` publishes
-//!   a failing worker's concluded cause itself.
-//! - [`DownloadBarrier`] (bytes flowing, readers ping-woken): its runner
-//!   [`DownloadBarrier::run`] turns a failure into a [`FailedDownload`], which
-//!   can be salvaged (skipped when the cache write is what failed) but never
-//!   run again or renamed, and whose drop publishes the concluded cause.
+//!   [`InitBarrier::decline`] (joiners answer what the originator answered)
+//!   or [`InitBarrier::download`] (takes the `QuotaReservation` by value).
+//!   One merely dropped publishes `Cancelled`, which joiners report as a
+//!   failure of unknown cause -- so hyper's `InitBarrier::run_settled`
+//!   worker must return the [`Settled`] proof of a sink, and splice's
+//!   `InitBarrier::run` publishes a failing worker's concluded cause itself.
+//! - [`DownloadBarrier`] (bytes flowing, readers ping-woken): a failure
+//!   turns it into a [`FailedDownload`], which can be salvaged (skipped when
+//!   the cache write is what failed) but never run again or renamed, and
+//!   whose drop publishes the concluded cause.
 //! - [`DownloadBarrier::begin_rename`] drops the `max_upstream_downloads`
-//!   slot (`active_downloads::UpstreamSlot`, which [`InitBarrier::new`] took
-//!   with the whole `Origination`) and the watch sender. Every backend
-//!   reaches it, and nothing else releases a slot.
+//!   slot and the watch sender before verification starts. Nothing else
+//!   releases the slot of a live download; a barrier that ends any other way
+//!   drops it with its state.
 //! - [`RenameBarrier::commit`] is the only way a download finishes and the
 //!   only constructor of an `integrity::RenamePlan`, so a new plan field is a
 //!   compile error there and nowhere else. It also arms or clears
 //!   `verify_throttle`.
 //!
-//! No backend commits on its connection task -- hyper spawns
-//! `download_file`, splice spawns `splice/commit.rs::CommitTail`, and
-//! `splice/detached.rs` is already off-connection -- so a completed response
-//! never proves the cache file exists. That includes `splice/volatile.rs`:
-//! it lands its buffered body in the temp file before the response, but
-//! spawns the tail (`CommitTail::spawn_before_serving`) and serves from
-//! memory while it commits.
+//! No backend commits on its connection task, so a completed response never
+//! proves the cache file exists: hyper spawns `download_file`, splice spawns
+//! `splice/commit.rs::CommitTail`, `splice/detached.rs` is already
+//! off-connection, and `splice/volatile.rs` spawns the tail
+//! (`CommitTail::spawn_before_serving`) and serves from memory while it
+//! commits.
 
 use std::{
     fmt,
@@ -62,43 +60,35 @@ use crate::{
     transfer_error::{DownloadFailure, ReportedDownloadFailure},
     upstream_head::ContentLength,
 };
-/// The one `Cancelled` every unexplained drop publishes; readers only match
-/// on the variant, so a single shared allocation serves every such abort.
+/// The shared `Cancelled` every unexplained drop publishes.
 pub(crate) static CANCELLED_DOWNLOAD: LazyLock<Arc<DownloadFailure>> =
     LazyLock::new(|| Arc::new(DownloadFailure::Cancelled));
 
 /// What the caller does after the runner reported the failure. It ends the
-/// log line, so every abort line carries the consequence clause
-/// `docs/logging.md` requires without a call site spelling it out.
+/// abort log line as the consequence clause `docs/logging.md` requires.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Consequence {
-    /// Nothing went out yet, so the failure still becomes a response:
-    /// `; returning {status}` from [`DownloadFailure::response_parts`].
+    /// Nothing went out yet, so the failure still becomes a response.
     Respond,
-    /// The response head is already on the wire: `; closing the connection`.
-    /// Splice-only: it is the one backend whose download runner keeps serving
-    /// the originating client past its own response head.
+    /// The response head is already on the wire.
     #[cfg_attr(
         not(any(feature = "splice", test)),
         expect(dead_code, reason = "only the splice backend serves past its own head")
     )]
     CloseConnection,
-    /// The download ends here and no response depends on it any more:
-    /// `; abandoning the download`. The detached download has no client at
-    /// all; the buffered volatile path still serves its client from memory.
+    /// No response depends on the download any more: the detached download
+    /// has no client, the buffered volatile path serves its client from
+    /// memory.
     Abandon,
 }
 
 /// Publish `failure` as the entry's terminal status and count the abort.
-/// Shared by every barrier `Drop` and by the reporting runners, so they
-/// cannot drift apart. Registry retirement is separate: a download's write
-/// lease can outlive its failure notification.
+/// Registry retirement is separate: a download's write lease can outlive its
+/// failure notification.
 ///
-/// Synchronous by necessity: `Drop` cannot await and the status handle is an
-/// `Arc<RwLock<...>>` (not an owned write guard), so the write lock is taken
-/// under `block_in_place`. The runners use it for the same reason a `Drop`
-/// does: an await between concluding the failure and publishing it would let
-/// a cancellation publish `Cancelled` in its place.
+/// Synchronous on purpose: `Drop` cannot await, and in the runners an await
+/// between concluding the failure and publishing it would let a cancellation
+/// publish `Cancelled` in its place.
 fn publish_abort(
     status: &Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     failure: Arc<DownloadFailure>,
@@ -115,16 +105,12 @@ fn publish_abort(
     });
 }
 
-/// The one bump pair for an aborted download: `DOWNLOADS_ABORTED` and its
-/// cause, so the causes always sum to the total.
+/// Bumps `DOWNLOADS_ABORTED` with its cause, so the causes sum to the total.
 fn count_abort(cause: &metrics::Signal) {
     metrics::DOWNLOADS_ABORTED.increment();
     cause.increment();
 }
 
-/// Conclude a download's terminal failure under the one abort wording; the
-/// consequence clause ends the line, so every abort line carries what
-/// `docs/logging.md` requires without a call site spelling it out.
 fn conclude(
     failure: DownloadFailure,
     key: CacheEntryKeyRef<'_>,
@@ -145,20 +131,17 @@ fn conclude(
     )
 }
 
-/// Proof that an [`InitBarrier`] reached a sink: [`InitBarrier::finished`],
-/// [`InitBarrier::download`] or [`InitBarrier::decline`]. A worker driven by
-/// `InitBarrier::run_settled` (hyper) returns one on every success path, so an
-/// answered request cannot leave the entry to `Drop`'s `Cancelled` -- which
-/// would tell every joiner the download was cancelled for no known cause.
+/// Proof that an [`InitBarrier`] reached a sink. A worker driven by
+/// `InitBarrier::run_settled` returns one on every success path, so an
+/// answered request cannot leave the entry to `Drop`'s `Cancelled`.
 #[must_use = "the init barrier's sink is only proven by handing this on"]
 pub(crate) struct Settled(());
 
-/// Exclusive ownership of a download's registry entry. A failed download
-/// remains registered until its last writer has stopped touching the partial.
-/// Splice's cache file and blocking writes share this lease with the barrier;
-/// notifying readers of an abort therefore cannot admit a replacement writer
-/// during salvage or after cancellation of an outstanding blocking write.
-/// Successful downloads carry the same lease into their rename barrier.
+/// Exclusive ownership of a download's registry entry. Splice's cache file
+/// and blocking writes share this lease with the barrier, so a failed
+/// download stays registered until its last writer has stopped touching the
+/// partial: notifying readers of an abort cannot admit a replacement writer
+/// during salvage or while a blocking write is outstanding.
 pub(crate) struct DownloadWriteLease {
     active_downloads: ActiveDownloads,
     key: Arc<CacheEntryKey>,
@@ -189,19 +172,12 @@ impl Drop for DownloadWriteLease {
     }
 }
 
-/// Owned setup state permits an unboxed lending async worker. The immutable
-/// key lives beside this state so reporting remains possible after a sink
-/// consumes it; the write lease shares that key with the init barrier.
 struct InitBarrierData {
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     active_downloads: ActiveDownloads,
-    /// The download's `max_upstream_downloads` slot, travelling with the
-    /// barrier chain: `download` hands it to the `DownloadBarrier`, every
-    /// other sink drops it here with the rest.
     slot: UpstreamSlot,
     resource_kind: ResourceKind,
-    /// The raw client request URI path (pre-normalisation, pre-redirect),
-    /// carried through to `RenameBarrier::commit`'s `RenamePlan`.
+    /// The raw client request URI path (pre-normalisation, pre-redirect).
     raw_uri_path: String,
     /// Unused, receivers just need to get notified by drop.
     _tx: tokio::sync::watch::Sender<()>,
@@ -210,10 +186,9 @@ struct InitBarrierData {
 #[must_use]
 pub(crate) struct InitBarrier {
     data: Option<InitBarrierData>,
-    /// Outside `data` on purpose: every sink takes `data`, and a worker may
-    /// reach a sink and only then fail, so the key that names the entry in the
-    /// abort report has to outlive them. Keeping it here means the runners
-    /// need neither a pre-worker capture nor a clone.
+    /// Outside `data`: every sink takes `data`, and a worker may reach a sink
+    /// and only then fail, so the key that names the entry in the abort
+    /// report has to outlive them.
     key: Arc<CacheEntryKey>,
 }
 
@@ -221,10 +196,6 @@ impl InitBarrier {
     /// `raw_uri_path` is the client's request path exactly as received
     /// (pre-normalisation, and for the splice backend pre-redirect and
     /// query-stripped) - both backends must agree, or registry keys diverge.
-    ///
-    /// Takes the whole [`Origination`], slot included: the barrier chain is
-    /// what carries the slot from here on, and a backend that registered a
-    /// download cannot end up holding its slot loose.
     pub(crate) fn new(
         origination: Origination,
         active_downloads: ActiveDownloads,
@@ -254,16 +225,10 @@ impl InitBarrier {
         }
     }
 
-    /// Drive one fallible step of registered-download setup under its
-    /// lifecycle owner, handing the barrier back for the next step. A worker
-    /// failure is concluded and published before this returns, and the
-    /// barrier is consumed with it: no later step can run on, or a sink be
-    /// reached by, a setup that already failed.
-    ///
-    /// Safe on a consumed barrier: a worker may reach a sink
-    /// (`finished`/`download`/`decline`) and only then fail, and `self.key`
-    /// lives beside `data` rather than inside it, so the report still names
-    /// the entry without capturing or cloning anything up front.
+    /// Drive one fallible step of registered-download setup, handing the
+    /// barrier back for the next step. A worker failure is concluded and
+    /// published before this returns, and consumes the barrier. The worker
+    /// may have reached a sink before failing.
     #[cfg(feature = "splice")]
     pub(crate) async fn run<T>(
         mut self,
@@ -275,9 +240,8 @@ impl InitBarrier {
         }
     }
 
-    /// `Self::run` (splice) for a worker that owns the whole setup: every success
-    /// path returns the [`Settled`] proof of the sink it reached, so the
-    /// barrier ends with the worker.
+    /// `Self::run` for a worker that owns the whole setup: every success
+    /// path returns the [`Settled`] proof of the sink it reached.
     #[cfg(feature = "hyper")]
     pub(crate) async fn run_settled<T>(
         mut self,
@@ -289,7 +253,6 @@ impl InitBarrier {
         }
     }
 
-    /// Conclude the terminal failure and publish it, retiring the entry.
     fn fail(mut self, failure: DownloadFailure) -> ReportedDownloadFailure {
         let reported = conclude(failure, self.key.as_ref().as_ref(), Consequence::Respond);
         if let Some(data) = self.data.take() {
@@ -311,11 +274,10 @@ impl InitBarrier {
 
     /// End the entry without a download: the upstream answered with nothing
     /// to cache, or this proxy refused to fetch it. Joiners answer from
-    /// `why` what the originator answered (`active_downloads::JoinFailure`);
-    /// nothing failed, so `DOWNLOADS_ABORTED` stays untouched and
-    /// `DOWNLOADS_DECLINED` counts it instead -- once settled: a future
-    /// cancelled while `settle` waits for the status lock leaves `Drop` to
-    /// count a cancellation, and the download must not count as both.
+    /// `why` what the originator answered. Counted in `DOWNLOADS_DECLINED`
+    /// only once settled: a future cancelled while `settle` waits for the
+    /// status lock leaves `Drop` to count a cancellation, and the download
+    /// must not count as both.
     pub(crate) async fn decline(&mut self, why: Declined) -> Settled {
         let settled = self
             .settle(ActiveDownloadStatus::Aborted(AbortReason::Declined(why)))
@@ -376,9 +338,6 @@ impl InitBarrier {
         (Settled(()), download)
     }
 
-    /// The live barrier state. `finished`, `download`, `decline`, a failed
-    /// run and `Drop` are the only sinks and each takes it, so it is `Some` for the barrier's whole
-    /// observable lifetime.
     fn data(&self) -> &InitBarrierData {
         self.data
             .as_ref()
@@ -395,13 +354,10 @@ impl InitBarrier {
         &self.key.mirror
     }
 
-    /// The raw client request path this barrier will hand to `RenamePlan`.
-    /// Read before [`Self::download`] consumes the barrier, so a download can
+    /// Read before [`Self::download`] takes the state, so a download can
     /// decide up front which digest it will be verified against
     /// (`integrity::stream_hash_algo_for_download`) using the very string the
     /// verifier later derives its registry key from.
-    ///
-    /// Splice-only: it is the sole backend that hashes as it writes.
     #[cfg(feature = "splice")]
     #[must_use]
     pub(crate) fn raw_uri_path(&self) -> &str {
@@ -413,15 +369,11 @@ impl InitBarrier {
         self.key.layout
     }
 
-    /// The alias-resolved on-disk identity of the download's mirror - the
-    /// same site `ConnectionDetails::site` resolves (alias' `main` host when
-    /// the request was redirected, else the mirror's own host), so
-    /// `partial_path_for_barrier` places the `.partial` in the same tree
-    /// as the eventual rename target.
+    /// The alias-resolved on-disk identity of the download's mirror, the
+    /// same site `ConnectionDetails::site` resolves, so the `.partial` lands
+    /// in the same tree as the eventual rename target.
     #[must_use]
     pub(crate) fn site(&self) -> MirrorSite<'_> {
-        // `key.mirror` is the canonical (alias-resolved) mirror, so this is
-        // the same projection as `ConnectionDetails::site`.
         self.key.mirror.site()
     }
 }
@@ -442,7 +394,6 @@ impl Drop for InitBarrier {
             publish_abort(&data.status, Arc::clone(&CANCELLED_DOWNLOAD));
             data.active_downloads.remove(self.key.as_ref().as_ref());
         }
-        // `data` (and with it the `UpstreamSlot`) drops with the struct.
     }
 }
 
@@ -456,15 +407,12 @@ struct DownloadBarrierData {
     quota_reservation: QuotaReservation,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     lease: Arc<DownloadWriteLease>,
-    /// The download's `max_upstream_downloads` slot, held until
-    /// [`DownloadBarrier::begin_rename`] -- where every backend has
-    /// necessarily finished reading the upstream body -- and dropped with the
-    /// rest on every other exit. Never reaches the `RenameBarrier`.
+    /// Held until [`DownloadBarrier::begin_rename`], where every backend has
+    /// finished reading the upstream body; never reaches the `RenameBarrier`.
     slot: UpstreamSlot,
     resource_kind: ResourceKind,
     raw_uri_path: String,
     tx: tokio::sync::watch::Sender<()>,
-    /// Single-owner via `&mut DownloadBarrier`; no atomic needed.
     bytes_since_ping: u64,
     /// Whether any ping was sent yet — the first one is unbatched.
     pinged_once: sticky::Bool,
@@ -478,7 +426,7 @@ impl DownloadBarrierData {
     }
 
     fn internal_ping(&mut self) {
-        // Send error means no receivers; not cached because send() is a cheap atomic load.
+        // A send error only means there are no receivers.
         if let Err(_err @ tokio::sync::watch::error::SendError(())) = self.tx.send(()) {}
         self.bytes_since_ping = 0;
         self.pinged_once.set();
@@ -491,14 +439,10 @@ pub(crate) struct DownloadBarrier {
 }
 
 impl DownloadBarrier {
-    /// Accumulate `bytes` and ping receivers once `PING_BATCH_THRESHOLD` is crossed.
-    /// `&mut self` enforces single-writer access at compile time.
-    ///
-    /// The very first ping is sent unbatched: the originating client reads
-    /// the partial file itself, so without it a download smaller than the
-    /// batch threshold would deliver its first byte only when the whole
-    /// download finished (pure store-and-forward latency, no wake-up-storm
-    /// justification).
+    /// Accumulate `bytes` and ping receivers once `PING_BATCH_THRESHOLD` is
+    /// crossed. The very first ping is sent unbatched: the originating client
+    /// reads the partial file itself, so a download smaller than the
+    /// threshold would otherwise deliver its first byte only when finished.
     pub(crate) fn ping_batched(&mut self, bytes: u64) {
         /// Roughly 1 MiB; tunes between wake-up overhead and joiner latency.
         const PING_BATCH_THRESHOLD: u64 = 1024 * 1024;
@@ -513,14 +457,9 @@ impl DownloadBarrier {
         }
     }
 
-    /// A worker can only end the shared download with a source-typed failure.
-    /// It is concluded before this returns, and the barrier becomes the
-    /// [`FailedDownload`] that publishes it: a failed download can be
-    /// salvaged, but never run again or renamed.
-    ///
-    /// `consequence` is what the caller does once this returns; it ends the
-    /// reported line, so a detached download and a connection-driven one
-    /// describe the same cause with their own outcome.
+    /// A worker failure is concluded before this returns, and the barrier
+    /// becomes the [`FailedDownload`] that publishes it. `consequence` is
+    /// what the caller does once this returns; it ends the reported line.
     pub(crate) async fn run<T>(
         mut self,
         consequence: Consequence,
@@ -545,20 +484,11 @@ impl DownloadBarrier {
             .expect("every sink consumes the instance");
 
         // Ordering matters: flush the final ping, flip `Download -> Verifying`
-        // under the status write lock, release the lock, then drop `tx`.
-        //
-        // The flip is what closes the late-joiner race: any reader that wakes
-        // from `receiver.changed().await` with `RecvError` (sender dropped)
-        // re-reads `status` and is guaranteed to see `Verifying`, `Finished`,
-        // or `Aborted` — never a stale `Download`. The reader paths in
-        // `hyper_conn.rs` and `sendfile_conn.rs` treat `Verifying` as "all
-        // bytes are on disk; drain the open file handle" rather than as an
-        // error.
-        //
-        // The write lock is only held for the brief variant swap, NOT for the
-        // subsequent SHA-256/-512 hashing in `RenameBarrier::commit` (which can
-        // take hundreds of ms for a large `.deb`). Late-joiner readers are
-        // therefore not stalled during verification.
+        // under the status write lock, release the lock, then drop `tx`. A
+        // reader woken by the sender drop (`RecvError`) re-reads `status` and
+        // so sees `Verifying`, `Finished` or `Aborted`, never a stale
+        // `Download`. The lock is held only for the swap, not for the
+        // hashing in `RenameBarrier::commit`.
         data.flush_batched_ping();
         {
             let mut lock = data.status.write().await;
@@ -600,7 +530,6 @@ impl DownloadBarrier {
         Arc::clone(&self.data.as_ref().expect("live download barrier").lease)
     }
 
-    /// Subscribe a `watch::Receiver` for handoff to a spawned file-serve task.
     pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
         let data = self
             .data
@@ -702,62 +631,36 @@ pub(crate) struct RenameBarrier {
 }
 
 impl RenameBarrier {
-    /// Verify the finished temp file, rename it into the cache, transition the
-    /// barrier to `Finished`, publish upstream metadata, and clear the
-    /// active-downloads entry.
+    /// Verify the finished temp file, rename it into the cache, flip the
+    /// status to `Finished`, publish upstream metadata and retire the entry.
+    /// On any `CommitError` the status becomes `Aborted`; a checksum mismatch
+    /// also arms the re-download throttle and removes the bad partial before
+    /// the registry entry is retired.
     ///
-    /// Verification is delegated to `integrity::verify_and_rename`; this is the
-    /// **only** way to finish a `RenameBarrier`, so no download backend can
-    /// commit a download without it. On any `CommitError` the status becomes
-    /// `Aborted`; a checksum mismatch also arms the re-download throttle and
-    /// removes the bad partial before the registry entry is retired. The
-    /// error is returned to the caller; `Drop` stays the safety net for a
-    /// cancelled future, while blocking jobs retain the registry lease.
+    /// All disk work -- `prepare` (splice's `fsync`; hyper passes none), the
+    /// `fstat` that sizes the quota finalisation, verification and the
+    /// `rename(2)` -- is one blocking job (`verify_and_rename`) that runs
+    /// before the status write lock is taken, so late joiners are not
+    /// stalled while the file is hashed.
     ///
-    /// Lock ordering: `verify_and_rename` runs *before* the status write lock
-    /// is acquired, so late-joiner readers (`status.read().await`) can proceed
-    /// concurrently while the temp file is being hashed on a blocking
-    /// thread. The lock is only held for the brief `Verifying -> Finished`
-    /// status flip after verification succeeds. The preceding `Download ->
-    /// Verifying` flip happens in `DownloadBarrier::begin_rename`.
+    /// Cancellation: once spawned, that job runs to completion and holds its
+    /// own registry lease, so a dropped `commit` future still ends with a
+    /// verified file renamed into the cache (or a rejected one left behind)
+    /// and the quota finalised. Only the `Verifying -> Finished` flip is
+    /// lost; `Drop` publishes `Aborted` instead.
     ///
-    /// All of the commit's disk work -- `prepare` (splice's `fsync`; hyper
-    /// passes none), the `fstat` that sizes the quota finalisation, the
-    /// verification on `temp_file`'s own descriptor and the `rename(2)` -- is
-    /// one blocking job (`verify_and_rename`), owning the descriptor, the
-    /// `TempPath` guard, the reservation and the registry lease.
+    /// On a re-download the metadata store still holds the previous
+    /// version's validators, and `resolve` answers from it without stat'ing
+    /// the file, so the blocking job invalidates the entry after the rename,
+    /// before it releases its lease. Aborts before the rename invalidate
+    /// nothing: the cached file is untouched, and on a filesystem without
+    /// xattrs the store is the validators' only carrier.
     ///
-    /// Cancellation window: once that job is spawned it runs to completion,
-    /// so a `commit` future dropped at any point after that -- even before
-    /// the verification finished -- still ends with a verified file renamed
-    /// into the cache (or a rejected one left behind), never a verified
-    /// `.partial`. The `Verifying -> Finished` flip is then what never runs;
-    /// `Drop for RenameBarrier` flips status to `Aborted` and releases its
-    /// registry lease, while the job retains its own until it finishes. The
-    /// quota stays right: the reservation is finalised inside the job, right
-    /// after the rename, whatever became of the future.
-    /// The metadata does *not* take care of itself: on a re-download the
-    /// store still holds the previous version's validators, and `resolve`'s
-    /// hot path answers from that map without ever stat'ing the file -- so
-    /// the daemon would serve a stale `ETag` / `Last-Modified` for the new
-    /// bytes, and honour an `If-None-Match` on the old tag with a 304, until
-    /// the process exits. The metadata entry is therefore invalidated in the
-    /// blocking rename job itself before it releases its registry lease, so
-    /// the next `resolve` lazy-loads the renamed file's own xattrs.
-    ///
-    /// Aborts *before* the rename invalidate nothing: the cached file is
-    /// untouched and its memoized validators still describe it. On a
-    /// filesystem without xattrs the store is their only carrier, so
-    /// invalidating there would lose them for the life of the process
-    /// (`resolve` negatively caches the resulting `(None, None)`).
-    ///
-    /// `finished` is the finished `.partial` / temp file, idle (every write
-    /// flushed), and `temp_path` its guard; on success the guard is defused
-    /// (the file now lives at `dest_path`), on a checksum mismatch the file is
-    /// unlinked (its bytes are known-bad, resuming them cannot succeed), on a
-    /// transient verify/rename failure the guard's `OnDrop::Keep` keeps it for
-    /// resumption. Every failure is counted and logged by
-    /// `verify_and_rename`.
+    /// `finished` must be idle (every write flushed). On success the
+    /// `temp_path` guard is defused, on a checksum mismatch the file is
+    /// unlinked, and on a transient verify/rename failure the guard's
+    /// `OnDrop::Keep` keeps it for resumption. Every failure is counted and
+    /// logged by `verify_and_rename`.
     pub(crate) async fn commit(
         mut self,
         finished: integrity::FinishedCacheFile,
@@ -793,21 +696,15 @@ impl RenameBarrier {
         if let Err(CommitFailure { error: err, guard }) =
             integrity::verify_and_rename(&plan, finished, temp_path, reservation, lease).await
         {
-            // Retire the entry here, not in `Drop` (which runs only after
-            // the `TempPath` guard is dropped and a blocking write lock
-            // is won): a request arriving while the entry was still
-            // joinable in `Verifying` state was served the mismatching
-            // partial as a finished file. Ordering, all under the status
-            // write lock so no joiner can observe an intermediate state:
-            // arm the throttle (genuine content mismatch only; VerifyIo and
-            // Rename are transient local problems), then publish
-            // `Aborted(Discarded)`. A joiner reading the new status finds
-            // the throttle armed and answers its 503 (`await_serveable`);
-            // a request arriving after the removal below originates anew
-            // and hits the pre-upstream throttle gate. `Discarded` (not
-            // an incomplete failure): every byte is on disk, so readers
-            // that already hold the file drain it instead of truncating the
-            // body they were promised.
+            // Retire the entry here, not in `Drop`, which runs only after
+            // the `TempPath` guard is dropped: a request joining an entry
+            // still in `Verifying` would be served the mismatching partial
+            // as a finished file. Under the status write lock, so no joiner
+            // sees an intermediate state: arm the throttle (content
+            // mismatch only; VerifyIo and Rename are transient local
+            // problems), then publish `Aborted(Discarded)`. `Discarded`,
+            // not a failure: every byte is on disk, so readers that already
+            // hold the file drain it instead of truncating the body.
             let data = self
                 .data
                 .as_ref()
@@ -854,21 +751,13 @@ impl RenameBarrier {
                     HumanFmt::Time(window),
                 );
             }
-            // `data` drops here; the reservation was reverted when
-            // `verify_and_rename` dropped it.
             return Err(err);
         }
 
-        // Verified and renamed; the job defused the guard. The quota was
-        // finalised in the rename step too. Take the write lock
-        // briefly for the `Verifying -> Finished` status flip.
-        //
-        // `self.data` stays populated across that `.await` so `Drop` really
-        // is the safety net the doc above promises: a future cancelled while
-        // waiting for the lock leaves the entry `Verifying` and unretired
-        // otherwise. It is taken only past the last await, where no
-        // cancellation can turn a `Finished` entry back into an `Aborted`
-        // one.
+        // `self.data` stays populated across the lock `.await`, so a future
+        // cancelled while waiting still retires the entry through `Drop`.
+        // It is taken only past the last await, where no cancellation can
+        // turn a `Finished` entry back into an `Aborted` one.
         let meta_for_status: Option<Arc<UpstreamMetadata>> = {
             let data = self
                 .data
@@ -885,8 +774,8 @@ impl RenameBarrier {
                         "RenameBarrier::commit reached with non-Verifying status for {} from mirror {}; finishing the download without publishing cache metadata: {:?}",
                         data.lease.key.debname, data.lease.key.mirror, *lock
                     );
-                    // Nothing to publish; the invalidate above already
-                    // dropped the previous version's validators.
+                    // Nothing to publish; the rename job already dropped the
+                    // previous version's validators.
                     None
                 }
             };
@@ -910,9 +799,8 @@ impl RenameBarrier {
 
 /// Known-bad bytes cannot be resumed. The blocking unlink owns the registry
 /// lease so cancellation cannot admit a new writer at the same partial path
-/// while that unlink is still queued. Open readers keep their inode as usual.
-/// The reservation already kept the partial's bytes when it dropped, and the
-/// unlink releases them again.
+/// while that unlink is still queued. The reservation already kept the
+/// partial's bytes when it dropped, and the unlink releases them again.
 async fn discard_partial(temp_path: TempPath, lease: Arc<DownloadWriteLease>) {
     lease
         .spawn_blocking(move |_lease| {
@@ -925,15 +813,11 @@ async fn discard_partial(temp_path: TempPath, lease: Arc<DownloadWriteLease>) {
 impl Drop for RenameBarrier {
     fn drop(&mut self) {
         if let Some(data) = &self.data {
-            // Before rename, the cached file is untouched and its memoized
-            // validators still describe it. After rename, the blocking job
-            // already invalidates them before releasing its lease. Invalidating
-            // here would discard valid metadata on an earlier abort; on a
-            // filesystem without xattrs the store is its only carrier.
+            // No metadata invalidation here: before the rename the memoized
+            // validators still describe the cached file, and after it the
+            // blocking job invalidates them itself.
             publish_abort(&data.status, Arc::clone(&CANCELLED_DOWNLOAD));
         }
-        // `data` (and with it any still-held `QuotaReservation`) drops with
-        // the struct right after this, reverting the reservation.
     }
 }
 
@@ -976,7 +860,6 @@ mod tests {
                 .run(
                     Consequence::CloseConnection,
                     async |_barrier| -> Result<(), DownloadFailure> {
-                        // Ordinary propagation at a cache operation boundary.
                         let operation: Result<(), CacheError> = Err(CacheError::io(
                             "injected cache write",
                             std::io::ErrorKind::StorageFull.into(),
@@ -1099,9 +982,6 @@ mod tests {
         }
     }
 
-    /// Salvage re-attempts nothing when the cache itself failed: the retry
-    /// would fail again, count `CACHE_IO_FAILURE` a second time and log a
-    /// second error for one condition. Any other cause salvages.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_download_salvages_unless_the_cache_failed() {
         use crate::transfer_error::{CacheError, InternalError};
@@ -1141,8 +1021,6 @@ mod tests {
         }
     }
 
-    /// A declined setup retires the entry without counting an abort, and a
-    /// joiner answers what the originator answered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn declined_setup_tells_joiners_what_the_originator_answered() {
         use crate::active_downloads::{JoinFailure, await_serveable};
@@ -1171,8 +1049,6 @@ mod tests {
         );
     }
 
-    /// A joiner of an originator the verify throttle declined is a request
-    /// the throttle rejected too, counted like the originator's own 503.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn verify_throttled_decline_counts_its_joiners() {
         use crate::active_downloads::{JoinFailure, await_serveable};
@@ -1436,8 +1312,7 @@ mod tests {
     }
 
     /// A barrier over a real registry entry, in the state a download
-    /// abandoned *before* the rename leaves behind: the entry is still
-    /// registered and joinable, and `Drop` must retire it.
+    /// abandoned before the rename leaves behind.
     fn abandoned_rename_barrier(key: &CacheEntryKey) -> RenameBarrier {
         let active_downloads = ActiveDownloads::new();
         let status = active_downloads.insert_uncapped(key.as_ref());
@@ -1561,12 +1436,10 @@ mod tests {
         );
     }
 
-    /// Before rename, the cached file is the one the memoized validators
-    /// already describe, and dropping them would be a
-    /// regression, not a safety measure: on a filesystem without xattrs the
-    /// store is their only carrier and `resolve` negatively caches the
-    /// resulting `(None, None)` for the life of the process, so every
-    /// `If-None-Match` on that file would miss and re-send the whole body.
+    /// On a filesystem without xattrs the store is the validators' only
+    /// carrier and `resolve` negatively caches a miss for the life of the
+    /// process, so dropping them before the rename would make every
+    /// `If-None-Match` on that file re-send the whole body.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn dropping_a_rename_barrier_keeps_the_cached_validators() {
         let store = cache_metadata::store();

@@ -3,15 +3,12 @@
 //! Drives `lzma_rust2::XzReader` in a tokio blocking task feeding a
 //! `tokio::io::duplex` pipe, so callers can treat it as any other
 //! `AsyncRead`. The task reads its input synchronously, so the input is a
-//! blocking reader (the `Packages.xz` file as a `std::fs::File`): a
-//! `tokio::fs::File` behind a `SyncIoBridge` would run every read as a second
-//! blocking-pool task that the decode thread sits blocked on. Replaces
-//! `async_compression::tokio::bufread::XzDecoder` to remove the C
-//! `liblzma`/`liblzma-sys` dependency.
+//! blocking reader: a `tokio::fs::File` behind a `SyncIoBridge` would run
+//! every read as a second blocking-pool task that the decode thread sits
+//! blocked on.
 //!
 //! The decoder is built through `new_mem_limit`: the LZMA2 dictionary size
-//! comes verbatim from the (untrusted) block header, and the decoder's
-//! window grows with the decoded output up to it.
+//! comes verbatim from the (untrusted) block header.
 //! [`crate::limits::MAX_XZ_DICT_SIZE`] bounds it.
 //!
 //! One `XzReader::read` decodes until it has output or the input ends, and
@@ -20,20 +17,13 @@
 //! never does. The hang-up check therefore sits in the input
 //! ([`HangUpCheck`]), consulted on every 64 KiB refill. `XzReader` rather
 //! than the push-style `XzStream`: the latter keeps 16 bytes per block until
-//! the index (~0.9x the compressed size for a stream of empty blocks) to
-//! check each index record against its block, where `XzReader` keeps a block
-//! count and compares only the record count. A corrupt payload fails either
-//! way on its block's integrity check, when the stream carries one (`xz`
-//! writes CRC64 unless told `--check=none`).
+//! the index (~0.9x the compressed size for a stream of empty blocks).
 //!
 //! The callers' size caps alone bound what a stream can cost: the decode
-//! works per input byte (empty blocks yield no output) and per output byte,
-//! and `limits::packages_reader` holds the input to the compressed cap and
-//! the output to the decompressed one as they are read. Up to lzma-rust2 0.21 every block allocated and zero-filled its
-//! declared dictionary up front, ~35 ms of CPU per empty block at the
-//! 64 MiB cap, which the decode loop answered with a CPU budget. Since 0.22
-//! the window grows with the output: an empty block costs ~1 us of CPU
-//! (measured with 0.25), so a stream of them at
+//! works per input byte (empty blocks yield no output) and per output byte.
+//! That relies on lzma-rust2 >= 0.22, where the window grows with the output
+//! instead of each block zero-filling its declared dictionary up front: an
+//! empty block costs ~1 us of CPU, so a stream of them at
 //! [`crate::limits::MAX_COMPRESSED_PACKAGES_SIZE`] holds the thread for
 //! ~7 s, the same order as decoding
 //! [`crate::limits::MAX_DECOMPRESSED_PACKAGES_SIZE`] of real index (~5 s).
@@ -51,25 +41,18 @@ use tokio_util::io::SyncIoBridge;
 use crate::humanfmt::HumanFmt;
 use crate::limits::MAX_XZ_DICT_SIZE;
 
-/// Internal pipe capacity. 64 KiB amortises copy syscalls between the blocking
-/// decoder thread and the async consumer without buffering meaningful amounts
-/// of memory.
 const PIPE_CAPACITY: usize = 64 * 1024;
 
 /// Async wrapper over a blocking [`XzReader`] decode.
 ///
 /// EOF on the inner pipe triggers a poll of `tail` to surface any terminal
-/// `io::Error` the decoder produced; a clean decode reports the EOF verbatim.
+/// `io::Error` the decoder produced.
 pub(crate) struct XzDecoderStream {
     inner: DuplexStream,
     tail: Option<oneshot::Receiver<io::Result<()>>>,
 }
 
-/// Construct an `AsyncRead` that yields the xz-decompressed bytes of `reader`,
-/// which the blocking decode task reads directly (see the module doc).
-///
-/// Multi-stream xz files are accepted (matches the `xz` CLI default and what
-/// `async_compression`'s `XzDecoder` did before).
+/// Multi-stream xz files are accepted (matches the `xz` CLI default).
 pub(crate) fn xz_decoder<R>(reader: R) -> XzDecoderStream
 where
     R: io::Read + Send + 'static,
@@ -78,24 +61,19 @@ where
     let (err_tx, err_rx) = oneshot::channel::<io::Result<()>>();
 
     tokio::task::spawn_blocking(move || {
-        // Buffer up to the duplex capacity: writing straight through would
-        // cross the bridge in small pieces, each a block_on round-trip
-        // between the blocking thread and the runtime — the BufWriter cuts
-        // those handoffs. The explicit flush surfaces write errors before
-        // the result send (BufWriter's Drop swallows them).
+        // Buffered: writing straight through would cross the bridge in small
+        // pieces, each a block_on round-trip between the blocking thread and
+        // the runtime. The explicit flush surfaces write errors
+        // (BufWriter's Drop swallows them).
         let mut bridge_out =
             io::BufWriter::with_capacity(PIPE_CAPACITY, SyncIoBridge::new(write_half));
         let result = decode_stream(reader, &mut bridge_out, || err_tx.is_closed())
             .and_then(|()| io::Write::flush(&mut bridge_out));
         // Drop the write half BEFORE sending the result so the consumer sees
-        // EOF on `inner` before polling `tail`. Without this, the consumer can
-        // observe Pending on the oneshot while the duplex still has an open
-        // writer, and the wrapper's poll_read never reaches the oneshot branch.
+        // EOF on `inner` before polling `tail`.
         drop(bridge_out);
         if err_tx.send(result).is_err() {
-            // Receiver was dropped; consumer hung up before observing the
-            // result. Nothing to do — the duplex pipe close already signalled
-            // EOF and any error is lost by design.
+            // The consumer hung up; the error is lost by design.
         }
     });
 
@@ -133,9 +111,8 @@ fn name_mem_limit(err: io::Error) -> io::Error {
     )
 }
 
-/// The decode's input: fails every read with `BrokenPipe` once `abandoned`
-/// reports that the consumer is gone (see the module doc for why the check
-/// sits here).
+/// Fails every read with `BrokenPipe` once `abandoned` reports that the
+/// consumer is gone (see the module doc for why the check sits here).
 struct HangUpCheck<R, F> {
     inner: R,
     abandoned: F,
@@ -153,19 +130,17 @@ impl<R: io::Read, F: Fn() -> bool> io::Read for HangUpCheck<R, F> {
     }
 }
 
-/// Pump `input` through a memory-limited [`XzReader`] into `output` until the
-/// stream ends.  A truncated stream fails, mostly as `UnexpectedEof` (a cut
-/// inside a following stream's magic bytes is `InvalidData`).
-///
-/// Gives up with `BrokenPipe` at the first input refill after `abandoned`
-/// reports that the consumer is gone.
+/// A truncated stream fails, mostly as `UnexpectedEof` (a cut inside a
+/// following stream's magic bytes is `InvalidData`). Gives up with
+/// `BrokenPipe` at the first input refill after `abandoned` reports that the
+/// consumer is gone.
 fn decode_stream(
     input: impl io::Read,
     output: &mut impl io::Write,
     abandoned: impl Fn() -> bool,
 ) -> io::Result<()> {
     // Buffered: `XzReader` parses headers, padding and the index a byte at a
-    // time. Each refill reads up to 64 KiB and passes the hang-up check.
+    // time.
     let input = io::BufReader::with_capacity(
         PIPE_CAPACITY,
         HangUpCheck {
@@ -194,25 +169,22 @@ impl AsyncRead for XzDecoderStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // Empty target buffer: behave like a normal AsyncRead. Without this,
-        // the inner stream returns Ready with zero bytes filled (no capacity
-        // to write to), which the EOF detection below would misread as
-        // end-of-stream and trigger a spurious `tail` poll.
+        // An empty target buffer reads zero bytes, which the EOF detection
+        // below would misread as end-of-stream.
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
         let before = buf.filled().len();
         match Pin::new(&mut self.inner).poll_read(cx, buf) {
             Poll::Ready(Ok(())) if buf.filled().len() == before => {
-                // EOF on the pipe. Check the tail for a terminal error.
                 let Some(mut tail) = self.tail.take() else {
                     return Poll::Ready(Ok(()));
                 };
                 match Pin::new(&mut tail).poll(cx) {
                     Poll::Ready(Ok(Ok(()))) => Poll::Ready(Ok(())),
                     Poll::Ready(Ok(Err(err))) => Poll::Ready(Err(err)),
-                    // Sender dropped without sending — blocking task panicked
-                    // or runtime is shutting down. Treat as decode failure.
+                    // The blocking task panicked or the runtime is shutting
+                    // down.
                     Poll::Ready(Err(_)) => {
                         Poll::Ready(Err(io::Error::other("xz blocking task aborted")))
                     }
@@ -259,9 +231,7 @@ pub(crate) mod tests {
     }
 
     /// A valid stream header and block header whose LZMA2 property byte
-    /// (0x1e) declares a 128 MiB dictionary, followed by nothing.  Only the
-    /// head matters: the decoder must refuse the dictionary before it
-    /// allocates anything.
+    /// (0x1e) declares a 128 MiB dictionary, followed by nothing.
     const BIG_DICT_XZ: &[u8] = &[
         0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x01, 0x69, 0x22, 0xde, 0x36, 0x02, 0x00, 0x21,
         0x01, 0x1e, 0x00, 0x00, 0x00, 0x9b, 0x07, 0x51, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -269,7 +239,7 @@ pub(crate) mod tests {
     ];
 
     /// `printf 'hello world\n' | xz -9 -c --check=crc32`: property byte
-    /// 0x1c, the 64 MiB dictionary at the cap.  Must still decode.
+    /// 0x1c, the 64 MiB dictionary at the cap.
     const HELLO_XZ_9: &[u8] = &[
         0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x01, 0x69, 0x22, 0xde, 0x36, 0x04, 0xc0, 0x10,
         0x0c, 0x21, 0x01, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb2, 0x20,
@@ -313,9 +283,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn oversized_dictionary_after_output_is_still_refused() {
-        // The output decoded before the refused block header reaches the
-        // consumer, and the decode still ends in the refusal, not in a hang
-        // or a clean EOF.
         let input = [HELLO_XZ, BIG_DICT_XZ].concat();
         let mut decoder = xz_decoder(Cursor::new(input));
         let mut out = Vec::new();
@@ -332,8 +299,8 @@ pub(crate) mod tests {
     /// `XzReader`'s index parser before lzma-rust2 0.22 reserved
     /// `count * 16` bytes (32 GiB) for it before comparing the count with the
     /// blocks it saw. The test pins the refusal only: on a host that
-    /// overcommits, a reservation succeeds unseen and the decode ends the
-    /// same way.
+    /// overcommits, such a reservation would succeed unseen and the decode
+    /// end the same way.
     const HOSTILE_INDEX_XZ: &[u8] = &[
         0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x01, 0x69, 0x22, 0xde, 0x36, 0x00, 0x80, 0x80,
         0x80, 0x80, 0x08,
@@ -369,8 +336,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn corrupt_input_surfaces_io_error() {
-        // Flip a byte in the LZMA2-encoded payload region (offset 32 is well
-        // inside the compressed block, past the stream header).
+        // Offset 32 is inside the LZMA2-encoded payload.
         let mut bad = HELLO_XZ.to_vec();
         bad[32] ^= 0xFF;
         let mut decoder = xz_decoder(Cursor::new(bad));
@@ -423,8 +389,7 @@ pub(crate) mod tests {
             "empty-buffer read must not surface tail decode error, got {result:?}"
         );
 
-        // The tail must still be intact: a subsequent real read should still
-        // surface the decode error.
+        // The tail must still be intact.
         let mut out = Vec::new();
         let err = decoder
             .read_to_end(&mut out)
@@ -436,10 +401,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn empty_buffer_read_is_immediately_ready() {
-        // Using a noop waker, a single poll with an empty ReadBuf must return
-        // Ready(Ok(())). Without the fix, the wrapper polls the (still
-        // pending) tail oneshot and returns Pending — which would never
-        // resolve under a noop waker.
         let mut decoder = xz_decoder(Cursor::new(HELLO_XZ));
 
         let waker = std::task::Waker::noop();
@@ -452,7 +413,6 @@ pub(crate) mod tests {
             "empty-buffer poll_read must return Ready(Ok(())), got {poll:?}"
         );
 
-        // The decoder must remain fully functional afterwards.
         let mut out = Vec::new();
         decoder
             .read_to_end(&mut out)
@@ -489,8 +449,7 @@ pub(crate) mod tests {
     /// A complete, valid xz stream (no check) of `blocks` empty blocks, each
     /// declaring the LZMA2 dictionary of property byte `dict_prop`: a
     /// 12-byte block header, the one-byte LZMA2 end marker and three bytes of
-    /// padding, then an index listing them and the footer.  It decodes to
-    /// nothing, and every block makes the decoder set up a fresh dictionary.
+    /// padding, then an index listing them and the footer.
     fn empty_blocks_xz(blocks: u64, dict_prop: u8) -> Vec<u8> {
         let flags = [0x00, 0x00];
         let mut out = vec![0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00];

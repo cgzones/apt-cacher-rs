@@ -1,10 +1,7 @@
 //! One directory walker for every pass over the cache tree.
 //!
-//! The startup / post-cleanup size scan (`task_cache_scan`), the dashboard
-//! size walk (`web`) and every cleanup unit (`cleanup/`) used to
-//! each hand-roll a `read_dir` / `next_entry` / `file_type` loop, and with it
-//! the "Failed to read / iterate / inspect" error lines, the
-//! `CACHE_IO_FAILURE` bumps and the anomaly taxonomy:
+//! The walker owns the error lines, the `CACHE_IO_FAILURE` bumps and the
+//! anomaly taxonomy:
 //!
 //! - A `read_dir` / `next_entry` failure is an `error!` + `CACHE_IO_FAILURE`;
 //!   [`DirFailure`] says whether the walk ends or carries on.
@@ -22,34 +19,24 @@
 //!   / `CACHE_UNEXPECTED_REGULAR` bump and the wording.
 //!
 //! The walker is a pull-style iterative DFS rather than a visitor callback:
-//! `while let Some(entry) = walker.next().await { ... }`.  Callers keep their
-//! natural loop shape (`continue`, `?`, early `return`), and no `AsyncFnMut`
-//! bound is needed - the call future of an async closure cannot be bounded
+//! the call future of an async closure (`AsyncFnMut`) cannot be bounded
 //! `Send` on stable, which the tokio-spawned cleanup tasks require.  A
 //! directory is descended into only when the caller asks
 //! ([`Entry::descend`]); a per-directory `Copy` tag rides along so a caller
-//! can remember what a subtree means (`dists/` vs `by-hash/` vs flat) without
-//! re-deriving it from the path on every entry.
+//! can remember what a subtree means (`dists/` vs `by-hash/` vs flat).
 //!
 //! Entries are classified from the directory listing's `d_type`, so a walk
 //! that only needs names and kinds costs no per-entry syscall; sizes and
 //! timestamps are fetched on demand through [`Entry::metadata`] (lstat, so a
-//! planted symlink is seen as itself and never followed; relative to the
-//! open directory, like the listing, so it costs no full-path walk and
+//! planted symlink is never followed; relative to the open directory, so it
 //! follows the entry if an ancestor is renamed mid-walk).
 //!
 //! A directory is listed in batches of [`LIST_BATCH`] entries, one
-//! blocking-pool hop per batch (the first rides along with the `opendir`).
-//! A walk that only tallies sizes (the startup / reconcile scan, the
-//! dashboard) opts in with [`Walker::stat_files`]: the lstat of each
-//! regular file then runs inside the listing hop, relative to the open
-//! directory, instead of costing one hop per file, and [`Entry::metadata`]
-//! hands out that result - including a failure, reported exactly as an
-//! on-demand one would be, when the caller asks.  The stat is then as old
-//! as the batch, not as the caller's use of it, so a walk that acts on the
-//! file afterwards (cleanup's reaps, which report a failed unlink) keeps
-//! the on-demand stat.  Name-only walks never set it and so still stat
-//! nothing.
+//! blocking-pool hop per batch.  A walk that only tallies sizes opts in
+//! with [`Walker::stat_files`]: the lstat of each regular file then runs
+//! inside the listing hop instead of costing one hop per file.  The stat is
+//! then as old as the batch, so a walk that acts on the file afterwards
+//! (cleanup's reaps) keeps the on-demand stat.
 
 use std::{
     collections::VecDeque,
@@ -70,23 +57,15 @@ use crate::{error::ErrorReport, log_once::Logged, metrics};
 #[derive(Debug)]
 pub(crate) struct WalkContext {
     /// Noun (with article) naming the tree in every line: `"the cache
-    /// directory"`, `"a mirror directory"`, `"a by-hash directory"`.  Reads
-    /// as `Failed to read {what} <path>` and `Unrecognized symlink entry
-    /// <path> in {what}; ...`.
+    /// directory"`, `"a mirror directory"`.
     pub(crate) what: &'static str,
-    /// What a failed `read_dir` / `next_entry` does to the walk, carrying
-    /// the consequence clause of its error line.
     pub(crate) dir_failure: DirFailure,
     /// Consequence clause when one entry drops out of the walk because its
-    /// file type or metadata could not be read (`"excluding it from the
-    /// cache size"`, `"retaining it and excluding it from cleanup"`).
+    /// file type or metadata could not be read.
     pub(crate) entry_failure: &'static str,
     /// Consequence clause of the warn for a symlink / FIFO / socket /
-    /// device, which the walker reports on sight (`"not counting it towards
-    /// the cache size"`, `"removing it"`).
+    /// device.
     pub(crate) non_regular: &'static str,
-    /// Level of the anomaly lines: a non-regular entry and
-    /// [`Entry::report_unexpected`].
     pub(crate) anomalies: AnomalyLevel,
 }
 
@@ -121,11 +100,11 @@ pub(crate) enum AnomalyLevel {
     Debug,
 }
 
-/// Policy for a directory that cannot be read or iterated.
+/// Policy for a directory that cannot be read or iterated, carrying the
+/// consequence clause of its error line.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum DirFailure {
-    /// Log, then end the walk: [`Walker::next`] yields nothing further and
-    /// [`Walker::finish`] returns [`WalkOutcome::Aborted`].
+    /// Log, then end the walk.
     Abort(&'static str),
     /// Log, then carry on with the next directory; the unread remainder of
     /// the failed directory is skipped.
@@ -162,11 +141,9 @@ pub(crate) enum WalkOutcome {
     /// The root does not exist and the walk was [`OnMissing::Tolerate`].
     RootMissing,
     /// A [`DirFailure::Abort`] fired.  `logged` proves the failure was
-    /// logged and counted where it happened (the walker's one directory-
-    /// failure line), so a caller maps it silently - cleanup's
-    /// `CleanupUnitError` carries the proof.  `err` is for a caller that has
-    /// to classify the failure or fold it into a typed error of its own
-    /// (`task_cache_scan`), never for a second line.
+    /// logged and counted where it happened; `err` is for a caller that has
+    /// to classify the failure or fold it into a typed error of its own,
+    /// never for a second line.
     Aborted { logged: Logged, err: io::Error },
 }
 
@@ -180,7 +157,6 @@ pub(crate) enum EntryKind {
     NonRegular,
 }
 
-/// A directory waiting to be opened.
 #[derive(Debug)]
 struct Frame<T> {
     path: PathBuf,
@@ -194,14 +170,11 @@ struct Frame<T> {
 /// metadata) while cutting its hops by that factor.
 const LIST_BATCH: usize = 256;
 
-/// One listed entry, as read inside the blocking hop.
 #[derive(Debug)]
 struct Listed {
     name: OsString,
-    /// The listing's entry, holding the open directory: the on-demand
-    /// [`Entry::metadata`] lstats relative to it (`DirEntry::metadata`, a
-    /// `statx`/`fstatat` on the directory descriptor) rather than walking
-    /// the entry's full path again.
+    /// Holds the open directory: the on-demand [`Entry::metadata`] lstats
+    /// relative to it.
     listing: Arc<DirEntry>,
     /// The listing's `d_type`, or an lstat where the filesystem leaves it
     /// unknown.
@@ -211,7 +184,6 @@ struct Listed {
     metadata: Option<io::Result<Metadata>>,
 }
 
-/// A directory's listing so far, as one blocking hop returns it.
 #[derive(Debug)]
 struct Batch {
     entries: VecDeque<Listed>,
@@ -223,15 +195,13 @@ struct Batch {
 }
 
 impl Batch {
-    /// Read up to [`LIST_BATCH`] entries from `reader`.  Blocking.
+    /// Blocking.
     fn read(mut reader: ReadDir, stat_files: bool) -> Self {
         let mut entries = VecDeque::with_capacity(LIST_BATCH);
         while entries.len() < LIST_BATCH {
             match reader.next() {
                 Some(Ok(dir_entry)) => {
                     let file_type = dir_entry.file_type();
-                    // `DirEntry::metadata` is an lstat relative to the open
-                    // directory, like the on-demand one.
                     let metadata = (stat_files && file_type.as_ref().is_ok_and(FileType::is_file))
                         .then(|| dir_entry.metadata());
                     entries.push_back(Listed {
@@ -265,7 +235,6 @@ impl Batch {
     }
 }
 
-/// The directory currently being iterated.
 #[derive(Debug)]
 struct Open<T> {
     frame: Frame<T>,
@@ -277,9 +246,7 @@ struct Open<T> {
 pub(crate) struct Walker<T> {
     ctx: &'static WalkContext,
     missing: OnMissing,
-    /// Set by [`Walker::stat_files`].
     stat_files: bool,
-    /// Set by [`Walker::confined_to`].
     confined_to: Option<PathBuf>,
     pending: Vec<Frame<T>>,
     current: Option<Open<T>>,
@@ -288,24 +255,19 @@ pub(crate) struct Walker<T> {
     descend: Option<Frame<T>>,
     root_missing: bool,
     aborted: Option<(Logged, io::Error)>,
-    /// See [`Walker::io_failures`].
     io_failures: u64,
 }
 
 impl<T: Copy + Send> Walker<T> {
     /// Prepare a walk of `root`, a directory below the trusted `base` (the
-    /// cache root, a host directory) that may be absent
-    /// ([`OnMissing::Tolerate`]) and is refused when reached through anything
-    /// but directories ([`Walker::confined_to`]).  Every walk but the one of
-    /// the cache root itself starts here.
+    /// cache root, a host directory) that may be absent and is refused when
+    /// reached through anything but directories ([`Walker::confined_to`]).
     #[must_use]
     pub(crate) fn below(base: &Path, root: &Path, ctx: &'static WalkContext, root_tag: T) -> Self {
         Self::new(root, ctx, OnMissing::Tolerate, root_tag).confined_to(base)
     }
 
-    /// Prepare a walk of `root`, the cache root itself; nothing is read
-    /// until the first [`Walker::next`].  `root_tag` is handed back on every
-    /// entry of the root directory itself.
+    /// Prepare a walk of `root`, the cache root itself.
     #[must_use]
     pub(crate) fn new(
         root: &Path,
@@ -331,11 +293,10 @@ impl<T: Copy + Send> Walker<T> {
         }
     }
 
-    /// Lstat every regular file while its directory is listed, in the
-    /// listing's blocking hop, so [`Entry::metadata`] costs no hop of its
-    /// own.  For a walk that only tallies (nearly) every regular file's
-    /// size; not for one that skips files by name before the stat, or acts
-    /// on a file after it (see the module doc).
+    /// Lstat every regular file in the listing's blocking hop.  For a walk
+    /// that only tallies (nearly) every regular file's size; not for one
+    /// that skips files by name before the stat, or acts on a file after it
+    /// (see the module doc).
     #[must_use]
     pub(crate) const fn stat_files(mut self) -> Self {
         self.stat_files = true;
@@ -349,19 +310,18 @@ impl<T: Copy + Send> Walker<T> {
     /// and it would be followed: two walks rooted at different paths could
     /// then read the same directory, or one outside the cache. With this
     /// set, a symlink / FIFO / socket / device among those components is
-    /// reported like a listed one (`CACHE_NON_REGULAR`, the walk's anomaly
-    /// line naming the component) and the walk yields nothing. The `lstat`s
-    /// run in the root's listing hop; they narrow a concurrent swap to the
-    /// window before its `opendir` without closing it. `root` must lie below
-    /// `base`, which the caller trusts (the cache root, a host directory).
+    /// reported like a listed one and the walk yields nothing. The `lstat`s
+    /// narrow a concurrent swap to the window before the root's `opendir`
+    /// without closing it. `root` must lie below `base`, which the caller
+    /// trusts.
     #[must_use]
     fn confined_to(mut self, base: &Path) -> Self {
         self.confined_to = Some(base.to_path_buf());
         self
     }
 
-    /// Yield the next entry, or `None` once every directory the caller
-    /// descended into has been read (or the walk aborted).
+    /// `None` once every directory the caller descended into has been read
+    /// (or the walk aborted).
     pub(crate) async fn next(&mut self) -> Option<Entry<'_, T>> {
         if let Some(frame) = self.descend.take() {
             self.pending.push(frame);
@@ -432,18 +392,13 @@ impl<T: Copy + Send> Walker<T> {
     }
 
     /// Directories and entries this walk skipped on an I/O failure so far,
-    /// each logged and counted (`CACHE_IO_FAILURE`) where it happened: a
-    /// directory it could not read or iterate, an entry whose file type or
-    /// [`Entry::metadata`] could not be read.  A vanished entry is no
-    /// failure.  For a caller that must tell a complete pass from one that
-    /// left entries unvisited, such as cleanup's per-run failure tally.
+    /// each logged and counted where it happened.  A vanished entry is no
+    /// failure.
     #[must_use]
     pub(crate) const fn io_failures(&self) -> u64 {
         self.io_failures
     }
 
-    /// Report how the walk ended.  Dropping the walker instead is fine for a
-    /// caller that cannot abort and does not care whether the root existed.
     #[must_use]
     pub(crate) fn finish(self) -> WalkOutcome {
         if let Some((logged, err)) = self.aborted {
@@ -490,7 +445,6 @@ impl<T: Copy + Send> Walker<T> {
         }
     }
 
-    /// The one site logging and counting a directory-level failure.
     fn dir_failed(&mut self, verb: &'static str, path: &Path, err: io::Error) {
         self.io_failures += 1;
         let logged = Logged::cache_io_failure(format_args!(
@@ -508,8 +462,6 @@ impl<T: Copy + Send> Walker<T> {
     }
 }
 
-/// The one report of a symlink / FIFO / socket / device met by a walk:
-/// `CACHE_NON_REGULAR` and the walk's anomaly line.
 fn report_non_regular(ctx: &'static WalkContext, path: &Path, ft: FileType) {
     metrics::CACHE_NON_REGULAR.increment();
     let kind = if ft.is_symlink() {
@@ -551,10 +503,8 @@ fn non_regular_component(base: &Path, root: &Path) -> io::Result<Option<(PathBuf
     Ok(None)
 }
 
-/// Classify one listed entry of directory `dir`, reporting a non-regular
-/// one on sight.  `None` means the entry dropped out of the walk (vanished,
-/// or its type could not be read - logged and counted here, and in
-/// `io_failures`).
+/// `None` means the entry dropped out of the walk (vanished, or its type
+/// could not be read).
 fn classify(
     ctx: &'static WalkContext,
     dir: &Path,
@@ -595,10 +545,8 @@ fn classify(
 #[derive(Debug)]
 pub(crate) struct Entry<'w, T> {
     ctx: &'static WalkContext,
-    /// Full path of the directory holding the entry.
     dir: &'w Path,
     name: OsString,
-    /// The listing's entry, for the on-demand lstat (see [`Listed`]).
     listing: Arc<DirEntry>,
     rel_dir: &'w Path,
     tag: T,
@@ -606,8 +554,6 @@ pub(crate) struct Entry<'w, T> {
     /// The lstat taken while listing, in a [`Walker::stat_files`] walk.
     prefetched: Option<io::Result<Metadata>>,
     descend: &'w mut Option<Frame<T>>,
-    /// The walker's [`Walker::io_failures`], bumped by a failed
-    /// [`Entry::metadata`].
     io_failures: &'w mut u64,
 }
 
@@ -617,7 +563,6 @@ impl<T: Copy + Send> Entry<'_, T> {
         self.kind
     }
 
-    /// The entry's file name, verbatim (may not be UTF-8).
     #[must_use]
     pub(crate) fn name(&self) -> &OsStr {
         &self.name
@@ -629,15 +574,12 @@ impl<T: Copy + Send> Entry<'_, T> {
         self.tag
     }
 
-    /// Full path of the entry.
     #[must_use]
     pub(crate) fn path(&self) -> PathBuf {
         self.dir.join(&self.name)
     }
 
-    /// Path of the entry relative to the walk root (`"a.deb"` for a root
-    /// entry, `"amd64/a.deb"` one level down); rejoining it onto the root
-    /// gives [`Entry::path`].
+    /// Path of the entry relative to the walk root.
     #[must_use]
     pub(crate) fn rel_path(&self) -> PathBuf {
         self.rel_dir.join(&self.name)
@@ -661,12 +603,8 @@ impl<T: Copy + Send> Entry<'_, T> {
     }
 
     /// Report a directory or regular file the caller's layout does not
-    /// allow here: bumps `CACHE_DIRECTORY_UNEXPECTED` /
-    /// `CACHE_UNEXPECTED_REGULAR` and logs at the walk's [`AnomalyLevel`]
-    /// with the caller's consequence clause (`"not counting it or its contents towards the cache size"`,
-    /// `"retaining it and excluding its contents from cleanup"`).  A
-    /// non-regular entry was already reported when it was yielded, so this
-    /// is a no-op for one.
+    /// allow here.  A non-regular entry was already reported when it was
+    /// yielded, so this is a no-op for one.
     pub(crate) fn report_unexpected(&self, consequence: &'static str) {
         let kind = match self.kind {
             EntryKind::Dir => {
@@ -684,10 +622,8 @@ impl<T: Copy + Send> Entry<'_, T> {
 
     /// `lstat` the entry, or hand out the lstat a [`Walker::stat_files`]
     /// walk took while listing it.  `None` means it dropped out of the walk:
-    /// it vanished or changed type since it was listed (`debug!`), or the
-    /// stat failed (`error!` + `CACHE_IO_FAILURE`, with the walk's
-    /// [`WalkContext::entry_failure`] clause, counted in
-    /// [`Walker::io_failures`]).
+    /// it vanished or changed type since it was listed, or the stat failed
+    /// (logged and counted here).
     pub(crate) async fn metadata(&mut self) -> Option<Metadata> {
         let on_demand;
         let result = if let Some(prefetched) = self.prefetched.as_ref() {
@@ -792,7 +728,6 @@ mod tests {
         (events, walker.finish())
     }
 
-    /// Every entry of a walk rooted at `root` confined to `base`.
     async fn confined_names(base: &Path, root: &Path) -> (Vec<PathBuf>, WalkOutcome) {
         let mut names = Vec::new();
         let mut walker = Walker::new(root, &CONTINUE, OnMissing::Tolerate, ()).confined_to(base);
@@ -802,10 +737,6 @@ mod tests {
         (names, walker.finish())
     }
 
-    /// A confined walk refuses a root reached through a symlink, at the root
-    /// itself or at any component below its base, and counts it as a
-    /// non-regular entry; a real tree, a missing root and a symlink above
-    /// the base (the base is trusted) walk as without the confinement.
     #[tokio::test]
     async fn a_confined_walk_refuses_a_root_reached_through_a_symlink() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -921,8 +852,6 @@ mod tests {
         assert!(matches!(walker.finish(), WalkOutcome::Complete));
     }
 
-    /// A directory larger than one listing batch is read across several
-    /// hops without losing or repeating an entry, in either mode.
     #[tokio::test]
     async fn a_directory_spanning_several_batches_is_listed_completely() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -958,9 +887,6 @@ mod tests {
         }
     }
 
-    /// A `stat_files` walk lstats regular files in the listing hop:
-    /// `metadata` hands out that result, so it no longer sees a removal
-    /// after the listing, and it still lstats a non-file on demand.
     #[tokio::test]
     async fn stat_files_serves_the_lstat_taken_while_listing() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -991,8 +917,6 @@ mod tests {
         assert_eq!(seen, 2);
     }
 
-    /// `metadata` is the walker's only per-entry syscall and runs after the
-    /// listing, so it has to absorb both races the listing cannot see.
     #[tokio::test]
     async fn metadata_skips_an_entry_that_vanished_or_changed_type() {
         let gone_dir = tempfile::tempdir().expect("tempdir");
@@ -1022,9 +946,6 @@ mod tests {
         assert_eq!(walker.io_failures(), 0, "a swapped entry is no failure");
     }
 
-    /// The on-demand lstat is relative to the listed directory, as the
-    /// listing itself is: it neither re-walks the entry's full path nor
-    /// loses the entry when an ancestor is renamed mid-walk.
     #[tokio::test]
     async fn metadata_is_anchored_to_the_listed_directory() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -1131,8 +1052,6 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::NotFound);
         assert!(metrics::CACHE_IO_FAILURE.get() > before);
 
-        // `Fail` with a `Continue` policy: logged, then the (empty) walk
-        // completes.
         let (events, outcome) = collect(&absent, &CONTINUE, OnMissing::Fail, &[]).await;
         assert_eq!(events, Vec::new());
         assert!(matches!(outcome, WalkOutcome::Complete), "{outcome:?}");

@@ -1,7 +1,5 @@
-//! `Display` newtypes the dashboard renders cells through: UTC timestamps,
-//! HTML escaping, ratio-based colouring and the small value formatters
-//! (sizes, percentages, yes/no). Each writes straight into the `Formatter`
-//! rather than building a `String` of its own.
+//! `Display` newtypes the dashboard renders cells through. Each writes
+//! straight into the `Formatter` rather than building a `String` of its own.
 
 use std::{
     fmt::{self, Display, Formatter, Write as _},
@@ -20,13 +18,9 @@ const WEBUI_DATE_FORMAT: &[FormatItem<'_>] =
 const WEBUI_ISO_FORMAT: &[FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
 
-/// `OffsetDateTime` constrained to UTC at construction. The `WEBUI_ISO_FORMAT`
-/// constant hard-codes a literal `Z` suffix, so feeding it a non-UTC value
-/// would silently emit a wrong timestamp. Wrap once at the source instead.
-///
-/// Renders as `<time datetime="…ISO…">…human…</time>`, which is the only
-/// pattern the dashboard needs. Routing every callsite through this
-/// `Display` impl is what keeps the `Z`-suffix invariant from leaking.
+/// `OffsetDateTime` constrained to UTC at construction: `WEBUI_ISO_FORMAT`
+/// hard-codes a literal `Z` suffix, so a non-UTC value would silently emit a
+/// wrong timestamp.
 #[derive(Copy, Clone)]
 pub(super) struct Utc(OffsetDateTime);
 
@@ -35,8 +29,6 @@ impl Utc {
         Self(OffsetDateTime::now_utc())
     }
 
-    /// Take any `OffsetDateTime` and shift it to UTC. Use at the boundary
-    /// when receiving a value from foreign code that may not already be UTC.
     fn from_offset(odt: OffsetDateTime) -> Self {
         Self(odt.to_offset(time::UtcOffset::UTC))
     }
@@ -55,9 +47,7 @@ impl Utc {
         write: impl FnOnce(&mut Formatter<'_>, &str, &str) -> fmt::Result,
     ) -> fmt::Result {
         // Both formats are fixed-width, 40 bytes together (42 with the sign
-        // of a negative year): a stack buffer spares every rendered time a
-        // heap allocation. One that did not fit would fail the format,
-        // rendered as an invalid time.
+        // of a negative year), so a stack buffer holds them.
         let mut buf = [0_u8; 64];
         let mut out = buf.as_mut_slice();
         let Ok(iso_len) = self.0.format_into(&mut out, WEBUI_ISO_FORMAT) else {
@@ -83,15 +73,12 @@ impl Display for Utc {
     }
 }
 
-/// The current wall-clock second, the `now` every relative time on one
-/// rendered list is measured against.
 pub(super) fn now_epoch() -> i64 {
     i64::try_from(coarsetime::Clock::now_since_epoch().as_secs()).unwrap_or(i64::MAX)
 }
 
 /// A coarse age in its most significant unit only: `45 s`, `12 min`, `3 h`,
-/// `5 d`. A reader glancing at "last: 3 h ago" wants the order of magnitude;
-/// the exact instant is in the `<time>` element's `title`.
+/// `5 d`.
 pub(super) struct Age(pub(super) u64);
 impl Display for Age {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -141,8 +128,7 @@ impl Display for Span {
 /// the bar green, amber or red with no inline style (the CSP forbids one).
 /// Browsers count a value equal to `low` as below it (and one equal to
 /// `high` as below that), so the marks sit half a step under the first
-/// integer at each threshold: with a cap of 20, 10 is amber and 16 red, and
-/// a cap of 1 turns red when full.
+/// integer at each threshold.
 pub(super) struct Gauge {
     pub(super) current: u64,
     pub(super) cap: Option<u64>,
@@ -177,7 +163,6 @@ impl Display for Gauge {
 /// never "0 ms".
 pub(super) struct Latency {
     pub(super) value: std::time::Duration,
-    /// The measuring clock's resolution (see [`Self::PRECISE`]).
     pub(super) resolution: std::time::Duration,
 }
 impl Latency {
@@ -192,7 +177,6 @@ impl Display for Latency {
         // under its own floor.
         let millis = value.as_micros().saturating_add(500) / 1000;
         if millis == 0 {
-            // The tick rounded up to whole milliseconds, at least one.
             let floor = resolution.as_micros().div_ceil(1000).max(1);
             write!(f, "&lt;{floor} ms")
         } else if millis < 1000 {
@@ -269,10 +253,8 @@ impl Display for UtcText {
 
 /// A Unix timestamp as a relative age inside a `<time>` element, e.g.
 /// `<time datetime="2026-09-25T10:00:00Z" title="25 Sep 2026 10:00:00 UTC">3 h ago</time>`,
-/// or `in 3 h` for one in the future. The relative figure is what a reader
-/// scans for; the absolute instant (for correlating with a log) is one hover
-/// away and machine-readable in `datetime`. `0` renders as `N/A`, the
-/// dashboard's "never" sentinel.
+/// or `in 3 h` for one in the future. `0` renders as `N/A`, the dashboard's
+/// "never" sentinel.
 pub(super) struct RelTime {
     pub(super) epoch: i64,
     pub(super) now: i64,
@@ -300,12 +282,6 @@ impl Display for RelTime {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Display wrappers — render directly into a Formatter without allocating.
-// ---------------------------------------------------------------------------
-
-/// HTML-escapes its inner string when formatted. Single-pass: any byte that
-/// needs escaping fans out to its named entity; the rest is copied verbatim.
 pub(super) struct HtmlEscape<'a>(pub(super) &'a str);
 impl Display for HtmlEscape<'_> {
     #[expect(
@@ -331,8 +307,8 @@ impl Display for HtmlEscape<'_> {
     }
 }
 
-/// HTML-escapes the formatted output of any inner `Display` value, streaming
-/// directly into the destination `Formatter`. Avoids an intermediate `String`.
+/// HTML-escapes the formatted output of any `Display` value, without an
+/// intermediate `String`.
 pub(super) struct HtmlEscaped<D: Display>(pub(super) D);
 impl<D: Display> Display for HtmlEscaped<D> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -374,8 +350,7 @@ impl Display for FmtMTimeAge {
 ///
 /// The page's CSP is `style-src 'self'`, which forbids the inline
 /// `style="width:37%"` a `<div>` bar would need; `<meter>` carries its fill
-/// in `value`/`max` attributes instead, and brings the right ARIA role with
-/// it. Renders nothing when there is no scale to draw against.
+/// in `value`/`max` attributes instead. Renders nothing when `max` is 0.
 pub(super) struct Meter {
     pub(super) value: u64,
     pub(super) max: u64,
@@ -394,7 +369,7 @@ impl Display for Meter {
     }
 }
 
-/// One part of a [`StackBar`]: its name in the legend and its figure.
+/// One part of a [`StackBar`].
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Segment {
     pub(super) name: &'static str,
@@ -413,23 +388,20 @@ const STACK_SEGMENTS_MAX: usize = 5;
 
 /// A 100%-stacked bar: how a total splits into its parts, drawn as inline
 /// SVG so it needs no script and no style attribute. Each segment is a
-/// `<rect>` whose width is its share of 100 (tenths of a percent, summing
-/// to exactly 100) and whose colour comes from its class; the stylesheet
-/// maps `s1`..`s5` onto the categorical palette in both themes. The shares
-/// are also text: the `aria-label`, a `<title>` per segment (the hover
-/// tooltip) and the legend beside it, so no figure is carried by colour
-/// alone. Nothing is drawn while the total is zero.
+/// `<rect>` whose width is its share of 100 and whose colour comes from its
+/// class (`s1`..`s5` in the stylesheet). The shares are also text (the
+/// `aria-label`, a `<title>` per segment and the legend), so no figure is
+/// carried by colour alone. Nothing is drawn while the total is zero.
 pub(super) struct StackBar<'a> {
     /// What the bar splits, e.g. "Responses by class".
     pub(super) label: &'static str,
-    /// At most [`STACK_SEGMENTS_MAX`], the palette's length.
+    /// At most [`STACK_SEGMENTS_MAX`].
     pub(super) segments: &'a [Segment],
     pub(super) unit: Unit,
 }
 
 impl StackBar<'_> {
-    /// The bar's shares, ready to render as [`Drawn::svg`] and
-    /// [`Drawn::legend`]; `None` while the total is zero.
+    /// `None` while the total is zero.
     pub(super) fn draw(&self) -> Option<Drawn<'_>> {
         debug_assert!(
             self.segments.len() <= STACK_SEGMENTS_MAX,
@@ -498,7 +470,6 @@ impl Drawn<'_> {
         DrawnLegend(self)
     }
 
-    /// Each segment with its share.
     fn parts(&self) -> impl Iterator<Item = (usize, &Segment, Share)> {
         let Self { bar, tenths } = self;
         bar.segments
@@ -518,7 +489,6 @@ impl Drawn<'_> {
     }
 }
 
-/// See [`Drawn::svg`].
 pub(super) struct DrawnSvg<'a>(&'a Drawn<'a>);
 
 impl Display for DrawnSvg<'_> {
@@ -561,7 +531,6 @@ impl Display for DrawnSvg<'_> {
     }
 }
 
-/// See [`Drawn::legend`].
 pub(super) struct DrawnLegend<'a>(&'a Drawn<'a>);
 
 impl Display for DrawnLegend<'_> {
@@ -583,7 +552,6 @@ impl Display for DrawnLegend<'_> {
     }
 }
 
-/// A [`StackBar`] figure in its unit.
 struct Figure {
     value: u64,
     unit: Unit,
@@ -629,10 +597,6 @@ impl Display for TenthsPlain {
 }
 
 /// How recently a mirror, origin or client was last seen.
-///
-/// The one place the staleness thresholds live: [`FmtLastSeenHealth`] paints
-/// the badge from it and [`Freshness::row_class`] paints the row's left rule,
-/// so the two cannot disagree about what "aging" means.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum Freshness {
     /// No timestamp recorded.
@@ -660,7 +624,7 @@ impl Freshness {
     }
 
     /// The `class` attribute for a row in this state, empty when the row
-    /// needs no marker. A rule on every fresh row would mark nothing.
+    /// needs no marker.
     pub(super) const fn row_class(self) -> &'static str {
         match self {
             Self::Unknown | Self::Fresh => "",
@@ -707,8 +671,6 @@ pub(super) enum RatioClass {
 }
 
 impl RatioClass {
-    /// Construct a `RatioClass` from a ratio of `value` to `limit`. Uses
-    /// integer arithmetic only.
     #[must_use]
     const fn new(value: u64, limit: u64) -> Self {
         if limit == 0 {
@@ -762,7 +724,6 @@ impl Count {
         Self(as_size(value))
     }
 
-    /// A count of in-memory entries.
     pub(super) fn len(value: usize) -> Self {
         Self(value as u64)
     }
@@ -795,8 +756,7 @@ pub(super) enum Level {
     Alert,
 }
 
-/// `value` painted at `level` when non-zero, plain `0` otherwise: the one
-/// rendering of a [`crate::metrics::Signal`].
+/// `value` painted at `level` when non-zero, plain `0` otherwise.
 pub(super) struct Nonzero {
     pub(super) value: u64,
     pub(super) level: Level,
@@ -810,7 +770,6 @@ impl Display for Nonzero {
     }
 }
 
-/// Render `inner` as-is; if `predicate` is true, wrap it in `<span class="warn">`.
 pub(super) fn warn_if<T: Display>(inner: T, predicate: bool) -> Colorize<T> {
     Colorize {
         inner,
@@ -822,7 +781,6 @@ pub(super) fn warn_if<T: Display>(inner: T, predicate: bool) -> Colorize<T> {
     }
 }
 
-/// Render `inner` as-is; if `predicate` is true, wrap it in `<span class="alert">`.
 pub(super) fn alert_if<T: Display>(inner: T, predicate: bool) -> Colorize<T> {
     Colorize {
         inner,
@@ -834,20 +792,13 @@ pub(super) fn alert_if<T: Display>(inner: T, predicate: bool) -> Colorize<T> {
     }
 }
 
-/// Convert an `i64` from a DB column to `u64` for display, clamping
-/// negative values to 0. The sqlx schemas write only non-negative values
-/// here, but i64 is the column type; this keeps the conversion site terse
-/// and consistent across the dashboard builders.
+/// An `i64` DB column as `u64`, negative values clamped to 0 (the schemas
+/// write only non-negative values).
 #[must_use]
 pub(super) fn as_size(v: i64) -> u64 {
     u64::try_from(v).unwrap_or(0)
 }
 
-// ---------------------------------------------------------------------------
-// Shared cell-value Display helpers — used across multiple section builders.
-// ---------------------------------------------------------------------------
-
-/// Render `Some(size)` as a human-readable size; render `None` as `fallback`.
 pub(super) struct OptSize {
     pub(super) bytes: Option<u64>,
     pub(super) fallback: &'static str,
@@ -861,7 +812,6 @@ impl Display for OptSize {
     }
 }
 
-/// Render `Some(v)` via its `Display`; render `None` as `"unlimited"`.
 pub(super) struct OptOrUnlimited<T: Display>(pub(super) Option<T>);
 impl<T: Display> Display for OptOrUnlimited<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -872,7 +822,6 @@ impl<T: Display> Display for OptOrUnlimited<T> {
     }
 }
 
-/// Render an optional rate-limit configuration as `<size>/s` or `"None"`.
 pub(super) struct MinRate(pub(super) Option<std::num::NonZero<usize>>);
 impl Display for MinRate {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -884,16 +833,13 @@ impl Display for MinRate {
 }
 
 /// A share as a percentage with one decimal, `42.5%`; `"N/A"` if the
-/// denominator is non-positive. The one rendering of a share on the page:
-/// each caller keeps its own policy for an empty whole (`N/A`, nothing, no
-/// suffix) and renders this only past it.
+/// denominator is non-positive.
 pub(super) struct Pct {
     num: i128,
     den: i128,
 }
 impl Pct {
-    /// Any mix of signed and unsigned counts: widening to `i128` is exact,
-    /// so the share is the one `num as f64 / den as f64` gives.
+    /// Any mix of signed and unsigned counts: widening to `i128` is exact.
     pub(super) fn new(num: impl Into<i128>, den: impl Into<i128>) -> Self {
         Self {
             num: num.into(),
@@ -1102,8 +1048,7 @@ mod tests {
             ),
             "{html}"
         );
-        // A zero part draws nothing but keeps its legend entry, so the
-        // legend reads the same from one refresh to the next.
+        // A zero part draws nothing but keeps its legend entry.
         assert!(
             html.ends_with(
                 "<span class=\"key s3\">never 0.0% <span class=\"muted\">(0)</span></span></span>"
@@ -1231,7 +1176,6 @@ mod tests {
     #[test]
     fn freshness_thresholds() {
         assert!(matches!(Freshness::of(NOW, NOW), Freshness::Fresh));
-        // A week is still fresh; the eighth day is not.
         assert!(matches!(
             Freshness::of(NOW - 7 * DAY, NOW),
             Freshness::Fresh
@@ -1240,7 +1184,6 @@ mod tests {
             Freshness::of(NOW - 8 * DAY, NOW),
             Freshness::Aging(8)
         ));
-        // A month is still aging; the thirty-first day is stale.
         assert!(matches!(
             Freshness::of(NOW - 30 * DAY, NOW),
             Freshness::Aging(30)

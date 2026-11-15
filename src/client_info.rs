@@ -13,9 +13,8 @@ pub(crate) struct ClientInfo {
     is_cleanup: bool,
 }
 
-/// Address attached to in-process requests synthesised by `task_cleanup`
-/// (Packages fetches for the GC reference set).  Distinct from `127.0.0.1`
-/// so logging and metrics can distinguish real loopback clients from the
+/// Address attached to in-process requests synthesised by `task_cleanup`.
+/// Distinct from `127.0.0.1` so logs can tell real loopback clients from the
 /// cleanup-driven probes.
 pub(crate) const CLEANUP_CLIENT_ADDR: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 0));
@@ -43,11 +42,8 @@ impl ClientInfo {
         self.ip
     }
 
-    /// `true` when this client is the in-process sentinel used by
-    /// `task_cleanup` to fetch a Packages index — never a real client.
-    /// Used by upstream-error logging to demote a routine 4xx during a
-    /// cleanup probe (e.g. the deliberate `.xz → .gz → raw` walk) from
-    /// WARN to DEBUG.
+    /// Whether this is the in-process sentinel `task_cleanup` fetches
+    /// indexes with, never a real client.
     #[must_use]
     #[inline]
     pub(crate) fn is_cleanup_synthetic(&self) -> bool {
