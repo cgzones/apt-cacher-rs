@@ -147,7 +147,7 @@ impl CacheTarget {
                 }
             }
         };
-        let tempfile = FinishedCacheFile::from_writer(drained);
+        let tempfile = FinishedCacheFile::from_writer(drained, sync_cache_file);
         let rbarrier = dbarrier.begin_rename().await;
         Ok(CommitTail {
             tempfile,
@@ -349,9 +349,7 @@ impl CommitTail {
             bytes,
             start,
         } = self;
-        let committed = rbarrier
-            .commit(tempfile, temppath, dest_path, Some(sync_cache_file))
-            .await;
+        let committed = rbarrier.commit(tempfile, temppath, dest_path).await;
         let elapsed = start.elapsed();
         if committed.is_err() {
             return None;

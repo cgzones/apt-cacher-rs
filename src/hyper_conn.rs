@@ -1579,12 +1579,11 @@ async fn download_file(
             }
         }
 
-        // No streamed digest: this path writes through a `BufWriter` whose
-        // bytes are not funnelled through a single hashable site, so the
-        // commit re-reads and hashes the finished file as before. No
-        // prepare step either: this backend has never `fsync`ed a download.
+        // No streamed digest and no prepare step
+        // (`FinishedCacheFile::flush`): the commit re-reads and hashes the
+        // finished file.
         if rbarrier
-            .commit(outfile, outpath, dest_file_path, None)
+            .commit(outfile, outpath, dest_file_path)
             .await
             .is_err()
         {

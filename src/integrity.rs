@@ -1247,11 +1247,28 @@ fn check_path_names_file(path: &Path, verified: &Metadata) -> std::io::Result<()
     }
 }
 
-/// A file whose writer has completed and flushed all pending I/O. Commit
-/// consumes this proof rather than accepting an arbitrary writable file.
+/// A step the commit job runs on the open temp file before anything else:
+/// splice's `fsync` (`splice/commit.rs::sync_cache_file`). It reports its own
+/// failure; the commit goes on either way.
+pub(crate) type PrepareStep = fn(&std::fs::File, &Path);
+
+/// A file whose writer has completed and flushed all pending I/O, handed to
+/// the commit job whole. Commit consumes this proof rather than accepting an
+/// arbitrary writable file.
 pub(crate) struct FinishedCacheFile {
+    /// The open descriptor: the job's `fstat`, and the read the verification
+    /// may need.
     file: tokio::fs::File,
+    /// The digest the download computed incrementally over the bytes it
+    /// wrote, when it could; spares `verify_temp_file` the re-read. `None`
+    /// from every path that cannot produce one -- the zero-copy splice loop
+    /// (the plaintext never reaches userspace), a resumed
+    /// download whose temp file already held a prefix, `volatile.rs`, and the
+    /// hyper backend (it writes through a `BufWriter` whose bytes are not
+    /// funnelled through a single hashable site).
     digest: Option<StreamedDigest>,
+    /// `None` from the hyper backend, which has never `fsync`ed a download.
+    prepare: Option<PrepareStep>,
 }
 
 impl FinishedCacheFile {
@@ -1264,43 +1281,25 @@ impl FinishedCacheFile {
         file.flush().await.map_err(|err| {
             crate::transfer_error::CacheError::counted_io("flush cache file for commit", path, err)
         })?;
-        Ok(Self { file, digest: None })
+        Ok(Self {
+            file,
+            digest: None,
+            prepare: None,
+        })
     }
 
     #[cfg(feature = "splice")]
-    pub(crate) fn from_writer(writer: crate::splice::DrainedCacheWriter) -> Self {
+    pub(crate) fn from_writer(
+        writer: crate::splice::DrainedCacheWriter,
+        prepare: PrepareStep,
+    ) -> Self {
         let (file, digest) = writer.into_parts();
-        Self { file, digest }
+        Self {
+            file,
+            digest,
+            prepare: Some(prepare),
+        }
     }
-
-    pub(crate) fn into_parts(self) -> (tokio::fs::File, Option<StreamedDigest>) {
-        (self.file, self.digest)
-    }
-}
-
-/// A step the commit job runs on the open temp file before anything else:
-/// splice's `fsync` (`splice/commit.rs::sync_cache_file`). It reports its own
-/// failure; the commit goes on either way.
-pub(crate) type PrepareStep = fn(&std::fs::File, &Path);
-
-/// The finished temp file, handed to the commit job whole: the open
-/// descriptor (the job's `fstat`, and the read the verification may need), the
-/// guard over its path, its optional streamed digest, and the optional
-/// [`PrepareStep`].
-pub(crate) struct TempFile {
-    pub(crate) file: std::fs::File,
-    /// The digest the download computed incrementally over the bytes it
-    /// wrote, when it could; spares `verify_temp_file` the re-read. `None`
-    /// from every path that cannot produce one -- the zero-copy splice loop
-    /// (the plaintext never reaches userspace), a resumed
-    /// download whose temp file already held a prefix, `volatile.rs`, and the
-    /// hyper backend.
-    pub(crate) streamed_digest: Option<StreamedDigest>,
-    /// Owned by the job, not the awaiting future, so a cancelled commit cannot
-    /// race the job's `rename(2)` with a scratch guard's unlink. The job
-    /// defuses it after the rename and hands it back on every other exit.
-    pub(crate) guard: TempPath,
-    pub(crate) prepare: Option<PrepareStep>,
 }
 
 /// Why [`verify_and_rename`] did not land the file, plus the temp file's guard
@@ -1340,7 +1339,11 @@ pub(crate) struct CommitFailure {
 /// the queued rename runs.
 pub(crate) async fn verify_and_rename(
     plan: &RenamePlan,
-    temp: TempFile,
+    finished: FinishedCacheFile,
+    // Owned by the job, not the awaiting future, so a cancelled commit cannot
+    // race the job's `rename(2)` with a scratch guard's unlink. The job
+    // defuses it after the rename and hands it back on every other exit.
+    guard: TempPath,
     reservation: QuotaReservation,
     lease: Arc<DownloadWriteLease>,
 ) -> Result<(), CommitFailure> {
@@ -1360,6 +1363,15 @@ pub(crate) async fn verify_and_rename(
         DigestSource::Absent => VerifyKind::Unverifiable,
     };
 
+    let FinishedCacheFile {
+        file,
+        digest: streamed,
+        prepare,
+    } = finished;
+    // No blocking hop: the file is idle, so this only waits out an in-flight
+    // operation that cannot exist.
+    let file = file.into_std().await;
+
     // Set just before the rename, so a job that dies is attributed to the
     // step it died in: the two keep their distinct messages and variants.
     let renaming = Arc::new(AtomicBool::new(false));
@@ -1367,12 +1379,6 @@ pub(crate) async fn verify_and_rename(
         let dest_path = plan.dest_path.clone();
         let renaming = Arc::clone(&renaming);
         move |lease: &DownloadWriteLease| -> Result<(), (CommitError, TempPath)> {
-            let TempFile {
-                file,
-                streamed_digest: streamed,
-                guard,
-                prepare,
-            } = temp;
             if let Some(prepare) = prepare {
                 prepare(&file, &guard);
             }

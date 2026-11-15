@@ -56,7 +56,7 @@ use crate::{
     fs_open::count_cache_failure,
     global_verify_throttle,
     humanfmt::HumanFmt,
-    integrity::{self, CommitError, CommitFailure, PrepareStep, RenamePlan, TempFile},
+    integrity::{self, CommitError, CommitFailure, RenamePlan},
     metrics,
     mirror_health::{self, MirrorFault},
     partial_file::TempPath,
@@ -753,7 +753,7 @@ impl RenameBarrier {
     /// invalidating there would lose them for the life of the process
     /// (`resolve` negatively caches the resulting `(None, None)`).
     ///
-    /// `temp_file` is the finished `.partial` / temp file, idle (every write
+    /// `finished` is the finished `.partial` / temp file, idle (every write
     /// flushed), and `temp_path` its guard; on success the guard is defused
     /// (the file now lives at `dest_path`), on a checksum mismatch the file is
     /// unlinked (its bytes are known-bad, resuming them cannot succeed), on a
@@ -766,24 +766,14 @@ impl RenameBarrier {
         finished: integrity::FinishedCacheFile,
         temp_path: TempPath,
         dest_path: PathBuf,
-        prepare: Option<PrepareStep>,
     ) -> Result<(), CommitError> {
-        let (temp_file, streamed_digest) = finished.into_parts();
-        // No blocking hop: the file is idle, so this only waits out an
-        // in-flight operation that cannot exist.
-        let temp = TempFile {
-            file: temp_file.into_std().await,
-            streamed_digest,
-            guard: temp_path,
-            prepare,
-        };
         let plan = {
             let data = self
                 .data
                 .as_mut()
                 .expect("every sink consumes the instance");
             RenamePlan {
-                temp_path: temp.guard.to_path_buf(),
+                temp_path: temp_path.to_path_buf(),
                 dest_path,
                 resource_kind: data.resource_kind,
                 debname: data.lease.key.debname.clone(),
@@ -806,7 +796,7 @@ impl RenameBarrier {
                 .lease,
         );
         if let Err(CommitFailure { error: err, guard }) =
-            integrity::verify_and_rename(&plan, temp, reservation, lease).await
+            integrity::verify_and_rename(&plan, finished, temp_path, reservation, lease).await
         {
             if let CommitError::Rename(io_err) = &err {
                 // A directory planted at the destination fails the rename
