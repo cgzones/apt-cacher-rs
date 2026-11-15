@@ -718,7 +718,7 @@ impl ChecksumRegistry {
     /// its eviction-order position to most-recent.
     fn insert_many(&self, authority: &str, mirror_path: &str, slots: &[Slot]) {
         let mut inner = self.inner.lock();
-        inner.insert(authority, mirror_path, slots);
+        let _scope = inner.insert(authority, mirror_path, slots);
         self.evict_over_cap(&mut inner);
         drop(inner);
     }
@@ -745,11 +745,7 @@ impl ChecksumRegistry {
     ) -> bool {
         let mut inner = self.inner.lock();
         let recorded = inner
-            .map
-            .get(&RegistryScopeRef {
-                authority,
-                mirror_path,
-            })
+            .scope(authority, mirror_path)
             .and_then(|state| state.release_dates.get(release_dir).copied());
         let supersedes = match (recorded, date) {
             (None | Some(None), _) => true,
@@ -759,15 +755,11 @@ impl ChecksumRegistry {
         if !supersedes {
             return false;
         }
-        inner.insert(authority, mirror_path, slots);
         // Only on a scope that exists: a `Release` listing no `Packages`
         // creates none. Recorded before the eviction, which drops the dates
         // with the scope if it drains it (a drained scope rebuilds its dates
         // on re-ingest).
-        if let Some(state) = inner.map.get_mut(&RegistryScopeRef {
-            authority,
-            mirror_path,
-        }) {
+        if let Some(state) = inner.insert(authority, mirror_path, slots) {
             state.release_dates.insert(release_dir.into(), date);
         }
         self.evict_over_cap(&mut inner);
@@ -782,11 +774,7 @@ impl ChecksumRegistry {
         let key = fingerprint(relpath);
         let inner = self.inner.lock();
         inner
-            .map
-            .get(&RegistryScopeRef {
-                authority,
-                mirror_path,
-            })
+            .scope(authority, mirror_path)
             .and_then(|state| state.live(&key))
             .map(|slot| slot.digest)
     }
@@ -800,11 +788,7 @@ impl ChecksumRegistry {
         let held = self
             .inner
             .lock()
-            .map
-            .get(&RegistryScopeRef {
-                authority,
-                mirror_path,
-            })
+            .scope(authority, mirror_path)
             .map_or(0, |state| match kind {
                 KeyKind::Package => state.packages,
                 KeyKind::Index => state.len() - state.packages,
@@ -873,11 +857,7 @@ impl ChecksumRegistry {
     fn scope_footprint(&self, authority: &str, mirror_path: &str) -> (usize, usize, usize, usize) {
         self.inner
             .lock()
-            .map
-            .get(&RegistryScopeRef {
-                authority,
-                mirror_path,
-            })
+            .scope(authority, mirror_path)
             .map(|state| {
                 (
                     state.len(),
@@ -923,12 +903,25 @@ impl ChecksumRegistry {
 }
 
 impl RegistryInner {
+    fn scope(&self, authority: &str, mirror_path: &str) -> Option<&ScopeState> {
+        self.map.get(&RegistryScopeRef {
+            authority,
+            mirror_path,
+        })
+    }
+
     /// Insert (or refresh) one scope's slots, resolving the scope once for
-    /// the batch. An empty batch creates no scope. Never evicts: the caller
-    /// does, once the whole batch is in ([`ChecksumRegistry::evict_over_cap`]).
-    fn insert(&mut self, authority: &str, mirror_path: &str, slots: &[Slot]) {
+    /// the batch, and return it. An empty batch creates no scope and returns
+    /// `None`. Never evicts: the caller does, once the whole batch is in
+    /// ([`ChecksumRegistry::evict_over_cap`]).
+    fn insert(
+        &mut self,
+        authority: &str,
+        mirror_path: &str,
+        slots: &[Slot],
+    ) -> Option<&mut ScopeState> {
         if slots.is_empty() {
-            return;
+            return None;
         }
         let state = match self.map.entry_ref(&RegistryScopeRef {
             authority,
@@ -948,6 +941,7 @@ impl RegistryInner {
                 self.len += 1;
             }
         }
+        Some(state)
     }
 }
 
@@ -2950,7 +2944,7 @@ mod tests {
                 let slots: Vec<_> = (0..count)
                     .map(|i| Slot::for_key(&format!("p{i}"), [0; 32]))
                     .collect();
-                inner.insert(host, "m", &slots);
+                let _scope = inner.insert(host, "m", &slots);
             }
             // Ten live entries at cap two: remove eight, draining the
             // largest two scopes and only the oldest of the third.
