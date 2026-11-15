@@ -1307,6 +1307,20 @@ impl<'a, S: CacheMode> BodyTransfer<'a, S> {
 }
 
 impl BodyTransfer<'_, SplicePipes> {
+    /// End the client's delivery partway through a teed batch and drop the
+    /// duplicate it will no longer take; the cache keeps its copy.
+    async fn abort_client_mid_tee(
+        &mut self,
+        failure: DeliveryFailure,
+    ) -> Result<(), DownloadFailure> {
+        self.abort_client(failure);
+        self.cache
+            .pipes_mut()
+            .discard_duplicate()
+            .await
+            .map_err(internal_io)
+    }
+
     async fn write_through(&mut self) -> Result<(), DownloadFailure> {
         let before = self.cache.position();
         self.cache.write_through().await?;
@@ -2505,12 +2519,8 @@ async fn tee_and_splice(
 
                 let _: Never = match result {
                     Ok(0) => {
-                        xfer.abort_client(zero_client_splice_failure());
-                        xfer.cache
-                            .pipes_mut()
-                            .discard_duplicate()
-                            .await
-                            .map_err(internal_io)?;
+                        xfer.abort_client_mid_tee(zero_client_splice_failure())
+                            .await?;
                         break;
                     }
                     Ok(n) => {
@@ -2561,10 +2571,7 @@ async fn tee_and_splice(
                             ) => match w {
                                 Ok(()) => {}
                                 Err(err) => {
-                                    xfer.abort_client(err.into());
-                                    xfer.cache.pipes_mut().discard_duplicate()
-                                        .await
-                                        .map_err(internal_io)?;
+                                    xfer.abort_client_mid_tee(err.into()).await?;
                                     break;
                                 }
                             },
@@ -2573,12 +2580,8 @@ async fn tee_and_splice(
                         continue;
                     }
                     Err(err) => {
-                        xfer.abort_client(client_splice_failure(err));
-                        xfer.cache
-                            .pipes_mut()
-                            .discard_duplicate()
-                            .await
-                            .map_err(internal_io)?;
+                        xfer.abort_client_mid_tee(client_splice_failure(err))
+                            .await?;
                         break;
                     }
                 };
