@@ -121,33 +121,19 @@ impl CacheTarget {
         bytes: CompletionBytes,
         start: PreciseInstant,
     ) -> Result<CommitTail, ReportedDownloadFailure> {
+        let (target, drained) = self
+            .run(Consequence::Abandon, async |writer, _barrier| {
+                writer.drain().await
+            })
+            .await?;
         let Self {
             writer,
             dbarrier,
             temppath,
             dest_path,
             validators: _,
-        } = self;
-        let drained = match writer.drain().await {
-            Ok(drained) => drained,
-            Err(super::body::FinishFailure {
-                mut writer,
-                failure,
-            }) => {
-                match dbarrier
-                    .run(Consequence::Abandon, async |_barrier| {
-                        Err::<std::convert::Infallible, _>(failure)
-                    })
-                    .await
-                {
-                    Err(failed) => {
-                        return Err(failed.salvage(async || writer.salvage().await).await);
-                    }
-                    Ok((_, never)) => match never {},
-                }
-            }
-        };
-        let tempfile = FinishedCacheFile::from_writer(drained, sync_cache_file);
+        } = target;
+        let tempfile = FinishedCacheFile::from_writer(writer.finished(drained), sync_cache_file);
         let rbarrier = dbarrier.begin_rename().await;
         Ok(CommitTail {
             tempfile,

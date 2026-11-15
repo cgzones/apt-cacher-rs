@@ -380,18 +380,10 @@ impl DrainedCacheWriter {
     }
 }
 
-pub(super) struct FinishFailure {
-    pub(super) writer: Box<CacheWriter>,
-    pub(super) failure: DownloadFailure,
-}
-
-impl std::fmt::Debug for FinishFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FinishFailure")
-            .field("failure", &self.failure)
-            .finish_non_exhaustive()
-    }
-}
+/// Proof that [`CacheWriter::drain`] succeeded, redeemed by
+/// [`CacheWriter::finished`].
+#[derive(Debug)]
+pub(super) struct Drained(());
 
 /// The batch a [`CacheWriter`] lands from, installed by the body loop that
 /// fills it.
@@ -476,26 +468,23 @@ impl CacheWriter {
         self.write_cache_chunk(buf).await
     }
 
-    pub(super) async fn drain(mut self) -> Result<DrainedCacheWriter, FinishFailure> {
+    /// Land the pending batch and Tokio's buffered file I/O. A failure
+    /// leaves the writer with its owner, to salvage like any body failure.
+    pub(super) async fn drain(&mut self) -> Result<Drained, DownloadFailure> {
         use tokio::io::AsyncWriteExt as _;
-        let result = async {
-            self.flush().await?;
-            self.core.tempfile.flush().await.map_err(|err| {
-                DownloadFailure::from(CacheError::counted_io(
-                    "flush splice cache file",
-                    &self.core.path,
-                    err,
-                ))
-            })
-        }
-        .await;
-        match result {
-            Ok(()) => Ok(DrainedCacheWriter(self)),
-            Err(failure) => Err(FinishFailure {
-                writer: Box::new(self),
-                failure,
-            }),
-        }
+        self.flush().await?;
+        self.core.tempfile.flush().await.map_err(|err| {
+            DownloadFailure::from(CacheError::counted_io(
+                "flush splice cache file",
+                &self.core.path,
+                err,
+            ))
+        })?;
+        Ok(Drained(()))
+    }
+
+    pub(super) fn finished(self, _drained: Drained) -> DrainedCacheWriter {
+        DrainedCacheWriter(self)
     }
 
     pub(super) fn position(&self) -> u64 {
@@ -3626,7 +3615,7 @@ mod tests {
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"first");
         assert_eq!(writer.batch().pending, 6);
         let drained = writer.drain().await.expect("drained pending pipe batch");
-        let (_file, _digest) = drained.into_parts();
+        let (_file, _digest) = writer.finished(drained).into_parts();
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"firstsecond");
     }
 
@@ -3648,7 +3637,8 @@ mod tests {
         writer.write_prefix(b"prefix-").await.unwrap();
         let mut body = b"body".to_vec();
         writer.write_cache_chunk(&mut body).await.unwrap();
-        let (_file, digest) = writer.drain().await.expect("drained writer").into_parts();
+        let drained = writer.drain().await.expect("drained writer");
+        let (_file, digest) = writer.finished(drained).into_parts();
         let digest = digest.unwrap();
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"prefix-body");
         assert_eq!(digest.bytes, 11);
@@ -3677,11 +3667,8 @@ mod tests {
         writer.buffer_mut().sink.buf.extend_from_slice(b"pending");
         writer.buffer_mut().queue(7);
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"");
-        let (_file, digest) = writer
-            .drain()
-            .await
-            .expect("drained pending buffer")
-            .into_parts();
+        let drained = writer.drain().await.expect("drained pending buffer");
+        let (_file, digest) = writer.finished(drained).into_parts();
         let digest = digest.expect("userspace digest");
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"pending");
         assert_eq!(digest.bytes, 7);
@@ -3773,7 +3760,8 @@ mod tests {
             "batches landed from a non-zero cursor: {landed_mid_buffer}"
         );
 
-        let (_file, digest) = writer.drain().await.expect("drained writer").into_parts();
+        let drained = writer.drain().await.expect("drained writer");
+        let (_file, digest) = writer.finished(drained).into_parts();
         let digest = digest.expect("a fresh userspace transfer streams a digest");
         let mut expected = prefix.to_vec();
         expected.extend_from_slice(&body);
@@ -3809,7 +3797,8 @@ mod tests {
             .write_cache_chunk(&mut b"body".to_vec())
             .await
             .unwrap();
-        let (_file, digest) = writer.drain().await.expect("drained writer").into_parts();
+        let drained = writer.drain().await.expect("drained writer");
+        let (_file, digest) = writer.finished(drained).into_parts();
         assert!(digest.is_none(), "a suffix is not a whole-file digest");
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"resume-prefix-body");
     }
@@ -3831,7 +3820,8 @@ mod tests {
         .unwrap();
         writer.write_prefix(b"whole body").await.unwrap();
         writer.write_prefix(b"").await.unwrap();
-        let (_file, digest) = writer.drain().await.expect("drained writer").into_parts();
+        let drained = writer.drain().await.expect("drained writer");
+        let (_file, digest) = writer.finished(drained).into_parts();
         let digest = digest.unwrap();
         assert_eq!(digest.bytes, 10);
         assert_eq!(
