@@ -106,8 +106,29 @@ enum AgeSweep {
 }
 
 impl AgeSweep {
+    /// The time the file's age counts from: [`age_reference_time`], and for
+    /// index metadata the modification time when that is later. A volatile
+    /// index that revalidates with a 304 keeps its inode, and with it its
+    /// birthtime; only its mtime is touched (`fs_open::touch_volatile_mtime`).
+    /// Aged by birthtime alone, an index whose content has not changed for
+    /// `keep_span` would be removed while it is still requested every day.
+    ///
+    /// Only where the filesystem has birthtime: without it the touch is
+    /// skipped (`Renewal::NoBirthTime`, mtime being the only content-age
+    /// signal there), both times are the unchanged mtime, and a revalidated
+    /// index still ages from its last content change.
+    fn reference_time(self, meta: &std::fs::Metadata, path: &Path) -> Option<SystemTime> {
+        let created = age_reference_time(meta, path)?;
+        Some(match self {
+            Self::Candidates => created,
+            Self::Metadata => meta
+                .modified()
+                .map_or(created, |modified| created.max(modified)),
+        })
+    }
+
     /// Whether the regular file at `path` (lstat `meta`) is at least
-    /// `keep_span` old at `now`, by [`age_reference_time`]. A file without a
+    /// `keep_span` old at `now`, by [`Self::reference_time`]. A file without a
     /// usable timestamp is counted in `stats.io_failures` (logged there); a
     /// file too young (logged by the candidate sweep only) or with a future
     /// timestamp (warned once per sweep) is kept.
@@ -119,7 +140,7 @@ impl AgeSweep {
         now: SystemTime,
         stats: &mut UnitStats,
     ) -> bool {
-        let Some(created) = age_reference_time(meta, path) else {
+        let Some(created) = self.reference_time(meta, path) else {
             stats.io_failures += 1;
             return false;
         };
@@ -339,13 +360,15 @@ static METADATA_WALK: WalkContext = WalkContext {
 /// Age out stale top-level index files in a metadata directory, dropping any
 /// matching `cache_metadata` entries on success.
 ///
-/// These volatile `Release`/`InRelease`/`Packages*`/... files are refreshed in
-/// place (a fresh inode, hence a fresh birthtime) while a distribution is in
-/// use, but nothing otherwise reclaims a *retired* distribution's metadata --
-/// and while its `Release` lingers, reference-mode by-hash cleanup keeps every
-/// digest it lists pinned. Removing regular files older than `keep_span`
-/// (birthtime, via [`age_reference_time`]) bounds that growth and lets the next
-/// by-hash cycle reclaim the now-unreferenced files.
+/// These volatile `Release`/`InRelease`/`Packages*`/... files are refreshed
+/// while a distribution is in use -- replaced (a fresh inode, hence a fresh
+/// birthtime) when the upstream copy changed, mtime-touched when it
+/// revalidated unchanged -- but nothing otherwise reclaims a *retired*
+/// distribution's metadata, and while its `Release` lingers, reference-mode
+/// by-hash cleanup keeps every digest it lists pinned. Removing regular files
+/// neither replaced nor revalidated for `keep_span` (the later of birthtime
+/// and mtime, via `AgeSweep::reference_time`) bounds that growth and lets the
+/// next by-hash cycle reclaim the now-unreferenced files.
 ///
 /// Sub-directories -- notably the `by-hash/` and `tmp/` subtrees, swept
 /// separately -- are skipped; a symlink / FIFO / socket / device is unlinked,
@@ -594,6 +617,40 @@ mod tests {
         .await;
         assert_eq!(res.removed, 0);
         assert!(dir.path().join("trixie_Release").exists());
+    }
+
+    /// A 304 revalidation touches only the mtime; the birthtime stays that
+    /// of the last content change. An index old by birthtime but revalidated
+    /// within the span is still in use and must be kept.
+    #[tokio::test]
+    async fn sweep_aged_metadata_keeps_an_index_revalidated_within_the_span() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let revalidated = dir.path().join("sid_InRelease");
+        let retired = dir.path().join("buster_InRelease");
+        std::fs::write(&revalidated, b"r").expect("write revalidated");
+        std::fs::write(&retired, b"r").expect("write retired");
+
+        let keep_span = Duration::from_hours(90 * 24);
+        // Both files are 91 days old by birthtime at the injected `now`.
+        let now = SystemTime::now() + Duration::from_hours(91 * 24);
+        std::fs::set_times(
+            &revalidated,
+            std::fs::FileTimes::new().set_modified(now - Duration::from_hours(1)),
+        )
+        .expect("touch mtime");
+
+        let res = sweep_aged_metadata(
+            dir.path(),
+            dir.path(),
+            keep_span,
+            now,
+            &test_mirror(),
+            CacheLayout::Dists,
+        )
+        .await;
+        assert_eq!(res.removed, 1, "only the index nobody revalidated is swept");
+        assert!(revalidated.exists());
+        assert!(!retired.exists());
     }
 
     #[tokio::test]

@@ -24,8 +24,9 @@ const UNREFERENCED_KEEP_SPAN: Duration = Duration::from_hours(3 * 24);
 
 /// Retention span for volatile index metadata (`Release`/`InRelease`/`Packages*`
 /// /...) in a structured `dists/` directory. Unlike per-`.deb` files these are
-/// refreshed in place (a fresh inode, hence a fresh birthtime) while a
-/// distribution is in use, so aging past this span marks the distribution as
+/// refreshed while a distribution is in use (replaced on an upstream change,
+/// hence a fresh birthtime; mtime-touched on an unchanged revalidation), so
+/// aging past this span marks the distribution as
 /// retired. Nothing else reclaims these files, and while a retired dist's
 /// `Release` lingers, reference-mode by-hash cleanup keeps every digest it lists
 /// pinned; removing the metadata bounds the growth and unblocks that reclaim.
