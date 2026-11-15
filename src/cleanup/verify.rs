@@ -38,7 +38,6 @@ enum Opened {
     NeedsHash {
         file: std::fs::File,
         pre_identity: FileIdentity,
-        pre_size: u64,
     },
 }
 
@@ -49,11 +48,9 @@ enum Opened {
 fn verify_file_sync(path: &Path, expected: &Digest) -> Verdict {
     match open_and_check_marker(path, expected) {
         Opened::Decided(verdict) => verdict,
-        Opened::NeedsHash {
-            file,
-            pre_identity,
-            pre_size,
-        } => hash_and_compare(file, path, pre_identity, pre_size, expected),
+        Opened::NeedsHash { file, pre_identity } => {
+            hash_and_compare(file, path, pre_identity, expected)
+        }
     }
 }
 
@@ -97,11 +94,7 @@ fn open_and_check_marker(path: &Path, expected: &Digest) -> Opened {
         return Opened::Decided(Verdict::Match);
     }
 
-    Opened::NeedsHash {
-        file,
-        pre_identity,
-        pre_size: pre_meta.len(),
-    }
+    Opened::NeedsHash { file, pre_identity }
 }
 
 /// Hash the file [`open_and_check_marker`] opened and compare the digest,
@@ -111,9 +104,9 @@ fn hash_and_compare(
     mut file: std::fs::File,
     path: &Path,
     pre_identity: FileIdentity,
-    pre_size: u64,
     expected: &Digest,
 ) -> Verdict {
+    let pre_size = pre_identity.size();
     // Past the memo fast path, which reads nothing but one xattr: from here
     // the whole file is read, so the readahead hint is worth its syscall.
     hint_sequential_read(&file, pre_size, path);
@@ -197,13 +190,9 @@ pub(super) async fn verify_cache_file(path: PathBuf, expected: Digest) -> Verdic
         Ok(checked) => checked,
         Err(join_err) => return Verdict::IoError(std::io::Error::other(join_err)),
     };
-    let (file, pre_identity, pre_size) = match opened {
+    let (file, pre_identity) = match opened {
         Opened::Decided(verdict) => return verdict,
-        Opened::NeedsHash {
-            file,
-            pre_identity,
-            pre_size,
-        } => (file, pre_identity, pre_size),
+        Opened::NeedsHash { file, pre_identity } => (file, pre_identity),
     };
 
     let permit = match VERIFY_SLOTS.acquire().await {
@@ -222,7 +211,7 @@ pub(super) async fn verify_cache_file(path: PathBuf, expected: Digest) -> Verdic
     // awaits its hashes inline); this keeps the bound from resting on that.
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        hash_and_compare(file, &path, pre_identity, pre_size, &expected)
+        hash_and_compare(file, &path, pre_identity, &expected)
     })
     .await
     {

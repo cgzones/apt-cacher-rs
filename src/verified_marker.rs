@@ -53,6 +53,12 @@ impl FileIdentity {
         }
     }
 
+    /// The file's size when the identity was taken.
+    #[must_use]
+    pub(crate) const fn size(&self) -> u64 {
+        self.size
+    }
+
     #[cfg(test)]
     const fn new(ino: u64, size: u64, mtime_secs: i64, mtime_nanos: i64) -> Self {
         Self {
