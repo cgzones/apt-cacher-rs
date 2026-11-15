@@ -6,6 +6,11 @@ PACKAGE_NAME="apt-cacher-rs"
 #DEBHELPER#
 
 if [ "$1" = "purge" ]; then
-  deluser --quiet --system "$PACKAGE_NAME"
+  # A purge can run long after the removal, when `adduser` (which ships
+  # `deluser` and is not essential) may be gone: a missing or failing
+  # `deluser` must not fail the purge and leave the package half-removed.
+  if command -v deluser >/dev/null 2>&1; then
+    deluser --quiet --system "$PACKAGE_NAME" || true
+  fi
   rm -rf "/var/cache/$PACKAGE_NAME" "/var/lib/$PACKAGE_NAME"
 fi
