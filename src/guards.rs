@@ -772,8 +772,7 @@ impl RenameBarrier {
             RenamePlan {
                 dest_path,
                 resource_kind: data.resource_kind,
-                debname: data.lease.key.debname.clone(),
-                mirror: data.lease.key.mirror.clone(),
+                key: Arc::clone(&data.lease.key),
                 raw_uri_path: std::mem::take(&mut data.raw_uri_path),
             }
         };

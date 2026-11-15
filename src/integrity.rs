@@ -55,7 +55,7 @@ use crate::ingest_ledger::{Claim, IngestLedger, Outcome};
 use crate::limits::{self, PackagesCompression};
 use crate::mem_usage::{ARC_HEADER, Footprint, buffer_bytes};
 use crate::{
-    cache_layout::{ByHashContent, ConnectionDetails, ResourceKind},
+    cache_layout::{ByHashContent, CacheEntryKey, ConnectionDetails, ResourceKind},
     cache_quota::QuotaReservation,
     deb_mirror::{Mirror, normalize_uri_path},
     guards::DownloadWriteLease,
@@ -329,19 +329,21 @@ pub(crate) struct RenamePlan {
     pub(crate) dest_path: PathBuf,
     /// Precise resource kind, from `ConnectionDetails::resource_kind`.
     pub(crate) resource_kind: ResourceKind,
-    /// On-disk leaf name. For a by-hash resource this is the hex digest, used
-    /// by `verify_temp_file` to decode the expected hash; for `Pool` it is
-    /// the basename used directly as the registry-lookup key; for other
-    /// kinds it is kept only for log context.
-    pub(crate) debname: String,
-    /// The canonical mirror. Its authority (host and port,
+    /// The download's cache entry, shared with its write lease.
+    ///
+    /// `debname` is the on-disk leaf name. For a by-hash resource this is the
+    /// hex digest, used by `verify_temp_file` to decode the expected hash;
+    /// for `Pool` it is the basename used directly as the registry-lookup
+    /// key; for other kinds it is kept only for log context.
+    ///
+    /// `mirror` is the canonical mirror. Its authority (host and port,
     /// `Mirror::format_authority()`) and repo-prefix path (`Mirror::path()`)
     /// are the registry key, so two distinct mirrors served from the same
     /// host (e.g. `host/m1/pool/...` vs `host/m2/pool/...`, or one repository
     /// per port) cannot poison each other's expected digests via
     /// same-named packages; the whole mirror names it in the
     /// `mirror_indexes` a committed `Release` records.
-    pub(crate) mirror: Mirror,
+    pub(crate) key: Arc<CacheEntryKey>,
     /// The raw request URI path (pre-normalisation). Used for `Release`
     /// relative-path resolution and as the relative-key component of the
     /// `Packages` registry lookup (see `verify_and_rename`).
@@ -1170,10 +1172,10 @@ fn log_registry_miss(plan: &RenamePlan, key: &str, miss: RegistryMiss) {
     warn_once_or_debug_gated!(
         if miss.held == 0 { &COLD } else { &UNLISTED },
         "No expected digest in the checksum registry for host {} mirror {} key `{}` ({miss}); caching {} unverified",
-        plan.mirror.host(),
-        plan.mirror.path(),
+        plan.key.mirror.host(),
+        plan.key.mirror.path(),
         key.escape_debug(),
-        plan.debname
+        plan.key.debname
     );
 }
 
@@ -1182,7 +1184,8 @@ fn log_registry_miss(plan: &RenamePlan, key: &str, miss: RegistryMiss) {
 /// no digest for `key`.
 fn registry_verify_kind(plan: &RenamePlan, key: &str) -> VerifyKind {
     let registry = global_checksum_registry();
-    let (authority, mirror_path) = (plan.mirror.format_authority(), plan.mirror.path());
+    let mirror = &plan.key.mirror;
+    let (authority, mirror_path) = (mirror.format_authority(), mirror.path());
     registry.lookup(authority, mirror_path, key).map_or_else(
         || {
             let miss = registry.explain_miss(authority, mirror_path, key);
@@ -1346,9 +1349,11 @@ pub(crate) async fn verify_and_rename(
     lease: Arc<DownloadWriteLease>,
 ) -> Result<(), CommitFailure> {
     let verify_enabled = global_config().verify_checksums;
-    let RenamePlan {
-        mirror, debname, ..
-    } = plan;
+    let CacheEntryKey {
+        mirror,
+        debname,
+        layout: _,
+    } = &*plan.key;
 
     // Build the verification kind. Layer-B/C registry lookups happen here -
     // synchronously, before spawn_blocking - so the pure decision stays
@@ -1790,15 +1795,14 @@ impl<'a> From<&'a RenamePlan> for IndexFile<'a> {
         let RenamePlan {
             dest_path,
             resource_kind,
-            debname,
-            mirror,
+            key,
             raw_uri_path,
         } = plan;
         Self {
             resource_kind: *resource_kind,
-            debname,
+            debname: &key.debname,
             raw_uri_path,
-            mirror,
+            mirror: &key.mirror,
             path: dest_path,
         }
     }
