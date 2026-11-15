@@ -182,16 +182,6 @@ fn byhash_verify_kind(algo: HashAlgo, filename: &str) -> VerifyKind {
     VerifyKind::Expected(digest)
 }
 
-/// Result of the pure verification decision.
-#[derive(Debug)]
-enum VerifyOutcome {
-    /// Verification passed, or was skipped (disabled / non-verifiable / unknown
-    /// digest). The caller proceeds with the `rename`.
-    Proceed,
-    /// Verification failed. The caller must not `rename`.
-    Reject(CommitError),
-}
-
 /// Verification decision. Covers by-hash self-verification plus
 /// registry-backed lookups for `Pool` (.deb) and `Packages` resources.
 ///
@@ -200,7 +190,10 @@ enum VerifyOutcome {
 /// and hashes `file`) only for [`VerifyKind::Expected`]; callers on an async
 /// worker must wrap that case in `spawn_blocking` (`verify_and_rename` runs it
 /// inside its commit job).
-fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
+///
+/// `Ok` when verification passed or was skipped (disabled / non-verifiable /
+/// unknown digest): the caller proceeds with the `rename`. `Err`: it must not.
+fn verify_temp_file(input: &VerifyInput<'_>) -> Result<(), CommitError> {
     let VerifyKind::Expected(expected) = &input.kind else {
         // Best-effort: no known digest -> cache unverified. Only count the
         // kinds that *could* have been verified, so the metric reflects a real
@@ -208,7 +201,7 @@ fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
         if matches!(input.kind, VerifyKind::Unknown) {
             metrics::CHECKSUM_UNVERIFIED.increment();
         }
-        return VerifyOutcome::Proceed;
+        return Ok(());
     };
     let algo = expected.algo();
 
@@ -234,7 +227,7 @@ fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
                     algo.as_str(),
                     ErrorReport(&err),
                 );
-                return VerifyOutcome::Reject(CommitError::VerifyIo(err));
+                return Err(CommitError::VerifyIo(err));
             }
         },
     };
@@ -242,14 +235,14 @@ fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
     if computed == expected.as_slice() {
         metrics::CHECKSUM_VERIFIED.increment();
         stamp_verified(input.file, input.meta, input.temp_path, expected);
-        VerifyOutcome::Proceed
+        Ok(())
     } else {
         metrics::CHECKSUM_MISMATCH.increment();
         // WARN (not ERROR): can also be a third-party repo that replaced a
         // file in place. The async wrapper logs once per mismatch with host
         // and path in scope; each event is potentially security-relevant so
         // they are not rate-limited.
-        VerifyOutcome::Reject(CommitError::ChecksumMismatch)
+        Err(CommitError::ChecksumMismatch)
     }
 }
 
@@ -1436,7 +1429,7 @@ pub(crate) async fn verify_and_rename(
                 }
             };
             let bytes_received = verified_meta.len();
-            if let VerifyOutcome::Reject(err) = verify_temp_file(&VerifyInput {
+            if let Err(err) = verify_temp_file(&VerifyInput {
                 kind,
                 file: &file,
                 meta: &verified_meta,
@@ -2465,7 +2458,7 @@ mod tests {
             temp_path: f.path(),
             streamed: None,
         };
-        assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
+        assert!(matches!(verify_temp_file(&plan), Ok(())));
     }
 
     /// The one digest-source table both the commit-time decision and the
@@ -2553,7 +2546,7 @@ mod tests {
                 bytes: b"not hello at all".len() as u64,
             }),
         };
-        assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
+        assert!(matches!(verify_temp_file(&plan), Ok(())));
     }
 
     #[test]
@@ -2571,7 +2564,7 @@ mod tests {
         };
         assert!(matches!(
             verify_temp_file(&plan),
-            VerifyOutcome::Reject(CommitError::ChecksumMismatch)
+            Err(CommitError::ChecksumMismatch)
         ));
     }
 
@@ -2592,7 +2585,7 @@ mod tests {
                 bytes: b"hello world".len() as u64,
             }),
         };
-        assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
+        assert!(matches!(verify_temp_file(&plan), Ok(())));
     }
 
     /// A digest that covered a different number of bytes than the file holds
@@ -2613,7 +2606,7 @@ mod tests {
                 bytes: 999,
             }),
         };
-        assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
+        assert!(matches!(verify_temp_file(&plan), Ok(())));
     }
 
     #[test]
@@ -2628,7 +2621,7 @@ mod tests {
         };
         assert!(matches!(
             verify_temp_file(&plan),
-            VerifyOutcome::Reject(CommitError::ChecksumMismatch)
+            Err(CommitError::ChecksumMismatch)
         ));
     }
 
@@ -2657,7 +2650,7 @@ mod tests {
             temp_path: f.path(),
             streamed: None,
         };
-        assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
+        assert!(matches!(verify_temp_file(&plan), Ok(())));
     }
 
     /// A descriptor the hash cannot read from -- here a write-only one --
@@ -2678,7 +2671,7 @@ mod tests {
         };
         assert!(matches!(
             verify_temp_file(&plan),
-            VerifyOutcome::Reject(CommitError::VerifyIo(_))
+            Err(CommitError::VerifyIo(_))
         ));
     }
 
@@ -2692,7 +2685,7 @@ mod tests {
             temp_path: f.path(),
             streamed: None,
         };
-        assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
+        assert!(matches!(verify_temp_file(&plan), Ok(())));
     }
 
     #[test]
@@ -2707,7 +2700,7 @@ mod tests {
         };
         assert!(matches!(
             verify_temp_file(&plan),
-            VerifyOutcome::Reject(CommitError::ChecksumMismatch)
+            Err(CommitError::ChecksumMismatch)
         ));
     }
 
@@ -2721,7 +2714,7 @@ mod tests {
             temp_path: f.path(),
             streamed: None,
         };
-        assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
+        assert!(matches!(verify_temp_file(&plan), Ok(())));
     }
 
     #[test]
@@ -3198,10 +3191,7 @@ mod tests {
                 streamed: None,
             };
             assert!(
-                matches!(
-                    verify_temp_file(&plan),
-                    VerifyOutcome::Reject(CommitError::ChecksumMismatch)
-                ),
+                matches!(verify_temp_file(&plan), Err(CommitError::ChecksumMismatch)),
                 "{path}"
             );
         }
@@ -3226,7 +3216,7 @@ mod tests {
             temp_path: f.path(),
             streamed: None,
         };
-        assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
+        assert!(matches!(verify_temp_file(&plan), Ok(())));
     }
 
     #[test]
@@ -3916,7 +3906,7 @@ mod tests {
             temp_path: &temp_path,
             streamed: None,
         });
-        assert!(matches!(outcome, VerifyOutcome::Proceed));
+        assert!(matches!(outcome, Ok(())));
 
         let file = std::fs::File::open(&temp_path).expect("reopen");
         let meta = file.metadata().expect("metadata");
