@@ -1086,35 +1086,6 @@ mod tests {
     }
 
     #[test]
-    fn lookup_or_insert_originator_on_empty() {
-        let ad = ActiveDownloads::new();
-        let mirror = test_mirror();
-        let result = ad.lookup_or_insert(
-            CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-            None,
-        );
-        assert!(matches!(result, Admission::Originator(_)));
-    }
-
-    #[test]
-    fn lookup_or_insert_late_joiner_on_existing() {
-        let ad = ActiveDownloads::new();
-        let mirror = test_mirror();
-        // First call: originator.
-        let first = ad.lookup_or_insert(
-            CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-            None,
-        );
-        assert!(matches!(first, Admission::Originator(_)));
-        // Second call on the same key: late joiner.
-        let second = ad.lookup_or_insert(
-            CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-            None,
-        );
-        assert!(matches!(second, Admission::LateJoiner { .. }));
-    }
-
-    #[test]
     fn lookup_or_insert_late_joiner_peak_counts_per_entry() {
         let ad = ActiveDownloads::new();
         let mirror = test_mirror();

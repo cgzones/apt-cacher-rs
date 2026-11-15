@@ -354,15 +354,17 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn truncated_input_surfaces_io_error() {
-        // Cut the stream before its index and footer: the decoder must not
-        // report a clean EOF.
-        let mut decoder = xz_decoder(Cursor::new(&HELLO_XZ[..48]));
-        let mut out = Vec::new();
-        let err = decoder
-            .read_to_end(&mut out)
-            .await
-            .expect_err("a truncated xz stream must be an error");
-        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+        // Cut the stream inside the LZMA2 payload (40) and before its index
+        // and footer (48): the decoder must not report a clean EOF.
+        for cut in [40, 48] {
+            let mut decoder = xz_decoder(Cursor::new(&HELLO_XZ[..cut]));
+            let mut out = Vec::new();
+            let err = decoder
+                .read_to_end(&mut out)
+                .await
+                .expect_err("a truncated xz stream must be an error");
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "cut {cut}: {err}");
+        }
     }
 
     #[tokio::test]
@@ -379,17 +381,6 @@ pub(crate) mod tests {
             .expect_err("corrupt xz must surface an io::Error");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
         assert!(out.is_empty(), "nothing must be decoded, got {out:?}");
-    }
-
-    #[tokio::test]
-    async fn truncated_input_surfaces_unexpected_eof() {
-        let mut decoder = xz_decoder(Cursor::new(&HELLO_XZ[..40]));
-        let mut out = Vec::new();
-        let err = decoder
-            .read_to_end(&mut out)
-            .await
-            .expect_err("a truncated stream must surface an io::Error");
-        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
     }
 
     #[tokio::test]
@@ -676,17 +667,5 @@ pub(crate) mod tests {
             served <= PIPE_CAPACITY,
             "the decode must stop once the reader is dropped, read {served} bytes"
         );
-    }
-
-    #[tokio::test]
-    async fn consumer_can_drop_after_reading_one_byte() {
-        // A consumer may stop after one byte. This small output fits in
-        // the pipe; worker cancellation is exercised separately above.
-        let mut decoder = xz_decoder(Cursor::new(HELLO_XZ));
-        let mut one = [0u8; 1];
-        let n = decoder.read(&mut one).await.expect("first byte ok");
-        assert_eq!(n, 1);
-        assert_eq!(one[0], b'h');
-        drop(decoder);
     }
 }

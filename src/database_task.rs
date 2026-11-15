@@ -712,10 +712,7 @@ mod tests {
         );
 
         shutdown_tx.send(true).expect("shutdown");
-        timeout(TEST_TIMEOUT, task)
-            .await
-            .expect("shutdown timeout")
-            .expect("db task");
+        join(task).await;
     }
 
     /// The other half: a cache hit is still evidence the client uses the
@@ -753,10 +750,7 @@ mod tests {
         assert_eq!(fixture.origins().await, 1, "no second row was minted");
 
         shutdown_tx.send(true).expect("shutdown");
-        timeout(TEST_TIMEOUT, task)
-            .await
-            .expect("shutdown timeout")
-            .expect("db task");
+        join(task).await;
     }
 
     /// A mirror row deleted by cleanup must not keep resolving from the
@@ -779,10 +773,7 @@ mod tests {
             .await
             .expect("send transfer after delete");
         shutdown_tx.send(true).expect("shutdown");
-        timeout(TEST_TIMEOUT, task)
-            .await
-            .expect("shutdown timeout")
-            .expect("db task");
+        join(task).await;
 
         let ids = fixture.database.load_all_mirror_ids().await.expect("ids");
         assert_eq!(ids.len(), 1, "the mirror row was re-created once");
@@ -808,15 +799,19 @@ mod tests {
         assert_eq!(delete(&tx, old_id).await, vec![old_id]);
 
         shutdown_tx.send(true).expect("shutdown");
-        timeout(TEST_TIMEOUT, task)
-            .await
-            .expect("shutdown timeout")
-            .expect("db task");
+        join(task).await;
 
         let ids = fixture.database.load_all_mirror_ids().await.expect("ids");
         assert_eq!(ids.len(), 1);
         assert_eq!(ids.first().expect("asserted above").0, old_id);
         assert_eq!(fixture.transfers().await, (1, 1));
+    }
+
+    async fn join(task: JoinHandle<()>) {
+        timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("task timeout")
+            .expect("task");
     }
 
     async fn seeded_mirror_id(fixture: &Fixture) -> i64 {
@@ -868,10 +863,7 @@ mod tests {
         ping(&tx).await;
         assert_eq!(fixture.transfers().await, (70, 2485));
         drop(tx);
-        timeout(TEST_TIMEOUT, task)
-            .await
-            .expect("drain timeout")
-            .expect("db task");
+        join(task).await;
         assert_eq!(fixture.transfers().await, (75, 2850));
     }
 
@@ -896,10 +888,7 @@ mod tests {
             .expect("queued tail timeout")
             .expect("queued tail reply")
             .expect("queued tail ping");
-        timeout(TEST_TIMEOUT, task)
-            .await
-            .expect("drain timeout")
-            .expect("db task");
+        join(task).await;
         assert_eq!(fixture.transfers().await, (75, 2850));
     }
 
@@ -942,13 +931,7 @@ mod tests {
         .expect("periodic flush while producer is active");
         assert!(!producer.is_finished());
         shutdown_tx.send(true).expect("shutdown");
-        timeout(TEST_TIMEOUT, task)
-            .await
-            .expect("shutdown timeout")
-            .expect("db task");
-        timeout(TEST_TIMEOUT, producer)
-            .await
-            .expect("producer timeout")
-            .expect("producer");
+        join(task).await;
+        join(producer).await;
     }
 }

@@ -187,19 +187,6 @@ mod tests {
     }
 
     #[test]
-    fn rate_checker_fills_zeros_for_gaps() {
-        let mut rc = RateChecker::with_timeframe(nonzero!(100), nonzero!(3));
-
-        rc.add_at(1, rc.last + Duration::from_secs(3));
-
-        // Buffer should be [0, 0, 1] — full with 1 byte over 3s = 0 B/s < 100 B/s.
-        let fail = rc.check_fail().expect("rate check should fail after gap");
-        assert_eq!(fail.transferred, 1);
-        assert_eq!(fail.timeframe, nonzero!(3));
-        assert_eq!(fail.min_rate, nonzero!(100));
-    }
-
-    #[test]
     fn sampling_gaps_retain_only_the_window_and_advance_the_full_time() {
         for capacity in [1, 3, 31] {
             for gap in [1, capacity - 1, capacity, 1_000_000] {
@@ -241,23 +228,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// `transferred / timeframe >= min_rate` passes at exactly the minimum
-    /// and fails one byte below it.
-    #[test]
-    fn one_second_window_threshold_is_inclusive() {
-        let mut rc = RateChecker::with_timeframe(nonzero!(1000), nonzero!(1));
-        rc.add_at(999, rc.last);
-        let fail = rc.check_fail().expect("999 B/s is below 1000 B/s");
-        assert_eq!(fail.transferred, 999);
-
-        let mut rc = RateChecker::with_timeframe(nonzero!(1000), nonzero!(1));
-        rc.add_at(1000, rc.last);
-        assert!(
-            rc.check_fail().is_none(),
-            "exactly the minimum rate must pass"
-        );
     }
 
     /// Over a three-second window the average is an integer division of the

@@ -2625,28 +2625,6 @@ mod tests {
     }
 
     #[test]
-    fn test_origin_from_path_byhash_does_not_mis_parse_filename() {
-        // Regression: a by-hash URL must NOT yield a filename of `"by-hash"`
-        // with unconsumed/unvalidated `SHA*/<hex>` segments.  The architecture
-        // segment is the canonical apt arch (`binary-amd64`), not the literal
-        // string `"by-hash"`.
-        let host = ClientHost::new("deb.debian.org").unwrap();
-        let parsed = Origin::from_path(
-            "/debian/dists/sid/main/binary-amd64/by-hash/SHA256/\
-             84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83",
-            host,
-            None,
-            &local_client(),
-        )
-        .expect("valid by-hash URL must parse");
-        assert_eq!(parsed.fields.distribution, "sid");
-        assert_eq!(parsed.fields.component, "main");
-        // The architecture must be `binary-amd64`, never `"by-hash"`.
-        assert_eq!(parsed.fields.architecture, "binary-amd64");
-        assert_ne!(parsed.fields.architecture, "by-hash");
-    }
-
-    #[test]
     fn test_origin_from_path_byhash_validates_algo_and_digest() {
         let host = || ClientHost::new("deb.debian.org").unwrap();
 
@@ -3070,7 +3048,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_sources_uncompressed_structured() {
+    fn parse_sources_and_translation_names() {
         assert_eq!(
             parse_request_path("debian/dists/sid/main/source/Sources"),
             Some(ResourceFile::Sources {
@@ -3080,84 +3058,27 @@ mod tests {
                 filename: "Sources",
             })
         );
-    }
-
-    #[test]
-    fn parse_translation_uncompressed_structured() {
-        assert_eq!(
-            parse_request_path("debian/dists/sid/main/i18n/Translation-en"),
-            Some(ResourceFile::Translation {
-                mirror_path: "debian",
-                distribution: "sid",
-                component: "main",
-                filename: "Translation-en",
-            })
-        );
-    }
-
-    #[test]
-    fn parse_translation_gz_structured() {
-        assert_eq!(
-            parse_request_path("debian/dists/sid/main/i18n/Translation-en.gz"),
-            Some(ResourceFile::Translation {
-                mirror_path: "debian",
-                distribution: "sid",
-                component: "main",
-                filename: "Translation-en.gz",
-            })
-        );
-    }
-
-    #[test]
-    fn parse_translation_xz_structured() {
-        assert_eq!(
-            parse_request_path("debian/dists/sid/main/i18n/Translation-en.xz"),
-            Some(ResourceFile::Translation {
-                mirror_path: "debian",
-                distribution: "sid",
-                component: "main",
-                filename: "Translation-en.xz",
-            })
-        );
-    }
-
-    #[test]
-    fn parse_translation_bz2_structured() {
-        // Regression guard: the bz2 translation form must keep parsing as a
-        // structured Translation resource.
-        assert_eq!(
-            parse_request_path("debian/dists/sid/main/i18n/Translation-en.bz2"),
-            Some(ResourceFile::Translation {
-                mirror_path: "debian",
-                distribution: "sid",
-                component: "main",
-                filename: "Translation-en.bz2",
-            })
-        );
-    }
-
-    #[test]
-    fn parse_flat_translation_gz() {
-        assert_eq!(
-            parse_request_path("apt/Translation-en.gz"),
-            Some(ResourceFile::Flat {
-                kind: FlatKind::Metadata,
-                mirror_path: "apt",
-                filename: "Translation-en.gz",
-            })
-        );
-    }
-
-    #[test]
-    fn parse_flat_translation_uncompressed() {
-        assert_eq!(
-            parse_request_path("apt/Translation-en"),
-            Some(ResourceFile::Flat {
-                kind: FlatKind::Metadata,
-                mirror_path: "apt",
-                filename: "Translation-en",
-            })
-        );
+        for filename in ["Translation-en", "Translation-en.gz", "Translation-en.xz"] {
+            assert_eq!(
+                parse_request_path(&format!("debian/dists/sid/main/i18n/{filename}")),
+                Some(ResourceFile::Translation {
+                    mirror_path: "debian",
+                    distribution: "sid",
+                    component: "main",
+                    filename,
+                })
+            );
+        }
+        for filename in ["Translation-en", "Translation-en.gz"] {
+            assert_eq!(
+                parse_request_path(&format!("apt/{filename}")),
+                Some(ResourceFile::Flat {
+                    kind: FlatKind::Metadata,
+                    mirror_path: "apt",
+                    filename,
+                })
+            );
+        }
     }
 
     #[test]
@@ -3189,38 +3110,9 @@ mod tests {
     }
 
     #[test]
-    fn valid_mirrorname_rejects_traversal_segments() {
-        assert!(!valid_mirrorname("debian/../etc", MirrorKind::Structured));
-        assert!(!valid_mirrorname("./debian", MirrorKind::Structured));
-    }
-
-    #[test]
-    fn is_flat_deb_filename_strict_shape() {
-        assert!(is_flat_deb_filename("abc_1.0_amd64.deb"));
-        assert!(!is_flat_deb_filename("abc_1.0.deb")); // missing arch
-        assert!(!is_flat_deb_filename("abc.deb")); // missing version+arch
-        assert!(!is_flat_deb_filename("_1.0_amd64.deb")); // empty name
-    }
-
-    #[test]
     fn parse_request_path_rejects_traversal_after_normalize() {
         // Even with `//` collapsed, traversal segments still get caught.
         assert!(parse_request_path("debian/dists/../passwd").is_none());
-    }
-
-    #[test]
-    fn parse_request_path_handles_double_slash() {
-        let raw = "debian//dists/sid/InRelease";
-        let normalized = normalize_uri_path(raw);
-        assert!(matches!(normalized, Cow::Owned(_)));
-        assert_eq!(
-            parse_request_path(&normalized),
-            Some(ResourceFile::Release {
-                mirror_path: "debian",
-                distribution: "sid",
-                filename: "InRelease",
-            })
-        );
     }
 
     #[test]

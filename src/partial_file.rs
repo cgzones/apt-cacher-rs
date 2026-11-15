@@ -876,8 +876,26 @@ mod tests {
         dir.path().join("mirror/tmp/foo_1.0_amd64.deb.partial")
     }
 
-    /// The guard of a fresh download; any other state fails the test with
-    /// `why` it should have been fresh.
+    fn seed(path: &Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, bytes).expect("write");
+    }
+
+    async fn prepare(
+        path: &Path,
+        quota: Option<CacheQuota>,
+    ) -> Result<PartialDownload, PartialOpenFailure> {
+        let mirror = structured_mirror("deb.example.org", "debian");
+        prepare_partial_resume_at(
+            path.to_path_buf(),
+            quota,
+            "foo_1.0_amd64.deb",
+            &mirror,
+            ResumeLog::Unprefixed,
+        )
+        .await
+    }
+
     fn expect_fresh(partial: PartialDownload, why: &str) -> TempPath {
         let guard = match partial {
             PartialDownload::Fresh(guard) => Some(guard),
@@ -909,17 +927,10 @@ mod tests {
     async fn the_claim_lasts_until_guard_and_reservation_are_gone() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = partial_path(&dir);
-        let mirror = structured_mirror("deb.example.org", "debian");
 
-        let resume = prepare_partial_resume_at(
-            path.clone(),
-            None,
-            "foo_1.0_amd64.deb",
-            &mirror,
-            ResumeLog::Unprefixed,
-        )
-        .await
-        .expect("no partial is a fresh download");
+        let resume = prepare(&path, None)
+            .await
+            .expect("no partial is a fresh download");
         let reserved = resume.reserved_partial().expect("a kept partial");
         let guard = expect_fresh(resume, "no partial on disk");
         assert!(PartialClaim::acquire(path.clone()).is_none(), "claimed");
@@ -940,21 +951,13 @@ mod tests {
     async fn a_claimed_partial_degrades_the_download_to_a_scratch_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = partial_path(&dir);
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&path, b"somebody's resume state").expect("write");
-        let mirror = structured_mirror("deb.example.org", "debian");
+        seed(&path, b"somebody's resume state");
         let held = claim(&path);
 
         let before = metrics::PARTIAL_CLAIM_CONTENDED.get();
-        let resume = prepare_partial_resume_at(
-            path.clone(),
-            None,
-            "foo_1.0_amd64.deb",
-            &mirror,
-            ResumeLog::Unprefixed,
-        )
-        .await
-        .expect("a scratch download, not a failure");
+        let resume = prepare(&path, None)
+            .await
+            .expect("a scratch download, not a failure");
         assert_eq!(resume.offset(), 0);
         assert!(matches!(resume, PartialDownload::Scratch));
         assert!(resume.reserved_partial().is_none());
@@ -1117,8 +1120,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = partial_path(&dir);
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&path, b"").expect("write");
+        seed(&path, b"");
         // Held open across the call, so the old inode stays allocated and its
         // number cannot be handed straight back to the new file.
         let leftover = std::fs::File::open(&path).expect("open leftover");
@@ -1182,18 +1184,11 @@ mod tests {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         std::fs::write(&other, original).expect("seed the other name");
         std::fs::hard_link(&other, &path).expect("link the partial to it");
-        let mirror = structured_mirror("deb.example.org", "debian");
 
         let before = metrics::PARTIAL_HARDLINKED.get();
-        let resume = prepare_partial_resume_at(
-            path.clone(),
-            None,
-            "foo_1.0_amd64.deb",
-            &mirror,
-            ResumeLog::Unprefixed,
-        )
-        .await
-        .expect("a hardlinked partial is a fresh download");
+        let resume = prepare(&path, None)
+            .await
+            .expect("a hardlinked partial is a fresh download");
         assert_eq!(metrics::PARTIAL_HARDLINKED.get() - before, 1, "counted");
         assert_eq!(resume.offset(), 0);
         assert_eq!(resume.if_range(), None);
@@ -1215,19 +1210,11 @@ mod tests {
     async fn prepare_partial_resume_discards_a_partial_without_etag() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = partial_path(&dir);
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&path, b"stale").expect("write");
-        let mirror = structured_mirror("deb.example.org", "debian");
+        seed(&path, b"stale");
 
-        let resume = prepare_partial_resume_at(
-            path.clone(),
-            None,
-            "foo_1.0_amd64.deb",
-            &mirror,
-            ResumeLog::Unprefixed,
-        )
-        .await
-        .expect("a discarded partial is a fresh download");
+        let resume = prepare(&path, None)
+            .await
+            .expect("a discarded partial is a fresh download");
         assert_eq!(resume.offset(), 0);
         assert_eq!(resume.expected_total(), None);
         assert_eq!(resume.if_range(), None);
@@ -1242,25 +1229,17 @@ mod tests {
     async fn prepare_partial_resume_discards_a_partial_with_a_weak_etag() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = partial_path(&dir);
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&path, b"partial-bytes").expect("write");
+        seed(&path, b"partial-bytes");
         let std_file = std::fs::File::open(&path).expect("open");
         if !plant_raw::<ETag>(&std_file, b"W/\"weak\"") {
             // Filesystem without user xattrs: nothing to gate on here.
             return;
         }
         drop(std_file);
-        let mirror = structured_mirror("deb.example.org", "debian");
 
-        let resume = prepare_partial_resume_at(
-            path.clone(),
-            None,
-            "foo_1.0_amd64.deb",
-            &mirror,
-            ResumeLog::Unprefixed,
-        )
-        .await
-        .expect("a discarded partial is a fresh download");
+        let resume = prepare(&path, None)
+            .await
+            .expect("a discarded partial is a fresh download");
         assert_eq!(resume.offset(), 0);
         assert_eq!(
             resume.if_range(),
@@ -1280,8 +1259,7 @@ mod tests {
     async fn prepare_partial_resume_resumes_a_partial_with_etag() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = partial_path(&dir);
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&path, b"partial-bytes").expect("write");
+        seed(&path, b"partial-bytes");
         let std_file = std::fs::File::open(&path).expect("open");
         if !plant_raw::<ETag>(&std_file, b"\"strong\"") {
             // Filesystem without user xattrs: the resume branch cannot be
@@ -1294,17 +1272,8 @@ mod tests {
             "the ETag planted, so the Last-Modified attribute must too"
         );
         drop(std_file);
-        let mirror = structured_mirror("deb.example.org", "debian");
 
-        let mut resume = prepare_partial_resume_at(
-            path.clone(),
-            None,
-            "foo_1.0_amd64.deb",
-            &mirror,
-            ResumeLog::Unprefixed,
-        )
-        .await
-        .expect("the partial reopens");
+        let mut resume = prepare(&path, None).await.expect("the partial reopens");
         assert_eq!(resume.offset(), 13);
         assert_eq!(resume.expected_total(), None, "no expected-size xattr");
         assert_eq!(resume.if_range(), Some("\"strong\""));
@@ -1344,8 +1313,7 @@ mod tests {
     async fn prepare_partial_resume_reports_the_expected_total_from_xattr() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = partial_path(&dir);
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&path, b"partial-bytes").expect("write");
+        seed(&path, b"partial-bytes");
         let std_file = std::fs::File::open(&path).expect("open");
         if !plant_raw::<ETag>(&std_file, b"\"strong\"") {
             // Filesystem without user xattrs: the resume branch cannot be
@@ -1357,17 +1325,8 @@ mod tests {
             "the ETag planted, so the expected-size attribute must too"
         );
         drop(std_file);
-        let mirror = structured_mirror("deb.example.org", "debian");
 
-        let resume = prepare_partial_resume_at(
-            path,
-            None,
-            "foo_1.0_amd64.deb",
-            &mirror,
-            ResumeLog::Unprefixed,
-        )
-        .await
-        .expect("the partial reopens");
+        let resume = prepare(&path, None).await.expect("the partial reopens");
         assert_eq!(resume.offset(), 13);
         assert_eq!(
             resume.expected_total(),
@@ -1386,23 +1345,15 @@ mod tests {
     async fn removing_a_kept_partial_releases_its_bytes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = partial_path(&dir);
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&path, b"stale").expect("write");
-        let mirror = structured_mirror("deb.example.org", "debian");
+        seed(&path, b"stale");
         // Ten blocks of cached files plus the 5-byte kept partial, accounted
         // as one block.
         let quota = CacheQuota::new(11 * QUOTA_BLOCK_SIZE, None);
 
         // Without an ETag the partial is discarded.
-        let resume = prepare_partial_resume_at(
-            path.clone(),
-            Some(quota.clone()),
-            "foo_1.0_amd64.deb",
-            &mirror,
-            ResumeLog::Unprefixed,
-        )
-        .await
-        .expect("a discarded partial is a fresh download");
+        let resume = prepare(&path, Some(quota.clone()))
+            .await
+            .expect("a discarded partial is a fresh download");
         assert_eq!(quota.current_size(), 10 * QUOTA_BLOCK_SIZE);
         let guard = expect_fresh(resume, "no ETag means no resume");
 
@@ -1423,19 +1374,11 @@ mod tests {
     async fn prepare_partial_resume_treats_an_empty_partial_as_fresh() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = partial_path(&dir);
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&path, b"").expect("write");
-        let mirror = structured_mirror("deb.example.org", "debian");
+        seed(&path, b"");
 
-        let resume = prepare_partial_resume_at(
-            path.clone(),
-            None,
-            "foo_1.0_amd64.deb",
-            &mirror,
-            ResumeLog::Unprefixed,
-        )
-        .await
-        .expect("an empty partial is a fresh download");
+        let resume = prepare(&path, None)
+            .await
+            .expect("an empty partial is a fresh download");
         assert_eq!(resume.offset(), 0);
         assert!(matches!(resume, PartialDownload::Fresh(_)));
     }

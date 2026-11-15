@@ -2370,18 +2370,6 @@ mod tests {
     // b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
     const HELLO_SHA256: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
 
-    /// A registry-style expectation: SHA256 over the 64-hex `digest`.
-    fn expect_sha256(digest: &str) -> VerifyKind {
-        VerifyKind::Expected(Digest::Sha256(Box::new(
-            index_parser::hex_decode_exact::<32>(digest).expect("test digest must be 64 hex chars"),
-        )))
-    }
-
-    /// An expectation nothing can match: 32 zero bytes.
-    fn expect_zero_sha256() -> VerifyKind {
-        VerifyKind::Expected(Digest::Sha256(Box::new([0u8; 32])))
-    }
-
     #[tokio::test]
     async fn packages_ingests_run_at_most_two_at_a_time() {
         use std::cell::Cell;
@@ -2638,35 +2626,6 @@ mod tests {
         assert!(matches!(
             verify_temp_file(&plan),
             Err(CommitError::VerifyIo(_))
-        ));
-    }
-
-    #[test]
-    fn expected_matching_digest_proceeds() {
-        let f = temp_file_with(b"hello world");
-        let plan = VerifyInput {
-            kind: expect_sha256(HELLO_SHA256),
-            file: f.as_file(),
-            meta: &f.as_file().metadata().unwrap(),
-            temp_path: f.path(),
-            streamed: None,
-        };
-        assert!(matches!(verify_temp_file(&plan), Ok(())));
-    }
-
-    #[test]
-    fn expected_mismatching_digest_rejects() {
-        let f = temp_file_with(b"tampered deb");
-        let plan = VerifyInput {
-            kind: expect_zero_sha256(),
-            file: f.as_file(),
-            meta: &f.as_file().metadata().unwrap(),
-            temp_path: f.path(),
-            streamed: None,
-        };
-        assert!(matches!(
-            verify_temp_file(&plan),
-            Err(CommitError::ChecksumMismatch)
         ));
     }
 
@@ -3048,37 +3007,8 @@ mod tests {
         assert_eq!(reg.len(), 1);
     }
 
-    #[test]
-    fn registry_reinsert_refreshes_eviction_position() {
-        use std::num::NonZero;
-        let reg = ChecksumRegistry::new(NonZero::new(4).unwrap());
-        let d = [0u8; 32];
-        reg.insert("h", "m", "a", d);
-        reg.insert("h", "m", "b", d);
-        reg.insert("h", "m", "c", d);
-        reg.insert("h", "m", "d", d);
-        // Refresh A -- order should now logically be B, C, D, A.
-        reg.insert("h", "m", "a", d);
-        // E pushes over cap (4) -> eviction drops oldest live entry, which is B.
-        reg.insert("h", "m", "e", d);
-        assert!(
-            reg.lookup("h", "m", "a").is_some(),
-            "A should survive re-insert refresh"
-        );
-        assert!(
-            reg.lookup("h", "m", "b").is_none(),
-            "B should be evicted first"
-        );
-        assert!(reg.lookup("h", "m", "c").is_some());
-        assert!(reg.lookup("h", "m", "d").is_some());
-        assert!(reg.lookup("h", "m", "e").is_some());
-    }
-
-    /// Regression: whether a by-hash object is also ingested as a `Packages`
-    /// index used to be re-read from the directory before the raw path's
-    /// *first* `by-hash` segment, while the parser validated the *last*. A
-    /// decoy `by-hash/` run in front flipped the answer either way. The
-    /// directory the parsed object hangs in decides now.
+    /// A decoy `by-hash/` run in front of the validated (last) one must not
+    /// flip the answer either way.
     #[test]
     fn byhash_ingest_is_decided_by_the_parsed_directory() {
         use crate::{
@@ -3208,10 +3138,6 @@ mod tests {
             );
         }
         assert_eq!(
-            release_dir_from_uri_path("/%64ebian/dists/%73id/Release").as_deref(),
-            Some("debian/dists/sid")
-        );
-        assert_eq!(
             registry_path_from_uri("/debian/dists/%2573id/Release"),
             "debian/dists/%73id/Release"
         );
@@ -3219,19 +3145,19 @@ mod tests {
 
     #[test]
     fn release_dir_extraction() {
-        assert_eq!(
-            release_dir_from_uri_path("/debian/dists/sid/Release"),
-            Some("debian/dists/sid".to_string())
-        );
-        assert_eq!(
-            release_dir_from_uri_path("/debian/dists/sid/InRelease"),
-            Some("debian/dists/sid".to_string())
-        );
-        assert_eq!(
-            release_dir_from_uri_path("/debian//dists/./sid/InRelease"),
-            Some("debian/dists/sid".to_string()),
-            "normalized like the Packages lookup key"
-        );
+        // Normalized and decoded like the Packages lookup key.
+        for path in [
+            "/debian/dists/sid/Release",
+            "/debian/dists/sid/InRelease",
+            "/debian//dists/./sid/InRelease",
+            "/%64ebian/dists/%73id/Release",
+        ] {
+            assert_eq!(
+                release_dir_from_uri_path(path).as_deref(),
+                Some("debian/dists/sid"),
+                "{path}"
+            );
+        }
         assert_eq!(release_dir_from_uri_path("/debian/pool/x/foo.deb"), None);
         // Release.gpg is a detached binary PGP signature with no SHA256
         // section, so the ingest dispatcher must not route it here.

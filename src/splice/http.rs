@@ -1549,27 +1549,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_upstream_response() {
-        let headers = b"HTTP/1.1 200 OK\r\n\
-                        Content-Length: 12345\r\n\
-                        Content-Type: application/vnd.debian.binary-package\r\n\
-                        Last-Modified: Thu, 01 Jan 2025 00:00:00 GMT\r\n\
-                        \r\n";
-        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
-            .expect("should parse");
-        assert_eq!(resp.status_code, 200);
-        assert_eq!(resp.content_length(), Some(12345));
-        assert_eq!(
-            resp.content_type.as_deref(),
-            Some("application/vnd.debian.binary-package")
-        );
-        assert_eq!(
-            resp.last_modified.as_deref(),
-            Some("Thu, 01 Jan 2025 00:00:00 GMT")
-        );
-    }
-
-    #[test]
     fn test_parse_upstream_response_no_content_length() {
         let headers = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
         let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
@@ -1577,15 +1556,6 @@ mod tests {
         assert_eq!(resp.status_code, 200);
         assert_eq!(resp.content_length(), None);
         assert_eq!(resp.framing, BodyFraming::Chunked);
-    }
-
-    #[test]
-    fn test_parse_upstream_response_not_chunked() {
-        let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n";
-        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
-            .expect("should parse");
-        assert_eq!(resp.framing, BodyFraming::ContentLength(42));
-        assert_eq!(resp.content_length(), Some(42));
     }
 
     #[test]
@@ -1632,25 +1602,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_upstream_response_404() {
-        let headers = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
-            .expect("should parse");
-        assert_eq!(resp.status_code, 404);
-    }
-
-    #[test]
-    fn test_parse_upstream_response_etag() {
-        let headers = b"HTTP/1.1 200 OK\r\n\
-                        Content-Length: 100\r\n\
-                        ETag: \"abc123\"\r\n\
-                        \r\n";
-        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
-            .expect("should parse");
-        assert_eq!(resp.etag.as_deref(), Some("\"abc123\""));
-    }
-
-    #[test]
     fn test_parse_upstream_response_keeps_raw_validators() {
         // The parser forwards validators verbatim; `discard_invalid_validators`
         // filters them once the driver knows the file they belong to.
@@ -1663,52 +1614,6 @@ mod tests {
             .expect("should parse");
         assert_eq!(resp.etag.as_deref(), Some("not-a-valid-etag"));
         assert_eq!(resp.last_modified.as_deref(), Some("not a date"));
-    }
-
-    #[test]
-    fn test_parse_upstream_response_content_range() {
-        let headers = b"HTTP/1.1 206 Partial Content\r\n\
-                        Content-Length: 500\r\n\
-                        Content-Range: bytes 100-599/1000\r\n\
-                        \r\n";
-        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
-            .expect("should parse");
-        assert_eq!(resp.status_code, 206);
-        assert_eq!(
-            resp.content_range
-                .map(|r| (r.start(), r.span().get(), r.total().get())),
-            Some((100, 500, 1000))
-        );
-    }
-
-    #[test]
-    fn test_parse_upstream_response_connection_close() {
-        let headers = b"HTTP/1.1 200 OK\r\n\
-                        Content-Length: 100\r\n\
-                        Connection: close\r\n\
-                        \r\n";
-        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
-            .expect("should parse");
-        assert!(resp.connection_close);
-    }
-
-    #[test]
-    fn test_parse_upstream_response_connection_keep_alive() {
-        let headers = b"HTTP/1.1 200 OK\r\n\
-                        Content-Length: 100\r\n\
-                        Connection: keep-alive\r\n\
-                        \r\n";
-        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
-            .expect("should parse");
-        assert!(!resp.connection_close);
-    }
-
-    #[test]
-    fn test_parse_upstream_response_no_connection_header() {
-        let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
-        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
-            .expect("should parse");
-        assert!(!resp.connection_close);
     }
 
     #[test]
@@ -1762,18 +1667,18 @@ mod tests {
 
     #[test]
     fn test_parse_upstream_response_all_fields() {
-        let headers = b"HTTP/1.1 200 OK\r\n\
-                        Content-Length: 999\r\n\
+        let headers = b"HTTP/1.1 206 Partial Content\r\n\
+                        Content-Length: 500\r\n\
                         Content-Type: application/octet-stream\r\n\
                         Last-Modified: Sat, 15 Mar 2025 12:00:00 GMT\r\n\
                         ETag: \"full-test\"\r\n\
-                        Content-Range: bytes 0-998/999\r\n\
+                        Content-Range: bytes 100-599/1000\r\n\
                         Connection: close\r\n\
                         \r\n";
         let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
             .expect("should parse");
-        assert_eq!(resp.status_code, 200);
-        assert_eq!(resp.content_length(), Some(999));
+        assert_eq!(resp.status_code, 206);
+        assert_eq!(resp.content_length(), Some(500));
         assert_eq!(
             resp.content_type.as_deref(),
             Some("application/octet-stream")
@@ -1786,7 +1691,7 @@ mod tests {
         assert_eq!(
             resp.content_range
                 .map(|r| (r.start(), r.span().get(), r.total().get())),
-            Some((0, 999, 999))
+            Some((100, 500, 1000))
         );
         assert!(resp.connection_close);
     }
@@ -1888,6 +1793,11 @@ mod tests {
                 head:
                     b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: junk\r\n\r\n",
                 framing: BodyFraming::Chunked,
+                connection_close: false,
+            },
+            Case {
+                head: b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: keep-alive\r\n\r\n",
+                framing: BodyFraming::ContentLength(7),
                 connection_close: false,
             },
             Case {

@@ -20,8 +20,6 @@ use std::{
 
 #[cfg(feature = "hyper")]
 use http::HeaderMap;
-#[cfg(test)]
-use http::StatusCode;
 use tracing::debug;
 
 use crate::cache_layout::{CacheEntryKeyRef, MissReason};
@@ -272,16 +270,6 @@ impl ServeParams {
     #[must_use]
     pub(crate) fn content_end(&self) -> u64 {
         self.content_start() + self.content_length()
-    }
-
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) fn http_status(&self) -> StatusCode {
-        if self.is_partial() {
-            StatusCode::PARTIAL_CONTENT
-        } else {
-            StatusCode::OK
-        }
     }
 }
 
@@ -543,7 +531,7 @@ mod tests {
             None
         };
         let params = params.expect("asserted above");
-        assert_eq!(params.http_status(), StatusCode::PARTIAL_CONTENT);
+        assert!(params.is_partial());
         assert_eq!(params.content_start(), 100);
         assert_eq!(params.content_length(), 100);
         assert_eq!(
@@ -780,7 +768,6 @@ mod tests {
         // valid-but-unsatisfiable range is the caller's 416.
         assert_eq!(ServeParams::from_parsed(None, 7), Ok(ServeParams::full(7)));
         assert!(!ServeParams::full(7).is_partial());
-        assert_eq!(ServeParams::full(7).http_status(), StatusCode::OK);
         assert_eq!(
             ServeParams::from_parsed(Some(ParsedRange::IfRangeFailed), 7),
             Ok(ServeParams::full(7))
@@ -807,7 +794,6 @@ mod tests {
             )
         );
         assert!(partial.is_partial());
-        assert_eq!(partial.http_status(), StatusCode::PARTIAL_CONTENT);
     }
 
     #[test]

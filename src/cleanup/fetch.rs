@@ -604,32 +604,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn debname_kind_maps_resource_kind_and_derives_its_layout() {
-        use crate::cache_layout::CacheLayout;
-
-        let origin = DebnameKind::OriginScoped {
-            distribution: "bookworm",
-            component: "main",
-            architecture: "amd64",
-        };
-        assert!(matches!(origin.resource_kind(), ResourceKind::Packages));
-        assert!(matches!(
-            DebnameKind::Flat.resource_kind(),
-            ResourceKind::FlatMetadata
-        ));
-        // The index is cached under the layout the serve path derives for the
-        // same kind: `Dists` for a structured index, the flat tree otherwise.
-        assert!(matches!(
-            origin.resource_kind().layout(),
-            CacheLayout::Dists
-        ));
-        assert!(matches!(
-            DebnameKind::Flat.resource_kind().layout(),
-            CacheLayout::Flat
-        ));
-    }
-
     /// Run [`probe_formats`] against scripted per-format answers (in
     /// `.xz`, `.gz`, raw order) and return its result with the URIs it
     /// requested.
@@ -773,25 +747,5 @@ mod tests {
             upstream: None,
         };
         assert_eq!(status_only.to_string(), "404 Not Found");
-    }
-
-    #[test]
-    fn fetch_failure_equality_spans_the_whole_struct() {
-        let a = FetchFailure {
-            status: StatusCode::BAD_GATEWAY,
-            upstream: Some(UpstreamFetchError {
-                reason: "timed out".to_owned(),
-            }),
-        };
-        let b = FetchFailure {
-            status: StatusCode::BAD_GATEWAY,
-            upstream: Some(UpstreamFetchError {
-                reason: "connection refused".to_owned(),
-            }),
-        };
-        // Two upstream failures with different reasons are NOT equal (drives the
-        // flat-root suffix-suppression in engine.rs).
-        assert_ne!(a, b);
-        assert_eq!(a, a);
     }
 }

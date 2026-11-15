@@ -2396,6 +2396,10 @@ mod test {
 
         assert_eq!(1024, parse_usize_with_magnitude("1Ki").unwrap());
 
+        assert_eq!(1_000_000, parse_usize_with_magnitude("1M").unwrap());
+
+        assert_eq!(0x0010_0000, parse_usize_with_magnitude("1Mi").unwrap());
+
         assert_eq!(42_000_000_000, parse_usize_with_magnitude("42 G").unwrap());
 
         assert_eq!(45_097_156_608, parse_usize_with_magnitude("42 Gi").unwrap());
@@ -2407,29 +2411,6 @@ mod test {
         assert!(parse_usize_with_magnitude("-9M").is_err());
 
         assert!(parse_usize_with_magnitude("-7 y").is_err());
-    }
-
-    #[test]
-    fn test_parse_u64_with_magnitude() {
-        assert_eq!(0, parse_u64_with_magnitude("0").unwrap());
-
-        assert_eq!(1024, parse_u64_with_magnitude("1024").unwrap());
-
-        assert_eq!(1000, parse_u64_with_magnitude("1k").unwrap());
-
-        assert_eq!(1024, parse_u64_with_magnitude("1Ki").unwrap());
-
-        assert_eq!(1_000_000, parse_u64_with_magnitude("1M").unwrap());
-
-        assert_eq!(0x0010_0000, parse_u64_with_magnitude("1Mi").unwrap());
-
-        assert_eq!(42_000_000_000, parse_u64_with_magnitude("42 G").unwrap());
-
-        assert_eq!(45_097_156_608, parse_u64_with_magnitude("42 Gi").unwrap());
-
-        assert!(parse_u64_with_magnitude("1K").is_err());
-
-        assert!(parse_u64_with_magnitude("-9M").is_err());
     }
 
     #[test]

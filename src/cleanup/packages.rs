@@ -379,131 +379,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reduce_file_list_rejects_decompression_bomb() {
-        use std::num::NonZero;
-
-        // 4 MiB of newlines compresses to a few KiB -- a ratio far above the cap.
-        let raw = vec![b'\n'; 4 * 1024 * 1024];
-        let compressed = gzip(&raw).await;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("Packages.gz");
-        tokio::fs::write(&path, &compressed)
-            .await
-            .expect("write fixture");
-        let file = tokio::fs::File::open(&path).await.expect("open fixture");
-
-        // Mirror the EXACT Mirror / ReduceContext construction used by the
-        // existing process_stanza_flat_prefix_strips_in_subtree_and_drops_siblings
-        // test in this module.
-        let mirror = Mirror::new(
-            ClientHost::new("example.com").expect("valid host"),
-            None::<NonZero<u16>>,
-            "apt/amd64".into(),
-            MirrorKind::Flat,
-        );
-        // A non-matching entry keeps `file_list` non-empty so the reducer
-        // streams the whole (bomb) input instead of early-returning.
-        let mut file_list = cands(&["never-matched.deb"]);
-        let mut tally = UnitStats::default();
-        let mut ctx = ReduceContext {
-            root: Path::new("/tmp"),
-            mirror: &mirror,
-            layout: CacheLayout::Flat,
-            tally: &mut tally,
-            keymap: KeyMapper::RelpathUnderPrefix { prefix: "amd64/" },
-        };
-
-        let result = reduce_file_list(
-            fetched(PackagesCompression::Gz, file, "Packages.gz").await,
-            &mut file_list,
-            &mut ctx,
-            BUFFER_SIZE,
-        )
-        .await;
-        let err = result.expect_err("a decompression bomb must abort reduce_file_list");
-        assert!(
-            matches!(err, ReduceError::Read { ref filename, .. } if filename == "Packages.gz"),
-            "a decompression bomb is a read failure of the named index, got {err:?}"
-        );
-    }
-
-    /// A compressed index past `MAX_COMPRESSED_PACKAGES_SIZE` is refused on
-    /// its size, before the decoder sees a byte (the sparse fixture holds no
-    /// valid xz header, so a decode attempt would fail differently).
-    #[tokio::test]
-    async fn reduce_file_list_refuses_an_oversized_compressed_index_unread() {
-        use std::num::NonZero;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("Packages.xz");
-        let std_file = std::fs::File::create(&path).expect("create fixture");
-        std_file
-            .set_len(MAX_COMPRESSED_PACKAGES_SIZE.get() + 1)
-            .expect("extend sparse");
-        drop(std_file);
-        let file = tokio::fs::File::open(&path).await.expect("open fixture");
-
-        let mirror = Mirror::new(
-            ClientHost::new("example.com").expect("valid host"),
-            None::<NonZero<u16>>,
-            "apt/amd64".into(),
-            MirrorKind::Flat,
-        );
-        let mut file_list = cands(&["never-matched.deb"]);
-        let mut tally = UnitStats::default();
-        let mut ctx = ReduceContext {
-            root: Path::new("/tmp"),
-            mirror: &mirror,
-            layout: CacheLayout::Flat,
-            tally: &mut tally,
-            keymap: KeyMapper::RelpathUnderPrefix { prefix: "amd64/" },
-        };
-
-        let err = reduce_file_list(
-            fetched(PackagesCompression::Xz, file, "Packages.xz").await,
-            &mut file_list,
-            &mut ctx,
-            BUFFER_SIZE,
-        )
-        .await
-        .expect_err("an oversized compressed index must bail the mirror");
-        assert!(
-            matches!(err, ReduceError::TooLarge { ref filename, .. } if filename == "Packages.xz"),
-            "got {err:?}"
-        );
-        assert_eq!(file_list.len(), 1, "the candidates must be left untouched");
-    }
-
-    /// A zero-byte compressed index is malformed (gzip needs at least a
-    /// header): the mirror bails with `ZeroSizeCompressed` and the candidate
-    /// list is left untouched rather than reconciled against nothing.
-    #[tokio::test]
-    async fn reduce_file_list_rejects_empty_compressed_index() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("Packages.gz");
-        tokio::fs::write(&path, b"").await.expect("write empty");
-        let file = tokio::fs::File::open(&path).await.expect("open empty");
-
-        let (result, file_list) = reduce_keys(
-            fetched(PackagesCompression::Gz, file, "Packages.gz").await,
-            dir.path(),
-            &["keep-me.deb"],
-        )
-        .await;
-        let err = result.expect_err("an empty compressed index must bail the mirror");
-        assert!(
-            matches!(err, ReduceError::ZeroSizeCompressed { ref filename } if filename == "Packages.gz"),
-            "got {err:?}"
-        );
-        assert_eq!(file_list.len(), 1);
-        assert!(
-            file_list.contains_key(OsStr::new("keep-me.deb")),
-            "a rejected index must leave the candidate list untouched"
-        );
-    }
-
-    #[tokio::test]
     async fn reduce_file_list_skips_overlong_line_and_keeps_parsing() {
         use sha2::{Digest as _, Sha256};
 
@@ -556,30 +431,6 @@ mod tests {
         assert!(
             file_list.contains_key(OsStr::new("keep-me.deb")),
             "unrelated entries must be left in place"
-        );
-    }
-
-    /// A zero-length raw `Packages` file is a valid empty stanza set
-    /// (e.g. a freshly-created component with no published debs) and
-    /// must not abort the per-mirror cleanup.
-    #[tokio::test]
-    async fn reduce_file_list_accepts_empty_raw_packages() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("Packages");
-        tokio::fs::write(&path, b"").await.expect("write empty");
-        let file = tokio::fs::File::open(&path).await.expect("open empty");
-
-        let (result, file_list) = reduce_keys(
-            fetched(PackagesCompression::Raw, file, "Packages").await,
-            dir.path(),
-            &["keep-me.deb"],
-        )
-        .await;
-        result.expect("an empty raw Packages file must be treated as zero stanzas");
-
-        assert!(
-            file_list.contains_key(OsStr::new("keep-me.deb")),
-            "empty Packages must leave the candidate list untouched"
         );
     }
 
@@ -789,60 +640,82 @@ mod tests {
     /// compressed index, a malformed or bomb-sized stream, and an index past
     /// its compressed cap all fail, an empty raw index is no stanzas.
     #[tokio::test]
-    async fn reduce_file_list_guards_in_memory_indexes() {
+    async fn reduce_file_list_guards_files_and_bytes_alike() {
         let root = Path::new("/nonexistent");
         let keys = ["keep-me.deb"];
-        let bytes = |compression, bytes: Vec<u8>| index_via(Via::Bytes, compression, bytes);
+        // 4 MiB of newlines gzips to a few KiB, far past the ratio cap.
+        let bomb = gzip(&vec![b'\n'; 4 * 1024 * 1024]).await;
 
-        let (result, left) = reduce_keys(
-            bytes(PackagesCompression::Raw, Vec::new()).await,
-            root,
-            &keys,
-        )
-        .await;
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!(left.len(), 1);
-
-        for compression in [PackagesCompression::Gz, PackagesCompression::Xz] {
-            let (result, left) =
-                reduce_keys(bytes(compression, Vec::new()).await, root, &keys).await;
-            assert!(
-                matches!(result, Err(ReduceError::ZeroSizeCompressed { .. })),
-                "{compression:?}: {result:?}"
-            );
+        for via in [Via::File, Via::Bytes] {
+            let (result, left) = reduce_keys(
+                index_via(via, PackagesCompression::Raw, Vec::new()).await,
+                root,
+                &keys,
+            )
+            .await;
+            assert!(result.is_ok(), "via {via:?}: {result:?}");
             assert_eq!(left.len(), 1);
 
-            let (result, left) = reduce_keys(
-                bytes(compression, b"not a compressed stream".to_vec()).await,
+            for compression in [PackagesCompression::Gz, PackagesCompression::Xz] {
+                let (result, left) =
+                    reduce_keys(index_via(via, compression, Vec::new()).await, root, &keys).await;
+                assert!(
+                    matches!(
+                        &result,
+                        Err(ReduceError::ZeroSizeCompressed { filename }) if filename == "packages"
+                    ),
+                    "{compression:?} via {via:?}: {result:?}"
+                );
+                assert_eq!(left.len(), 1);
+
+                let (result, left) = reduce_keys(
+                    index_via(via, compression, b"not a compressed stream".to_vec()).await,
+                    root,
+                    &keys,
+                )
+                .await;
+                assert!(
+                    matches!(result, Err(ReduceError::Read { .. })),
+                    "{compression:?} via {via:?}: {result:?}"
+                );
+                assert_eq!(left.len(), 1);
+            }
+
+            let (result, _) = reduce_keys(
+                index_via(via, PackagesCompression::Gz, bomb.clone()).await,
                 root,
                 &keys,
             )
             .await;
             assert!(
-                matches!(result, Err(ReduceError::Read { .. })),
-                "{compression:?}: {result:?}"
+                matches!(
+                    &result,
+                    Err(ReduceError::Read { filename, .. }) if filename == "packages"
+                ),
+                "via {via:?}: {result:?}"
+            );
+
+            // All zeroes (no xz header), so a decode attempt would fail as a
+            // read instead.
+            let mut oversized = index_via(via, PackagesCompression::Xz, Vec::new()).await;
+            oversized.len = MAX_COMPRESSED_PACKAGES_SIZE.get() + 1;
+            match &mut oversized.input {
+                PackagesInput::File(file) => {
+                    file.set_len(oversized.len).await.expect("extend sparse");
+                }
+                PackagesInput::Bytes(bytes) => {
+                    bytes.resize(usize::try_from(oversized.len).expect("fits"), 0);
+                }
+            }
+            let (result, left) = reduce_keys(oversized, root, &keys).await;
+            assert!(
+                matches!(
+                    &result,
+                    Err(ReduceError::TooLarge { filename, .. }) if filename == "packages"
+                ),
+                "via {via:?}: {result:?}"
             );
             assert_eq!(left.len(), 1);
         }
-
-        // 4 MiB of newlines gzips to a few KiB, far past the ratio cap.
-        let bomb = gzip(&vec![b'\n'; 4 * 1024 * 1024]).await;
-        let (result, _) =
-            reduce_keys(bytes(PackagesCompression::Gz, bomb).await, root, &keys).await;
-        assert!(
-            matches!(result, Err(ReduceError::Read { .. })),
-            "{result:?}"
-        );
-
-        // Zero-filled, so the allocation stays lazy; refused before decoding.
-        let oversized =
-            vec![0; usize::try_from(MAX_COMPRESSED_PACKAGES_SIZE.get() + 1).expect("fits")];
-        let (result, left) =
-            reduce_keys(bytes(PackagesCompression::Xz, oversized).await, root, &keys).await;
-        assert!(
-            matches!(result, Err(ReduceError::TooLarge { .. })),
-            "{result:?}"
-        );
-        assert_eq!(left.len(), 1);
     }
 }

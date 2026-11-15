@@ -849,10 +849,7 @@ mod tests {
         /// empty body on a keep-alive raw socket.
         #[test]
         fn unsatisfied_range_carries_content_range() {
-            let wire = render(&ResponseHead {
-                content_length: Some(0),
-                ..ResponseHead::range_not_satisfiable(1234)
-            });
+            let wire = render(&ResponseHead::range_not_satisfiable(1234));
             assert!(
                 wire.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"),
                 "{wire}"

@@ -491,17 +491,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_query_none() {
-        let q = parse_query(None);
-        assert_eq!(q.theme, Theme::Unset);
-        assert!(q.refresh_secs.is_none());
-    }
-
-    #[test]
-    fn parse_query_empty_string() {
-        let q = parse_query(Some(""));
-        assert_eq!(q.theme, Theme::Unset);
-        assert!(q.refresh_secs.is_none());
+    fn parse_query_without_known_keys_keeps_defaults() {
+        for query in [None, Some(""), Some("foo=bar&baz=qux")] {
+            let q = parse_query(query);
+            assert_eq!(q.theme, Theme::Unset, "{query:?}");
+            assert!(q.refresh_secs.is_none(), "{query:?}");
+        }
     }
 
     #[test]
@@ -634,12 +629,5 @@ mod tests {
                 && pin.contains(">keep open</a>"),
             "{pin}"
         );
-    }
-
-    #[test]
-    fn parse_query_unknown_keys_ignored() {
-        let q = parse_query(Some("foo=bar&baz=qux"));
-        assert_eq!(q.theme, Theme::Unset);
-        assert!(q.refresh_secs.is_none());
     }
 }

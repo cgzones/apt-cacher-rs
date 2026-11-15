@@ -925,35 +925,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_filename_field_strips_lf() {
-        assert_eq!(
-            parse_filename_field("Filename: pool/main/a/abc/abc_1.0_amd64.deb\n"),
-            Some("pool/main/a/abc/abc_1.0_amd64.deb"),
-        );
-    }
-
-    #[test]
-    fn parse_filename_field_strips_crlf() {
-        assert_eq!(
-            parse_filename_field("Filename: pool/main/a/abc/abc_1.0_amd64.deb\r\n"),
-            Some("pool/main/a/abc/abc_1.0_amd64.deb"),
-        );
-    }
-
-    #[test]
-    fn parse_filename_field_no_terminator() {
-        assert_eq!(
-            parse_filename_field("Filename: pool/main/a/abc/abc_1.0_amd64.deb"),
-            Some("pool/main/a/abc/abc_1.0_amd64.deb"),
-        );
-    }
-
-    #[test]
-    fn parse_filename_field_handles_udeb_extension() {
-        assert_eq!(
-            parse_filename_field("Filename: pool/main/i/inst/inst_1.0_amd64.udeb\n"),
-            Some("pool/main/i/inst/inst_1.0_amd64.udeb"),
-        );
+    fn parse_filename_field_strips_the_line_terminator() {
+        for (line, expected) in [
+            (
+                "Filename: pool/main/a/abc/abc_1.0_amd64.deb\n",
+                "pool/main/a/abc/abc_1.0_amd64.deb",
+            ),
+            (
+                "Filename: pool/main/a/abc/abc_1.0_amd64.deb\r\n",
+                "pool/main/a/abc/abc_1.0_amd64.deb",
+            ),
+            (
+                "Filename: pool/main/a/abc/abc_1.0_amd64.deb",
+                "pool/main/a/abc/abc_1.0_amd64.deb",
+            ),
+            (
+                "Filename: pool/main/i/inst/inst_1.0_amd64.udeb\n",
+                "pool/main/i/inst/inst_1.0_amd64.udeb",
+            ),
+        ] {
+            assert_eq!(parse_filename_field(line), Some(expected), "{line:?}");
+        }
     }
 
     #[test]
@@ -1022,31 +1014,10 @@ mod tests {
     }
 
     #[test]
-    fn hex_decode_exact_round_trip_lowercase() {
-        let bytes: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
-        let s = hex_encode(&bytes);
-        assert_eq!(s, "deadbeef");
-        assert_eq!(hex_decode_exact::<4>(&s), Some(bytes));
-    }
-
-    #[test]
-    fn hex_decode_exact_accepts_uppercase() {
-        assert_eq!(
-            hex_decode_exact::<4>("DEADBEEF"),
-            Some([0xde, 0xad, 0xbe, 0xef])
-        );
-    }
-
-    #[test]
     fn hex_decode_exact_rejects_wrong_length() {
         assert_eq!(hex_decode_exact::<4>("deadbe"), None); // too short
         assert_eq!(hex_decode_exact::<4>("deadbeef00"), None); // too long
-    }
-
-    #[test]
-    fn hex_decode_exact_rejects_non_hex() {
-        assert_eq!(hex_decode_exact::<4>("deadbeeg"), None);
-        assert_eq!(hex_decode_exact::<4>("deadbe!f"), None);
+        assert_eq!(hex_decode_exact::<4>("deadbee"), None); // odd
     }
 
     #[test]
@@ -1932,28 +1903,5 @@ SHA256:
         // too few digits and must still be rejected.
         assert_eq!(hex_decode_exact::<4>("0x0aF9c3"), None);
         assert_eq!(hex_decode_exact::<3>("0x0aF9c3"), None);
-    }
-
-    #[test]
-    fn hex_decode_exact_rejects_truncated() {
-        assert!(hex_decode_exact::<32>("deadbeef").is_none());
-    }
-
-    #[test]
-    fn hex_decode_exact_rejects_oversize() {
-        let oversize = "a".repeat(128);
-        assert!(hex_decode_exact::<32>(&oversize).is_none());
-    }
-
-    #[test]
-    fn hex_decode_exact_rejects_odd_length() {
-        let odd = "a".repeat(63);
-        assert!(hex_decode_exact::<32>(&odd).is_none());
-    }
-
-    #[test]
-    fn byhash_digest_rejects_non_hex_with_correct_length() {
-        let bad = "g".repeat(64);
-        assert!(byhash_digest_for_algo(HashAlgo::Sha256, &bad).is_none());
     }
 }

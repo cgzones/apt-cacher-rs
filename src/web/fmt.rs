@@ -1165,17 +1165,8 @@ mod tests {
     }
 
     #[test]
-    fn html_escape_empty() {
-        assert_eq!(escape(""), "");
-    }
-
-    #[test]
-    fn html_escape_no_special_chars() {
-        assert_eq!(escape("plain text 123"), "plain text 123");
-    }
-
-    #[test]
     fn html_escape_each_special_byte() {
+        assert_eq!(escape(""), "");
         assert_eq!(escape("&"), "&amp;");
         assert_eq!(escape("<"), "&lt;");
         assert_eq!(escape(">"), "&gt;");
@@ -1203,12 +1194,6 @@ mod tests {
         );
         assert_eq!(escape("a&b h\u{e9}llo<c"), "a&amp;b h\u{e9}llo&lt;c",);
         assert_eq!(escape("emoji \u{1f980}"), "emoji \u{1f980}");
-    }
-
-    #[test]
-    fn html_escape_repeated_specials() {
-        assert_eq!(escape("&&&"), "&amp;&amp;&amp;");
-        assert_eq!(escape("<><>"), "&lt;&gt;&lt;&gt;");
     }
 
     #[test]

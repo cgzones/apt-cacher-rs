@@ -263,13 +263,14 @@ pub(crate) async fn splice_simple_proxy(
 mod tests {
     use super::*;
 
+    /// However many `Connection` lines the upstream sent, the head carries
+    /// exactly one (ours), and no field they nominate (RFC 9110 §7.6.1).
     #[test]
-    fn test_rewrite_simple_proxy_headers_single_connection() {
-        // Upstream sends two Connection headers; the rewrite must emit
-        // exactly one (ours), regardless of how many the upstream sent.
+    fn rewrite_simple_proxy_headers_replaces_connection_and_drops_nominated() {
         let raw = b"HTTP/1.1 200 OK\r\n\
                     Connection: keep-alive\r\n\
-                    Connection: close\r\n\
+                    Connection: close, X-Custom-Hop\r\n\
+                    X-Custom-Hop: secret\r\n\
                     Content-Type: text/plain\r\n\
                     Content-Length: 5\r\n\
                     \r\n";
@@ -292,9 +293,11 @@ mod tests {
             "expected exactly one Connection header in rewritten output, got:\n{out}"
         );
         assert!(out.contains("Connection: keep-alive\r\n"));
-        // Upstream's Connection values must not be forwarded.
-        assert!(!out.contains("Connection: close"));
-        // The relay's own Content-Length announces the framing.
+        assert!(
+            !out.to_ascii_lowercase().contains("x-custom-hop"),
+            "Connection-nominated header leaked into output:\n{out}"
+        );
+        assert!(out.contains("Content-Type: text/plain\r\n"));
         assert!(out.contains("Content-Length: 5\r\n"));
         assert!(out.contains("Via: "));
     }
@@ -445,68 +448,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_rewrite_simple_proxy_headers_drops_cl_with_chunked() {
-        // RFC 9112 §6.1: Content-Length must be dropped when Transfer-Encoding:
-        // chunked is also present (smuggling defense).
-        let raw = b"HTTP/1.1 200 OK\r\n\
-                    Transfer-Encoding: chunked\r\n\
-                    Content-Length: 12345\r\n\
-                    \r\n";
-        let (out, _) = rewrite_simple_proxy_headers(
-            raw,
-            ConnectionVersion::Http11,
-            ConnectionAction::Close,
-            StatusCode::OK,
-            BodyFraming::Chunked,
-        )
-        .expect("rewrite should succeed");
-        let out = String::from_utf8(out).unwrap();
-        assert!(!out.to_ascii_lowercase().contains("content-length:"));
-        assert!(out.contains("Transfer-Encoding: chunked\r\n"));
-    }
-
-    #[test]
-    fn test_rewrite_simple_proxy_headers_drops_connection_nominated() {
-        // RFC 9110 §7.6.1: header fields nominated by the upstream Connection
-        // header must be stripped before forwarding to the client.
-        let raw = b"HTTP/1.1 200 OK\r\n\
-                    Connection: close, X-Custom-Hop\r\n\
-                    X-Custom-Hop: secret\r\n\
-                    Content-Type: text/plain\r\n\
-                    \r\n";
-        let (out, _) = rewrite_simple_proxy_headers(
-            raw,
-            ConnectionVersion::Http11,
-            ConnectionAction::Close,
-            StatusCode::OK,
-            BodyFraming::CloseDelimited,
-        )
-        .expect("rewrite should succeed");
-        let out = String::from_utf8(out).unwrap();
-
-        // The nominated field must not be forwarded.
-        assert!(
-            !out.to_ascii_lowercase().contains("x-custom-hop"),
-            "Connection-nominated header leaked into output:\n{out}"
-        );
-        // End-to-end headers still pass through.
-        assert!(out.contains("Content-Type: text/plain\r\n"));
-        // Exactly one Connection header (ours), regardless of the upstream's.
-        let connection_lines = out
-            .split("\r\n")
-            .filter(|line| line.to_ascii_lowercase().starts_with("connection:"))
-            .count();
-        assert_eq!(
-            connection_lines, 1,
-            "expected exactly one Connection header in rewritten output, got:\n{out}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod opaque_headers_tests {
-    use super::*;
     #[test]
     fn relay_preserves_opaque_header_bytes() {
         let raw = b"HTTP/1.1 200 OK\r\nX-Opaque: \xff\x80\r\nContent-Length: 0\r\n\r\n";

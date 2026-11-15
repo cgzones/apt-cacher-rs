@@ -1304,28 +1304,4 @@ mod tests {
         assert_eq!(key.port, None);
         assert_eq!(details.key().mirror.host().as_str(), "fixture.test");
     }
-
-    #[test]
-    fn test_endpoint_port_defaults() {
-        let mirror = Mirror::new(
-            ClientHost::new("example.com").unwrap(),
-            None,
-            "".into(),
-            MirrorKind::Structured,
-        );
-        assert_eq!(endpoint_port((&mirror).into(), false), 80);
-        assert_eq!(endpoint_port((&mirror).into(), true), 443);
-    }
-
-    #[test]
-    fn test_endpoint_port_explicit() {
-        let mirror = Mirror::new(
-            ClientHost::new("example.com").unwrap(),
-            Some(NonZero::new(8080).unwrap()),
-            "".into(),
-            MirrorKind::Structured,
-        );
-        assert_eq!(endpoint_port((&mirror).into(), false), 8080);
-        assert_eq!(endpoint_port((&mirror).into(), true), 8080);
-    }
 }

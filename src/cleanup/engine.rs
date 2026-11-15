@@ -1358,27 +1358,8 @@ mod tests {
         assert_eq!(archive_root_segment(&colocated), None);
     }
 
-    #[test]
-    fn hybrid_prefix_mapping_excludes_siblings() {
-        // The hybrid/root sources key on the in-mirror relpath with the archive
-        // prefix stripped; an entry outside that subtree belongs to a sibling
-        // mirror and must not match (invariant-8 owner keying depends on this).
-        let km = KeyMapper::RelpathUnderPrefix {
-            prefix: "pool/php-zts/main/",
-        };
-        assert_eq!(
-            km.map("pool/php-zts/main/php-zts-cli_8.5.7-1_amd64.deb"),
-            Some("php-zts-cli_8.5.7-1_amd64.deb")
-        );
-        assert_eq!(km.map("pool/other-pkg/main/x_1.0_amd64.deb"), None);
-    }
-
-    // --- by-hash sweep. These exercise the deletion behaviour at the sweep
-    //     level with an injected `now` (birthtime is not backdatable on Linux)
-    //     and an explicitly-built reference set; the DB-driven reference-set
-    //     assembly (`active_origin_distributions` / `build_byhash_reference_set`)
-    //     is covered by `refs.rs`'s unit tests, so isolating the sweep here keeps
-    //     these tests DB-free while still gating the keep/remove verdicts.
+    // --- by-hash sweep, with an injected `now` (birthtime is not backdatable
+    //     on Linux) and an explicitly-built reference set.
 
     use hashbrown::HashSet;
 

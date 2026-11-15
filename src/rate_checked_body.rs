@@ -165,28 +165,11 @@ mod tests {
     #[test]
     fn accounting_observes_client_rate_failure() {
         use crate::{
-            accounted_body::{AccountedBody, Subject},
-            passthrough_limiter,
-            precise_instant::PreciseInstant,
+            accounted_body::AccountedBody, test_support::passthrough_subject,
             transfer_error::DeliveryFailure,
         };
         let body = breaching_body().into_client_body();
-        let mut body = AccountedBody::new(
-            body,
-            Subject::Passthrough {
-                host: "rate.test".into(),
-                path: "/file".into(),
-                client: crate::test_support::local_client(),
-                request_received_at: PreciseInstant::now(),
-                request_sent: PreciseInstant::now(),
-                relay_slot: passthrough_limiter::admit(
-                    None,
-                    "/file",
-                    &crate::test_support::local_client(),
-                )
-                .expect("uncapped"),
-            },
-        );
+        let mut body = AccountedBody::new(body, passthrough_subject());
         let waker = std::task::Waker::noop();
         let before = crate::metrics::RATE_LIMIT_CLIENT.get();
         let failed = match Pin::new(&mut body).poll_frame(&mut Context::from_waker(waker)) {

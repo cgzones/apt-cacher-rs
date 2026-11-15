@@ -329,13 +329,6 @@ mod tests {
     }
 
     #[test]
-    fn if_none_match_finds_within_cap() {
-        // The matching value is at position 0; well within MAX_IF_NONE_MATCH_ENTRIES.
-        let header = "\"abc\", \"x\", \"y\"";
-        assert!(if_none_match(header, "\"abc\""));
-    }
-
-    #[test]
     fn if_none_match_handles_comma_inside_opaque_tag() {
         // RFC 9110 §8.8.3 etagc includes 0x2C (','), so `"a,b"` is a valid ETag.
         // The split must not treat that comma as a list separator.

@@ -431,6 +431,21 @@ fn classify_mirror_subdir(entry: &Entry<'_, Level>, mirror_path: &str, nested: &
     }
 }
 
+/// Scan the structured mirror `debian` below `cache_root`.
+#[cfg(test)]
+async fn scan_debian(cache_root: &Path, nested: &[String]) -> (WalkOutcome, ScanTotals) {
+    let mirror = cache_root.join("debian");
+    scan_tree(
+        cache_root,
+        &mirror,
+        &MIRROR_WALK,
+        Level::Mirror,
+        "debian",
+        nested,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,15 +484,7 @@ mod tests {
         std::fs::create_dir_all(mirror.join("tmp")).expect("mkdir");
         std::fs::write(mirror.join("foo_1.0_amd64.deb"), b"12345").expect("deb");
         std::fs::write(mirror.join("tmp/bar_1.0_amd64.deb.partial"), b"123").expect("partial");
-        let (_outcome, totals) = scan_tree(
-            dir.path(),
-            &mirror,
-            &MIRROR_WALK,
-            Level::Mirror,
-            "debian",
-            &[],
-        )
-        .await;
+        let (_outcome, totals) = scan_debian(dir.path(), &[]).await;
         assert_eq!((totals.bytes, totals.files), (2 * QUOTA_BLOCK_SIZE, 2));
 
         let flat = dir.path().join("flat");
@@ -508,15 +515,7 @@ mod tests {
         std::fs::write(mirror.join("pool_1.0_amd64.deb.partial"), b"1").expect("misplaced");
         let claim = PartialClaim::acquire(held).expect("unclaimed");
 
-        let (_outcome, totals) = scan_tree(
-            dir.path(),
-            &mirror,
-            &MIRROR_WALK,
-            Level::Mirror,
-            "debian",
-            &[],
-        )
-        .await;
+        let (_outcome, totals) = scan_debian(dir.path(), &[]).await;
         assert_eq!(totals.files, 4);
         assert_eq!(
             (totals.orphaned_files, totals.orphaned_bytes),
@@ -524,15 +523,7 @@ mod tests {
         );
         drop(claim);
 
-        let (_outcome, totals) = scan_tree(
-            dir.path(),
-            &mirror,
-            &MIRROR_WALK,
-            Level::Mirror,
-            "debian",
-            &[],
-        )
-        .await;
+        let (_outcome, totals) = scan_debian(dir.path(), &[]).await;
         assert_eq!(totals.orphaned_files, 2, "released, it is left behind too");
     }
 }
@@ -572,15 +563,7 @@ mod layout_totals_tests {
         file(&mirror.join("dists/sid/main/h"), 100);
         file(&mirror.join("dists/by-hash/SHA256/i"), 100);
         let nested = ["debian/security".to_owned(), "debian/ports/arm".to_owned()];
-        let (outcome, totals) = scan_tree(
-            dir.path(),
-            &mirror,
-            &MIRROR_WALK,
-            Level::Mirror,
-            "debian",
-            &nested,
-        )
-        .await;
+        let (outcome, totals) = scan_debian(dir.path(), &nested).await;
         assert!(matches!(outcome, WalkOutcome::Complete));
         assert_eq!((totals.bytes, totals.files), (5 * QUOTA_BLOCK_SIZE, 5));
         assert_eq!(totals.orphaned_files, 1);
@@ -611,15 +594,7 @@ mod layout_totals_tests {
         file(&outside.path().join("a_1.0_all.deb"), 10);
         std::os::unix::fs::symlink(outside.path(), dir.path().join("debian")).expect("symlink");
         let before = metrics::CACHE_NON_REGULAR.get();
-        let (_outcome, totals) = scan_tree(
-            dir.path(),
-            &dir.path().join("debian"),
-            &MIRROR_WALK,
-            Level::Mirror,
-            "debian",
-            &[],
-        )
-        .await;
+        let (_outcome, totals) = scan_debian(dir.path(), &[]).await;
         assert_eq!((totals.bytes, totals.files), (0, 0));
         assert_eq!(metrics::CACHE_NON_REGULAR.get(), before + 1);
     }

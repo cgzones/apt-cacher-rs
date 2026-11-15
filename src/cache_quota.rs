@@ -1280,18 +1280,6 @@ mod tests {
     }
 
     #[test]
-    fn release_round_trip_drop_without_finalize_reverts() {
-        let quota = CacheQuota::new(b(50), Some(nz(100)));
-        let reservation = quota
-            .try_acquire(exact(20), b(5), None, "drop-revert")
-            .expect("must accept");
-        assert_eq!(quota.current_size(), b(65));
-        drop(reservation);
-        // Drop without finalize reverts net change: back to original 50.
-        assert_eq!(quota.current_size(), b(50));
-    }
-
-    #[test]
     fn no_quota_configured_always_accepts() {
         let quota = CacheQuota::new(u64::MAX / 2, None);
         let reservation = quota

@@ -260,8 +260,8 @@ mod tests {
     use super::*;
     use crate::{
         channel_body::{ChannelBody, ChannelEvent},
-        nonzero, passthrough_limiter,
-        test_support::{connection_details, local_client},
+        nonzero,
+        test_support::{connection_details, passthrough_subject},
         transfer_error::CacheError,
         upstream_head::ContentLength,
     };
@@ -424,18 +424,7 @@ mod tests {
         use crate::rate_checked_body::MaybeRated;
         let inner = MaybeRated::new(http_body_util::Full::new(Bytes::from_static(b"body")), None)
             .into_client_body();
-        let mut body = AccountedBody::new(
-            inner,
-            Subject::Passthrough {
-                host: "passthrough.test".into(),
-                path: "/body".into(),
-                client: local_client(),
-                request_received_at: PreciseInstant::now(),
-                request_sent: PreciseInstant::now(),
-                relay_slot: passthrough_limiter::admit(None, "/body", &local_client())
-                    .expect("uncapped"),
-            },
-        );
+        let mut body = AccountedBody::new(inner, passthrough_subject());
         let before = metrics::SERVED_PASSTHROUGH.get();
         let frame = Pin::new(&mut body)
             .poll_frame(&mut std::task::Context::from_waker(std::task::Waker::noop()));

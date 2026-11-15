@@ -40,9 +40,20 @@ pub(crate) fn connection_details(debname: &str) -> ConnectionDetails {
     }
 }
 
-/// Collect the levels of every event emitted while `f` runs. The delivery
-/// sinks pick their level from `DeliveryFailure::severity`, so a test asserts
-/// the policy by reading the levels back off the subscriber.
+#[cfg(feature = "hyper")]
+pub(crate) fn passthrough_subject() -> crate::accounted_body::Subject {
+    crate::accounted_body::Subject::Passthrough {
+        host: "passthrough.test".into(),
+        path: "/body".into(),
+        client: local_client(),
+        request_received_at: PreciseInstant::now(),
+        request_sent: PreciseInstant::now(),
+        relay_slot: crate::passthrough_limiter::admit(None, "/body", &local_client())
+            .expect("uncapped"),
+    }
+}
+
+/// Collect the levels of every event emitted while `f` runs.
 pub(crate) fn levels_during(f: impl FnOnce()) -> Vec<tracing::Level> {
     use std::sync::Arc;
 

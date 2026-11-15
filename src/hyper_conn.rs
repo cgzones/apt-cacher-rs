@@ -3250,7 +3250,7 @@ fn log_client_connection_error(client: ClientInfo, err: &hyper::Error) {
 
 #[cfg(test)]
 mod tests {
-    use super::{LoggedHeaderValue, SchemeDecision, UpgradeProbe, Uri, host_header_from_uri};
+    use super::{LoggedHeaderValue, Uri, host_header_from_uri};
     use crate::{
         cache_layout::CachedFlavor, upstream_head::FetchMode, xattr_helpers::XattrValue as _,
     };
@@ -3773,55 +3773,16 @@ mod tests {
         assert!(big.iter().all(|&len| len <= 4096), "{big:?}");
     }
 
-    /// Only an uncached `Auto` decision may fall back to the original
-    /// scheme; `Always` probes without a fallback, and a fixed scheme is no
-    /// probe at all. The metrics identity
-    /// `ATTEMPTED == SUCCEEDED + REVERTED + FAILED` rests on this mapping.
     #[test]
-    fn upgrade_probe_of_decision() {
-        assert_eq!(
-            UpgradeProbe::of(SchemeDecision::Http),
-            UpgradeProbe::NotProbing
-        );
-        assert_eq!(
-            UpgradeProbe::of(SchemeDecision::Https),
-            UpgradeProbe::NotProbing
-        );
-        assert_eq!(
-            UpgradeProbe::of(SchemeDecision::AutoUpgrade),
-            UpgradeProbe::Revertible
-        );
-        assert_eq!(
-            UpgradeProbe::of(SchemeDecision::AlwaysUpgrade),
-            UpgradeProbe::Committed
-        );
-
-        assert!(!UpgradeProbe::NotProbing.is_probing());
-        assert!(UpgradeProbe::Revertible.is_probing());
-        assert!(UpgradeProbe::Committed.is_probing());
-    }
-
-    #[test]
-    fn host_header_from_uri_plain_host() {
-        let uri: Uri = "http://deb.debian.org/foo".parse().unwrap();
-        assert_eq!(host_header_from_uri(&uri), "deb.debian.org");
-    }
-
-    #[test]
-    fn host_header_from_uri_with_port() {
-        let uri: Uri = "http://mirror.example.com:8080/foo".parse().unwrap();
-        assert_eq!(host_header_from_uri(&uri), "mirror.example.com:8080");
-    }
-
-    #[test]
-    fn host_header_from_uri_ipv6_bracketed() {
-        let uri: Uri = "http://[2001:db8::1]/foo".parse().unwrap();
-        assert_eq!(host_header_from_uri(&uri), "[2001:db8::1]");
-    }
-
-    #[test]
-    fn host_header_from_uri_drops_the_http_default_port() {
+    fn host_header_from_uri_keeps_brackets_and_drops_the_http_default_port() {
         for (uri, host) in [
+            ("http://deb.debian.org/foo", "deb.debian.org"),
+            (
+                "http://mirror.example.com:8080/foo",
+                "mirror.example.com:8080",
+            ),
+            ("http://[2001:db8::1]/foo", "[2001:db8::1]"),
+            ("http://[2001:db8::1]:8080/foo", "[2001:db8::1]:8080"),
             ("http://deb.debian.org:80/foo", "deb.debian.org"),
             ("http://[2001:db8::1]:80/foo", "[2001:db8::1]"),
             ("https://deb.debian.org:80/foo", "deb.debian.org:80"),
@@ -3829,11 +3790,5 @@ mod tests {
             let uri: Uri = uri.parse().unwrap();
             assert_eq!(host_header_from_uri(&uri), host, "{uri}");
         }
-    }
-
-    #[test]
-    fn host_header_from_uri_ipv6_with_port() {
-        let uri: Uri = "http://[2001:db8::1]:8080/foo".parse().unwrap();
-        assert_eq!(host_header_from_uri(&uri), "[2001:db8::1]:8080");
     }
 }

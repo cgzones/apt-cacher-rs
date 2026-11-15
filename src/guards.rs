@@ -1149,15 +1149,14 @@ mod tests {
         let active = ActiveDownloads::new();
         let key = key("declined.deb");
         let details = details_for(&key);
-        let origination = active.originate_uncapped(key.as_ref());
-        let status = Arc::clone(&origination.status);
-        let mut barrier = InitBarrier::new(origination, active.clone(), &details, "/declined.deb");
         let aborted = metrics::DOWNLOADS_ABORTED.get();
         let declined = metrics::DOWNLOADS_DECLINED.get();
-        let _settled = barrier
-            .decline(Declined::Passthrough(http::StatusCode::NOT_FOUND))
-            .await;
-        drop(barrier);
+        let status = decline(
+            &active,
+            &key,
+            Declined::Passthrough(http::StatusCode::NOT_FOUND),
+        )
+        .await;
         assert_eq!(metrics::DOWNLOADS_ABORTED.get(), aborted);
         assert!(metrics::DOWNLOADS_DECLINED.get() > declined);
         assert_eq!(active.len(), 0, "the declined entry is retired");
@@ -1180,15 +1179,7 @@ mod tests {
         let active = ActiveDownloads::new();
         let key = key("throttled.deb");
         let details = details_for(&key);
-        let origination = active.originate_uncapped(key.as_ref());
-        let status = Arc::clone(&origination.status);
-        let mut barrier = InitBarrier::new(origination, active.clone(), &details, "/throttled.deb");
-        let _settled = barrier
-            .decline(Declined::VerifyThrottled {
-                remaining: std::time::Duration::from_secs(5),
-            })
-            .await;
-        drop(barrier);
+        let status = decline(&active, &key, THROTTLED).await;
         let rejected = metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.get();
         let failure = await_serveable(&status, &details).await.err();
         assert!(
@@ -1214,20 +1205,7 @@ mod tests {
         let active = ActiveDownloads::new();
         let key = key("cleanup-throttled.deb");
         let details = details_for(&key);
-        let origination = active.originate_uncapped(key.as_ref());
-        let status = Arc::clone(&origination.status);
-        let mut barrier = InitBarrier::new(
-            origination,
-            active.clone(),
-            &details,
-            "/cleanup-throttled.deb",
-        );
-        let _settled = barrier
-            .decline(Declined::VerifyThrottled {
-                remaining: std::time::Duration::from_secs(5),
-            })
-            .await;
-        drop(barrier);
+        let status = decline(&active, &key, THROTTLED).await;
         let cleanup = ConnectionDetails {
             client: ClientInfo::new_cleanup(),
             ..details_for(&key)
@@ -1356,6 +1334,30 @@ mod tests {
             resource_kind: ResourceKind::Pool,
             origin_fields: None,
         }
+    }
+
+    const THROTTLED: Declined = Declined::VerifyThrottled {
+        remaining: std::time::Duration::from_secs(5),
+    };
+
+    /// Originate `key` and decline it with `why`; returns the status its
+    /// joiners wait on.
+    async fn decline(
+        active: &ActiveDownloads,
+        key: &CacheEntryKey,
+        why: Declined,
+    ) -> Arc<tokio::sync::RwLock<ActiveDownloadStatus>> {
+        let origination = active.originate_uncapped(key.as_ref());
+        let status = Arc::clone(&origination.status);
+        let mut barrier = InitBarrier::new(
+            origination,
+            active.clone(),
+            &details_for(key),
+            "/debian/pool/test.deb",
+        );
+        let _settled = barrier.decline(why).await;
+        drop(barrier);
+        status
     }
 
     async fn downloading(active: &ActiveDownloads, key: &CacheEntryKey) -> DownloadBarrier {

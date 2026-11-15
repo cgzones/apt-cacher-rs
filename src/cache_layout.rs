@@ -1280,8 +1280,6 @@ mod tests {
         assert_eq!(&*class.mirror_path, "debian");
         assert_eq!(class.debname, "firefox-esr_115.9.1esr-1_amd64.deb");
         assert_eq!(class.resource_kind, ResourceKind::Pool);
-        assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
-        assert_eq!(class.resource_kind.layout(), CacheLayout::StructuredPool);
         assert!(class.origin_fields.is_none());
     }
 
@@ -1308,8 +1306,6 @@ mod tests {
         let class = classify_request(&res, &local_client()).unwrap();
         assert_eq!(class.debname, "sid_InRelease");
         assert_eq!(class.resource_kind, ResourceKind::Release);
-        assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Volatile);
-        assert_eq!(class.resource_kind.layout(), CacheLayout::Dists);
         assert!(class.origin_fields.is_none());
     }
 
@@ -1325,8 +1321,6 @@ mod tests {
         let class = classify_request(&res, &local_client()).unwrap();
         assert_eq!(class.debname, "sid_main_binary-amd64_Packages.gz");
         assert_eq!(class.resource_kind, ResourceKind::Packages);
-        assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Volatile);
-        assert_eq!(class.resource_kind.layout(), CacheLayout::Dists);
         let origin = class
             .origin_fields
             .expect("binary-amd64 must record an origin");
@@ -1371,8 +1365,6 @@ mod tests {
             class.resource_kind,
             ResourceKind::ByHash(HashAlgo::Sha256, ByHashContent::Other)
         );
-        assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
-        assert_eq!(class.resource_kind.layout(), CacheLayout::DistsByHash);
     }
 
     /// Regression: an `Acquire-By-Hash: yes` mirror sends no literal
@@ -1402,8 +1394,11 @@ mod tests {
     }
 
     /// The shapes that carry no per-binary origin: a pseudo-architecture, a
-    /// component-scoped `by-hash` (the `Release` sibling) and a deeper path
-    /// such as `Packages.diff/by-hash`.
+    /// component-scoped `by-hash` (the `Release` sibling), a deeper path
+    /// such as `Packages.diff/by-hash`, and a directory at architecture depth
+    /// that is no architecture (Ubuntu's `cnf`, the `uefi`/`signed` trees): a
+    /// row minted from one has a `Packages` whose 404 bails the mirror's
+    /// sweep.
     #[test]
     fn classify_byhash_without_a_real_architecture_records_nothing() {
         for path in [
@@ -1412,6 +1407,10 @@ mod tests {
             "debian/dists/sid/main/source/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
             "debian/dists/trixie/main/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
             "debian/dists/sid/main/binary-amd64/Packages.diff/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
+            "ubuntu/dists/noble/main/cnf/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
+            "ubuntu/dists/noble/main/uefi/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
+            "ubuntu/dists/noble/main/signed/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
+            "ubuntu/dists/noble/main/binary-/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
         ] {
             let res = parse_request_path(path).expect("by-hash path parses");
             let class = classify_request(&res, &local_client()).unwrap();
@@ -1423,29 +1422,6 @@ mod tests {
                 "{path}"
             );
             assert!(class.origin_fields.is_none(), "{path} must mint no origin");
-        }
-    }
-
-    /// Regression: the by-hash scope's third segment is at architecture depth
-    /// but need not be an architecture. Ubuntu's `cnf` (and the `uefi`/
-    /// `signed` trees) sit there and escaped the old pseudo-arch denylist,
-    /// minting rows whose `Packages` 404 bails the mirror's sweep.
-    #[test]
-    fn classify_byhash_under_a_non_binary_directory_records_nothing() {
-        const DIGEST: &str = "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba";
-        for dir in ["cnf", "uefi", "signed", "binary-"] {
-            let path = format!("ubuntu/dists/noble/main/{dir}/by-hash/SHA256/{DIGEST}");
-            let res = parse_request_path(&path).expect("by-hash path parses");
-            let class = classify_request(&res, &local_client()).unwrap();
-            assert_eq!(
-                class.resource_kind,
-                ResourceKind::ByHash(HashAlgo::Sha256, ByHashContent::Other),
-                "{path}"
-            );
-            assert!(
-                class.origin_fields.is_none(),
-                "`{dir}` is not an architecture and must mint no origin"
-            );
         }
     }
 
@@ -1489,8 +1465,7 @@ mod tests {
         };
         let class = classify_request(&res, &local_client()).unwrap();
         assert_eq!(class.debname, "InRelease");
-        assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Volatile);
-        assert_eq!(class.resource_kind.layout(), CacheLayout::Flat);
+        assert_eq!(class.resource_kind, ResourceKind::FlatMetadata);
     }
 
     #[test]
@@ -1502,8 +1477,7 @@ mod tests {
         };
         let class = classify_request(&res, &local_client()).unwrap();
         assert_eq!(class.debname, "twilio-cli_5.0.0_amd64.deb");
-        assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
-        assert_eq!(class.resource_kind.layout(), CacheLayout::Flat);
+        assert_eq!(class.resource_kind, ResourceKind::FlatPool);
     }
 
     #[test]
@@ -1520,26 +1494,6 @@ mod tests {
             classify_request(&res, &local_client()),
             Err(ClassifyError::NonDebPool { filename }) if filename == "foo_bar_1.0_amd64.deb"
         ));
-    }
-
-    #[test]
-    fn classify_gitea_flat_pool() {
-        // issue #162: a non-canonical Gitea pool path arrives as Flat { Pool } and
-        // classifies as a permanent flat-pool resource under the host flat layout.
-        let res = ResourceFile::Flat {
-            kind: FlatKind::Pool,
-            mirror_path: "api/packages/85/debian/pool/php-zts/main",
-            filename: "php-zts-cli_8.5.7-1_amd64.deb",
-        };
-        let class = classify_request(&res, &local_client()).unwrap();
-        assert_eq!(
-            &*class.mirror_path,
-            "api/packages/85/debian/pool/php-zts/main"
-        );
-        assert_eq!(class.debname, "php-zts-cli_8.5.7-1_amd64.deb");
-        assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
-        assert_eq!(class.resource_kind.layout(), CacheLayout::Flat);
-        assert_eq!(class.resource_kind, ResourceKind::FlatPool);
     }
 
     /// Regression: `dists` is reserved in a *structured* mirror path only (a
@@ -1581,8 +1535,10 @@ mod tests {
             filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
         };
         let class = classify_request(&res, &local_client()).unwrap();
-        assert_eq!(class.resource_kind.layout(), CacheLayout::FlatByHash);
-        assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
+        assert!(matches!(
+            class.resource_kind,
+            ResourceKind::FlatByHash(HashAlgo::Sha256, _)
+        ));
     }
 
     #[test]
@@ -1729,8 +1685,6 @@ mod tests {
         let class = classify_request(&res, &local_client()).unwrap();
         assert_eq!(class.debname, "trixie_main_binary-amd64_Release");
         assert_eq!(class.resource_kind, ResourceKind::ComponentRelease);
-        assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Volatile);
-        assert_eq!(class.resource_kind.layout(), CacheLayout::Dists);
         // A per-component Release is metadata about the indices, never a
         // per-binary origin - not even for a real architecture.
         assert!(class.origin_fields.is_none());

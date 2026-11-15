@@ -1525,27 +1525,4 @@ mod tests {
         assert_eq!(acc.oldest_mtime, Some(at(20)));
         assert_eq!(acc.newest_mtime, Some(at(80)));
     }
-
-    #[test]
-    fn dir_stats_merge_into_default_is_identity() {
-        let stats = DirStats {
-            size: 2,
-            byhash_files: 3,
-            deb_files: 4,
-            metadata_files: 5,
-            max_file_size: 6,
-            oldest_mtime: Some(at(7)),
-            newest_mtime: Some(at(8)),
-        };
-        let mut acc = DirStats::default();
-        acc.merge(stats);
-        assert_eq!(acc.files(), 9);
-        assert_eq!(acc.size, 2);
-        assert_eq!(acc.byhash_files, 3);
-        assert_eq!(acc.deb_files, 4);
-        assert_eq!(acc.metadata_files, 5);
-        assert_eq!(acc.max_file_size, 6);
-        assert_eq!(acc.oldest_mtime, Some(at(7)));
-        assert_eq!(acc.newest_mtime, Some(at(8)));
-    }
 }

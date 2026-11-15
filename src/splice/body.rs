@@ -691,58 +691,6 @@ impl CacheWriterRef<'_, CacheBatch<BufferSink>> {
     }
 }
 
-#[cfg(test)]
-impl CacheWriter {
-    async fn flush_if_due(&mut self) -> Result<(), DownloadFailure> {
-        self.view().flush_if_due().await
-    }
-    async fn write_through(&mut self) -> Result<(), DownloadFailure> {
-        let Self { core, sink } = self;
-        match sink {
-            CacheSink::Pipes(pipes) => CacheWriterRef { core, sink: pipes }.write_through().await,
-            CacheSink::Direct | CacheSink::Buffer(_) => {
-                Err(InternalError::invalid("test pipe writer", "unexpected sink").into())
-            }
-        }
-    }
-
-    fn pipes(&self) -> &SplicePipes {
-        match &self.sink {
-            CacheSink::Pipes(pipes) => Some(pipes),
-            CacheSink::Direct | CacheSink::Buffer(_) => None,
-        }
-        .expect("the splice loop installed its pipes")
-    }
-
-    fn pipes_mut(&mut self) -> &mut SplicePipes {
-        match &mut self.sink {
-            CacheSink::Pipes(pipes) => Some(pipes),
-            CacheSink::Direct | CacheSink::Buffer(_) => None,
-        }
-        .expect("the splice loop installed its pipes")
-    }
-
-    fn batch(&self) -> &CacheBatch<PipeSink> {
-        &self.pipes().cache
-    }
-
-    fn buffer(&self) -> &CacheBatch<BufferSink> {
-        match &self.sink {
-            CacheSink::Buffer(batch) => Some(batch),
-            CacheSink::Direct | CacheSink::Pipes(_) => None,
-        }
-        .expect("the userspace loop installed its buffer")
-    }
-
-    fn buffer_mut(&mut self) -> &mut CacheBatch<BufferSink> {
-        match &mut self.sink {
-            CacheSink::Buffer(batch) => Some(batch),
-            CacheSink::Direct | CacheSink::Pipes(_) => None,
-        }
-        .expect("the userspace loop installed its buffer")
-    }
-}
-
 /// The demotion floor: an attached client reading far below what its mirror
 /// has delivered is demoted even while it stays above `min_download_rate`.
 ///
@@ -2695,11 +2643,8 @@ async fn drain_pipe_to_file(
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::local_client;
-    use std::{
-        os::fd::AsRawFd as _,
-        task::{Context, Waker},
-    };
+    use crate::test_support::{connection_details, local_client};
+    use std::task::{Context, Waker};
 
     use super::*;
     use crate::{active_downloads::AbortReason, guards::Consequence};
@@ -2728,19 +2673,6 @@ mod tests {
         let before = metrics::CLIENT_DISCONNECTED_MID_BODY.get();
         let _reported = failure.conclude(None, format_args!("zero-length client splice"));
         assert_eq!(metrics::CLIENT_DISCONNECTED_MID_BODY.get(), before);
-    }
-
-    #[tokio::test]
-    async fn test_create_pipe() {
-        use tokio::io::AsyncWriteExt as _;
-
-        let (mut tx, mut rx) = create_pipe().expect("pipe creation should succeed");
-        assert_ne!(rx.as_raw_fd(), tx.as_raw_fd());
-        // The two ends are wired to each other.
-        tx.write_all(b"ping").await.expect("write into the pipe");
-        let mut got = [0u8; 4];
-        rx.read_exact(&mut got).await.expect("read from the pipe");
-        assert_eq!(&got, b"ping");
     }
 
     #[tokio::test]
@@ -3019,24 +2951,11 @@ mod tests {
 
     async fn cache_barrier(path: &Path) -> DownloadBarrier {
         use crate::{
-            active_downloads::ActiveDownloads,
-            cache_layout::{ConnectionDetails, ResourceKind},
-            cache_metadata::UpstreamMetadata,
-            cache_quota::CacheQuota,
-            guards::InitBarrier,
-            upstream_head::ContentLength,
+            active_downloads::ActiveDownloads, cache_metadata::UpstreamMetadata,
+            cache_quota::CacheQuota, guards::InitBarrier, upstream_head::ContentLength,
         };
         let active = ActiveDownloads::new();
-        let mirror = crate::test_support::structured_mirror("writer.test", "/debian");
-        let details = ConnectionDetails {
-            client: local_client(),
-            request_received_at: crate::precise_instant::PreciseInstant::now(),
-            upstream_host: mirror.host().clone(),
-            mirror,
-            debname: "writer.deb".into(),
-            resource_kind: ResourceKind::Pool,
-            origin_fields: None,
-        };
+        let details = connection_details("writer.deb");
         let origination = active.originate_uncapped(details.key());
         let length = ContentLength::Exact(NonZero::new(1024 * 1024).unwrap());
         let quota = CacheQuota::new(0, None)
@@ -3236,20 +3155,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn resumed_prefix_uses_original_descriptor_and_preserves_cursor() {
         use crate::cache_conditional::ServeParams;
-        use crate::cache_layout::{ConnectionDetails, ResourceKind};
         use tokio::io::AsyncSeekExt as _;
 
         install_sendfile_config();
-        let mirror = crate::test_support::structured_mirror("writer.test", "/debian");
-        let details = ConnectionDetails {
-            client: local_client(),
-            request_received_at: crate::precise_instant::PreciseInstant::now(),
-            upstream_host: mirror.host().clone(),
-            mirror,
-            debname: "writer.deb".into(),
-            resource_kind: ResourceKind::Pool,
-            origin_fields: None,
-        };
+        let details = connection_details("writer.deb");
         for replace in [false, true] {
             let mut scratch = ScratchFile::new();
             std::fs::write(&scratch.path, b"0123456789").unwrap();
@@ -3606,14 +3515,14 @@ mod tests {
         )
         .await
         .unwrap();
-        writer.sink = CacheSink::Pipes(SplicePipes::new().unwrap());
-        queue_cache(writer.pipes_mut(), b"first").await;
-        writer.flush_if_due().await.unwrap();
+        let mut view = pipes_view(&mut writer);
+        queue_cache(view.pipes_mut(), b"first").await;
+        view.flush_if_due().await.unwrap();
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"first");
-        queue_cache(writer.pipes_mut(), b"second").await;
-        writer.flush_if_due().await.unwrap();
+        queue_cache(view.pipes_mut(), b"second").await;
+        view.flush_if_due().await.unwrap();
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"first");
-        assert_eq!(writer.batch().pending, 6);
+        assert_eq!(view.batch().pending, 6);
         let drained = writer.drain().await.expect("drained pending pipe batch");
         let (_file, _digest) = writer.finished(drained).into_parts();
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"firstsecond");
@@ -3663,9 +3572,9 @@ mod tests {
         )
         .await
         .unwrap();
-        writer.sink = CacheSink::Buffer(CacheBatch::with_sink(BufferSink::new(7)));
-        writer.buffer_mut().sink.buf.extend_from_slice(b"pending");
-        writer.buffer_mut().queue(7);
+        let mut view = buffer_view(&mut writer, 7);
+        view.buffer_mut().sink.buf.extend_from_slice(b"pending");
+        view.buffer_mut().queue(7);
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"");
         let drained = writer.drain().await.expect("drained pending buffer");
         let (_file, digest) = writer.finished(drained).into_parts();
@@ -3708,9 +3617,7 @@ mod tests {
         .await
         .unwrap();
         writer.write_prefix(prefix).await.unwrap();
-        writer.sink = CacheSink::Buffer(CacheBatch::with_sink(BufferSink::new(
-            u64::try_from(body.len()).unwrap(),
-        )));
+        let mut view = buffer_view(&mut writer, u64::try_from(body.len()).unwrap());
 
         let mut sent = 0;
         let mut reads = 0;
@@ -3720,40 +3627,39 @@ mod tests {
         while sent < body.len() {
             // The loop's make-room step, as in `drive_reads` -- skipped
             // after a stale flush, which continues the accumulation instead.
-            if writer.buffer().sink.is_full() {
-                writer.flush().await.unwrap();
+            if view.buffer().sink.is_full() {
+                view.flush().await.unwrap();
             }
             if stale_flushed {
                 stale_flushed = false;
-                if writer.buffer().sink.landed != 0 {
+                if view.buffer().sink.landed != 0 {
                     landed_mid_buffer += 1;
                 }
             } else {
-                let before = writer.buffer().sink.buf.len();
-                writer.buffer_mut().sink.recycle();
-                if before != 0 && writer.buffer().sink.buf.is_empty() {
+                let before = view.buffer().sink.buf.len();
+                view.buffer_mut().sink.recycle();
+                if before != 0 && view.buffer().sink.buf.is_empty() {
                     recycled += 1;
                 }
             }
             // One read, capped at the room left in the batch.
-            let room = BufferSink::CAPACITY - writer.buffer().sink.buf.len();
+            let room = BufferSink::CAPACITY - view.buffer().sink.buf.len();
             let got = READ.min(room).min(body.len() - sent);
-            writer
-                .buffer_mut()
+            view.buffer_mut()
                 .sink
                 .buf
                 .extend_from_slice(&body[sent..sent + got]);
             sent += got;
             reads += 1;
-            writer.buffer_mut().queue(got);
-            writer.flush_if_due().await.unwrap();
+            view.buffer_mut().queue(got);
+            view.flush_if_due().await.unwrap();
             // A stale-batch flush below the threshold every few reads.
             if reads % 5 == 0 {
-                writer.flush().await.unwrap();
+                view.flush().await.unwrap();
                 stale_flushed = true;
             }
         }
-        writer.flush().await.unwrap();
+        view.flush().await.unwrap();
         assert!(recycled >= 2, "the buffer wrapped: {recycled}");
         assert!(
             landed_mid_buffer >= 2,
@@ -3847,13 +3753,34 @@ mod tests {
         )
         .await
         .unwrap();
-        writer.sink = CacheSink::Pipes(SplicePipes::new().unwrap());
-        accumulate(writer.pipes_mut(), b"tail");
-        writer.write_through().await.unwrap();
+        let mut view = pipes_view(&mut writer);
+        accumulate(view.pipes_mut(), b"tail");
+        view.write_through().await.unwrap();
         drop(writer);
         let mut expected = prefix;
         expected.extend_from_slice(b"tail");
         assert_eq!(std::fs::read(&scratch.path).unwrap(), expected);
+    }
+
+    fn pipes_view(writer: &mut CacheWriter) -> CacheWriterRef<'_, SplicePipes> {
+        writer.sink = CacheSink::Pipes(SplicePipes::new().unwrap());
+        let CacheWriter { core, sink } = writer;
+        let CacheSink::Pipes(pipes) = sink else {
+            unreachable!("just installed")
+        };
+        CacheWriterRef { core, sink: pipes }
+    }
+
+    fn buffer_view(
+        writer: &mut CacheWriter,
+        body_len: u64,
+    ) -> CacheWriterRef<'_, CacheBatch<BufferSink>> {
+        writer.sink = CacheSink::Buffer(CacheBatch::with_sink(BufferSink::new(body_len)));
+        let CacheWriter { core, sink } = writer;
+        let CacheSink::Buffer(batch) = sink else {
+            unreachable!("just installed")
+        };
+        CacheWriterRef { core, sink: batch }
     }
 
     /// Feed the actual receive operation so salvageability does not rely on
@@ -4014,104 +3941,32 @@ mod tests {
     }
 
     #[test]
-    fn test_range_slice_no_overlap_before() {
-        let buf = &[10, 20, 30, 40, 50];
-        // buf covers file bytes [100, 105), range is [0, 50) — no overlap
-        assert_eq!(range_slice(buf, 100, 0, 50), &[] as &[u8]);
-    }
-
-    #[test]
-    fn test_range_slice_no_overlap_after() {
-        let buf = &[10, 20, 30, 40, 50];
-        // buf covers [100, 105), range is [200, 50) — no overlap
-        assert_eq!(range_slice(buf, 100, 200, 50), &[] as &[u8]);
-    }
-
-    #[test]
-    fn test_range_slice_full_overlap() {
-        let buf = &[10, 20, 30, 40, 50];
-        // buf covers [100, 105), range is [0, 200) — buf entirely inside range
-        assert_eq!(range_slice(buf, 100, 0, 200), buf);
-    }
-
-    #[test]
-    fn test_range_slice_exact_match() {
-        let buf = &[10, 20, 30, 40, 50];
-        // buf covers [100, 105), range is [100, 5) — exact match
-        assert_eq!(range_slice(buf, 100, 100, 5), buf);
-    }
-
-    #[test]
-    fn test_range_slice_partial_start() {
-        let buf = &[10, 20, 30, 40, 50];
-        // buf covers [100, 105), range starts at 102 — skip first 2 bytes
-        assert_eq!(range_slice(buf, 100, 102, 100), &[30, 40, 50]);
-    }
-
-    #[test]
-    fn test_range_slice_partial_end() {
-        let buf = &[10, 20, 30, 40, 50];
-        // buf covers [100, 105), range is [0, 103) — only first 3 bytes overlap
-        assert_eq!(range_slice(buf, 100, 0, 103), &[10, 20, 30]);
-    }
-
-    #[test]
-    fn test_range_slice_partial_both_ends() {
-        let buf = &[10, 20, 30, 40, 50];
-        // buf covers [100, 105), range is [101, 3) = [101, 104) — middle 3 bytes
-        assert_eq!(range_slice(buf, 100, 101, 3), &[20, 30, 40]);
-    }
-
-    #[test]
-    fn test_range_slice_single_byte() {
-        let buf = &[10, 20, 30, 40, 50];
-        // range is [102, 1) = [102, 103) — single byte at offset 2
-        assert_eq!(range_slice(buf, 100, 102, 1), &[30]);
-    }
-
-    #[test]
-    fn test_range_slice_zero_length_range() {
-        let buf = &[10, 20, 30, 40, 50];
-        // zero-length range
-        assert_eq!(range_slice(buf, 100, 102, 0), &[] as &[u8]);
-    }
-
-    #[test]
-    fn test_range_slice_empty_buf() {
-        let buf: &[u8] = &[];
-        assert_eq!(range_slice(buf, 100, 100, 50), &[] as &[u8]);
-    }
-
-    #[test]
-    fn test_range_slice_adjacent_no_overlap() {
-        let buf = &[10, 20, 30];
-        // buf covers [100, 103), range is [103, 5) — adjacent, no overlap
-        assert_eq!(range_slice(buf, 100, 103, 5), &[] as &[u8]);
-        // range is [97, 3) = [97, 100) — adjacent before, no overlap
-        assert_eq!(range_slice(buf, 100, 97, 3), &[] as &[u8]);
-    }
-
-    #[test]
-    fn test_range_slice_one_byte_overlap_at_boundary() {
-        let buf = &[10, 20, 30];
-        // buf covers [100, 103), range is [102, 5) = [102, 107) — 1 byte overlap at end
-        assert_eq!(range_slice(buf, 100, 102, 5), &[30]);
-        // range is [99, 2) = [99, 101) — 1 byte overlap at start
-        assert_eq!(range_slice(buf, 100, 99, 2), &[10]);
-    }
-
-    #[test]
-    fn test_dev_null_accessor_returns_writable_fd() {
-        use std::os::fd::AsRawFd as _;
-        let f1 = dev_null().expect("first call should open /dev/null");
-        let f2 = dev_null().expect("second call should reuse cached fd");
-        // Same underlying fd both calls (OnceLock returns the cached File).
-        assert_eq!(f1.as_raw_fd(), f2.as_raw_fd());
-        assert_eq!(
-            nix::unistd::write(f1, b"x"),
-            Ok(1),
-            "the cached /dev/null fd must be open for writing"
-        );
+    fn range_slice_clips_a_chunk_to_the_client_range() {
+        let buf: &[u8] = &[10, 20, 30, 40, 50];
+        // (chunk, range start, range length, expected); every chunk starts at file offset 100.
+        let cases: &[(&[u8], u64, u64, &[u8])] = &[
+            (buf, 0, 50, &[]),
+            (buf, 200, 50, &[]),
+            (buf, 0, 200, buf),
+            (buf, 100, 5, buf),
+            (buf, 102, 100, &[30, 40, 50]),
+            (buf, 0, 103, &[10, 20, 30]),
+            (buf, 101, 3, &[20, 30, 40]),
+            (buf, 102, 1, &[30]),
+            (buf, 102, 0, &[]),
+            (&[], 100, 50, &[]),
+            (&buf[..3], 103, 5, &[]),
+            (&buf[..3], 97, 3, &[]),
+            (&buf[..3], 102, 5, &[30]),
+            (&buf[..3], 99, 2, &[10]),
+        ];
+        for &(chunk, start, len, expected) in cases {
+            assert_eq!(
+                range_slice(chunk, 100, start, len),
+                expected,
+                "chunk {chunk:?}, range start {start}, length {len}"
+            );
+        }
     }
 
     #[test]
