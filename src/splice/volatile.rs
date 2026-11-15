@@ -246,15 +246,25 @@ async fn serve_buffered(
     // Cork to coalesce headers + body into fewer TCP segments.
     let cork = CorkGuard::new_optional(client.stream);
 
-    let written = write_buffered_response(
-        client,
-        conn_details,
-        upstream_resp,
-        range_plan,
-        validators,
-        body,
-        rates,
-    )
+    let written = async {
+        rates.t_client_first = write_splice_response_headers(
+            client,
+            conn_details,
+            upstream_resp,
+            range_plan,
+            validators,
+            HEAD_PHASE,
+        )
+        .await
+        .map_err(|failure| conclude_write(conn_details, HEAD_PHASE, failure))?;
+
+        #[expect(clippy::cast_possible_truncation, reason = "body capped at 1 MiB")]
+        let body_slice =
+            &body[range_plan.content_start() as usize..range_plan.content_end() as usize];
+        write_client_bytes(client.stream, body_slice, rates)
+            .await
+            .map_err(|err| conclude_write(conn_details, BODY_PHASE, DeliveryFailure::from(err)))
+    }
     .await;
     rates.t_client_done = PreciseInstant::now();
 
@@ -273,33 +283,4 @@ fn conclude_write(
         "splice proxy: failed to write {phase} to client {} for {} from mirror {}; closing the connection",
         conn_details.client, conn_details.debname, conn_details.mirror,
     ))
-}
-
-/// The two client writes of [`serve_buffered`], split out so that function
-/// can time and uncork both exits in one place.
-async fn write_buffered_response(
-    client: ClientConn<'_>,
-    conn_details: &ConnectionDetails,
-    upstream_resp: &UpstreamResponse,
-    range_plan: &ServeParams,
-    validators: &HeadValidators,
-    body: &[u8],
-    rates: &mut RateTimestamps,
-) -> Result<(), ReportedDelivery> {
-    rates.t_client_first = write_splice_response_headers(
-        client,
-        conn_details,
-        upstream_resp,
-        range_plan,
-        validators,
-        HEAD_PHASE,
-    )
-    .await
-    .map_err(|failure| conclude_write(conn_details, HEAD_PHASE, failure))?;
-
-    #[expect(clippy::cast_possible_truncation, reason = "body capped at 1 MiB")]
-    let body_slice = &body[range_plan.content_start() as usize..range_plan.content_end() as usize];
-    write_client_bytes(client.stream, body_slice, rates)
-        .await
-        .map_err(|err| conclude_write(conn_details, BODY_PHASE, DeliveryFailure::from(err)))
 }
