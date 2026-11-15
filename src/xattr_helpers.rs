@@ -8,8 +8,9 @@
 //!
 //! # Blocking
 //!
-//! Every [`XattrTarget`] issues its syscall directly. The [`std::fs::File`]
-//! impl is for callers already on a blocking thread; [`XattrFile`] wraps a
+//! Every [`XattrTarget`] issues its syscall directly. The blanket impl (any
+//! [`xattr::FileExt`], such as a [`std::fs::File`]) is for callers already
+//! on a blocking thread; [`XattrFile`] wraps a
 //! tokio file for a caller that enters one [`tokio::task::block_in_place`]
 //! section around all the operations it batches on that file (which needs
 //! a multi-threaded runtime).
@@ -24,7 +25,6 @@ use std::{
 
 use nix::libc;
 use tracing::warn;
-use xattr::FileExt as _;
 
 use crate::{error::ErrorReport, log_once::warn_once_or_info_gated, warn_once_or_debug};
 
@@ -47,38 +47,7 @@ pub(crate) trait XattrTarget {
     fn remove(&self, key: &'static str) -> io::Result<()>;
 }
 
-/// Test-only: each syscall demotes the worker on its own, which production
-/// code batches through [`XattrFile`] instead.
-#[cfg(test)]
-impl XattrTarget for tokio::fs::File {
-    fn get(&self, key: &'static str) -> io::Result<Option<Vec<u8>>> {
-        tokio::task::block_in_place(|| XattrFile(self).get_xattr(key))
-    }
-
-    fn set(&self, key: &'static str, value: &[u8]) -> io::Result<()> {
-        tokio::task::block_in_place(|| XattrFile(self).set_xattr(key, value))
-    }
-
-    fn remove(&self, key: &'static str) -> io::Result<()> {
-        tokio::task::block_in_place(|| XattrFile(self).remove_xattr(key))
-    }
-}
-
-impl XattrTarget for XattrFile<'_> {
-    fn get(&self, key: &'static str) -> io::Result<Option<Vec<u8>>> {
-        self.get_xattr(key)
-    }
-
-    fn set(&self, key: &'static str, value: &[u8]) -> io::Result<()> {
-        self.set_xattr(key, value)
-    }
-
-    fn remove(&self, key: &'static str) -> io::Result<()> {
-        self.remove_xattr(key)
-    }
-}
-
-impl XattrTarget for std::fs::File {
+impl<T: xattr::FileExt> XattrTarget for T {
     fn get(&self, key: &'static str) -> io::Result<Option<Vec<u8>>> {
         self.get_xattr(key)
     }
@@ -288,6 +257,8 @@ impl XattrValue for ExpectedSize {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use xattr::FileExt as _;
+
     use super::*;
     use crate::test_support::levels_during;
 
@@ -425,9 +396,9 @@ pub(crate) mod tests {
         if !supports_user_xattrs(&path) {
             return;
         }
-        write(&file, &path, &ExpectedSize(1_071_434_820));
+        write(&XattrFile(&file), &path, &ExpectedSize(1_071_434_820));
         assert_eq!(
-            read::<ExpectedSize>(&file, &path),
+            read::<ExpectedSize>(&XattrFile(&file), &path),
             Some(ExpectedSize(1_071_434_820))
         );
     }
@@ -438,6 +409,6 @@ pub(crate) mod tests {
         let path = dir.path().join("probe");
         let file = tokio::fs::File::create(&path).await.expect("create file");
 
-        assert_eq!(read::<ExpectedSize>(&file, &path), None);
+        assert_eq!(read::<ExpectedSize>(&XattrFile(&file), &path), None);
     }
 }

@@ -197,26 +197,6 @@ pub(crate) async fn invalidate_aggregates() {
     *AGGREGATE_CACHE.lock().await = None;
 }
 
-/// The FS work the dashboard footer reports as `disk`.
-///
-/// This is a free async fn rather than an inline `tokio::join!` branch so
-/// rustc can prove `Send` for the future without tripping over higher-rank
-/// lifetime auto-trait inference at the spawn site.
-async fn build_mirror_fs_section(
-    mirrors: &[MirrorStatEntry],
-    snapshots: &MirrorSnapshots,
-    now_epoch: i64,
-) -> (Section, DirStats, Option<u64>) {
-    let config = global_config();
-
-    let ((section, aggregate), free_disk_bytes) = tokio::join!(
-        build_mirror_table(mirrors, snapshots, now_epoch, config),
-        free_disk_bytes(&config.cache_directory),
-    );
-
-    (section, aggregate, free_disk_bytes)
-}
-
 static DISK_FREE_PROBE: ProbeSlot = ProbeSlot::new();
 
 /// The last free-space figure and when it was taken. The lock is held across
@@ -349,8 +329,11 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
     // costs a second memo slot for the mirror query alone; measure a large
     // cache before paying for it.
     let fs_start = Instant::now();
-    let (mirror_table, aggregate_dir_stats, free_disk_bytes) =
-        build_mirror_fs_section(mirror_rows, &snapshots, now_epoch).await;
+    let config = global_config();
+    let ((mirror_table, aggregate_dir_stats), free_disk_bytes) = tokio::join!(
+        build_mirror_table(mirror_rows, &snapshots, now_epoch, config),
+        free_disk_bytes(&config.cache_directory),
+    );
     let fs_elapsed: std::time::Duration = fs_start.elapsed().into();
     let mirror = match mirrors {
         Ok(_rows) => mirror_table,

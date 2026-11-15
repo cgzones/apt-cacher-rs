@@ -371,6 +371,18 @@ async fn stage_received(
     }
 }
 
+fn finish_flush<T>(flushed: Result<(), sqlx::Error>, rows: &mut Vec<T>, noun: &str) {
+    if let Err(err) = flushed {
+        metrics::DB_OPERATION_FAILED.increment();
+        error!(
+            "Failed to flush {} {noun} rows, dropping them:  {}",
+            rows.len(),
+            SqlxErrorReport(&err)
+        );
+    }
+    rows.clear();
+}
+
 /// A buffer whose flush fails is logged and dropped, not retried.
 async fn flush_batches(db: &Database, buf: &mut BatchBuffers, reason: FlushReason) {
     let total = buf.len();
@@ -378,35 +390,14 @@ async fn flush_batches(db: &Database, buf: &mut BatchBuffers, reason: FlushReaso
         return;
     }
 
-    if let Err(err) = db.batch_insert_deliveries(&buf.deliveries).await {
-        metrics::DB_OPERATION_FAILED.increment();
-        error!(
-            "Failed to flush {} delivery rows, dropping them:  {}",
-            buf.deliveries.len(),
-            SqlxErrorReport(&err)
-        );
-    }
-    buf.deliveries.clear();
+    let flushed = db.batch_insert_deliveries(&buf.deliveries).await;
+    finish_flush(flushed, &mut buf.deliveries, "delivery");
 
-    if let Err(err) = db.batch_insert_downloads(&buf.downloads).await {
-        metrics::DB_OPERATION_FAILED.increment();
-        error!(
-            "Failed to flush {} download rows, dropping them:  {}",
-            buf.downloads.len(),
-            SqlxErrorReport(&err)
-        );
-    }
-    buf.downloads.clear();
+    let flushed = db.batch_insert_downloads(&buf.downloads).await;
+    finish_flush(flushed, &mut buf.downloads, "download");
 
-    if let Err(err) = db.batch_upsert_origins(&buf.origins).await {
-        metrics::DB_OPERATION_FAILED.increment();
-        error!(
-            "Failed to flush {} origin rows, dropping them:  {}",
-            buf.origins.len(),
-            SqlxErrorReport(&err)
-        );
-    }
-    buf.origins.clear();
+    let flushed = db.batch_upsert_origins(&buf.origins).await;
+    finish_flush(flushed, &mut buf.origins, "origin");
 
     match reason {
         FlushReason::BySize => metrics::DB_BATCH_FLUSHES_BY_SIZE.increment(),

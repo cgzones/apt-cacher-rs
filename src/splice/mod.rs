@@ -234,8 +234,8 @@ async fn resolve_client_range(
         return Ok(Some(plan));
     }
     let _settled = ibarrier.decline(Declined::RangeNotSatisfiable).await;
-    client
-        .write_416(total)
+    ResponseHead::range_not_satisfiable(total)
+        .write_to(client, WireBody::None)
         .await
         .map_err(SpliceProxyError::client(phase_416))?;
     Ok(None)
@@ -1759,7 +1759,6 @@ mod tests {
     #[test]
     fn splice_response_head_is_the_cache_hit_head() {
         use crate::cache_conditional::CacheInfo;
-        use crate::http_helpers::cached_file_head;
         use crate::xattr_helpers::XattrValue as _;
 
         const LAST_MODIFIED: &str = "Thu, 01 Jan 2025 00:00:00 GMT";
@@ -1786,7 +1785,7 @@ mod tests {
             let content_type = "application/vnd.debian.binary-package";
             assert_eq!(
                 splice_response_head(range, content_type, &validators),
-                cached_file_head(range, content_type, &cache_info),
+                ResponseHead::cached(range.into(), content_type, &cache_info),
             );
         }
     }

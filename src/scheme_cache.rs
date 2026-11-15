@@ -242,24 +242,13 @@ impl SchemeDecision {
 
     /// Only splice reads this, for its upgrade accounting; hyper folds the
     /// same distinction into its own `UpgradeProbe`.
-    #[cfg(any(test, feature = "splice"))]
+    #[cfg(feature = "splice")]
     pub(crate) fn is_upgrade_attempt(self) -> bool {
         matches!(self, Self::AlwaysUpgrade | Self::AutoUpgrade)
     }
 }
 
-/// `https_permitted` is whether `allowed_mirror_ports` lets the mirror be
-/// dialled over https at all (see `https_permitted`); without it the mirror
-/// stays on http whatever was cached.
-fn decide(
-    cached: Option<Scheme>,
-    is_http_only: bool,
-    https_permitted: bool,
-    mode: HttpsUpgradeMode,
-) -> SchemeDecision {
-    if !https_permitted {
-        return SchemeDecision::Http;
-    }
+fn decide(cached: Option<Scheme>, is_http_only: bool, mode: HttpsUpgradeMode) -> SchemeDecision {
     if let Some(cached) = cached {
         return match cached {
             Scheme::Http => SchemeDecision::Http,
@@ -317,7 +306,7 @@ pub(crate) fn resolve(key: SchemeKeyRef<'_>, config: &Config) -> SchemeDecision 
     // `decide` returns on `cached` before reading `is_http_only`; skip the
     // `http_only_mirrors` scan on a cache hit.
     let is_http_only = cached.is_none() && is_http_only(key, config);
-    decide(cached, is_http_only, true, config.https_upgrade_mode)
+    decide(cached, is_http_only, config.https_upgrade_mode)
 }
 
 /// Whether `allowed_mirror_ports` lets `key` be dialled over https at all.
@@ -402,7 +391,7 @@ impl SchemeVerdict {
 /// never contradicts them (no upgrade is attempted for such a host, and no
 /// scheme is recorded for one the mode fixes), and naming the option is
 /// what the dashboard needs. Then the mode, where an upgrading mode first
-/// needs `https_permitted` (see [`https_permitted`]), as in `decide`.
+/// needs `https_permitted` (see [`https_permitted`]), as in [`resolve`].
 #[must_use]
 fn verdict(
     mode: HttpsUpgradeMode,
@@ -686,7 +675,6 @@ mod tests {
             decide(
                 cached_scheme_at(host, expired),
                 false,
-                true,
                 HttpsUpgradeMode::Auto
             ),
             SchemeDecision::AutoUpgrade,
@@ -787,7 +775,7 @@ mod tests {
                     );
                 }
                 // A refused 443 keeps every upgrading mode on http, live
-                // entry or not, as `decide` does; `Never` keeps its own name.
+                // entry or not, as `resolve` does; `Never` keeps its own name.
                 assert_eq!(
                     verdict(mode, false, false, live),
                     if mode == HttpsUpgradeMode::Never {
@@ -877,60 +865,12 @@ mod tests {
         ] {
             for http_only in [false, true] {
                 assert_eq!(
-                    decide(Some(Scheme::Http), http_only, true, mode),
+                    decide(Some(Scheme::Http), http_only, mode),
                     SchemeDecision::Http
                 );
                 assert_eq!(
-                    decide(Some(Scheme::Https), http_only, true, mode),
+                    decide(Some(Scheme::Https), http_only, mode),
                     SchemeDecision::Https
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn uncached_http_only_is_http_regardless_of_mode() {
-        for mode in [
-            HttpsUpgradeMode::Never,
-            HttpsUpgradeMode::Auto,
-            HttpsUpgradeMode::Always,
-        ] {
-            assert_eq!(decide(None, true, true, mode), SchemeDecision::Http);
-        }
-    }
-
-    #[test]
-    fn uncached_never_is_http() {
-        assert_eq!(
-            decide(None, false, true, HttpsUpgradeMode::Never),
-            SchemeDecision::Http
-        );
-    }
-
-    #[test]
-    fn uncached_always_is_always_upgrade() {
-        assert_eq!(
-            decide(None, false, true, HttpsUpgradeMode::Always),
-            SchemeDecision::AlwaysUpgrade
-        );
-    }
-
-    #[test]
-    fn uncached_auto_is_auto_upgrade() {
-        assert_eq!(
-            decide(None, false, true, HttpsUpgradeMode::Auto),
-            SchemeDecision::AutoUpgrade
-        );
-    }
-
-    #[test]
-    fn a_refused_https_port_keeps_the_mirror_on_http() {
-        for mode in [HttpsUpgradeMode::Auto, HttpsUpgradeMode::Always] {
-            for cached in [None, Some(Scheme::Https), Some(Scheme::Http)] {
-                assert_eq!(
-                    decide(cached, false, false, mode),
-                    SchemeDecision::Http,
-                    "{mode:?} {cached:?}"
                 );
             }
         }
@@ -948,10 +888,24 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_attempt_flag() {
-        assert!(!SchemeDecision::Http.is_upgrade_attempt());
-        assert!(!SchemeDecision::Https.is_upgrade_attempt());
-        assert!(SchemeDecision::AlwaysUpgrade.is_upgrade_attempt());
-        assert!(SchemeDecision::AutoUpgrade.is_upgrade_attempt());
+    fn uncached_http_only_is_http_regardless_of_mode() {
+        for mode in [
+            HttpsUpgradeMode::Never,
+            HttpsUpgradeMode::Auto,
+            HttpsUpgradeMode::Always,
+        ] {
+            assert_eq!(decide(None, true, mode), SchemeDecision::Http);
+        }
+    }
+
+    #[test]
+    fn uncached_follows_the_mode() {
+        for (mode, expected) in [
+            (HttpsUpgradeMode::Never, SchemeDecision::Http),
+            (HttpsUpgradeMode::Always, SchemeDecision::AlwaysUpgrade),
+            (HttpsUpgradeMode::Auto, SchemeDecision::AutoUpgrade),
+        ] {
+            assert_eq!(decide(None, false, mode), expected, "{mode:?}");
+        }
     }
 }

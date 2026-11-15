@@ -175,22 +175,6 @@ impl<'a> ClientConn<'a> {
         }
     }
 
-    pub(crate) async fn write_304(
-        self,
-        last_modified_str: &crate::http_last_modified::LastModified,
-        age: u32,
-        etag: Option<&crate::http_etag::ETag>,
-    ) -> std::io::Result<()> {
-        ResponseHead::not_modified(last_modified_str, etag, age)
-            .write_to(self, WireBody::None)
-            .await
-    }
-
-    pub(crate) async fn write_416(self, file_size: u64) -> std::io::Result<()> {
-        let head = ResponseHead::range_not_satisfiable(file_size);
-        head.write_to(self, WireBody::None).await
-    }
-
     pub(crate) async fn write_invalid(
         self,
         status: StatusCode,
@@ -211,18 +195,10 @@ impl<'a> ClientConn<'a> {
         content_type: &'static str,
         cache_info: &CacheInfo,
     ) -> std::io::Result<()> {
-        cached_file_head(params, content_type, cache_info)
+        ResponseHead::cached(params.into(), content_type, cache_info)
             .write_to(self, WireBody::Follows)
             .await
     }
-}
-
-pub(crate) fn cached_file_head<'a>(
-    params: &'a ServeParams,
-    content_type: &'static str,
-    cache_info: &'a CacheInfo,
-) -> ResponseHead<'a> {
-    ResponseHead::cached(params.into(), content_type, cache_info)
 }
 
 /// Which syscall the shared write loop issues, and which timeout counter its

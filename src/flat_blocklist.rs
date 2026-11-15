@@ -14,7 +14,7 @@
 use std::num::NonZero;
 use std::sync::OnceLock;
 
-use hashbrown::{Equivalent, HashSet};
+use hashbrown::HashSet;
 use parking_lot::RwLock;
 use tracing::warn;
 
@@ -28,29 +28,13 @@ type Port = NonZero<u16>;
 
 /// The host is the alias-resolved cache identity, so sibling aliases of the
 /// same configured `main` share a single entry.
+///
+/// The set holds only rows recorded before dispatch stopped minting colliding
+/// mirrors (empty on almost every install), so [`is_blocked`] scans it.
 #[derive(Debug, Eq, Hash, PartialEq)]
 struct BlocklistKey {
     host: CacheHost,
     port: Option<Port>,
-}
-
-/// Borrowed lookup form of [`BlocklistKey`], so `is_blocked` clones no
-/// `CacheHost` per flat request.
-#[derive(Hash)]
-struct BlocklistKeyRef<'a> {
-    host: &'a CacheHost,
-    port: Option<Port>,
-}
-
-impl Equivalent<BlocklistKey> for BlocklistKeyRef<'_> {
-    fn equivalent(&self, key: &BlocklistKey) -> bool {
-        let &Self { host, port } = self;
-        let BlocklistKey {
-            host: khost,
-            port: kport,
-        } = key;
-        host == khost && port == *kport
-    }
 }
 
 static BLOCKLIST: OnceLock<RwLock<HashSet<BlocklistKey>>> = OnceLock::new();
@@ -125,42 +109,19 @@ pub(crate) fn is_blocked(host: &CacheHost, port: Option<Port>) -> bool {
         .get()
         .expect("initialized in main()")
         .read()
-        .contains(&BlocklistKeyRef { host, port })
+        .iter()
+        .any(|key| {
+            let BlocklistKey {
+                host: khost,
+                port: kport,
+            } = key;
+            khost == host && *kport == port
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ClientHost;
-
-    /// The borrowed lookup key must hash and compare exactly like the owned
-    /// one it stands in for; a mismatch would make every `is_blocked` query
-    /// miss silently instead of failing loudly.
-    #[test]
-    fn borrowed_key_matches_owned_entry() {
-        let host = ClientHost::new("apt.example.org")
-            .expect("valid host")
-            .into_cache_host();
-        let other = ClientHost::new("apt.example.net")
-            .expect("valid host")
-            .into_cache_host();
-        let port = NonZero::new(8080);
-
-        let mut set: HashSet<BlocklistKey> = HashSet::new();
-        set.insert(BlocklistKey {
-            host: host.clone(),
-            port,
-        });
-
-        assert!(set.contains(&BlocklistKeyRef { host: &host, port }));
-        // Both halves of the key take part in the match.
-        assert!(!set.contains(&BlocklistKeyRef {
-            host: &host,
-            port: None
-        }));
-        assert!(!set.contains(&BlocklistKeyRef { host: &other, port }));
-    }
-
     #[test]
     fn path_collision_predicate() {
         assert!(path_collides_with_flat_layout("flat"));

@@ -439,6 +439,12 @@ pub(crate) struct DownloadBarrier {
 }
 
 impl DownloadBarrier {
+    fn data_mut(&mut self) -> &mut DownloadBarrierData {
+        self.data
+            .as_mut()
+            .expect("every sink consumes the instance")
+    }
+
     /// Accumulate `bytes` and ping receivers once `PING_BATCH_THRESHOLD` is
     /// crossed. The very first ping is sent unbatched: the originating client
     /// reads the partial file itself, so a download smaller than the
@@ -447,10 +453,7 @@ impl DownloadBarrier {
         /// Roughly 1 MiB; tunes between wake-up overhead and joiner latency.
         const PING_BATCH_THRESHOLD: u64 = 1024 * 1024;
 
-        let data = self
-            .data
-            .as_mut()
-            .expect("every sink consumes the instance");
+        let data = self.data_mut();
         data.bytes_since_ping = data.bytes_since_ping.saturating_add(bytes);
         if !data.pinged_once.get() || data.bytes_since_ping >= PING_BATCH_THRESHOLD {
             data.internal_ping();
@@ -478,10 +481,7 @@ impl DownloadBarrier {
     }
 
     pub(crate) async fn begin_rename(mut self) -> RenameBarrier {
-        let data = self
-            .data
-            .as_mut()
-            .expect("every sink consumes the instance");
+        let data = self.data_mut();
 
         // Ordering matters: flush the final ping, flip `Download -> Verifying`
         // under the status write lock, release the lock, then drop `tx`. A
@@ -524,6 +524,12 @@ impl DownloadBarrier {
 
 #[cfg(feature = "splice")]
 impl DownloadBarrier {
+    fn data(&self) -> &DownloadBarrierData {
+        self.data
+            .as_ref()
+            .expect("every sink consumes the instance")
+    }
+
     /// Retain the registry entry through salvage and every blocking write.
     /// The lease carries no progress sender, so failed readers wake promptly.
     pub(crate) fn write_lease(&self) -> Arc<DownloadWriteLease> {
@@ -531,19 +537,11 @@ impl DownloadBarrier {
     }
 
     pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
-        let data = self
-            .data
-            .as_ref()
-            .expect("every sink consumes the instance");
-        data.tx.subscribe()
+        self.data().tx.subscribe()
     }
 
     pub(crate) fn status(&self) -> &Arc<tokio::sync::RwLock<ActiveDownloadStatus>> {
-        let data = self
-            .data
-            .as_ref()
-            .expect("every sink consumes the instance");
-        &data.status
+        &self.data().status
     }
 }
 
@@ -631,6 +629,18 @@ pub(crate) struct RenameBarrier {
 }
 
 impl RenameBarrier {
+    fn data(&self) -> &RenameBarrierData {
+        self.data
+            .as_ref()
+            .expect("every sink consumes the instance")
+    }
+
+    fn data_mut(&mut self) -> &mut RenameBarrierData {
+        self.data
+            .as_mut()
+            .expect("every sink consumes the instance")
+    }
+
     /// Verify the finished temp file, rename it into the cache, flip the
     /// status to `Finished`, publish upstream metadata and retire the entry.
     /// On any `CommitError` the status becomes `Aborted`; a checksum mismatch
@@ -667,32 +677,18 @@ impl RenameBarrier {
         temp_path: TempPath,
         dest_path: PathBuf,
     ) -> Result<(), CommitError> {
-        let plan = {
-            let data = self
-                .data
-                .as_mut()
-                .expect("every sink consumes the instance");
-            RenamePlan {
-                dest_path,
-                resource_kind: data.resource_kind,
-                key: Arc::clone(&data.lease.key),
-                raw_uri_path: std::mem::take(&mut data.raw_uri_path),
-            }
+        let data = self.data_mut();
+        let plan = RenamePlan {
+            dest_path,
+            resource_kind: data.resource_kind,
+            key: Arc::clone(&data.lease.key),
+            raw_uri_path: std::mem::take(&mut data.raw_uri_path),
         };
-        let reservation = self
-            .data
-            .as_mut()
-            .expect("every sink consumes the instance")
+        let reservation = data
             .quota_reservation
             .take()
             .expect("commit runs once per barrier");
-        let lease = Arc::clone(
-            &self
-                .data
-                .as_ref()
-                .expect("every sink consumes the instance")
-                .lease,
-        );
+        let lease = Arc::clone(&data.lease);
         if let Err(CommitFailure { error: err, guard }) =
             integrity::verify_and_rename(&plan, finished, temp_path, reservation, lease).await
         {
@@ -705,10 +701,7 @@ impl RenameBarrier {
             // problems), then publish `Aborted(Discarded)`. `Discarded`,
             // not a failure: every byte is on disk, so readers that already
             // hold the file drain it instead of truncating the body.
-            let data = self
-                .data
-                .as_ref()
-                .expect("every sink consumes the instance");
+            let data = self.data();
             let checksum_mismatch = matches!(err, CommitError::ChecksumMismatch);
             let throttle = {
                 let mut status = data.status.write().await;
@@ -759,10 +752,7 @@ impl RenameBarrier {
         // It is taken only past the last await, where no cancellation can
         // turn a `Finished` entry back into an `Aborted` one.
         let meta_for_status: Option<Arc<UpstreamMetadata>> = {
-            let data = self
-                .data
-                .as_ref()
-                .expect("every sink consumes the instance");
+            let data = self.data();
             let mut lock = data.status.write().await;
             let meta = match &*lock {
                 ActiveDownloadStatus::Verifying { path: _, meta } => Some(Arc::clone(meta)),

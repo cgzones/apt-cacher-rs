@@ -171,7 +171,6 @@ impl Digest {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn from_bytes(algo: HashAlgo, bytes: &[u8]) -> Option<Self> {
         match algo {
             HashAlgo::Sha256 => bytes
@@ -357,9 +356,8 @@ impl Stanza {
     }
 
     pub(crate) fn chosen_digest(&self) -> Option<Digest> {
-        self.sha256
-            .map(|value| Digest::Sha256(Box::new(value)))
-            .or_else(|| self.sha512.map(|value| Digest::Sha512(Box::new(value))))
+        let (algo, digest) = self.chosen()?;
+        Digest::from_bytes(algo, digest)
     }
 
     /// SHA256 wins, SHA512 is the fallback.

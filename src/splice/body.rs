@@ -405,10 +405,7 @@ impl CacheWriter {
     /// Prefixes and fully buffered bodies use the same append path as TLS
     /// chunks. Publish only after the owned blocking write has completed.
     pub(super) async fn write_prefix(&mut self, bytes: &[u8]) -> Result<(), DownloadFailure> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        self.write_cache_chunk(&mut bytes.to_vec()).await
+        self.write_owned(&mut bytes.to_vec()).await
     }
 
     /// [`Self::write_prefix`] for a buffer the caller owns: it moves into the

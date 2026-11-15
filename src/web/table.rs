@@ -340,7 +340,7 @@ impl Display for Highlights {
 
 impl DetailsList {
     pub(super) fn new() -> Self {
-        Self::with_now(now_epoch())
+        Self::open_in(String::with_capacity(1024), "details", now_epoch())
     }
 
     /// A list appended to `out`, which [`Self::finish_counted`] hands back:
@@ -349,13 +349,10 @@ impl DetailsList {
         Self::open_in(out, "details", now_epoch())
     }
 
-    /// A list whose relative times are measured against `now`: tests pin it.
+    /// A list whose relative times are measured against a pinned `now`.
+    #[cfg(test)]
     fn with_now(now: i64) -> Self {
-        Self::open("details", now)
-    }
-
-    fn open(class: &'static str, now: i64) -> Self {
-        Self::open_in(String::with_capacity(1024), class, now)
+        Self::open_in(String::new(), "details", now)
     }
 
     fn open_in(mut out: String, class: &'static str, now: i64) -> Self {
@@ -529,7 +526,7 @@ impl Entry<'_> {
     /// the grid flows left to right, so a "part" placed after its total
     /// would land beside it, or on the next line under an unrelated cell.
     pub(super) fn parts(mut self, build: impl FnOnce(&mut DetailsList)) -> Self {
-        let mut parts = DetailsList::open("parts", self.list.now);
+        let mut parts = DetailsList::open_in(String::with_capacity(1024), "parts", self.list.now);
         parts.scope = series_path(&self.list.scope, self.label).to_string();
         build(&mut parts);
         self.parts = Some(parts.finish());

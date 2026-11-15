@@ -82,15 +82,25 @@ pub(super) fn now_epoch() -> i64 {
 pub(super) struct Age(pub(super) u64);
 impl Display for Age {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        const MIN: u64 = 60;
-        const HOUR: u64 = 60 * MIN;
-        const DAY: u64 = 24 * HOUR;
-        match self.0 {
-            s if s < MIN => write!(f, "{s} s"),
-            s if s < HOUR => write!(f, "{} min", s / MIN),
-            s if s < DAY => write!(f, "{} h", s / HOUR),
-            s => write!(f, "{} d", s / DAY),
-        }
+        let (major, major_unit, _, _) = two_units(self.0);
+        write!(f, "{major} {major_unit}")
+    }
+}
+
+/// `secs` split into its two most significant units, as `(major, unit,
+/// minor, unit)`; below a minute the minor part is 0.
+const fn two_units(secs: u64) -> (u64, &'static str, u64, &'static str) {
+    const MIN: u64 = 60;
+    const HOUR: u64 = 60 * MIN;
+    const DAY: u64 = 24 * HOUR;
+    if secs < MIN {
+        (secs, "s", 0, "")
+    } else if secs < HOUR {
+        (secs / MIN, "min", secs % MIN, "s")
+    } else if secs < DAY {
+        (secs / HOUR, "h", secs % HOUR / MIN, "min")
+    } else {
+        (secs / DAY, "d", secs % DAY / HOUR, "h")
     }
 }
 
@@ -100,19 +110,7 @@ impl Display for Age {
 struct Span(u64);
 impl Display for Span {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        const MIN: u64 = 60;
-        const HOUR: u64 = 60 * MIN;
-        const DAY: u64 = 24 * HOUR;
-        let s = self.0;
-        let (major, major_unit, minor, minor_unit) = if s < MIN {
-            return write!(f, "{s} s");
-        } else if s < HOUR {
-            (s / MIN, "min", s % MIN, "s")
-        } else if s < DAY {
-            (s / HOUR, "h", s % HOUR / MIN, "min")
-        } else {
-            (s / DAY, "d", s % DAY / HOUR, "h")
-        };
+        let (major, major_unit, minor, minor_unit) = two_units(self.0);
         if minor == 0 {
             write!(f, "{major} {major_unit}")
         } else {
@@ -763,33 +761,25 @@ pub(super) struct Nonzero {
 }
 impl Display for Nonzero {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self.level {
-            Level::Warn => Display::fmt(&warn_if(Count(self.value), self.value != 0), f),
-            Level::Alert => Display::fmt(&alert_if(Count(self.value), self.value != 0), f),
-        }
+        Display::fmt(&paint_if(Count(self.value), self.level, self.value != 0), f)
     }
+}
+
+fn paint_if<T: Display>(inner: T, level: Level, predicate: bool) -> Colorize<T> {
+    let class = match level {
+        _ if !predicate => RatioClass::Normal,
+        Level::Warn => RatioClass::Warn,
+        Level::Alert => RatioClass::Alert,
+    };
+    Colorize { inner, class }
 }
 
 pub(super) fn warn_if<T: Display>(inner: T, predicate: bool) -> Colorize<T> {
-    Colorize {
-        inner,
-        class: if predicate {
-            RatioClass::Warn
-        } else {
-            RatioClass::Normal
-        },
-    }
+    paint_if(inner, Level::Warn, predicate)
 }
 
 pub(super) fn alert_if<T: Display>(inner: T, predicate: bool) -> Colorize<T> {
-    Colorize {
-        inner,
-        class: if predicate {
-            RatioClass::Alert
-        } else {
-            RatioClass::Normal
-        },
-    }
+    paint_if(inner, Level::Alert, predicate)
 }
 
 /// An `i64` DB column as `u64`, negative values clamped to 0 (the schemas

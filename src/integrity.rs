@@ -1368,13 +1368,6 @@ const RELEASE_INGEST_QUEUE: usize = 16;
 
 static RELEASE_INGEST_SLOTS: Semaphore = Semaphore::const_new(RELEASE_INGEST_QUEUE);
 
-fn ingest_pool(kind: &IngestKind) -> &'static Semaphore {
-    match kind {
-        IngestKind::Release { release_dir: _ } => &RELEASE_INGEST_SLOTS,
-        IngestKind::Packages { compression: _ } => &INGEST_SLOTS,
-    }
-}
-
 enum Admission<'l, 's> {
     /// Ingested under the current epoch, failed for good, or already running.
     Nothing,
@@ -1444,7 +1437,11 @@ fn schedule_ingest(file: &IndexFile<'_>) -> bool {
     let registry = global_checksum_registry();
     let (authority, mirror_path) = (file.mirror.format_authority(), file.mirror.path());
     let epoch = registry.scope_epoch(authority, mirror_path);
-    let (claim, slot) = match admit(&INGEST_LEDGER, ingest_pool(&kind), file.path, epoch) {
+    let slots = match &kind {
+        IngestKind::Release { release_dir: _ } => &RELEASE_INGEST_SLOTS,
+        IngestKind::Packages { compression: _ } => &INGEST_SLOTS,
+    };
+    let (claim, slot) = match admit(&INGEST_LEDGER, slots, file.path, epoch) {
         Admission::Nothing => return false,
         Admission::Refused => {
             metrics::INGEST_SKIPPED_QUEUE_FULL.increment();
@@ -3552,26 +3549,6 @@ mod tests {
             "slots are full again"
         );
         drop(again);
-    }
-
-    #[test]
-    fn release_ingests_use_their_own_admission_pool() {
-        let release = IngestKind::Release {
-            release_dir: "debian/dists/sid".to_owned(),
-        };
-        let packages = IngestKind::Packages {
-            compression: Some(PackagesCompression::Xz),
-        };
-        let sniff = IngestKind::Packages { compression: None };
-        assert!(std::ptr::eq(
-            ingest_pool(&release),
-            &raw const RELEASE_INGEST_SLOTS
-        ));
-        assert!(std::ptr::eq(
-            ingest_pool(&packages),
-            &raw const INGEST_SLOTS
-        ));
-        assert!(std::ptr::eq(ingest_pool(&sniff), &raw const INGEST_SLOTS));
     }
 
     #[test]

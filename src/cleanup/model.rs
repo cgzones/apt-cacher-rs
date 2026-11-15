@@ -92,18 +92,28 @@ pub(super) struct ReconcileUnit {
     pub policy: ReconcilePolicy,
 }
 
-/// `release_dir`/`dist_gate` name the on-disk `Release` set that defines
-/// "referenced". A complete reference set keeps referenced digests and sweeps
+/// The on-disk `Release` set that defines "referenced" follows from `layout`.
+/// A complete reference set keeps referenced digests and sweeps
 /// unreferenced-but-covered ones past `grace`; anything uncovered (or the
 /// whole tree, when the reference set is incomplete) sweeps past `backstop`.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ByHashUnit {
     pub layout: CacheLayout,
     pub root: PathBuf,
-    pub release_dir: PathBuf,
-    pub dist_gate: DistGate,
     pub grace: Duration,
     pub backstop: Duration,
+}
+
+impl ByHashUnit {
+    /// The layout whose entry directory holds the `Release` files that
+    /// reference this tree: the root of the same site's `Metadata` unit.
+    pub(super) fn release_layout(&self) -> CacheLayout {
+        if self.layout.is_flat() {
+            CacheLayout::Flat
+        } else {
+            CacheLayout::Dists
+        }
+    }
 }
 
 /// A pure age sweep of `root`.
@@ -167,16 +177,6 @@ pub(super) enum IndexSource {
     FlatPackages { fetch: FlatFetch },
 }
 
-impl IndexSource {
-    /// Only an archive-root reference set owns the complete reconciliation.
-    pub(super) const fn is_owning(&self) -> bool {
-        match self {
-            Self::ArchiveRoot { .. } => true,
-            Self::SelfOrigins | Self::FlatPackages { .. } => false,
-        }
-    }
-}
-
 /// Where a flat `Packages` index is fetched from.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum FlatFetch {
@@ -184,17 +184,6 @@ pub(super) enum FlatFetch {
     Colocated,
     /// Fetched from a flat-root segment above the mirror path (issue #162).
     RootSegment { seg: String, prefix: String },
-}
-
-/// Whether a [`ByHashUnit`] requires every expected active-origin distribution
-/// to be present before its `Release` digest set counts as complete.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DistGate {
-    /// Complete only when every active-origin distribution's `Release` is
-    /// present and readable.
-    ActiveOriginDists,
-    /// No completeness gate (flat trees have no distributions).
-    None,
 }
 
 /// How a [`ReconcileUnit`] retains leftovers once its ordered [`IndexSource`]s
@@ -490,8 +479,6 @@ pub(super) fn classify_mirror(
         units.push(CleanupUnit::ByHash(ByHashUnit {
             layout,
             root: paths.entry_dir(layout, site),
-            release_dir: paths.entry_dir(CacheLayout::Dists, site),
-            dist_gate: DistGate::ActiveOriginDists,
             grace: UNREFERENCED_KEEP_SPAN,
             backstop: byhash_backstop,
         }));
@@ -501,8 +488,6 @@ pub(super) fn classify_mirror(
     units.push(CleanupUnit::ByHash(ByHashUnit {
         layout,
         root: paths.entry_dir(layout, site),
-        release_dir: paths.entry_dir(CacheLayout::Flat, site),
-        dist_gate: DistGate::None,
         grace: UNREFERENCED_KEEP_SPAN,
         backstop: byhash_backstop,
     }));
@@ -730,19 +715,12 @@ mod tests {
                 CleanupUnit::ByHash(ByHashUnit {
                     layout: CacheLayout::DistsByHash,
                     root: PathBuf::from("/cache/deb.debian.org/debian/dists/by-hash"),
-                    // Exactly the root the structured `Metadata` unit above
-                    // sweeps: retiring a `Release` this cycle unpins its digests
-                    // in the same cycle.
-                    release_dir: PathBuf::from("/cache/deb.debian.org/debian/dists"),
-                    dist_gate: DistGate::ActiveOriginDists,
                     grace: UNREFERENCED_KEEP_SPAN,
                     backstop,
                 }),
                 CleanupUnit::ByHash(ByHashUnit {
                     layout: CacheLayout::FlatByHash,
                     root: PathBuf::from("/cache/deb.debian.org/flat/debian/by-hash"),
-                    release_dir: PathBuf::from("/cache/deb.debian.org/flat/debian"),
-                    dist_gate: DistGate::None,
                     grace: UNREFERENCED_KEEP_SPAN,
                     backstop,
                 }),
@@ -779,12 +757,14 @@ mod tests {
                 }
                 CleanupUnit::ByHash(b) => {
                     assert_eq!(b.root, paths.entry_dir(b.layout, site));
-                    let release_layout = if b.layout.is_flat() {
-                        CacheLayout::Flat
-                    } else {
-                        CacheLayout::Dists
-                    };
-                    assert_eq!(b.release_dir, paths.entry_dir(release_layout, site));
+                    let release_dir = paths.entry_dir(b.release_layout(), site);
+                    assert!(
+                        units.iter().any(
+                            |u| matches!(u, CleanupUnit::Metadata(m) if m.root == release_dir)
+                        ),
+                        "{} is a Metadata unit's root",
+                        release_dir.display()
+                    );
                 }
                 CleanupUnit::Metadata(m) => {
                     assert_eq!(m.root, paths.entry_dir(m.layout, site));
@@ -835,8 +815,6 @@ mod tests {
             CleanupUnit::ByHash(ByHashUnit {
                 layout: CacheLayout::FlatByHash,
                 root: _,
-                release_dir: _,
-                dist_gate: _,
                 grace: _,
                 backstop: _,
             })
@@ -854,15 +832,6 @@ mod tests {
 
         let units = classify_mirror(&entry, Vec::new(), &config);
         let flat_tree = flat_tree_unit(&units);
-
-        assert_eq!(
-            flat_tree
-                .groups
-                .iter()
-                .map(IndexSource::is_owning)
-                .collect::<Vec<_>>(),
-            [true, false, false],
-        );
 
         assert_eq!(
             flat_tree.groups,

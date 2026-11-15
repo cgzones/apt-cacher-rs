@@ -1247,46 +1247,6 @@ where
     Ok(NonZero::new(u))
 }
 
-#[must_use]
-fn intersect<T: Ord>(a: &[T], b: &[T]) -> bool {
-    debug_assert!(
-        a.is_sorted(),
-        "a must be sorted for the intersection operation"
-    );
-    debug_assert!(
-        b.is_sorted(),
-        "b must be sorted for the intersection operation"
-    );
-
-    let mut iter_a = a.iter();
-    let mut iter_b = b.iter();
-
-    let Some(mut elem_a) = iter_a.next() else {
-        return false;
-    };
-    let Some(mut elem_b) = iter_b.next() else {
-        return false;
-    };
-
-    loop {
-        match elem_a.cmp(elem_b) {
-            Ordering::Equal => return true,
-            Ordering::Greater => {
-                elem_b = match iter_b.next() {
-                    Some(n) => n,
-                    None => return false,
-                }
-            }
-            Ordering::Less => {
-                elem_a = match iter_a.next() {
-                    Some(n) => n,
-                    None => return false,
-                }
-            }
-        }
-    }
-}
-
 /// DNS-only label-string validator: caller has already excluded any
 /// IPv6/colon form.
 #[must_use]
@@ -1673,7 +1633,10 @@ impl Config {
                             .aliases
                             .binary_search_by_key(&ialias.main.as_str(), |a| a.as_str())
                             .is_ok()
-                        || intersect(&ialias.aliases, &alias.aliases)
+                        || ialias
+                            .aliases
+                            .iter()
+                            .any(|a| alias.aliases.binary_search(a).is_ok())
                 }) {
                     invalid!("Alias {} conflicts with alias {}", alias.main, falias.main);
                 }

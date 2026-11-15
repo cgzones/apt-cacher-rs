@@ -506,8 +506,7 @@ mod tests {
         // Trailing junk is not silently accepted.
         assert_eq!(HttpDate::parse("Thu, 01 Jan 1970 00:00:00 GMT junk"), None);
         // The two obsolete HTTP-date spellings RFC 9110 section 5.6.7 still
-        // requires *recipients* to accept are rejected here; see
-        // `http_last_modified::is_valid_http_date`.
+        // requires *recipients* to accept are rejected here.
         assert_eq!(HttpDate::parse("Sunday, 06-Nov-94 08:49:37 GMT"), None);
         assert_eq!(HttpDate::parse("Sun Nov  6 08:49:37 1994"), None);
     }

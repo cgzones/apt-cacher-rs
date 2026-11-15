@@ -1415,14 +1415,12 @@ async fn serve_planned(
     let params = match cache_info.plan(size, &headers, &client) {
         ServePlan::Serve(params) => params,
         ServePlan::NotModified => {
-            if let Err(err) = conn
-                .write_304(
-                    &cache_info.last_modified,
-                    cache_info.age,
-                    cache_info.file_etag.as_ref(),
-                )
-                .await
-            {
+            let head = ResponseHead::not_modified(
+                &cache_info.last_modified,
+                cache_info.file_etag.as_ref(),
+                cache_info.age,
+            );
+            if let Err(err) = head.write_to(conn, WireBody::None).await {
                 log_client_write_failure(client, "304 response", &err);
                 return SendfileResult::Closed;
             }
@@ -1433,7 +1431,8 @@ async fn serve_planned(
             return SendfileResult::Served(conn.action);
         }
         ServePlan::NotSatisfiable => {
-            if let Err(err) = conn.write_416(size).await {
+            let head = ResponseHead::range_not_satisfiable(size);
+            if let Err(err) = head.write_to(conn, WireBody::None).await {
                 log_client_write_failure(client, "416 response", &err);
                 return SendfileResult::Closed;
             }
@@ -1807,6 +1806,34 @@ async fn sendfile_chunk_loop(
     const MAX_PER_SYSCALL: usize = 0x7fff_f000;
     static_assert!(MAX_PER_SYSCALL < usize::MAX);
 
+    fn credit(
+        moved: usize,
+        new_offset: i64,
+        file_offset: &mut i64,
+        remaining: &mut u64,
+        rate_checker: &mut Option<RateChecker>,
+    ) {
+        *file_offset = new_offset;
+        *remaining = remaining
+            .checked_sub(moved as u64)
+            .expect("sendfile(2) should not transfer more bytes than requested");
+        metrics::BYTES_SERVED_SENDFILE.increment_by(moved as u64);
+        if let Some(rc) = rate_checker
+            && moved > 0
+        {
+            rc.add(moved);
+        }
+    }
+
+    fn stopped_at_eof(file_offset: i64, remaining: u64, amount: u64) -> ChunkLoopOutcome {
+        warn_once_or_debug!(
+            "sendfile: returned 0 at offset {file_offset} with {remaining}/{amount} bytes remaining; stopping the transfer at that offset"
+        );
+        ChunkLoopOutcome::Eof {
+            transferred: amount - remaining,
+        }
+    }
+
     let config = global_config();
     let mut remaining = amount;
 
@@ -1865,29 +1892,18 @@ async fn sendfile_chunk_loop(
 
         fds = SendfileFds { socket: s, file: f };
 
-        *file_offset = batch.new_offset;
-        remaining = remaining
-            .checked_sub(batch.transferred as u64)
-            .expect("sendfile(2) should not transfer more bytes than requested");
-        metrics::BYTES_SERVED_SENDFILE.increment_by(batch.transferred as u64);
-        if let Some(rc) = rate_checker
-            && batch.transferred > 0
-        {
-            rc.add(batch.transferred);
-        }
+        credit(
+            batch.transferred,
+            batch.new_offset,
+            file_offset,
+            &mut remaining,
+            rate_checker,
+        );
 
         match batch.stop {
             SendfileBatchStop::Done => return Ok((ChunkLoopOutcome::Complete, fds)),
             SendfileBatchStop::Eof => {
-                warn_once_or_debug!(
-                    "sendfile: returned 0 at offset {file_offset} with {remaining}/{amount} bytes remaining; stopping the transfer at that offset"
-                );
-                return Ok((
-                    ChunkLoopOutcome::Eof {
-                        transferred: amount - remaining,
-                    },
-                    fds,
-                ));
+                return Ok((stopped_at_eof(*file_offset, remaining, amount), fds));
             }
             SendfileBatchStop::NeedsWritable => {
                 // The raw sendfile(2) EAGAIN inside the blocking batch is
@@ -1913,27 +1929,8 @@ async fn sendfile_chunk_loop(
                 match socket.try_io(Interest::WRITABLE, || {
                     sendfile_once(fds.socket.as_fd(), fds.file.as_fd(), &mut off, chunk_size)
                 }) {
-                    Ok(0) => {
-                        warn_once_or_debug!(
-                            "sendfile: returned 0 at offset {off} with {remaining}/{amount} bytes remaining; stopping the transfer at that offset"
-                        );
-                        return Ok((
-                            ChunkLoopOutcome::Eof {
-                                transferred: amount - remaining,
-                            },
-                            fds,
-                        ));
-                    }
-                    Ok(n) => {
-                        *file_offset = off;
-                        remaining = remaining
-                            .checked_sub(n as u64)
-                            .expect("sendfile(2) should not transfer more bytes than requested");
-                        metrics::BYTES_SERVED_SENDFILE.increment_by(n as u64);
-                        if let Some(rc) = rate_checker {
-                            rc.add(n);
-                        }
-                    }
+                    Ok(0) => return Ok((stopped_at_eof(off, remaining, amount), fds)),
+                    Ok(n) => credit(n, off, file_offset, &mut remaining, rate_checker),
                     // Readiness cleared race-free; the next loop iteration
                     // parks in `wait_writable_rated` until a fresh event.
                     Err(err) if err.kind() == ErrorKind::WouldBlock => {}

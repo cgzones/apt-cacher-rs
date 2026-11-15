@@ -1302,7 +1302,7 @@ pub(crate) fn valid_mirrorname(name: &str, kind: MirrorKind) -> bool {
 /// `_` anywhere but the first byte.  The alphanumeric-first rule is what
 /// keeps `.` and `..` out of every field validated through here.
 #[must_use]
-fn valid_path_segment(name: &str) -> bool {
+pub(crate) fn valid_path_segment(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_SEGMENT_LEN
         && name.bytes().enumerate().all(|(i, b)| {
@@ -1323,28 +1323,6 @@ pub(crate) fn valid_directory(name: &str) -> bool {
         && name.bytes().enumerate().all(|(i, b)| {
             b.is_ascii_alphanumeric() || (i > 0 && matches!(b, b'-' | b'.' | b'_' | b'+'))
         })
-}
-
-// The three field validators below are [`valid_path_segment`] under
-// per-field names, so `cache_layout::ValidateKind` dispatches to a name that
-// says which URL field is being checked and one rule can diverge later
-// without touching any call site.
-
-#[must_use]
-pub(crate) fn valid_distribution(name: &str) -> bool {
-    valid_path_segment(name)
-}
-
-#[must_use]
-pub(crate) fn valid_component(name: &str) -> bool {
-    valid_path_segment(name)
-}
-
-/// Accepts both the `binary-<arch>` token and the `source` / `dep11` /
-/// `i18n` pseudo-architectures, which all reach it from the same URL slot.
-#[must_use]
-pub(crate) fn valid_architecture(name: &str) -> bool {
-    valid_path_segment(name)
 }
 
 #[cfg(test)]
@@ -2129,55 +2107,37 @@ mod tests {
         }
     }
 
-    const INVALID_PATH_SEGMENTS: [&str; 15] = [
-        "",
-        ".",
-        "..",
-        "-foo",
-        ".foo",
-        "_foo",
-        "foo\nbar",
-        "foo/bar",
-        "foo/./bar",
-        "foo/../bar",
-        "foo//bar",
-        "/",
-        "/debian",
-        "~/foo",
-        "~foo",
-    ];
-
     #[test]
-    fn test_invalid_distribution() {
-        /* valid */
-        assert!(valid_distribution("sid"));
-        assert!(valid_distribution("lunar-updates"));
-
-        for segment in INVALID_PATH_SEGMENTS {
-            assert!(!valid_distribution(segment), "distribution: {segment:?}");
+    fn test_invalid_path_segment() {
+        for segment in [
+            "sid",
+            "lunar-updates",
+            "main",
+            "non-free",
+            "mysql-8.0",
+            "foo_bar",
+            "binary-amd64",
+        ] {
+            assert!(valid_path_segment(segment), "{segment:?}");
         }
-    }
-
-    #[test]
-    fn test_invalid_component() {
-        /* valid */
-        assert!(valid_component("main"));
-        assert!(valid_component("non-free"));
-        assert!(valid_component("mysql-8.0"));
-        assert!(valid_component("foo_bar"));
-
-        for segment in INVALID_PATH_SEGMENTS {
-            assert!(!valid_component(segment), "component: {segment:?}");
-        }
-    }
-
-    #[test]
-    fn test_invalid_architecture() {
-        /* valid */
-        assert!(valid_architecture("binary-amd64"));
-
-        for segment in INVALID_PATH_SEGMENTS {
-            assert!(!valid_architecture(segment), "architecture: {segment:?}");
+        for segment in [
+            "",
+            ".",
+            "..",
+            "-foo",
+            ".foo",
+            "_foo",
+            "foo\nbar",
+            "foo/bar",
+            "foo/./bar",
+            "foo/../bar",
+            "foo//bar",
+            "/",
+            "/debian",
+            "~/foo",
+            "~foo",
+        ] {
+            assert!(!valid_path_segment(segment), "{segment:?}");
         }
     }
 

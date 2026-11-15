@@ -88,7 +88,7 @@ pub(crate) enum RejectReason {
     /// URL-decoding a request field produced invalid UTF-8.
     BadEncoding,
     /// A decoded field failed its allowlist validator
-    /// (`valid_mirrorname`, `valid_distribution`, etc.).
+    /// (`valid_mirrorname`, `valid_path_segment`, etc.).
     InvalidValue,
     /// The simple-proxy gate found `..`/`.` traversal segments or a
     /// control byte in the percent-decoded path, or the cache-route gate an

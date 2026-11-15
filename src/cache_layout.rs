@@ -67,8 +67,7 @@ use crate::{
     deb_mirror::{
         ByHashScope, FlatKind, Mirror, MirrorKind, Origin, OriginFields, OriginSighting,
         ResourceFile, is_binary_arch, is_deb_package, is_flat_deb_filename, is_packages_directory,
-        valid_architecture, valid_component, valid_directory, valid_distribution, valid_filename,
-        valid_mirrorname,
+        valid_directory, valid_filename, valid_mirrorname, valid_path_segment,
     },
     flat_blocklist::path_collides_with_flat_layout,
     index_parser::HashAlgo,
@@ -617,6 +616,8 @@ pub(crate) enum ValidateKind {
     FlatMirrorPath,
     Distribution,
     Component,
+    /// Both the `binary-<arch>` token and the `source` / `dep11` / `i18n`
+    /// pseudo-architectures, which all reach it from the same URL slot.
     Architecture,
     /// A directory segment outside the cache name: see
     /// [`crate::deb_mirror::valid_directory`].
@@ -630,9 +631,9 @@ impl ValidateKind {
         match self {
             Self::MirrorPath => valid_mirrorname(decoded, MirrorKind::Structured),
             Self::FlatMirrorPath => valid_mirrorname(decoded, MirrorKind::Flat),
-            Self::Distribution => valid_distribution(decoded),
-            Self::Component => valid_component(decoded),
-            Self::Architecture => valid_architecture(decoded),
+            Self::Distribution | Self::Component | Self::Architecture => {
+                valid_path_segment(decoded)
+            }
             Self::Directory => valid_directory(decoded),
             Self::Filename => valid_filename(decoded),
         }

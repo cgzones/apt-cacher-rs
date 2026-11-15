@@ -56,7 +56,8 @@ use crate::{
     cache_layout::{CacheEntryKeyRef, CacheLayout},
     deb_mirror::Mirror,
     http_etag::{ETag, MAX_ETAG_LEN, is_valid_etag},
-    http_last_modified::{LastModified, is_valid_http_date},
+    http_last_modified::LastModified,
+    http_range::HttpDate,
     mem_usage::{ARC_HEADER, Footprint},
     warn_once_or_info,
     xattr_helpers::{self, ExpectedSize, XattrValue as _},
@@ -322,7 +323,7 @@ pub(crate) fn check_upstream_validators<S: AsRef<str>>(
             });
             return false;
         }
-        let valid = is_valid_http_date(lm);
+        let valid = HttpDate::parse(lm).is_some();
         if !valid {
             on_invalid(InvalidValidator::LastModified(lm));
         }
@@ -596,12 +597,16 @@ mod tests {
     use crate::xattr_helpers::tests::supports_user_xattrs;
 
     fn write_etag(file: &File, path: &Path, etag: &str) {
-        xattr_helpers::write(file, path, &ETag::parse(etag).expect("valid ETag"));
+        xattr_helpers::write(
+            &xattr_helpers::XattrFile(file),
+            path,
+            &ETag::parse(etag).expect("valid ETag"),
+        );
     }
 
     fn write_last_modified(file: &File, path: &Path, value: &str) {
         xattr_helpers::write(
-            file,
+            &xattr_helpers::XattrFile(file),
             path,
             &LastModified::parse(value).expect("valid HTTP-date"),
         );
@@ -668,7 +673,7 @@ mod tests {
             "the published value is what was persisted"
         );
         assert_eq!(
-            xattr_helpers::read::<ExpectedSize>(&file, &path),
+            xattr_helpers::read::<ExpectedSize>(&xattr_helpers::XattrFile(&file), &path),
             Some(ExpectedSize(4096))
         );
     }
@@ -686,15 +691,15 @@ mod tests {
         write_upstream_metadata(&file, &path, &meta, Some(4096), TargetFile::Resumed);
 
         assert!(
-            xattr_helpers::read::<ETag>(&file, &path).is_none(),
+            xattr_helpers::read::<ETag>(&xattr_helpers::XattrFile(&file), &path).is_none(),
             "the first attempt's ETag must not outlive a download without one"
         );
         assert!(
-            xattr_helpers::read::<LastModified>(&file, &path).is_none(),
+            xattr_helpers::read::<LastModified>(&xattr_helpers::XattrFile(&file), &path).is_none(),
             "the first attempt's Last-Modified must not outlive a download without one"
         );
         assert_eq!(
-            xattr_helpers::read::<ExpectedSize>(&file, &path),
+            xattr_helpers::read::<ExpectedSize>(&xattr_helpers::XattrFile(&file), &path),
             Some(ExpectedSize(4096))
         );
     }
@@ -712,7 +717,7 @@ mod tests {
         write_upstream_metadata(&file, &path, &meta, None, TargetFile::New);
 
         assert_eq!(
-            xattr_helpers::read::<ETag>(&file, &path),
+            xattr_helpers::read::<ETag>(&xattr_helpers::XattrFile(&file), &path),
             ETag::parse("\"planted\""),
             "no removal is attempted on a new file"
         );
@@ -764,8 +769,13 @@ mod tests {
         let (_dir, file, path) = fixture_file().await;
         let meta = UpstreamMetadata::from_upstream(Some("\"abc\""), None);
         write_upstream_metadata(&file, &path, &meta, None, TargetFile::New);
-        assert_eq!(xattr_helpers::read::<ExpectedSize>(&file, &path), None);
-        assert!(xattr_helpers::read::<LastModified>(&file, &path).is_none());
+        assert_eq!(
+            xattr_helpers::read::<ExpectedSize>(&xattr_helpers::XattrFile(&file), &path),
+            None
+        );
+        assert!(
+            xattr_helpers::read::<LastModified>(&xattr_helpers::XattrFile(&file), &path).is_none()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

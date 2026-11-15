@@ -1052,7 +1052,7 @@ mod tests {
         );
         if planted {
             assert!(
-                xattr_helpers::read::<ETag>(&file, &path).is_none(),
+                xattr_helpers::read::<ETag>(&xattr_helpers::XattrFile(&file), &path).is_none(),
                 "the leftover's xattrs stay with the leftover"
             );
         }

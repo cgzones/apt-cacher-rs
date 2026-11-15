@@ -97,10 +97,6 @@ impl Drop for RelaySlot {
     }
 }
 
-fn try_acquire(max: Option<NonZero<usize>>) -> Option<RelaySlot> {
-    RELAYS.try_acquire(max)
-}
-
 /// Counts and logs a refusal; the caller answers a `None` with 503
 /// [`REFUSAL_BODY`].
 #[must_use]
@@ -109,7 +105,7 @@ pub(crate) fn admit(
     uri: impl std::fmt::Display,
     client: &ClientInfo,
 ) -> Option<RelaySlot> {
-    let slot = try_acquire(max);
+    let slot = RELAYS.try_acquire(max);
     if slot.is_none() {
         metrics::PASSTHROUGH_REJECTED_CAP.increment();
         warn_once_or_info!(
@@ -131,8 +127,8 @@ mod tests {
     fn slots_are_capped_and_released_on_drop() {
         let base = active_relays();
         let max = NonZero::new(base + 2).expect("non-zero");
-        let first = try_acquire(Some(max)).expect("first slot");
-        let second = try_acquire(Some(max)).expect("second slot");
+        let first = RELAYS.try_acquire(Some(max)).expect("first slot");
+        let second = RELAYS.try_acquire(Some(max)).expect("second slot");
         let before = metrics::PASSTHROUGH_REJECTED_CAP.get();
         assert!(
             admit(Some(max), "/x", &local_client()).is_none(),
@@ -141,7 +137,9 @@ mod tests {
         assert!(metrics::PASSTHROUGH_REJECTED_CAP.get() > before);
 
         drop(second);
-        let third = try_acquire(Some(max)).expect("a released slot is handed out again");
+        let third = RELAYS
+            .try_acquire(Some(max))
+            .expect("a released slot is handed out again");
         drop(first);
         drop(third);
     }
@@ -173,7 +171,7 @@ mod tests {
 
     #[test]
     fn no_cap_admits_and_counts() {
-        let slot = try_acquire(None).expect("uncapped");
+        let slot = RELAYS.try_acquire(None).expect("uncapped");
         assert!(active_relays() >= 1);
         assert!(metrics::PASSTHROUGH_ACTIVE_PEAK.get() >= 1);
         drop(slot);

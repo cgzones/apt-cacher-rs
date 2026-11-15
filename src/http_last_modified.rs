@@ -5,13 +5,6 @@ use std::{
 
 use crate::{http_range::HttpDate, xattr_helpers::XattrValue};
 
-/// IMF-fixdate (and its RFC 2822 superset) only: the legacy RFC 850 and
-/// asctime forms of RFC 9110 §5.6.7 are rejected as malformed.
-#[must_use]
-pub(crate) fn is_valid_http_date(s: &str) -> bool {
-    HttpDate::parse(s).is_some()
-}
-
 /// A validated upstream `Last-Modified` value, persisted on a cached file as
 /// `user.apt_cacher_rs.last_modified`. Keeps the origin's spelling for the
 /// response header (RFC 9110 §10.2.2: forward the origin's value) next to
@@ -74,24 +67,6 @@ impl XattrValue for LastModified {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn is_valid_http_date_test() {
-        assert!(is_valid_http_date("Thu, 01 Jan 1970 00:00:00 GMT"));
-        assert!(is_valid_http_date("Tue, 21 Mar 2361 19:15:09 GMT"));
-
-        assert!(!is_valid_http_date(""));
-        assert!(!is_valid_http_date("not a date"));
-        assert!(!is_valid_http_date("Thu, 32 Jan 1970 00:00:00 GMT"));
-
-        // The two obsolete formats of RFC 9110 section 5.6.7.
-        assert!(!is_valid_http_date("Sunday, 06-Nov-94 08:49:37 GMT"));
-        assert!(!is_valid_http_date("Sun Nov  6 08:49:37 1994"));
-
-        // Pre-epoch timestamps parse as dates but have no `HttpDate`, so they
-        // are not storable validators either.
-        assert!(!is_valid_http_date("Wed, 31 Dec 1969 23:59:59 GMT"));
-    }
 
     #[test]
     fn last_modified_parse_and_render() {

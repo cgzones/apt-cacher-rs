@@ -11,6 +11,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::{
     AppState,
     cache_layout::CacheLayout,
+    cache_paths::CachePaths,
     cache_quota::accounted_size,
     cache_walk::{AnomalyLevel, DirFailure, EntryKind, WalkContext, WalkOutcome, Walker},
     config::Config,
@@ -26,9 +27,9 @@ use crate::{
 
 use crate::cleanup::fetch::{DebnameKind, FetchFailure, fetch_packages};
 use crate::cleanup::model::{
-    ByHashUnit, CleanupUnit, DistGate, FlatFetch, GroupOutcome, GroupResult, IndexSource,
-    MetadataUnit, PartialsUnit, ReconcileFacet, ReconcileUnit, SkipReason, SweepAction,
-    SweepReason, decide_sweep,
+    ByHashUnit, CleanupUnit, FlatFetch, GroupOutcome, GroupResult, IndexSource, MetadataUnit,
+    PartialsUnit, ReconcileFacet, ReconcileUnit, SkipReason, SweepAction, SweepReason,
+    decide_sweep,
 };
 use crate::cleanup::packages::{KeyMapper, ReduceContext, ReduceError, reduce_file_list};
 use crate::cleanup::partials::cleanup_tmp_dir;
@@ -444,20 +445,23 @@ async fn run_byhash_unit(
         return Ok(UnitStats::default());
     }
 
-    // `None` means age mode for the whole tree. Structured trees gate
-    // reference mode on the complete active-origin distribution set (an unread
-    // origin set forces age mode); flat trees have a single root Release.
-    let reference = match unit.dist_gate {
-        DistGate::ActiveOriginDists => match active_origin_distributions(ctx.self_origins) {
-            Some(expected_dists) => {
-                build_byhash_reference_set(cache_root, &unit.release_dir, layout, &expected_dists)
-                    .await
-            }
-            None => None,
-        },
-        DistGate::None => {
-            build_byhash_reference_set(cache_root, &unit.release_dir, layout, &[]).await
+    // The on-disk `Release` set that defines "referenced" is the metadata
+    // tree the by-hash directory sits in. Structured trees gate reference mode
+    // on the complete active-origin distribution set (an unread origin set
+    // forces age mode); flat trees have a single root Release.
+    let release_layout = unit.release_layout();
+    let expected_dists = if layout.is_flat() {
+        Some(Vec::new())
+    } else {
+        active_origin_distributions(ctx.self_origins)
+    };
+    // `None` means age mode for the whole tree.
+    let reference = match expected_dists {
+        Some(expected_dists) => {
+            let release_dir = CachePaths::new(cache_root).entry_dir(release_layout, mirror.site());
+            build_byhash_reference_set(cache_root, &release_dir, layout, &expected_dists).await
         }
+        None => None,
     };
 
     let stats = sweep_byhash_dir(
@@ -643,24 +647,16 @@ async fn run_reconcile_unit(
             GroupResolution::Exhausted => return Ok(tally),
             GroupResolution::Skipped => {}
             GroupResolution::Ran(outcome) => {
-                // An owning group that Completed owns the whole reconciliation:
-                // stop resolving further groups and grace-sweep the leftovers.
-                let owning_complete =
-                    group.is_owning() && matches!(outcome, GroupOutcome::Complete);
-                let root_seg = flat_root_segment(group);
-                // `decide_sweep` names the fallback warn's flat root by the
-                // nearest group carrying a segment, so an owning group must
-                // never carry one.
-                debug_assert!(
-                    !(group.is_owning() && root_seg.is_some()),
-                    "owning group with a flat root segment: {group:?}"
-                );
+                let complete = matches!(outcome, GroupOutcome::Complete);
                 results.push(GroupResult {
-                    root_seg: root_seg.map(str::to_owned),
+                    root_seg: flat_root_segment(group).map(str::to_owned),
                     outcome,
                 });
-                if owning_complete {
-                    owning_root = archive_root_segment(group);
+                // An archive-root group that Completed owns the whole
+                // reconciliation: stop resolving further groups and
+                // grace-sweep the leftovers.
+                if complete && let IndexSource::ArchiveRoot { root, prefix: _ } = group {
+                    owning_root = Some(root);
                     break;
                 }
             }
@@ -748,13 +744,6 @@ async fn resolve_group(
         IndexSource::FlatPackages {
             fetch: FlatFetch::RootSegment { seg, prefix },
         } => resolve_flat_root_segment(ctx, seg, prefix, cached_files, tally).await,
-    }
-}
-
-fn archive_root_segment(source: &IndexSource) -> Option<&str> {
-    match source {
-        IndexSource::ArchiveRoot { root, prefix: _ } => Some(root.as_str()),
-        IndexSource::SelfOrigins | IndexSource::FlatPackages { fetch: _ } => None,
     }
 }
 
@@ -1138,26 +1127,6 @@ mod tests {
         assert_eq!(plan.owner_mirror.path(), "apt/amd64");
         assert_ne!(plan.mirror, owner);
         assert_eq!(plan.mirror.path(), "apt");
-    }
-
-    #[test]
-    fn archive_root_segment_only_for_owning_hybrid_source() {
-        let hybrid = IndexSource::ArchiveRoot {
-            root: "api/packages/85/debian".to_owned(),
-            prefix: "pool/php-zts/main/".to_owned(),
-        };
-        assert_eq!(
-            archive_root_segment(&hybrid),
-            Some("api/packages/85/debian")
-        );
-
-        let self_row = IndexSource::SelfOrigins;
-        assert_eq!(archive_root_segment(&self_row), None);
-
-        let colocated = IndexSource::FlatPackages {
-            fetch: FlatFetch::Colocated,
-        };
-        assert_eq!(archive_root_segment(&colocated), None);
     }
 
     // --- by-hash sweep, with an injected `now` (birthtime is not backdatable

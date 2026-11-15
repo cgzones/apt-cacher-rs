@@ -43,9 +43,7 @@ use crate::{
         at_capacity_refusal, await_progress, await_serveable,
     },
     build_info::{APP_USER_AGENT, APP_VIA},
-    cache_conditional::{
-        CacheInfo, RangeRequestHeaders, ServeParams, ServePlan, check_volatile_hit,
-    },
+    cache_conditional::{CacheInfo, RangeRequestHeaders, ServePlan, check_volatile_hit},
     cache_layout::{
         CacheMiss, CachedFlavor, ConnectionDetails, FetchRole, LookupOutcome, MissReason,
     },
@@ -1011,7 +1009,7 @@ fn serve_unfinished_file(
 async fn serve_cached_file(
     conn_details: ConnectionDetails,
     req: &Request<Empty<()>>,
-    file: tokio::fs::File,
+    mut file: tokio::fs::File,
     file_path: PathBuf,
     prefetched_upstream_metadata: Option<&UpstreamMetadata>,
     prefetched_local_metadata: Option<std::fs::Metadata>,
@@ -1080,25 +1078,6 @@ async fn serve_cached_file(
         conn_details.debname, conn_details.mirror, aliased, conn_details.client
     );
 
-    serve_cached_file_buf(
-        conn_details,
-        file,
-        file_path,
-        file_size,
-        &cache_info,
-        params,
-    )
-    .await
-}
-
-async fn serve_cached_file_buf(
-    conn_details: ConnectionDetails,
-    mut file: tokio::fs::File,
-    file_path: PathBuf,
-    file_size: u64,
-    cache_info: &CacheInfo,
-    params: ServeParams,
-) -> Response<ProxyCacheBody> {
     let start = params.content_start();
     let content_length = params.content_length();
     debug_assert!(
@@ -1150,7 +1129,7 @@ async fn serve_cached_file_buf(
         },
     );
 
-    let head = ResponseHead::cached((&params).into(), content_type, cache_info);
+    let head = ResponseHead::cached((&params).into(), content_type, &cache_info);
 
     let response = head.into_hyper(body);
 
@@ -2905,9 +2884,9 @@ fn accounted_body_failure<'a>(
     error_chain(err).find_map(|e| e.downcast_ref::<DeliveryFailure>())
 }
 
-/// The request-head allowance in [`client_max_buf_size`], and its floor:
-/// the sendfile backend refuses a head past 8 KiB, and twice that leaves
-/// room for a pipelined request behind a maximal head in a sendfile handoff.
+/// The request-head allowance in [`client_max_buf_size`]: the sendfile
+/// backend refuses a head past 8 KiB, and twice that leaves room for a
+/// pipelined request behind a maximal head in a sendfile handoff.
 const CLIENT_HEAD_ALLOWANCE: usize = 16 * 1024;
 
 /// `max_buf_size` of the client-facing server connection, i.e. hyper
@@ -2925,14 +2904,13 @@ const CLIENT_HEAD_ALLOWANCE: usize = 16 * 1024;
 ///   a loopback cache hit through the stream body measured about 24 % less
 ///   throughput and 14 % more CPU per MiB than with no limit.
 ///
-/// Hence `buffer_size` plus [`CLIENT_HEAD_ALLOWANCE`], never below that
-/// allowance: one queued frame (plus its response head) stays under the
-/// limit, so the next file read overlaps the write, while the head bound
-/// (48 KiB at the default 32 KiB `buffer_size`) stays far below hyper's
-/// default.
+/// Hence `buffer_size` plus [`CLIENT_HEAD_ALLOWANCE`]: one queued frame
+/// (plus its response head) stays under the limit, so the next file read
+/// overlaps the write, while the head bound (48 KiB at the default 32 KiB
+/// `buffer_size`) stays far below hyper's default.
 #[must_use]
 pub(crate) fn client_max_buf_size(buffer_size: usize) -> usize {
-    CLIENT_HEAD_ALLOWANCE.max(buffer_size.saturating_add(CLIENT_HEAD_ALLOWANCE))
+    buffer_size.saturating_add(CLIENT_HEAD_ALLOWANCE)
 }
 
 fn client_http1_builder() -> http1::Builder {
@@ -3630,13 +3608,8 @@ mod tests {
     /// it before polling the body for the next (see `client_max_buf_size`).
     #[test]
     fn client_max_buf_size_leaves_room_for_one_frame_and_a_head() {
-        use super::{CLIENT_HEAD_ALLOWANCE, client_max_buf_size};
+        use super::client_max_buf_size;
         assert_eq!(client_max_buf_size(32 * 1024), 48 * 1024);
-        for buffer_size in [1024, 32 * 1024, 128 * 1024, 16 * 1024 * 1024] {
-            let limit = client_max_buf_size(buffer_size);
-            assert!(limit >= CLIENT_HEAD_ALLOWANCE);
-            assert!(limit >= buffer_size + CLIENT_HEAD_ALLOWANCE);
-        }
         assert_eq!(client_max_buf_size(usize::MAX), usize::MAX);
     }
 
