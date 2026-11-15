@@ -403,23 +403,6 @@ impl std::fmt::Display for DomainName {
     }
 }
 
-/// [`DomainName`]'s `Display` for a host held only as its bare canonical
-/// text (`DomainName::as_str`, e.g. a checksum-registry scope): an IPv6
-/// address bracketed, so a log line naming it stays unambiguous.
-pub(crate) struct HostText<'a>(pub(crate) &'a str);
-
-impl std::fmt::Display for HostText<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self(host) = self;
-        // Only an IPv6 address has a colon in its canonical text.
-        if host.contains(':') {
-            write!(f, "[{host}]")
-        } else {
-            f.write_str(host)
-        }
-    }
-}
-
 impl PartialEq<str> for DomainName {
     fn eq(&self, other: &str) -> bool {
         self.as_str() == other
@@ -2580,13 +2563,6 @@ mod test {
         assert_eq!(canonical.as_str(), "2001:db8::1");
         assert_eq!(canonical.format_authority(None), "[2001:db8::1]");
         assert_eq!(canonical.to_string(), "[2001:db8::1]", "logs bracket it");
-        for host in ["2001:db8::1", "deb.debian.org", "192.0.2.1"] {
-            assert_eq!(
-                HostText(host).to_string(),
-                dn(host).to_string(),
-                "bare text renders like its host"
-            );
-        }
         assert_eq!(dn("DEB.debian.org").to_string(), "deb.debian.org");
         assert_eq!(dn("[0:0::1]").as_str(), "::1");
 

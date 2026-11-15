@@ -49,7 +49,6 @@ use parking_lot::Mutex;
 use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use tracing::{debug, error, warn};
 
-use crate::config::HostText;
 use crate::error::ErrorReport;
 use crate::fs_open::{hint_sequential_read, nofollow_nonblock_options};
 use crate::ingest_ledger::{Claim, IngestLedger, Outcome};
@@ -1196,25 +1195,6 @@ fn registry_verify_kind(plan: &RenamePlan, key: &str) -> VerifyKind {
     )
 }
 
-/// A `Packages` index cached in a compression the ingest ladder does not
-/// know (`.zst`, `.bz2`, `.lz4` on third-party repos): the file is served
-/// from cache, but its digests never reach the registry, so every deb it
-/// lists is cached unverified. The early return is otherwise shared with the
-/// deliberate no-op kinds, which is why nothing marks this case today.
-fn log_unsupported_packages_compression(leaf: &str, host: &str) {
-    // `Packages` and the two supported suffixes always classify; anything
-    // else with the `Packages.` prefix is an unsupported compression. Other
-    // metadata leaves (Release, InRelease) legitimately have none.
-    if !leaf.starts_with("Packages.") {
-        return;
-    }
-    warn_once_or_debug!(
-        "Unsupported Packages compression `{}` from host {host}; skipping registry ingest, its debs stay unverified",
-        leaf.escape_debug(),
-        host = HostText(host),
-    );
-}
-
 /// `rename(2)` the finished temp file into the cache, creating the
 /// destination directory only when it turns out to be missing.
 ///
@@ -1822,27 +1802,20 @@ impl<'a> From<&'a RenamePlan> for IndexFile<'a> {
 /// How `file` is ingested, or `None` for a resource that feeds no registry
 /// entries. One table for the commit and the touch path.
 fn ingest_kind(file: &IndexFile<'_>) -> Option<IngestKind> {
-    // For Packages, `file.debname` is `_`-joined; extract the leaf filename
-    // (the part after the last `_`).
-    let leaf = file
-        .debname
-        .rsplit('_')
-        .next()
-        .expect("rsplit yields at least one element");
-
-    let packages_kind = || {
-        let compression = PackagesCompression::from_filename(leaf);
-        if compression.is_none() {
-            log_unsupported_packages_compression(leaf, file.mirror.host().as_str());
-        }
-        compression.map(|compression| IngestKind::Packages {
-            compression: Some(compression),
-        })
-    };
-
     #[expect(clippy::match_same_arms, reason = "prefer clarity")]
     let kind = match file.resource_kind {
-        ResourceKind::Packages => packages_kind(),
+        // `file.debname` is `_`-joined; the leaf after the last `_` is the
+        // filename, which the router only classifies as `Packages` when
+        // `from_filename` knows it (`deb_mirror::is_packages_filename`).
+        ResourceKind::Packages => {
+            let leaf = file
+                .debname
+                .rsplit_once('_')
+                .map_or(file.debname, |(_, leaf)| leaf);
+            PackagesCompression::from_filename(leaf).map(|compression| IngestKind::Packages {
+                compression: Some(compression),
+            })
+        }
         // A flat repository's indexes feed nothing: its pool downloads are
         // `VerifyKind::Unverifiable` and its `Packages` files are not
         // verified against a flat `Release` either, so their digests would
