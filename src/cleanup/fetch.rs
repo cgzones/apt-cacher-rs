@@ -125,20 +125,6 @@ pub(super) struct FetchedPackages {
     pub(super) len: u64,
 }
 
-/// Fold one "missing-ish" status (404/403/410) into the best-known one the
-/// fetch reports once every format has failed: a specific 403/410 promotes over
-/// the generic 404, and among non-404 statuses the first one seen wins.
-fn prefer_missing_status(best: Option<StatusCode>, seen: StatusCode) -> StatusCode {
-    let Some(prev) = best else {
-        return seen;
-    };
-    if prev == StatusCode::NOT_FOUND && seen != StatusCode::NOT_FOUND {
-        seen
-    } else {
-        prev
-    }
-}
-
 /// Fetch the index at `base_uri` + extension, trying `.xz`, `.gz`, raw in
 /// turn; the first format answering a complete body wins.
 pub(super) async fn fetch_packages(
@@ -169,9 +155,7 @@ where
     F: FnMut(PackagesCompression, Uri) -> Fut,
     Fut: Future<Output = Result<IndexAnswer<B>, FetchFailure>>,
 {
-    // The most informative missing-ish status, surfaced once every format
-    // has failed.
-    let mut last_missing: Option<StatusCode> = None;
+    let mut last_missing = StatusCode::NOT_FOUND;
 
     for compression in [
         PackagesCompression::Xz,
@@ -193,7 +177,7 @@ where
         let _: Never = match status {
             StatusCode::NOT_FOUND | StatusCode::FORBIDDEN | StatusCode::GONE => {
                 debug!("Cleanup request {uri} unavailable ({status})");
-                last_missing = Some(prefer_missing_status(last_missing, status));
+                last_missing = status;
                 continue;
             }
             _ => {
@@ -211,7 +195,7 @@ where
     }
 
     Err(FetchFailure {
-        status: last_missing.unwrap_or(StatusCode::NOT_FOUND),
+        status: last_missing,
         upstream: None,
     })
 }
@@ -633,41 +617,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_formats_reports_the_most_specific_missing_status() {
+    async fn probe_formats_reports_the_last_missing_status() {
         let (result, requested) = probe(vec![
             Ok(status(StatusCode::NOT_FOUND)),
             Ok(status(StatusCode::FORBIDDEN)),
-            Ok(status(StatusCode::NOT_FOUND)),
+            Ok(status(StatusCode::GONE)),
         ])
         .await;
         assert_eq!(
             result,
             Err(FetchFailure {
-                status: StatusCode::FORBIDDEN,
+                status: StatusCode::GONE,
                 upstream: None,
             })
         );
         assert_eq!(requested.len(), 3);
-    }
-
-    #[test]
-    fn prefer_missing_status_promotes_specific_over_generic_404() {
-        use http::StatusCode as S;
-        assert_eq!(prefer_missing_status(None, S::NOT_FOUND), S::NOT_FOUND);
-        assert_eq!(
-            prefer_missing_status(Some(S::NOT_FOUND), S::FORBIDDEN),
-            S::FORBIDDEN
-        );
-        assert_eq!(prefer_missing_status(Some(S::NOT_FOUND), S::GONE), S::GONE);
-        assert_eq!(
-            prefer_missing_status(Some(S::FORBIDDEN), S::NOT_FOUND),
-            S::FORBIDDEN
-        );
-        // Among non-404 statuses the first one seen wins.
-        assert_eq!(
-            prefer_missing_status(Some(S::FORBIDDEN), S::GONE),
-            S::FORBIDDEN
-        );
     }
 
     #[test]

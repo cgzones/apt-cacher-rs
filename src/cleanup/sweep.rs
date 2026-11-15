@@ -50,32 +50,17 @@ impl SpanTable {
 }
 
 /// The reference time for age-based eviction of a cached file: birthtime,
-/// falling back to mtime on filesystems without birthtime support. `None`
-/// (logged) when neither is available.
-fn age_reference_time(meta: &std::fs::Metadata, path: &Path) -> Option<SystemTime> {
-    match meta.created() {
-        Ok(t) => Some(t),
-        Err(created_err) => {
-            info_once!(
-                "Failed to get create timestamp for file `{}`; falling back to the modify timestamp:  {}",
-                path.display(),
-                ErrorReport(&created_err)
-            );
-            match meta.modified() {
-                Ok(t) => Some(t),
-                Err(modified_err) => {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
-                        "Failed to get create timestamp ({}) and modify timestamp ({}) of file `{}`; retaining it indefinitely since it can never be aged out",
-                        ErrorReport(&created_err),
-                        ErrorReport(&modified_err),
-                        path.display()
-                    );
-                    None
-                }
-            }
-        }
-    }
+/// falling back to mtime on filesystems without birthtime support.
+fn age_reference_time(meta: &std::fs::Metadata, path: &Path) -> SystemTime {
+    meta.created().unwrap_or_else(|created_err| {
+        info_once!(
+            "Failed to get create timestamp for file `{}`; falling back to the modify timestamp:  {}",
+            path.display(),
+            ErrorReport(&created_err)
+        );
+        meta.modified()
+            .expect("Platform should support modification timestamps via setup check")
+    })
 }
 
 /// Which age-based sweep a file is aged out by: each keeps its own log
@@ -99,19 +84,18 @@ impl AgeSweep {
     /// Only where the filesystem has birthtime: without it the touch is
     /// skipped (`Renewal::NoBirthTime`), both times are the unchanged mtime,
     /// and a revalidated index still ages from its last content change.
-    fn reference_time(self, meta: &std::fs::Metadata, path: &Path) -> Option<SystemTime> {
-        let created = age_reference_time(meta, path)?;
-        Some(match self {
+    fn reference_time(self, meta: &std::fs::Metadata, path: &Path) -> SystemTime {
+        let created = age_reference_time(meta, path);
+        match self {
             Self::Candidates => created,
             Self::Metadata => meta
                 .modified()
                 .map_or(created, |modified| created.max(modified)),
-        })
+        }
     }
 
     /// Whether the regular file at `path` is at least `keep_span` old at
-    /// `now`, by [`Self::reference_time`]. A file without a usable timestamp
-    /// is counted in `stats.io_failures`; a file with a future timestamp is
+    /// `now`, by [`Self::reference_time`]. A file with a future timestamp is
     /// kept.
     fn is_due(
         self,
@@ -119,12 +103,8 @@ impl AgeSweep {
         meta: &std::fs::Metadata,
         keep_span: Duration,
         now: SystemTime,
-        stats: &mut UnitStats,
     ) -> bool {
-        let Some(created) = self.reference_time(meta, path) else {
-            stats.io_failures += 1;
-            return false;
-        };
+        let created = self.reference_time(meta, path);
 
         match now.duration_since(created) {
             Ok(existing_for) if existing_for < keep_span => {
@@ -300,7 +280,7 @@ fn sweep_candidate(
         }
     };
 
-    if !AgeSweep::Candidates.is_due(path, &data, keep_span, now, stats) {
+    if !AgeSweep::Candidates.is_due(path, &data, keep_span, now) {
         return;
     }
 
@@ -369,7 +349,7 @@ pub(super) async fn sweep_aged_metadata(
 
         let path = entry.path();
 
-        if !AgeSweep::Metadata.is_due(&path, &data, keep_span, now, &mut result) {
+        if !AgeSweep::Metadata.is_due(&path, &data, keep_span, now) {
             continue;
         }
 

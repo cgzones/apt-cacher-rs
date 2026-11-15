@@ -230,18 +230,11 @@ pub(super) enum GroupOutcome {
 pub(super) enum SkipReason {
     /// The gating `mirrors_v2` row (e.g. the archive-root row for a hybrid
     /// group) does not exist.
-    NoRow { seg: String },
+    NoRow,
     /// A DB lookup needed to resolve the group failed.
     DbError,
     /// The gating row exists but has no active origins.
     NoActiveOrigins,
-}
-
-#[derive(Debug)]
-pub(super) struct GroupResult {
-    /// Set for [`FlatFetch::RootSegment`] groups — feeds the warn suffix.
-    pub root_seg: Option<String>,
-    pub outcome: GroupOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,17 +255,13 @@ pub(super) enum SweepReason {
     /// genuinely unreferenced and reaped past the policy's short grace span.
     Grace,
     /// Every index source failed, so the reference set is incomplete and
-    /// leftovers age out on the long fallback span instead. `root_failed` is
-    /// set when the root fallback was attempted and its fetch failed.
-    AgeFallback {
-        primary: FetchFailure,
-        root_failed: Option<(String, FetchFailure)>,
-    },
+    /// leftovers age out on the long fallback span instead.
+    AgeFallback { primary: FetchFailure },
 }
 
 /// Final sweep decision for a unit from its policy and the ordered results of
 /// the groups that ran.
-pub(super) fn decide_sweep(policy: ReconcilePolicy, groups: &[GroupResult]) -> SweepAction {
+pub(super) fn decide_sweep(policy: ReconcilePolicy, groups: &[GroupOutcome]) -> SweepAction {
     let grace_sweep = || SweepAction::Sweep {
         spans: SpanTable::uniform(policy.grace()),
         reason: SweepReason::Grace,
@@ -280,14 +269,14 @@ pub(super) fn decide_sweep(policy: ReconcilePolicy, groups: &[GroupResult]) -> S
 
     match policy {
         ReconcilePolicy::ReferencedOrBail { grace: _ } => {
-            for g in groups {
-                match &g.outcome {
+            for outcome in groups {
+                match outcome {
                     // A gate that legitimately did not apply (no row, no active
                     // origins) means there is no reference set to be had, which
                     // the grace sweep already handles.
                     GroupOutcome::Complete
                     | GroupOutcome::NotApplicable(
-                        SkipReason::NoRow { seg: _ } | SkipReason::NoActiveOrigins,
+                        SkipReason::NoRow | SkipReason::NoActiveOrigins,
                     ) => {}
                     // A DB error is different: the reference set is *unknown*,
                     // not empty, so sweeping could delete a still-referenced
@@ -302,49 +291,33 @@ pub(super) fn decide_sweep(policy: ReconcilePolicy, groups: &[GroupResult]) -> S
             grace_sweep()
         }
         ReconcilePolicy::ReferencedOrAge { grace: _, fallback } => {
-            let age_sweep = |primary, root_failed| SweepAction::Sweep {
+            let age_sweep = |primary| SweepAction::Sweep {
                 spans: SpanTable::uniform(fallback),
-                reason: SweepReason::AgeFallback {
-                    primary,
-                    root_failed,
-                },
+                reason: SweepReason::AgeFallback { primary },
             };
 
-            // The engine stops resolving at an owning group that completed, so
-            // the last result is either that group -- which then owns the whole
-            // reconciliation, hence Grace -- or the always-present co-located
-            // probe.
-            let Some(colocated) = groups.last() else {
+            // The engine stops resolving at an archive-root group that
+            // completed, so the last result is either that group -- which then
+            // owns the whole reconciliation, hence Grace -- or the
+            // always-present co-located probe.
+            let Some((colocated, earlier)) = groups.split_last() else {
                 return grace_sweep();
             };
-            match &colocated.outcome {
+            match colocated {
                 GroupOutcome::Complete | GroupOutcome::NotApplicable(_) => grace_sweep(),
                 // Quirk: a parse error falls back to age retention even when
                 // the root index reduced fine.
-                GroupOutcome::ParseError => age_sweep(
-                    FetchFailure {
-                        status: StatusCode::BAD_GATEWAY,
-                        upstream: None,
-                    },
-                    None,
-                ),
+                GroupOutcome::ParseError => age_sweep(FetchFailure {
+                    status: StatusCode::BAD_GATEWAY,
+                    upstream: None,
+                }),
+                // Only the root-segment group can have completed ahead of
+                // the co-located probe; its reference set then stands.
                 GroupOutcome::FetchFailed(primary) => {
-                    // The root-segment group, when one ran ahead of the
-                    // co-located probe: its segment names the flat-repo root in
-                    // the fallback warn suffix.
-                    let root = groups
-                        .iter()
-                        .rev()
-                        .skip(1)
-                        .find_map(|g| g.root_seg.as_deref().map(|seg| (seg, &g.outcome)));
-                    match root {
-                        Some((_, GroupOutcome::Complete)) => grace_sweep(),
-                        Some((seg, GroupOutcome::FetchFailed(root_failure))) => age_sweep(
-                            primary.clone(),
-                            Some((seg.to_owned(), root_failure.clone())),
-                        ),
-                        Some((_, GroupOutcome::NotApplicable(_) | GroupOutcome::ParseError))
-                        | None => age_sweep(primary.clone(), None),
+                    if earlier.contains(&GroupOutcome::Complete) {
+                        grace_sweep()
+                    } else {
+                        age_sweep(primary.clone())
                     }
                 }
             }
@@ -506,20 +479,6 @@ mod tests {
         }
     }
 
-    fn gr(outcome: GroupOutcome) -> GroupResult {
-        GroupResult {
-            root_seg: None,
-            outcome,
-        }
-    }
-
-    fn root(seg: &str, outcome: GroupOutcome) -> GroupResult {
-        GroupResult {
-            root_seg: Some(seg.to_owned()),
-            outcome,
-        }
-    }
-
     /// The `Grace` decision both test policies produce (their grace is 1s).
     fn grace() -> SweepAction {
         SweepAction::Sweep {
@@ -529,13 +488,10 @@ mod tests {
     }
 
     /// The `AgeFallback` decision `AGE` produces (its fallback is 2s).
-    fn age_back(primary: FetchFailure, root_failed: Option<(String, FetchFailure)>) -> SweepAction {
+    fn age_back(primary: FetchFailure) -> SweepAction {
         SweepAction::Sweep {
             spans: SpanTable::uniform(Duration::from_secs(2)),
-            reason: SweepReason::AgeFallback {
-                primary,
-                root_failed,
-            },
+            reason: SweepReason::AgeFallback { primary },
         }
     }
 
@@ -553,19 +509,13 @@ mod tests {
 
         for (groups, expected) in [
             (vec![], grace()),
-            (vec![gr(Complete)], grace()),
-            (
-                vec![gr(NotApplicable(SkipReason::NoActiveOrigins))],
-                grace(),
-            ),
-            (vec![gr(FetchFailed(ff(404)))], SweepAction::Bail),
+            (vec![Complete], grace()),
+            (vec![NotApplicable(SkipReason::NoActiveOrigins)], grace()),
+            (vec![FetchFailed(ff(404))], SweepAction::Bail),
             // The reference set is unknown rather than empty, so a grace
             // sweep could delete a deb the unread origins still reference.
-            (
-                vec![gr(NotApplicable(SkipReason::DbError))],
-                SweepAction::Bail,
-            ),
-            (vec![gr(ParseError)], SweepAction::Bail),
+            (vec![NotApplicable(SkipReason::DbError)], SweepAction::Bail),
+            (vec![ParseError], SweepAction::Bail),
         ] {
             assert_eq!(decide_sweep(BAIL, &groups), expected, "{groups:?}");
         }
@@ -576,46 +526,26 @@ mod tests {
     fn decide_sweep_referenced_or_age() {
         use GroupOutcome::{Complete, FetchFailed, NotApplicable, ParseError};
 
-        let no_row = || {
-            NotApplicable(SkipReason::NoRow {
-                seg: "apt".to_owned(),
-            })
-        };
         for (groups, expected) in [
-            (vec![gr(Complete)], grace()),
-            (vec![gr(FetchFailed(ff(404)))], age_back(ff(404), None)),
-            (vec![gr(ParseError)], age_back(ff(502), None)),
+            (vec![Complete], grace()),
+            (vec![FetchFailed(ff(404))], age_back(ff(404))),
+            (vec![ParseError], age_back(ff(502))),
             // A completed root group stands when the co-located fetch fails.
+            (vec![Complete, FetchFailed(ff(404))], grace()),
             (
-                vec![root("apt", Complete), gr(FetchFailed(ff(404)))],
-                grace(),
-            ),
-            // A failed root fetch rides along as the warn's root context.
-            (
-                vec![root("apt", FetchFailed(ff(403))), gr(FetchFailed(ff(404)))],
-                age_back(ff(404), Some(("apt".to_owned(), ff(403)))),
+                vec![FetchFailed(ff(403)), FetchFailed(ff(404))],
+                age_back(ff(404)),
             ),
             (
-                vec![root("apt", no_row()), gr(FetchFailed(ff(404)))],
-                age_back(ff(404), None),
+                vec![NotApplicable(SkipReason::NoRow), FetchFailed(ff(404))],
+                age_back(ff(404)),
             ),
-            (
-                vec![root("apt", ParseError), gr(FetchFailed(ff(404)))],
-                age_back(ff(404), None),
-            ),
-            // Quirk: a co-located parse error falls back to age retention
-            // even when the root index reduced fine.
-            (
-                vec![root("apt", Complete), gr(ParseError)],
-                age_back(ff(502), None),
-            ),
+            (vec![ParseError, FetchFailed(ff(404))], age_back(ff(404))),
+            // Quirk: a co-located parse error ignores the completed root.
+            (vec![Complete, ParseError], age_back(ff(502))),
             // A failed hybrid group does not prejudice a completed root.
             (
-                vec![
-                    gr(FetchFailed(ff(404))),
-                    root("apt", Complete),
-                    gr(FetchFailed(ff(404))),
-                ],
+                vec![FetchFailed(ff(404)), Complete, FetchFailed(ff(404))],
                 grace(),
             ),
         ] {

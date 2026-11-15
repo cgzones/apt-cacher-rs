@@ -27,9 +27,8 @@ use crate::{
 
 use crate::cleanup::fetch::{DebnameKind, FetchFailure, fetch_packages};
 use crate::cleanup::model::{
-    ByHashUnit, CleanupUnit, FlatFetch, GroupOutcome, GroupResult, IndexSource, MetadataUnit,
-    PartialsUnit, ReconcileFacet, ReconcileUnit, SkipReason, SweepAction, SweepReason,
-    decide_sweep,
+    ByHashUnit, CleanupUnit, FlatFetch, GroupOutcome, IndexSource, MetadataUnit, PartialsUnit,
+    ReconcileFacet, ReconcileUnit, SkipReason, SweepAction, SweepReason, decide_sweep,
 };
 use crate::cleanup::packages::{KeyMapper, ReduceContext, ReduceError, reduce_file_list};
 use crate::cleanup::partials::cleanup_tmp_dir;
@@ -591,7 +590,7 @@ async fn sweep_byhash_dir(
     Ok(swept)
 }
 
-/// Scan the tree, resolve each ordered [`IndexSource`] into a [`GroupResult`],
+/// Scan the tree, resolve each ordered [`IndexSource`] into a [`GroupOutcome`],
 /// let [`decide_sweep`] pick the [`SweepAction`] from the unit's policy, and act
 /// on it.
 async fn run_reconcile_unit(
@@ -638,7 +637,7 @@ async fn run_reconcile_unit(
     // present (the flat cascade's decision depends on the always-last
     // co-located group appearing even when an earlier root/hybrid group
     // failed).
-    let mut results: Vec<GroupResult> = Vec::with_capacity(unit.groups.len());
+    let mut results: Vec<GroupOutcome> = Vec::with_capacity(unit.groups.len());
     // Set when an owning group (the hybrid archive-root reconcile) Completes:
     // its archive-root segment, for the strict-reconcile summary.
     let mut owning_root: Option<&str> = None;
@@ -648,10 +647,7 @@ async fn run_reconcile_unit(
             GroupResolution::Skipped => {}
             GroupResolution::Ran(outcome) => {
                 let complete = matches!(outcome, GroupOutcome::Complete);
-                results.push(GroupResult {
-                    root_seg: flat_root_segment(group).map(str::to_owned),
-                    outcome,
-                });
+                results.push(outcome);
                 // An archive-root group that Completed owns the whole
                 // reconciliation: stop resolving further groups and
                 // grace-sweep the leftovers.
@@ -672,32 +668,9 @@ async fn run_reconcile_unit(
         }
     };
 
-    if let SweepReason::AgeFallback {
-        primary,
-        root_failed,
-    } = &reason
-    {
-        // Root-segment groups carry `root_seg`; the hybrid group does not, so
-        // it is not reported here.
-        for result in &results {
-            if result.root_seg.is_some()
-                && let GroupOutcome::NotApplicable(SkipReason::NoRow { seg }) = &result.outcome
-            {
-                info!(
-                    "Flat mirror {mirror}: no `mirrors_v2` row for flat-repo root `{seg}`; skipping root fallback"
-                );
-            }
-        }
-        // Suffix only when the root fallback was attempted and failed with a
-        // status *differing* from the co-located probe.
-        let suffix = match root_failed {
-            Some((seg, root_status)) if root_status != primary => {
-                format!(", flat-root `{seg}` {root_status}")
-            }
-            _ => String::new(),
-        };
+    if let SweepReason::AgeFallback { primary } = &reason {
         warn!(
-            "Failed to fetch the flat Packages index for mirror {mirror} ({primary}{suffix}); falling back to time-based retention over {}",
+            "Failed to fetch the flat Packages index for mirror {mirror} ({primary}); falling back to time-based retention over {}",
             HumanFmt::Time(spans.deb)
         );
     }
@@ -705,10 +678,7 @@ async fn run_reconcile_unit(
     let swept = sweep_candidates(&unit.tree.root, &cached_files, spans, now, mirror, layout).await;
 
     match reason {
-        SweepReason::AgeFallback {
-            primary: _,
-            root_failed: _,
-        } => info!(
+        SweepReason::AgeFallback { primary: _ } => info!(
             "Removed {} aged flat deb files for mirror {mirror} ({})",
             swept.removed,
             HumanFmt::Size(swept.bytes_removed)
@@ -747,19 +717,6 @@ async fn resolve_group(
     }
 }
 
-fn flat_root_segment(source: &IndexSource) -> Option<&str> {
-    match source {
-        IndexSource::FlatPackages {
-            fetch: FlatFetch::RootSegment { seg, prefix: _ },
-        } => Some(seg.as_str()),
-        IndexSource::FlatPackages {
-            fetch: FlatFetch::Colocated,
-        }
-        | IndexSource::SelfOrigins
-        | IndexSource::ArchiveRoot { root: _, prefix: _ } => None,
-    }
-}
-
 /// The `mirrors_v2` row gate for the resolvers whose referencing index
 /// belongs to *another* row (the archive root, the flat-repo root): cleanup
 /// never mints a row, so the group runs only when that row exists.
@@ -777,9 +734,7 @@ async fn gate_on_row(
     {
         Ok(true) => Ok(()),
         Ok(false) => Err(GroupResolution::Ran(GroupOutcome::NotApplicable(
-            SkipReason::NoRow {
-                seg: seg.to_owned(),
-            },
+            SkipReason::NoRow,
         ))),
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
@@ -946,8 +901,8 @@ async fn resolve_flat_root_segment(
     }
 
     let plan = flat_root_fetch_plan(mirror, seg, prefix);
-    // A fetch failure is silent here: `run_reconcile_unit`'s age-fallback
-    // warn reports the root status next to the co-located one.
+    // A fetch failure is silent here: the co-located probe still runs, and
+    // `run_reconcile_unit`'s age-fallback warn reports that one's status.
     match map_reduce(
         reduce_against(&plan, ctx, cached_files, tally).await,
         mirror,

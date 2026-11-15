@@ -98,18 +98,7 @@ pub(super) async fn cleanup_tmp_dir(
             continue;
         };
 
-        let mtime = match mdata.modified() {
-            Ok(m) => m,
-            Err(err) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to read mtime of tmp entry `{}`; treating it as epoch, so it is eligible for removal:  {}",
-                    entry.path().display(),
-                    ErrorReport(&err)
-                );
-                SystemTime::UNIX_EPOCH
-            }
-        };
+        let mtime = mtime_of(&mdata);
         // Anomalous however young it is; the walker already reported a
         // non-regular entry.
         if entry.kind() == EntryKind::Dir {
@@ -175,6 +164,12 @@ pub(super) async fn cleanup_tmp_dir(
     reaped
 }
 
+fn mtime_of(mdata: &Metadata) -> SystemTime {
+    mdata
+        .modified()
+        .expect("Platform should support modification timestamps via setup check")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reaped {
     /// Unlinked, freeing a regular file of this length (zero for anything
@@ -205,10 +200,7 @@ impl Reaped {
 fn reap_partial(path: &Path, walked: &Metadata, cutoffs: PartialCutoffs) -> Reaped {
     let reap = tokio::task::block_in_place(|| {
         reap_unclaimed(path, FileId::of(walked), |now| {
-            // The walk reported an unreadable mtime for this very entry, and
-            // fell back the same way.
-            let mtime = now.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            cutoffs.is_stale(now.len(), mtime)
+            cutoffs.is_stale(now.len(), mtime_of(now))
         })
     });
     match reap {
