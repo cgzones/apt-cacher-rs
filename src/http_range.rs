@@ -254,6 +254,16 @@ pub(crate) enum ParsedRange {
     IfRangeFailed,
 }
 
+/// Range units are ASCII case-insensitive in both request and response fields.
+fn byte_range_value(header: &str, separator: char) -> Option<&str> {
+    let (unit, rest) = header.split_at_checked("bytes".len())?;
+    if unit.eq_ignore_ascii_case("bytes") {
+        rest.strip_prefix(separator)
+    } else {
+        None
+    }
+}
+
 /// A syntactically valid byte-range-spec, not yet resolved against the
 /// file size.
 enum RangeSpec {
@@ -276,7 +286,7 @@ pub(crate) fn http_parse_range(
 
     // TODO: support multiple ranges: bytes=500-600,601-999  --  bytes=500-700,601-999
 
-    let Some(byte_range) = range.strip_prefix("bytes=") else {
+    let Some(byte_range) = byte_range_value(range, '=') else {
         return ParsedRange::Invalid;
     };
     if byte_range.contains(',') {
@@ -444,7 +454,7 @@ impl std::fmt::Display for ContentRange {
 /// bounds yield `None`.
 #[must_use]
 pub(crate) fn parse_content_range(value: &str) -> Option<ContentRange> {
-    let rest = value.strip_prefix("bytes ")?;
+    let rest = byte_range_value(value, ' ')?;
     let (range_part, total_str) = rest.split_once('/')?;
     let (start_str, end_str) = range_part.split_once('-')?;
 
@@ -625,7 +635,7 @@ mod tests {
                 2000,
             ),
             ("bytes=5000-6999", 6000, "bytes 5000-5999/6000", 5000, 1000),
-            ("bytes=0-0", 10000, "bytes 0-0/10000", 0, 1),
+            ("ByTeS=0-0", 10000, "bytes 0-0/10000", 0, 1),
             ("bytes=9999-9999", 10000, "bytes 9999-9999/10000", 9999, 1),
             ("bytes=-1", 10000, "bytes 9999-9999/10000", 9999, 1),
             ("bytes=-500", 10000, "bytes 9500-9999/10000", 9500, 500),
@@ -993,7 +1003,7 @@ mod tests {
             Some(content_range(500, 999, 1000))
         );
         assert_eq!(
-            parse_content_range("bytes 0-0/1"),
+            parse_content_range("BYTES 0-0/1"),
             Some(content_range(0, 0, 1))
         );
         assert_eq!(
