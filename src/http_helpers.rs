@@ -79,10 +79,7 @@ pub(crate) fn find_header_end(buf: &[u8]) -> Option<usize> {
     // to a `\r\n\r\n` search: httparse accepts bare LF, and a CRLF-only scan
     // desyncs the sendfile keep-alive request boundary against the parser,
     // dropping the next pipelined request.
-    for (i, &b) in buf.iter().enumerate() {
-        if b != b'\n' {
-            continue;
-        }
+    for i in memchr::memchr_iter(b'\n', buf) {
         match buf.get(i + 1) {
             Some(b'\n') => return Some(i + 2),
             Some(b'\r') if buf.get(i + 2) == Some(&b'\n') => return Some(i + 3),
