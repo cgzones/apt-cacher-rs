@@ -264,6 +264,15 @@ fn byte_range_value(header: &str, separator: char) -> Option<&str> {
     }
 }
 
+/// Byte positions and lengths contain only digits. Rust's unsigned integer
+/// parser also accepts a leading plus sign.
+fn range_number(value: &str) -> Option<u64> {
+    if value.starts_with('+') {
+        return None;
+    }
+    value.parse().ok()
+}
+
 /// A syntactically valid byte-range-spec, not yet resolved against the
 /// file size.
 enum RangeSpec {
@@ -303,7 +312,7 @@ pub(crate) fn http_parse_range(
     let start = if start.is_empty() {
         None
     } else {
-        let Ok(s) = start.parse::<u64>() else {
+        let Some(s) = range_number(start) else {
             return ParsedRange::Invalid;
         };
         Some(s)
@@ -311,7 +320,7 @@ pub(crate) fn http_parse_range(
     let end = if end.is_empty() {
         None
     } else {
-        let Ok(e) = end.parse::<u64>() else {
+        let Some(e) = range_number(end) else {
             return ParsedRange::Invalid;
         };
         Some(e)
@@ -458,9 +467,9 @@ pub(crate) fn parse_content_range(value: &str) -> Option<ContentRange> {
     let (range_part, total_str) = rest.split_once('/')?;
     let (start_str, end_str) = range_part.split_once('-')?;
 
-    let start = start_str.parse::<u64>().ok()?;
-    let end = end_str.parse::<u64>().ok()?;
-    let total = total_str.parse::<u64>().ok()?;
+    let start = range_number(start_str)?;
+    let end = range_number(end_str)?;
+    let total = range_number(total_str)?;
 
     ContentRange::new(start, end, total)
 }
@@ -821,6 +830,9 @@ mod tests {
         for range in [
             "bytes=1000-2000 foo",
             "bytes=foo-bar",
+            "bytes=+1-2",
+            "bytes=1-+2",
+            "bytes=-+2",
             "ABCDEFG",
             "bytes=",
             "bytes=-",
@@ -1025,6 +1037,9 @@ mod tests {
         assert_eq!(parse_content_range("bytes 0-499/*"), None);
         // Invalid: empty
         assert_eq!(parse_content_range(""), None);
+        for signed in ["bytes +0-1/2", "bytes 0-+1/2", "bytes 0-1/+2"] {
+            assert_eq!(parse_content_range(signed), None);
+        }
         // Invalid: garbage
         assert_eq!(parse_content_range("bytes abc-def/ghi"), None);
     }
