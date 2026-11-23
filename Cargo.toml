@@ -65,7 +65,7 @@ libsqlite3-sys = { version = "0.37.0", default-features = false }
 log = "0.4.20"
 lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "xz"] }
 memchr = "2.8"
-nix = { version = "0.31", features = ["fs", "hostname", "resource", "user"] }
+nix = { version = "0.32", features = ["fs", "hostname", "resource", "user"] }
 openssl = { version = "0.10", optional = true }
 parking_lot = "0.13"
 pin-project = { version = "1.1.11", optional = true }
@@ -102,7 +102,7 @@ mimalloc = "0.1.48"
 [dev-dependencies]
 tokio = { version = "1.37.0", features = ["test-util"] }
 filetime = "0.2"
-nix = { version = "0.31", features = ["poll"] }
+nix = { version = "0.32", features = ["poll"] }
 tempfile = "3.27"
 
 
