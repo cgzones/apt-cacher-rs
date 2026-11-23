@@ -168,7 +168,7 @@ pub(crate) struct CacheAccessFailure(pub(crate) Logged);
 /// It must stay a `statx`, not an `fstat`: `cache_file_http_date` reads
 /// `Metadata::created()` (btime) and only falls back to mtime, while
 /// [`touch_volatile_mtime_with`] repurposes mtime as "last revalidated".
-/// `fstat(2)` carries no btime and nix 0.31 wraps no `statx`, so the fd is
+/// `fstat(2)` carries no btime and nix (as of 0.32) wraps no `statx`, so the fd is
 /// borrowed into a `std::fs::File` and std's own `statx` is used.
 fn borrowed_metadata(file: &tokio::fs::File) -> std::io::Result<std::fs::Metadata> {
     use std::mem::ManuallyDrop;

@@ -2,13 +2,13 @@ use std::{
     fmt::{self, Display},
     io::ErrorKind,
     net::SocketAddr,
-    os::fd::AsRawFd as _,
 };
 
+use nix::sys::socket::{setsockopt, sockopt::TcpCork};
 use tokio::net::TcpStream;
 use tracing::warn;
 
-use crate::{error::ErrorReport, static_assert, warn_once_or_debug};
+use crate::{error::ErrorReport, warn_once_or_debug};
 
 /// One end of a socket as the log lines below render it: the address, or
 /// `<unknown>` when `getsockname`/`getpeername` failed. Formats straight into
@@ -37,7 +37,7 @@ pub(crate) struct CorkGuard<'a>(&'a TcpStream);
 impl<'a> CorkGuard<'a> {
     /// Creates a new `CorkGuard` that sets `TCP_CORK` on the given stream.
     fn new(stream: &'a TcpStream) -> std::io::Result<Self> {
-        Self::set_tcp_cork(stream, true)?;
+        setsockopt(stream, TcpCork, &true)?;
         Ok(Self(stream))
     }
 
@@ -71,46 +71,18 @@ impl<'a> CorkGuard<'a> {
             }
         }
     }
-
-    fn set_tcp_cork(stream: &TcpStream, cork: bool) -> std::io::Result<()> {
-        let val: nix::libc::c_int = cork.into();
-        static_assert!(size_of::<nix::libc::c_int>() == 4);
-
-        // TODO: refactor once https://github.com/nix-rust/nix/pull/2769 is merged
-        // SAFETY: stream.as_raw_fd() is a valid socket fd; val is a stack-local c_int.
-        let ret = unsafe {
-            nix::libc::setsockopt(
-                stream.as_raw_fd(),
-                nix::libc::IPPROTO_TCP,
-                nix::libc::TCP_CORK,
-                std::ptr::from_ref::<nix::libc::c_int>(&val).cast(),
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "size_of c_int (4) always fits in socklen_t (u32)"
-                )]
-                {
-                    size_of_val(&val) as nix::libc::socklen_t
-                },
-            )
-        };
-        if ret == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    }
 }
 
 impl Drop for CorkGuard<'_> {
     fn drop(&mut self) {
         let stream = self.0;
 
-        if let Err(err) = Self::set_tcp_cork(stream, false) {
+        if let Err(errno) = setsockopt(stream, TcpCork, &false) {
             warn!(
                 "Failed to uncork TCP socket from {} to {}; leaving the socket corked:  {}",
                 Endpoint(stream.local_addr()),
                 Endpoint(stream.peer_addr()),
-                ErrorReport(&err)
+                ErrorReport(&std::io::Error::from(errno))
             );
         }
     }
