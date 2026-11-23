@@ -91,10 +91,6 @@ pub(crate) const QUOTA_BLOCK_SIZE: u64 = 4096;
 /// The size a file of `len` bytes is accounted as: `len` rounded up to whole
 /// [`QUOTA_BLOCK_SIZE`] blocks, saturating. An empty file counts 0: it holds
 /// no data block, and inodes are not what the quota measures.
-///
-/// Every length reaching the quota goes through this, and so does every file
-/// the cache scan and cleanup count, or the reconcile would "repair" the
-/// difference between the two sums.
 #[must_use]
 pub(crate) const fn accounted_size(len: u64) -> u64 {
     len.div_ceil(QUOTA_BLOCK_SIZE)
@@ -534,9 +530,9 @@ impl CacheQuota {
         }
     }
 
-    /// Admit a download and reserve its space in one operation.
-    /// Cleanup's synthetic index fetches bypass both limits so a full cache
-    /// can still fetch the reference set needed to shrink it.
+    /// Admit a download and reserve its space in one operation. Cleanup's
+    /// synthetic index fetches bypass both limits
+    /// ([`Self::acquire_for_cleanup`]).
     pub(crate) async fn acquire(
         &self,
         client: &ClientInfo,

@@ -359,9 +359,7 @@ impl UpstreamError {
         )
     }
 
-    /// A head the transport delivered intact but HTTP could not accept.
-    /// Counts nothing here: every such head is counted in
-    /// `UPSTREAM_PROTOCOL_VIOLATION` where it was parsed.
+    /// Counts nothing once concluded (see `UpstreamKind::counter`).
     pub(crate) fn head_protocol(reason: impl Into<String>) -> Self {
         Self::new(
             "upstream response head",

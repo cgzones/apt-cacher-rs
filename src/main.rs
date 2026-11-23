@@ -381,7 +381,6 @@ type RootStoreError = std::convert::Infallible;
     expect(clippy::unnecessary_wraps, reason = "webpki setup is infallible")
 )]
 fn build_rustls_client_config() -> Result<rustls::ClientConfig, RootStoreError> {
-    /* Set a process wide default crypto provider. */
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("first and sole call should succeed");

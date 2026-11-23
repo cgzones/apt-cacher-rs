@@ -211,7 +211,6 @@ enum WriteMode {
     MsgMore,
 }
 
-/// Write every byte of `data` within the configured HTTP timeout.
 async fn write_all(stream: &TcpStream, mut data: &[u8], mode: WriteMode) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
 

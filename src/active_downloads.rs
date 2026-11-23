@@ -582,12 +582,10 @@ impl std::fmt::Debug for ActiveDownloads {
 }
 
 /// The unit `max_upstream_downloads` counts: one upstream connection opened
-/// on behalf of a download, released by drop.
-///
-/// The barrier chain in `guards.rs` drops it in
-/// `DownloadBarrier::begin_rename`, where every backend has finished reading
-/// the upstream body, before the `fsync`, verify and rename. The entry stays
-/// mapped until that commit ends, because joiners still need to find it.
+/// on behalf of a download, released by drop: in
+/// `DownloadBarrier::begin_rename`, before the `fsync`, verify and rename.
+/// The entry stays mapped until that commit ends, because joiners still need
+/// to find it.
 #[must_use = "dropping the slot is what frees it; hold it for as long as the upstream connection is open"]
 pub(crate) struct UpstreamSlot {
     registry: ActiveDownloads,

@@ -870,8 +870,6 @@ pub(crate) fn valid_filename(name: &str) -> bool {
         })
 }
 
-/// Check whether the given URI path is a diff request path.
-///
 /// Dispatched both when the configuration setting `reject_pdiff_requests` is
 /// on (to refuse with 410) and when it is off (to suppress the "Unrecognized
 /// resource path" warning for a URL shape we recognise but do not cache).
@@ -888,7 +886,7 @@ pub(crate) fn is_diff_request_path(uri_path: &str) -> bool {
         || contains_translation_diff(uri_path)
 }
 
-/// Check whether the path contains a `Translation-XX.diff/T-` segment for any language.
+/// A `Translation-XX.diff/T-` segment pair, for any language.
 #[must_use]
 fn contains_translation_diff(uri_path: &str) -> bool {
     // Skip the first segment: a match requires the preceding slash. Looking
@@ -917,8 +915,6 @@ fn contains_translation_diff(uri_path: &str) -> bool {
 /// (percent-decoding is applied internally before inspection).
 ///
 /// Rejects traversal segments (`..`, `.`) and control characters (including null bytes).
-///
-/// Returns `true` if the path is unsafe and should be rejected.
 #[must_use]
 pub(crate) fn is_unsafe_proxy_path(raw_path: &str) -> bool {
     let decoded = match percent_encoding::percent_decode_str(raw_path).decode_utf8() {
@@ -936,8 +932,6 @@ pub(crate) fn is_unsafe_proxy_path(raw_path: &str) -> bool {
 /// byte - is refused.  A cached request is forwarded upstream as sent while
 /// its cache name comes from the validated fields alone, so a traversal the
 /// validators missed would store one resource under another's name.
-///
-/// Returns `true` if the path is unsafe and should be rejected.
 #[must_use]
 pub(crate) fn is_unsafe_cache_path(normalized_path: &str) -> bool {
     let decoded = match percent_encoding::percent_decode_str(normalized_path).decode_utf8() {

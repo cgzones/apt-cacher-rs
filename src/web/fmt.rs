@@ -457,7 +457,6 @@ pub(super) struct Drawn<'a> {
 }
 
 impl Drawn<'_> {
-    /// The `<svg>` element.
     pub(super) fn svg(&self) -> DrawnSvg<'_> {
         DrawnSvg(self)
     }

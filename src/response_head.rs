@@ -105,9 +105,8 @@ const TEXT_PLAIN_UTF8: &str = "text/plain; charset=utf-8";
 pub(crate) struct ResponseHead<'a> {
     status: StatusCode,
     kind: ResponseKind,
-    /// `Content-Length`.  The hyper renderer emits it only when set (hyper
-    /// derives it from the body otherwise); the raw-socket renderer emits
-    /// it only when set, so bodiless heads must set `Some(0)` explicitly.
+    /// `Content-Length`.  Unset, hyper derives it from the body while the
+    /// raw-socket renderer emits none, so a bodiless head sets `Some(0)`.
     content_length: Option<u64>,
     content_type: Option<&'static str>,
     accept_ranges: bool,

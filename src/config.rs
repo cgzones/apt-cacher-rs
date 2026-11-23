@@ -1287,8 +1287,6 @@ fn is_valid_dns_label_string(domain: &str) -> bool {
 /// match.
 #[must_use]
 fn is_valid_wildcard(domain: &str) -> bool {
-    /* No unicode characters allowed for now */
-
     let Some(suffix) = domain.strip_prefix("*.") else {
         return false;
     };

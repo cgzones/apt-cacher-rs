@@ -1319,7 +1319,6 @@ async fn drive_batches(
                 // The socket ran dry and the batch already holds bytes: fan
                 // them out now instead of parking.
                 Err(nix::errno::Errno::EAGAIN) if got > 0 => break,
-                // EAGAIN/EWOULDBLOCK: see module-level static_assert.
                 Err(nix::errno::Errno::EAGAIN) => {
                     // We can't tell from EAGAIN which side is the blocker, so
                     // clear both caches and wake on whichever next produces a
@@ -1491,9 +1490,7 @@ async fn pwrite_buf_to_file(
 /// client gets each read's bytes at once, and the cache file gets them when
 /// the batch is due, under the same policy as the zero-copy loop's `pipe_B`.
 ///
-/// On error the upstream is left mid-message (fewer than `content_length`
-/// bytes consumed), so its socket still holds undelivered bytes -- the caller
-/// drops the unfinished response, keeping the connection out of the pool.
+/// Errors leave the upstream as [`splice_proxy_body`]'s do.
 pub(super) async fn splice_proxy_body_tls(
     xfer: BodyTransfer<'_>,
     upstream: &mut UpstreamConn,
@@ -2262,7 +2259,6 @@ async fn tee_and_splice(
                         xfer.flush().await?;
                         continue;
                     }
-                    // EAGAIN/EWOULDBLOCK: see module-level static_assert.
                     Err(nix::errno::Errno::EAGAIN) => {
                         clear_pipe_readable_cache(&xfer.cache.pipes().upstream_rx);
                         clear_pipe_writable_cache(&xfer.cache.batch().sink.tx);
@@ -2324,7 +2320,6 @@ async fn tee_and_splice(
                         continue;
                     }
                     Err(nix::errno::Errno::EINTR) => continue,
-                    // EAGAIN/EWOULDBLOCK: see module-level static_assert.
                     Err(nix::errno::Errno::EAGAIN) => {
                         // About to park on a back-pressuring client. Land the
                         // batch first: a joiner reads the partial file, and
@@ -2461,7 +2456,6 @@ async fn drain_pipe_to_file(
                 SpliceFFlags::SPLICE_F_MOVE,
             );
             match res {
-                // EAGAIN/EWOULDBLOCK: see module-level static_assert.
                 Ok(0) | Err(nix::errno::Errno::EAGAIN) => break Ok(()),
                 Ok(n) => landed += n,
                 Err(nix::errno::Errno::EINTR) => {}

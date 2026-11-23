@@ -104,7 +104,7 @@ use crate::{
     write_stall::WriteStallTimeout,
 };
 
-/// Maximum size for HTTP request headers buffer (matches hyper's default of 8192).
+/// Matches hyper's default.
 const MAX_HEADER_SIZE: usize = 8192;
 
 /// A request head that outgrew [`MAX_HEADER_SIZE`], answered 431 (RFC 6585
@@ -129,7 +129,7 @@ const INITIAL_HEADER_SIZE: usize = 2048;
 /// capacity is exactly zero; without this, a read on a keep-alive connection
 /// regularly gets only the few bytes left at the end of the buffer.
 const MIN_HEADER_READ_ROOM: usize = INITIAL_HEADER_SIZE / 2;
-/// Maximum number of HTTP headers to parse (matches hyper's default of 100).
+/// Matches hyper's default.
 const MAX_HEADERS: usize = 100;
 
 // The large variant is the `CacheMiss` handoff plan, which exists only
@@ -207,7 +207,8 @@ pub(crate) async fn handle_sendfile_connection(
     trace!("Using sendfile(2) backend to handle request from client {client}...");
 
     let mut req_num = 0;
-    let mut conn_version = ConnectionVersion::Http11; // assume more recent version 1.1 if not yet parsed from any request
+    // Until a request line has been parsed.
+    let mut conn_version = ConnectionVersion::Http11;
 
     loop {
         let next_header_index = match read_request_headers(&mut stream, &mut buf).await {

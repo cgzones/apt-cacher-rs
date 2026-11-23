@@ -67,7 +67,7 @@ impl RateChecker {
         }
     }
 
-    /// The averaging window in seconds.
+    /// In seconds.
     #[cfg(feature = "sendfile")]
     #[must_use]
     pub(crate) fn timeframe(&self) -> NonZero<usize> {

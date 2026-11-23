@@ -98,13 +98,9 @@ pub(super) enum CompletionClient {
 }
 
 impl CacheTarget {
-    /// End the download on the calling task: the `Download -> Verifying`
-    /// flip that drops the `max_upstream_downloads` slot and the watch sender
-    /// (`DownloadBarrier::begin_rename`, which also flushes the final ping),
-    /// after draining any pending cache writes. It belongs on the connection
-    /// task: the slot goes back at the same point as in the hyper backend,
-    /// and a demoted file-serve task parked on the sender is awake before
-    /// anyone can await it.
+    /// End the download on the calling task, after draining any pending
+    /// cache writes; the module docs say what that covers and why it belongs
+    /// on the connection task.
     ///
     /// The only constructor of [`CommitTail`], so nothing can commit a
     /// download that has not been through the flip.
@@ -143,10 +139,7 @@ impl CacheTarget {
 }
 
 /// A finished download's commit, owned so it can outlive the connection
-/// task. Built only by [`CacheTarget::begin_rename`]: every body byte is in
-/// the temp file, the registry entry says `Verifying`, the watch sender and
-/// the `max_upstream_downloads` slot are gone, and the [`RenameBarrier`] is
-/// what is left to commit.
+/// task: what [`CacheTarget::begin_rename`] leaves to do.
 #[must_use = "the download is only committed once the tail is spawned, finished or committed"]
 pub(super) struct CommitTail {
     tempfile: FinishedCacheFile,
@@ -289,8 +282,7 @@ impl CommitTail {
         ClientVerdict { report }
     }
 
-    /// Commit, then report. A commit failure already logged its cause and
-    /// dropped the barrier; nothing is cached, so nothing is reported.
+    /// Commit, then report; a failed commit reports nothing.
     pub(super) async fn finish(self, rates: RateTimestamps, client: CompletionClient) {
         if let Some(committed) = self.commit().await {
             committed.report(&rates, client).await;
@@ -431,10 +423,8 @@ impl Committed {
     }
 }
 
-/// The completion line of a download that landed in the cache: "Served and
-/// cached ..." when the client got the whole response, "Cached ..." when the
-/// client was lost mid-body, "Finished download of ..." when there was no
-/// client.
+/// The completion line of a download that landed in the cache, worded by
+/// what became of its client.
 fn log_splice_completion(
     conn_details: &ConnectionDetails,
     conn_label: ConnLabel,

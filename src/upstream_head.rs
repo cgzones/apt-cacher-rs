@@ -44,9 +44,8 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ContentLength {
-    /// An exact size
     Exact(NonZero<u64>),
-    /// A limit for an unknown size
+    /// An upper limit for an unknown size.
     Unknown(NonZero<u64>),
 }
 

@@ -45,8 +45,6 @@ impl Table {
         Self::build(key, headers, 0)
     }
 
-    /// `key` names the table for the scripts (`data-table`); see the module
-    /// docs.
     fn build(key: &'static str, headers: &[&'static str], numeric: u64) -> Self {
         // Realistic dashboard tables (Mirrors, Origins) easily exceed 10 KB.
         let mut out = String::with_capacity(16 * 1024);
@@ -662,8 +660,7 @@ impl Entry<'_> {
     }
 }
 
-/// Append a `<div class="section">` wrapping a titled HTML body; `key`
-/// names the section (see the module docs).
+/// Append a `<div class="section">` wrapping a titled HTML body.
 pub(super) fn write_section(out: &mut String, title: &'static str, key: &'static str, body: &str) {
     swrite!(
         out,

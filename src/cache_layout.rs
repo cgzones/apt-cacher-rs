@@ -580,7 +580,6 @@ impl ConnectionDetails {
         AliasSuffix(self)
     }
 
-    /// The absolute cached file path for this request.
     #[must_use]
     pub(crate) fn cache_file_path(&self) -> PathBuf {
         CachePaths::global().entry_file(self.layout(), self.site(), Path::new(&self.debname))

@@ -154,10 +154,6 @@ impl UpstreamConn {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Upstream connection pool
-// ---------------------------------------------------------------------------
-
 struct PooledConn {
     conn: UpstreamConn,
     idle_since: coarsetime::Instant,
@@ -255,9 +251,8 @@ fn pool_pop(host: &ClientHost, port: u16, is_tls: bool) -> Option<PooledConn> {
 ///
 /// Walks the key's entries most-recently-returned first and probes each
 /// outside the lock: a server that closes after a request cap kills the
-/// busiest entry
-/// first, and giving up on it would open a fresh connection while a live
-/// one sat below it.
+/// busiest entry first, and giving up on it would open a fresh connection
+/// while a live one sat below it.
 pub(super) fn pool_checkout(host: &ClientHost, port: u16, is_tls: bool) -> PoolCheckout {
     let mut saw_dead = false;
     while let Some(PooledConn {
@@ -566,7 +561,6 @@ fn peek_socket(fd: RawFd) -> nix::Result<usize> {
     use nix::sys::socket::{MsgFlags, recv};
 
     let mut buf = [0u8; 1];
-    // EAGAIN/EWOULDBLOCK: see the static_assert in `super`.
     recv(fd, &mut buf, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT)
 }
 
@@ -672,9 +666,8 @@ pub(super) async fn connect_upstream(
             Ok(UpstreamConn::Tls(tls))
         }
         None => {
-            // Auto mode: try HTTPS first, fall back to HTTP
-            // (the fallback is remembered for `HTTP_SCHEME_TTL` only, after
-            // which the next request probes HTTPS again).
+            // The fallback is remembered for `HTTP_SCHEME_TTL` only, after
+            // which the next request probes HTTPS again.
             match tcp_connect(host, endpoint_port(endpoint, true)).await {
                 Ok(tcp) => match tls_connect(tcp, host).await {
                     Ok(tls) => {
@@ -734,8 +727,7 @@ pub(super) async fn connect_upstream(
     }
 }
 
-/// Establish a TCP connection to the given host and port, racing its IPv6
-/// and IPv4 addresses (`upstream_dial`).
+/// Races the host's IPv6 and IPv4 addresses (`upstream_dial`).
 ///
 /// Times out after the configured HTTP timeout; a timeout counts in
 /// `HTTP_TIMEOUT_UPSTREAM_CONNECT` per attempt, a request whose connect fails

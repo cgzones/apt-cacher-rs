@@ -40,9 +40,6 @@ use crate::cleanup::sweep::{SpanTable, sweep_aged_metadata, sweep_candidates};
 
 /// Retention class of a scanned cache-tree entry, selecting its sweep span from
 /// the `SpanTable`.
-///
-/// Candidates live in a `HashMap<OsString, SpanClass>` keyed by the entry's path
-/// *relative to the unit's tree root*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SpanClass {
     /// A pool/flat `.deb`: swept past the policy grace (or age fallback).
@@ -236,8 +233,6 @@ fn flat_root_fetch_plan<'a>(mirror: &'a Mirror, seg: &str, prefix: &'a str) -> F
     FetchPlan {
         base_uri: flat_packages_base_uri(&root_mirror),
         mirror: root_mirror,
-        // The debs live under the original sub-path `mirror`, not the flat-repo
-        // root, so metadata invalidation must key by `mirror`, not `root_mirror`.
         owner_mirror: mirror,
         cache_layout: CacheLayout::Flat,
         debname: DebnameKind::Flat,
@@ -368,10 +363,6 @@ async fn run_unit(unit: &CleanupUnit, ctx: &MirrorCtx<'_>) -> Result<UnitStats, 
     }
 }
 
-/// Only the reaped bytes reach [`UnitStats`], as `tmp_bytes_removed`: the
-/// quota counts kept partials, so the reconcile must subtract them, but
-/// scratch files are not cached content and must not inflate
-/// `CLEANUP_EVICTIONS`/`CLEANUP_BYTES_RECLAIMED`.
 async fn run_partials_unit(unit: &PartialsUnit, ctx: &MirrorCtx<'_>) -> UnitStats {
     let mirror = ctx.mirror;
 
@@ -861,8 +852,6 @@ async fn resolve_origin_packages_archive_root(
 
     let keymap = KeyMapper::RelpathUnderPrefix { prefix };
     for origin in &active_origins {
-        // The debs live under the original flat sub-path `mirror`, not the
-        // archive root, so metadata invalidation must key by `mirror`.
         let plan = origin_fetch_plan(&archive_mirror, mirror, origin, CacheLayout::Flat, keymap);
         let step = map_reduce(
             reduce_against(&plan, ctx, cached_files, tally).await,

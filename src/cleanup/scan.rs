@@ -75,9 +75,6 @@ pub(super) struct ScannedTree {
 /// non-regular entry met on the way is unlinked.  An unreadable directory
 /// abandons the unit (`Err`, logged by the walker): reconciling against a
 /// partial candidate set would grace-sweep live debs.
-///
-/// Candidates are keyed by the entry's path *relative to `tree.root`*, which
-/// is what `sweep_candidates` rejoins to reach the file.
 pub(super) async fn scan_candidates(
     cache_root: &Path,
     tree: &TreeSpec,

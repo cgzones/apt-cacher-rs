@@ -516,10 +516,8 @@ impl CacheMetadataStore {
         meta
     }
 
-    /// **Publication invariant:** callers must have already persisted
-    /// matching xattrs to the cached file before invoking this, so that
-    /// a restart, which reads the file, serves what this published (see
-    /// the module-level docs).
+    /// The caller must already have persisted matching xattrs on the cached
+    /// file (the publication invariant, module docs).
     pub(crate) fn set(&self, key: &CacheEntryKeyRef<'_>, meta: Arc<UpstreamMetadata>) {
         let mut inner = self.inner.write();
         if let Some(published) = inner.map.get_mut(key) {

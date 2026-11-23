@@ -55,9 +55,6 @@ impl Section {
     };
 }
 
-// Per-mirror directory scan
-// ---------------------------------------------------------------------------
-
 const DIR_STATS_TTL_SECS: u64 = 60;
 
 /// Idle time after which a `DIR_STATS_CACHE` slot no load asked for is
@@ -242,10 +239,6 @@ fn evict_idle_dir_stats() {
         entry.used.elapsed().as_secs() < DIR_STATS_IDLE_SECS || Arc::strong_count(&entry.slot) > 1
     });
 }
-
-// ---------------------------------------------------------------------------
-// Table builders
-// ---------------------------------------------------------------------------
 
 /// `Display` wrappers for the Mirrors table's cells.
 mod mirror_cells {
@@ -556,8 +549,7 @@ mod mirror_cells {
                 f.write_str("N/A")
             } else {
                 // Not `Pct`'s own rendering, which reads a negative
-                // `delivered` (a corrupt database) as N/A: this cell has
-                // always printed what the division gives.
+                // `delivered` (a corrupt database) as N/A.
                 let pct = Pct::new(
                     self.delivered.saturating_sub(self.downloaded),
                     self.delivered,

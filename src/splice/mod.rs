@@ -495,7 +495,6 @@ async fn prepare_cache_target(
         etag: download_meta.etag.clone(),
         last_modified,
     };
-    // `If-Range` compares against the validators this response carries.
     let Some(range_plan) = resolve_client_range(
         &mut ibarrier,
         client,
@@ -936,10 +935,8 @@ async fn splice_body_count(
     Ok(None)
 }
 
-/// The debug line opening a download. A served download reads "downloading
-/// and serving ... for client ..."; a nudged one (`detached`) never had a
-/// client attached and reads "downloading ... after nudging client ...",
-/// since that client already moved on to its retry.
+/// The debug line opening a download; a `nudged` one (`detached`) names the
+/// client it runs without, which already moved on to its retry.
 fn log_download_start(
     conn_details: &ConnectionDetails,
     conn_label: ConnLabel,
@@ -1206,8 +1203,6 @@ async fn transfer_body(
     // readers learn that from `begin_rename`, which every caller reaches
     // next: its flush of the last sub-`PING_BATCH_THRESHOLD` chunk and its
     // drop of the watch sender.
-    // Both rate windows end here; a demoted client reassigns `t_client_done`
-    // after its file-serve task completes.
     rates.t_upstream_done = PreciseInstant::now();
     rates.t_client_done = rates.t_upstream_done;
     rates.client_bytes_sent += client_bytes;
@@ -1458,8 +1453,6 @@ pub(crate) async fn splice_proxy(
         }
     };
 
-    // The body prefix beyond the declared length is refused before any cache
-    // file exists, so the refusal declines the download.
     let body_prefix = &header_buf[header_end..];
     let Some(splice_count) = splice_body_count(
         &mut ibarrier,
@@ -1554,7 +1547,6 @@ pub(crate) async fn splice_proxy(
 
     let start = PreciseInstant::now();
 
-    // The upstream-rate window ends here in case the splice loop never runs.
     let mut rates = RateTimestamps::new(upstream_resp.request_sent_at, upstream_resp.head_at);
 
     log_download_start(
@@ -1634,21 +1626,14 @@ pub(crate) async fn splice_proxy(
     // Only successful body completion can return this connection to the pool.
     upstream.complete();
 
-    // End the download on this task: `begin_rename` gives the
-    // `max_upstream_downloads` slot back (where the hyper backend gives its
-    // own back), flips the entry to `Verifying` so a request arriving
-    // meanwhile still late-joins it, and drops the watch sender -- the
-    // wake-up a demoted file-serve task may be parked on, after draining
-    // any remaining cache writes.
+    // End the download on this task; `commit`'s module docs say why here.
     let tail = target
         .begin_rename(conn_details.clone(), conn_label, bytes, start)
         .await
         .map_err(SpliceProxyError::ReportedAfterHeader)?;
 
-    // Start the commit immediately, independently of the demoted writer.
-    // The returned settlement proves the watch sender is gone and the commit
-    // is spawned. It only waits for this socket's writer, so keep-alive never
-    // waits for the commit and slow clients never hold up verification/rename.
+    // The commit runs on its own task; the settlement waits only for this
+    // socket's writer.
     let client_succeeded = tail
         .spawn(
             rates,

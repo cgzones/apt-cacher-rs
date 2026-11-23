@@ -177,7 +177,6 @@ struct InitBarrierData {
     active_downloads: ActiveDownloads,
     slot: UpstreamSlot,
     resource_kind: ResourceKind,
-    /// The raw client request URI path (pre-normalisation, pre-redirect).
     raw_uri_path: String,
     /// Unused, receivers just need to get notified by drop.
     _tx: tokio::sync::watch::Sender<()>,
@@ -265,8 +264,8 @@ impl InitBarrier {
     /// Finalise the entry without going through `Download` (e.g. a
     /// volatile-revalidation 304 from upstream — the existing on-disk
     /// file remains valid).  No upstream metadata is published; readers
-    /// that observe `Finished { meta: None }` fall through to the
-    /// post-flight cache, which will lazy-load from xattr if needed.
+    /// that observe `Finished { meta: None }` fall through to the cache,
+    /// which lazy-loads it from the xattrs.
     pub(crate) async fn finished(&mut self, path: PathBuf) -> Settled {
         self.settle(ActiveDownloadStatus::Finished { path, meta: None })
             .await

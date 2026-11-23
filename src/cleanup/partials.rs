@@ -73,10 +73,6 @@ static TMP_WALK: WalkContext = WalkContext {
 /// deleted, however old. Anything else (current code only writes `.partial`
 /// here) goes once past the longer `FOREIGN_MAX_AGE`, since we don't know
 /// what produced it.
-///
-/// The unlinked regular files' bytes feed the quota reconcile (the cache scan
-/// counts every regular file in `tmp/`), never
-/// `UnitStats::removed`/`bytes_removed`: scratch files are not cached content.
 pub(super) async fn cleanup_tmp_dir(
     cache_root: &Path,
     tmp_dir: &Path,
@@ -268,6 +264,8 @@ mod tests {
     };
     use crate::partial_claim::PartialClaim;
 
+    // The multi-thread tests reap a partial, which runs `block_in_place`.
+
     const PARTIAL_MAX_AGE: Duration = Duration::from_hours(1);
     const ONE_DAY: Duration = Duration::from_hours(24);
 
@@ -313,8 +311,6 @@ mod tests {
         assert_eq!(metrics::CACHE_NON_REGULAR.get(), before + 1);
     }
 
-    // A partial is reaped through `block_in_place`, which needs the
-    // multi-thread runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn partials_are_reaped_when_past_partial_max_age() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -336,8 +332,6 @@ mod tests {
         assert!(!tmp.join("old.partial").exists(), "aged partial reaped");
     }
 
-    // A partial is reaped through `block_in_place`, which needs the
-    // multi-thread runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn a_claimed_partial_is_reaped_only_once_released() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -363,8 +357,6 @@ mod tests {
         assert!(!tmp.join("resumed.partial").exists());
     }
 
-    // `reap_partial` runs `block_in_place`, which needs the multi-thread
-    // runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn reap_partial_rechecks_the_file_the_walk_judged() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -407,8 +399,6 @@ mod tests {
         assert!(!path.exists());
     }
 
-    // A partial is reaped through `block_in_place`, which needs the
-    // multi-thread runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn empty_partials_are_reaped_only_past_their_minimum_age() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -509,8 +499,6 @@ mod tests {
         );
     }
 
-    // A partial is reaped through `block_in_place`, which needs the
-    // multi-thread runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn an_unremovable_stale_partial_is_reported_as_a_failure() {
         use std::os::unix::fs::PermissionsExt as _;

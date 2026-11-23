@@ -123,8 +123,6 @@ pub(super) async fn handle_volatile_buffered_download(
 
     let start = PreciseInstant::now();
 
-    // The body lands in the temp file BEFORE the client is written to (see
-    // the module doc).
     // `Abandon`, not `CloseConnection`: the body is already in memory, so a
     // failed cache write loses only the download -- the client is served
     // below and the connection survives.
@@ -134,12 +132,10 @@ pub(super) async fn handle_volatile_buffered_download(
     let cache_write =
         super::write_buffered_body_to_cache(target, &mut body, Consequence::Abandon).await;
 
-    // Commit on a task of its own, only if the body reached the temp file, and
-    // start it before serving. `begin_rename` stays here on the connection
-    // task so the slot goes back before the client write. When the write
-    // failed, the target went with the failure: its barrier published the
-    // terminal aborted state (nothing is on disk for late joiners to serve)
-    // and gave the `max_upstream_downloads` slot back with the entry.
+    // When the cache write failed, the target went with the failure: its
+    // barrier published the terminal aborted state (nothing is on disk for
+    // late joiners to serve) and gave the `max_upstream_downloads` slot back
+    // with the entry.
     let verdict = match cache_write {
         Ok(target) => target
             .begin_rename(

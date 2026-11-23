@@ -1011,17 +1011,14 @@ impl Database {
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
-        // Newly-registered structured mirrors at `path = "flat"` (or
-        // `flat/<anything>`) would have their files written into the same
-        // `<host>/flat/` tree the host-level flat layout reserves.  Record
-        // the host in the blocklist so subsequent flat URLs for it fall
-        // through to passthrough uncached.
+        // A structured mirror at `path = "flat"` (or `flat/<anything>`)
+        // writes into the `<host>/flat/` tree the host-level flat layout
+        // reserves, so the blocklist makes flat URLs for the host pass
+        // through uncached.
         //
-        // Gate on the post-upsert `kind` column rather than `was_inserted`:
-        // a structured request can latch a previously-flat row to structured
-        // (was_inserted=false), and that transition must still be observed
-        // by the blocklist.  `record_mirror`'s `path_collides_with_flat_layout`
-        // check is the cheap pre-filter; the HashSet insert is idempotent.
+        // Gated on the post-upsert `kind` rather than `was_inserted`: a
+        // structured request can latch an existing flat row to structured,
+        // and the blocklist must see that transition too.
         if MirrorKind::from_db_int(row.kind) == Some(MirrorKind::Structured) {
             // `mirror` is canonical (alias-resolved at dispatch), so its host is
             // the on-disk host directory the blocklist keys on.
@@ -1227,12 +1224,11 @@ impl Database {
     /// below the cache root that cleanup walks and sweeps, so a `..` in a
     /// corrupted or hand-edited row would point it outside the cache.
     ///
-    /// The host check uses `DomainName::new` (not `ConfigDomainName::new`) so
-    /// the row set this function purges is exactly the set of rows
-    /// downstream code — notably `flat_blocklist::init` — relies on
-    /// being absent.  Any future tightening of `DomainName::new` then
-    /// automatically also tightens cleanup, instead of opening a
-    /// panic gap between the two validators.
+    /// The host check is `DomainName::new` itself (not
+    /// `ConfigDomainName::new`), so the rows purged are exactly those
+    /// downstream code — notably `flat_blocklist::init` — relies on being
+    /// absent, and a future tightening of `DomainName::new` tightens this
+    /// purge with it.
     ///
     /// Runs at startup and on every cleanup cycle: unlike the usage-row
     /// scrub, `mirrors_v2` is bounded by the mirror count, so the scan stays

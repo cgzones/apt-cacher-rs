@@ -243,8 +243,6 @@ where
     Ok(CappedLine::Line(line_buf))
 }
 
-/// Compression of a `Packages` file.
-///
 /// [`extension`](Self::extension) and [`from_filename`](Self::from_filename)
 /// are inverses of one table, so a new format is one edit here rather than
 /// two in separate modules.

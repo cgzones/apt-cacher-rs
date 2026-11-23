@@ -124,10 +124,8 @@ impl DetachedDownload {
 
         upstream.complete();
 
-        // A commit failure already logged its cause and dropped the barrier;
-        // nothing is cached, so no DB rows and no completion line. Upstream
-        // side only: no client was ever served, so there is no `SERVED_*` /
-        // `BYTES_SERVED_SPLICE` bump and no `Delivery` row.
+        // Upstream side only: no client was ever served, so there is no
+        // `SERVED_*` / `BYTES_SERVED_SPLICE` bump and no `Delivery` row.
         if let Ok(tail) = target
             .begin_rename(conn_details, conn_label, bytes, start)
             .await
