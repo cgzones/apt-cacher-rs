@@ -27,7 +27,17 @@ const UNREFERENCED_KEEP_SPAN: Duration = Duration::from_hours(3 * 24);
 /// upstream change, mtime-touched on an unchanged revalidation), so aging
 /// past this span marks the distribution as retired. While a retired dist's
 /// `Release` lingers, by-hash cleanup keeps every digest it lists pinned.
+/// Cached pdiff patches in `dists/` age out after [`PDIFF_KEEP_SPAN`] instead.
 const METADATA_KEEP_SPAN: Duration = Duration::from_hours(90 * 24);
+
+/// Retention span for a cached pdiff patch in a structured `dists/`
+/// directory. A patch never changes under its name and is never
+/// mtime-touched, so the span counts from its download. dak re-mints patch
+/// names every run (~6 h) and deletes them after ~18 h, so two days keep
+/// every patch through its upstream lifetime with margin while bounding the
+/// disk the dead ones take. Carried as the structured `dists/`
+/// [`MetadataUnit`]'s `pdiff_span`; the flat unit carries none.
+const PDIFF_KEEP_SPAN: Duration = Duration::from_hours(2 * 24);
 
 /// Age threshold for a `.partial` scratch file.
 ///
@@ -122,6 +132,10 @@ pub(super) struct MetadataUnit {
     pub layout: CacheLayout,
     pub root: PathBuf,
     pub span: Duration,
+    /// The shorter span for a cached pdiff patch, if this tree can hold
+    /// one: the structured `dists/` tree does, the flat tree does not (no
+    /// flat patch is cached, and a flat file may carry such a name).
+    pub pdiff_span: Option<Duration>,
 }
 
 /// A pure age reap of one `tmp/` directory. Carries no [`CacheLayout`]:
@@ -437,6 +451,7 @@ pub(super) fn classify_mirror(
             layout,
             root: paths.entry_dir(layout, site),
             span: METADATA_KEEP_SPAN,
+            pdiff_span: Some(PDIFF_KEEP_SPAN),
         }));
     }
 
@@ -445,6 +460,7 @@ pub(super) fn classify_mirror(
         layout,
         root: paths.entry_dir(layout, site),
         span: METADATA_KEEP_SPAN,
+        pdiff_span: None,
     }));
 
     if !is_flat {
@@ -636,11 +652,13 @@ mod tests {
                     layout: CacheLayout::Dists,
                     root: PathBuf::from("/cache/deb.debian.org/debian/dists"),
                     span: METADATA_KEEP_SPAN,
+                    pdiff_span: Some(PDIFF_KEEP_SPAN),
                 }),
                 CleanupUnit::Metadata(MetadataUnit {
                     layout: CacheLayout::Flat,
                     root: PathBuf::from("/cache/deb.debian.org/flat/debian"),
                     span: METADATA_KEEP_SPAN,
+                    pdiff_span: None,
                 }),
                 CleanupUnit::ByHash(ByHashUnit {
                     layout: CacheLayout::DistsByHash,
@@ -738,6 +756,7 @@ mod tests {
                 layout: CacheLayout::Flat,
                 root: _,
                 span: _,
+                pdiff_span: None,
             })
         ));
         assert!(matches!(

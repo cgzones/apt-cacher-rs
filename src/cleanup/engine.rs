@@ -388,6 +388,7 @@ async fn run_metadata_unit(unit: &MetadataUnit, ctx: &MirrorCtx<'_>) -> UnitStat
         &ctx.config.cache_directory,
         &unit.root,
         unit.span,
+        unit.pdiff_span,
         ctx.now,
         mirror,
         unit.layout,

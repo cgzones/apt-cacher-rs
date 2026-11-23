@@ -8,7 +8,7 @@ use tracing::{debug, error, warn};
 use crate::cache_layout::{CacheEntryKeyRef, CacheLayout};
 use crate::cache_quota::accounted_size;
 use crate::cache_walk::{AnomalyLevel, DirFailure, EntryKind, WalkContext, Walker};
-use crate::deb_mirror::{Mirror, is_deb_package};
+use crate::deb_mirror::{Mirror, is_cached_pdiff_patch, is_deb_package};
 use crate::error::ErrorReport;
 use crate::humanfmt::HumanFmt;
 use crate::{cache_metadata, info_once, metrics, warn_once_or_info};
@@ -69,7 +69,7 @@ fn age_reference_time(meta: &std::fs::Metadata, path: &Path) -> SystemTime {
 enum AgeSweep {
     /// Cached debs and by-hash files.
     Candidates,
-    /// Top-level index files.
+    /// Top-level index files (and cached pdiff patches).
     Metadata,
 }
 
@@ -304,7 +304,9 @@ static METADATA_WALK: WalkContext = WalkContext {
 /// matching `cache_metadata` entries on success.
 ///
 /// Removes regular files neither replaced nor revalidated for `keep_span`
-/// (`AgeSweep::reference_time`). Only the direct children are scanned:
+/// (`AgeSweep::reference_time`); a cached pdiff patch is removed after the
+/// shorter `pdiff_span` instead, when the caller's tree can hold patches
+/// (`Some`). Only the direct children are scanned:
 /// sub-directories (`by-hash/`, `tmp/`, nested mirrors) have their own
 /// cleanup. A flat `layout` leaves any deb-named entry to the
 /// reference-based flat-deb cleanup.
@@ -315,6 +317,7 @@ pub(super) async fn sweep_aged_metadata(
     cache_root: &Path,
     dir: &Path,
     keep_span: Duration,
+    pdiff_span: Option<Duration>,
     now: SystemTime,
     mirror: &Mirror,
     layout: CacheLayout,
@@ -349,7 +352,14 @@ pub(super) async fn sweep_aged_metadata(
 
         let path = entry.path();
 
-        if !AgeSweep::Metadata.is_due(&path, &data, keep_span, now) {
+        let span = match pdiff_span {
+            Some(pdiff_span) if entry.name().to_str().is_some_and(is_cached_pdiff_patch) => {
+                keep_span.min(pdiff_span)
+            }
+            Some(_) | None => keep_span,
+        };
+
+        if !AgeSweep::Metadata.is_due(&path, &data, span, now) {
             continue;
         }
 
@@ -473,6 +483,7 @@ mod tests {
             dir.path(),
             dir.path(),
             keep_span,
+            None,
             now,
             &mirror,
             CacheLayout::Dists,
@@ -497,6 +508,7 @@ mod tests {
             dir.path(),
             dir.path(),
             keep_span,
+            None,
             now,
             &mirror,
             CacheLayout::Dists,
@@ -504,6 +516,58 @@ mod tests {
         .await;
         assert_eq!(res.removed, 0);
         assert!(dir.path().join("trixie_Release").exists());
+    }
+
+    /// A cached pdiff patch is dead upstream within hours, so a unit with a
+    /// `pdiff_span` (the `dists/` one) ages it out after that span while its
+    /// 90-day neighbours stay; without one (the flat unit) a file of the same
+    /// name is ordinary metadata and keeps the metadata span.
+    #[tokio::test]
+    async fn sweep_aged_metadata_ages_pdiff_patches_out_after_2_days() {
+        const PATCH: &str =
+            "sid_main_binary-amd64_Packages.diff_T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz";
+        let keep_span = Duration::from_hours(90 * 24);
+        let mirror = test_mirror();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(PATCH), b"p").expect("write patch");
+        std::fs::write(dir.path().join("sid_Release"), b"r").expect("write release");
+
+        let sweep = |now| {
+            sweep_aged_metadata(
+                dir.path(),
+                dir.path(),
+                keep_span,
+                Some(Duration::from_hours(2 * 24)),
+                now,
+                &mirror,
+                CacheLayout::Dists,
+            )
+        };
+        let res = sweep(SystemTime::now() + Duration::from_hours(24)).await;
+        assert_eq!(res.removed, 0);
+        assert!(dir.path().join(PATCH).exists());
+
+        let res = sweep(SystemTime::now() + Duration::from_hours(3 * 24)).await;
+        assert_eq!(res.removed, 1);
+        assert!(!dir.path().join(PATCH).exists());
+        assert!(dir.path().join("sid_Release").exists());
+
+        let flat = tempfile::tempdir().expect("tempdir");
+        let flat_name = "Translation-en.diff_T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz";
+        std::fs::write(flat.path().join(flat_name), b"t").expect("write flat file");
+        let res = sweep_aged_metadata(
+            flat.path(),
+            flat.path(),
+            keep_span,
+            None,
+            SystemTime::now() + Duration::from_hours(3 * 24),
+            &mirror,
+            CacheLayout::Flat,
+        )
+        .await;
+        assert_eq!(res.removed, 0);
+        assert!(flat.path().join(flat_name).exists());
     }
 
     /// A 304 revalidation touches only the mtime; the birthtime stays that
@@ -530,6 +594,7 @@ mod tests {
             dir.path(),
             dir.path(),
             keep_span,
+            None,
             now,
             &test_mirror(),
             CacheLayout::Dists,
@@ -560,6 +625,7 @@ mod tests {
             dir.path(),
             dir.path(),
             keep_span,
+            None,
             now,
             &mirror,
             CacheLayout::Flat,
@@ -581,6 +647,7 @@ mod tests {
             dir.path(),
             &dir.path().join("does-not-exist"),
             Duration::from_hours(90 * 24),
+            None,
             SystemTime::now() + Duration::from_hours(91 * 24),
             &test_mirror(),
             CacheLayout::Dists,
