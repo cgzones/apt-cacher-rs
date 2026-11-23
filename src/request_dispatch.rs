@@ -10,8 +10,9 @@
 //!
 //! The request-classification pipeline, in order:
 //!
-//!   1. diff-request gate          - reject (410) pdiff URLs when configured,
-//!      else fall through silently as `Unrecognized`
+//!   1. diff-request gate          - reject (410) pdiff URLs when configured;
+//!      else a strict patch name is cached and any other `.diff/T-` shape
+//!      falls through silently as `Unrecognized`
 //!   2. [`normalize_uri_path`]     - collapse `//` runs / strip `.` segments
 //!   3. [`parse_request_path`]     - structural shape-match into `ResourceFile`
 //!   4. [`classify_request`]       - per-field URL-decode + allowlist validate
@@ -588,16 +589,16 @@ fn decide_request(
     let (uri_path, query) = split_query(path_and_query);
     trace!("Dispatching request from client {client} (host=`{requested_host}` path=`{uri_path}`)");
 
-    // pdiff URLs are uncacheable here and `parse_request_path` deliberately
-    // does not match them.  Detect them first, to refuse with 410 (the
-    // default) or to pass them through without a misleading "Unrecognized
+    // Detect pdiff URLs first: refused with 410 when configured, before the
+    // parser would cache a strict patch name; otherwise a shape the parser
+    // does not match passes through without a misleading "Unrecognized
     // resource path" warning.
     let is_diff = LazyCell::new(|| is_diff_request_path(uri_path));
 
     if reject_pdiff_requests && *is_diff {
         // Several per `apt update`; the count lives in PDIFF_REJECTED.
         info_once!(
-            "Rejecting diff request {uri_path} for client {client}; pdiff URLs are uncacheable here and are refused with 410 (further rejections counted in PDIFF_REJECTED)"
+            "Rejecting diff request {uri_path} for client {client} with 410, as `reject_pdiff_requests` is set (further rejections counted in PDIFF_REJECTED)"
         );
         metrics::PDIFF_REJECTED.increment();
         return DispatchOutcome::Reject(RejectReason::DiffRequest);
@@ -757,7 +758,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::*;
-    use crate::cache_layout::CacheLayout;
+    use crate::cache_layout::{CacheLayout, CachedFlavor};
     use crate::test_support::local_client;
 
     const OPEN_ACLS: ClientAcls<'static> = ClientAcls {
@@ -1460,22 +1461,38 @@ mod tests {
         );
     }
 
-    /// With the pdiff gate disabled the path, which the parser does not
-    /// match, is a plain unrecognized passthrough.
+    /// With the pdiff gate disabled a strict patch name is cached as a
+    /// permanent `dists/` entry; any other `.diff/T-` shape, which the
+    /// parser does not match, stays a plain unrecognized passthrough.
     #[test]
-    fn pdiff_request_passes_through_when_not_configured() {
-        let decision = decide_request(
-            "/debian/dists/sid/main/binary-amd64/Packages.diff/T-12345",
-            fake_host(),
-            None,
-            &local_client(),
-            &[],
-            false,
-            never_flat_blocked,
-            PreciseInstant::now(),
-        );
+    fn pdiff_requests_when_not_rejected() {
+        let decide = |path| {
+            decide_request(
+                path,
+                fake_host(),
+                None,
+                &local_client(),
+                &[],
+                false,
+                never_flat_blocked,
+                PreciseInstant::now(),
+            )
+        };
+
+        let details = match decide(
+            "/debian/dists/sid/main/binary-amd64/Packages.diff/T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz",
+        ) {
+            DispatchOutcome::Cache(details) => Some(details),
+            DispatchOutcome::Reject(_) | DispatchOutcome::Passthrough(_) => None,
+        }
+        .expect("a strict patch name is cached");
+        assert_eq!(details.layout(), CacheLayout::Dists);
+        assert_eq!(details.cached_flavor(), CachedFlavor::Permanent);
+
         assert_eq!(
-            verdict(&decision),
+            verdict(&decide(
+                "/debian/dists/sid/main/binary-amd64/Packages.diff/T-12345"
+            )),
             Verdict::Passthrough(PassthroughReason::Unrecognized)
         );
     }

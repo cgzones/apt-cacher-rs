@@ -456,6 +456,23 @@ pub(crate) enum ResourceFile<'a> {
         /// row a literal `Packages*` request would.
         scope: Option<DistsScope<'a>>,
     },
+    /// A by-name pdiff patch,
+    /// `dists/<dist>/<component>/<slot>/<index>.diff/T-<ts>-F-<ts>.gz`: a
+    /// merged patch from one index state to another, whose name never
+    /// names other bytes.  APT always fetches these by name, never by-hash.
+    Pdiff {
+        mirror_path: &'a str,
+        distribution: &'a str,
+        component: &'a str,
+        /// The `Packages` slot (`binary-<arch>` or a pseudo-architecture);
+        /// `None` for `Sources` / `Translation-*`, whose scope directory is
+        /// fixed.
+        architecture: Option<&'a str>,
+        /// The index base without `.diff`: `Packages`, `Sources` or
+        /// `Translation-<lang>`.
+        index: &'a str,
+        patch: &'a str,
+    },
     Icon {
         mirror_path: &'a str,
         distribution: &'a str,
@@ -716,6 +733,29 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 filename,
                 scope,
             });
+        } else if is_pdiff_patch_name(filename) {
+            let index = parts.next()?.strip_suffix(".diff")?;
+            // Only a `Packages` patch keeps its slot: `Sources` and
+            // `Translation-*` sit in a fixed scope directory.
+            let (scope, architecture) = match index {
+                "Packages" => {
+                    let scope = dists_scope(&mut parts)?;
+                    (scope, Some(scope.architecture))
+                }
+                "Sources" => (dists_scope_in(&mut parts, "source")?, None),
+                _ if is_pdiff_translation_base(index) => {
+                    (dists_scope_in(&mut parts, "i18n")?, None)
+                }
+                _ => return None,
+            };
+            return Some(ResourceFile::Pdiff {
+                mirror_path,
+                distribution: scope.distribution,
+                component: scope.component,
+                architecture,
+                index,
+                patch: filename,
+            });
         }
 
         return None;
@@ -848,7 +888,9 @@ pub(crate) fn valid_filename(name: &str) -> bool {
 
 /// Dispatched both when the configuration setting `reject_pdiff_requests` is
 /// on (to refuse with 410) and when it is off (to suppress the "Unrecognized
-/// resource path" warning for a URL shape we recognise but do not cache).
+/// resource path" warning for a pdiff shape the parser does not cache, such
+/// as a malformed patch name; strict names are cached as
+/// [`ResourceFile::Pdiff`]).
 ///
 /// Example request paths:
 /// - `http://deb.debian.org/debian-debug/dists/sid-debug/main/binary-i386/Packages.diff/T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz`
@@ -870,21 +912,60 @@ fn contains_translation_diff(uri_path: &str) -> bool {
     // for every malformed Translation prefix.
     let mut segments = uri_path.split('/').skip(1).peekable();
     while let Some(segment) = segments.next() {
-        if let Some(lang) = segment
-            .strip_prefix("Translation-")
-            .and_then(|rest| rest.strip_suffix(".diff"))
+        if segment
+            .strip_suffix(".diff")
+            .is_some_and(is_pdiff_translation_base)
+            && segments.peek().is_some_and(|next| next.starts_with("T-"))
         {
-            // Language tags in Debian translations are of the form `en`, `de`,
-            // `zh_CN`, `pt_BR` - alphanumeric with optional underscore.
-            if !lang.is_empty()
-                && lang.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                && segments.peek().is_some_and(|next| next.starts_with("T-"))
-            {
-                return true;
-            }
+            return true;
         }
     }
     false
+}
+
+/// `Translation-<lang>`, the base of a Translation pdiff directory
+/// (`Translation-<lang>.diff/`).  Language tags in Debian translations are
+/// of the form `en`, `de`, `zh_CN`, `pt_BR` - alphanumeric with optional
+/// underscore - so no `%` (and no percent-decoding surprise) can appear.
+#[must_use]
+fn is_pdiff_translation_base(base: &str) -> bool {
+    base.strip_prefix("Translation-").is_some_and(|lang| {
+        !lang.is_empty() && lang.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    })
+}
+
+/// Whether `name` is a merged pdiff patch as dak publishes it:
+/// `T-<ts>-F-<ts>.gz`, each timestamp exactly `YYYY-MM-DD-HHMM.SS`.  Strict
+/// on purpose: the name becomes part of a cache name, and holds no `%` or
+/// `_`, so decoding cannot change it and it cannot split a joined name.
+#[must_use]
+pub(crate) fn is_pdiff_patch_name(name: &str) -> bool {
+    name.strip_prefix("T-")
+        .and_then(|rest| rest.strip_suffix(".gz"))
+        .and_then(|stamps| stamps.split_once("-F-"))
+        .is_some_and(|(to, from)| is_pdiff_timestamp(to) && is_pdiff_timestamp(from))
+}
+
+/// `YYYY-MM-DD-HHMM.SS`, the timestamp in a pdiff patch name.
+#[must_use]
+fn is_pdiff_timestamp(stamp: &str) -> bool {
+    stamp.len() == 18
+        && stamp.bytes().enumerate().all(|(i, b)| match i {
+            4 | 7 | 10 => b == b'-',
+            15 => b == b'.',
+            _ => b.is_ascii_digit(),
+        })
+}
+
+/// Whether the cache name `debname` is that of a cached pdiff patch
+/// (`…<index>.diff_T-<ts>-F-<ts>.gz`, see [`ResourceFile::Pdiff`]).  The
+/// classifier refuses any other resource decoding to such a name, and
+/// cleanup gives these files their own, shorter retention.
+#[must_use]
+pub(crate) fn is_cached_pdiff_patch(debname: &str) -> bool {
+    debname
+        .rsplit_once(".diff_")
+        .is_some_and(|(_, patch)| is_pdiff_patch_name(patch))
 }
 
 /// Check whether a raw URI path is safe to forward upstream
@@ -1668,15 +1749,18 @@ mod tests {
             })
         );
 
-        /*
-         * TODO: support those?
-         */
-
         assert_eq!(
             parse_request_path(
                 "debian/dists/sid/main/binary-amd64/Packages.diff/T-2024-04-16-1405.22-F-2024-04-15-2018.42.gz"
             ),
-            None
+            Some(ResourceFile::Pdiff {
+                mirror_path: "debian",
+                distribution: "sid",
+                component: "main",
+                architecture: Some("binary-amd64"),
+                index: "Packages",
+                patch: "T-2024-04-16-1405.22-F-2024-04-15-2018.42.gz"
+            })
         );
 
         /*
@@ -2719,6 +2803,88 @@ mod tests {
         assert!(!contains_translation_diff(&repeated));
         repeated.push_str("/Translation-en.diff/T-good");
         assert!(contains_translation_diff(&repeated));
+    }
+
+    #[test]
+    fn pdiff_patch_name_shape() {
+        for ok in [
+            "T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz",
+            "T-2026-11-23-1403.38-F-2026-11-23-1403.38.gz",
+        ] {
+            assert!(is_pdiff_patch_name(ok), "{ok}");
+        }
+        for bad in [
+            "T-12345",
+            "T-2024-09-24-2005.48-F-2024-09-23-2021.00",
+            "T-2024-09-24-2005.48-F-2024-09-23-2021.00.xz",
+            "2024-09-24-2005.48.gz",
+            "T-2024-09-24-2005.48.gz",
+            "T-2024-09-24-2005.4-F-2024-09-23-2021.00.gz",
+            "T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz.gz",
+            "T-2024-09-24_2005.48-F-2024-09-23-2021.00.gz",
+            "T-2024-09-24-2005%2e48-F-2024-09-23-2021.00.gz",
+            "t-2024-09-24-2005.48-F-2024-09-23-2021.00.gz",
+            "",
+        ] {
+            assert!(!is_pdiff_patch_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn cached_pdiff_patch_debnames() {
+        let p = "T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz";
+        for ok in [
+            format!("sid_main_binary-amd64_Packages.diff_{p}"),
+            format!("sid_main_Sources.diff_{p}"),
+            format!("sid_main_Translation-zh_CN.diff_{p}"),
+        ] {
+            assert!(is_cached_pdiff_patch(&ok), "{ok}");
+        }
+        for bad in [
+            "sid_main_binary-amd64_Packages.xz",
+            "sid_InRelease",
+            p,
+            "sid_main_Packages.diff_T-12345",
+        ] {
+            assert!(!is_cached_pdiff_patch(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn parse_pdiff_patches() {
+        const P: &str = "T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz";
+        let pdiff = |architecture, index| ResourceFile::Pdiff {
+            mirror_path: "debian",
+            distribution: "sid",
+            component: "main",
+            architecture,
+            index,
+            patch: P,
+        };
+        for (dir, expected) in [
+            (
+                "binary-amd64/Packages.diff",
+                pdiff(Some("binary-amd64"), "Packages"),
+            ),
+            ("i18n/Packages.diff", pdiff(Some("i18n"), "Packages")),
+            ("source/Sources.diff", pdiff(None, "Sources")),
+            ("i18n/Translation-en.diff", pdiff(None, "Translation-en")),
+        ] {
+            let path = format!("debian/dists/sid/main/{dir}/{P}");
+            assert_eq!(parse_request_path(&path), Some(expected), "{path}");
+        }
+        for path in [
+            "debian/dists/sid/main/binary-amd64/Packages.diff/T-12345".to_owned(),
+            "debian/dists/sid/main/binary-amd64/Packages.diff/Index".to_owned(),
+            format!("debian/dists/sid/main/Packages.diff/{P}"),
+            format!("debian/dists/sid/main/source/Translation-en.diff/{P}"),
+            format!("debian/dists/sid/main/binary-amd64/Contents.diff/{P}"),
+            format!("debian/dists/x/sid/main/binary-amd64/Packages.diff/{P}"),
+            format!("debian/dists/sid/main/i18n/Translation-.diff/{P}"),
+            format!("debian/dists/sid/main/i18n/Translation-e%6E.diff/{P}"),
+        ] {
+            assert_eq!(parse_request_path(&path), None, "{path}");
+        }
     }
 
     #[test]

@@ -967,9 +967,14 @@ pub(crate) struct Config {
     /// 40 ms ACK delay the kernel can otherwise add to every request.
     pub(crate) upstream_tcp_nodelay: bool,
 
-    /// Whether to reject differential (pdiff) resource requests with 410 Gone.
-    /// When disabled, diff requests are proxied to the upstream mirror but not cached
-    /// (while full resources are always cached).
+    /// Whether to reject pdiff patch requests (`*.diff/T-*`) with 410 Gone
+    /// instead of caching them.  Cached patches never change under their
+    /// name, need a `Content-Length` from the mirror (without one, apt gets a
+    /// 502 for that patch), and are deleted by the first cleanup run about 2
+    /// days after download; a bad one is served until then.  With rejection,
+    /// apt falls back to the full, cached index, but newer apt releases may
+    /// drop that fallback; `Acquire::PDiffs "false";` on the clients avoids
+    /// pdiffs altogether.
     pub(crate) reject_pdiff_requests: bool,
 
     /// Whether to verify the integrity of cached content against the

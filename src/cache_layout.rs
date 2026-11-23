@@ -25,6 +25,7 @@
 //! | `ComponentRelease`           | `{mirror_path}`   | `Some("dists")`          | `{distribution}_{component}_{architecture}_{filename}` | `Volatile` |
 //! | `Icon`/`Sources`/`Translation` | `{mirror_path}` | `Some("dists")`          | `{distribution}_{component}_{filename}`        | `Volatile`      |
 //! | `ByHash`                     | `{mirror_path}`   | `Some("dists/by-hash")`  | `{filename}` (hex hash)                        | `Permanent`     |
+//! | `Pdiff`                      | `{mirror_path}`   | `Some("dists")`          | `{distribution}_{component}[_{architecture}]_{index}.diff_{patch}` | `Permanent` |
 //! | `Flat { Metadata }`          | `flat/{mirror_path}` | `None`                | `{filename}`                                   | `Volatile`      |
 //! | `Flat { Pool }`              | `flat/{mirror_path}` | `None`                | `{filename}`                                   | `Permanent`     |
 //! | `Flat { ByHash }`            | `flat/{mirror_path}` | `Some("by-hash")`     | `{filename}` (hex hash)                        | `Permanent`     |
@@ -41,6 +42,10 @@
 //! ([`ClassifyError::PackagesOutsideArchitecture`]): its directory sits
 //! where a component-scoped index's filename does, so `Translation-en` +
 //! `Packages` would name the Translation file `Translation-en_Packages`.
+//! And a component-scoped filename (`Translation-*`, `icons-*`, the open
+//! ones) that forms a cached pdiff patch's name is refused
+//! ([`ClassifyError::InvalidValue`]), or `i18n/Translation-en.diff_T-…` and
+//! the patch `i18n/Translation-en.diff/T-…` would name one file.
 //!
 //! `ByHash` keys on the digest alone, but still carries the
 //! `dists/<dist>/<comp>/<arch>/` scope it was fetched under: an
@@ -66,8 +71,9 @@ use crate::{
     database_task::{DatabaseCommand, send_db_command_nonblocking},
     deb_mirror::{
         DistsScope, FlatKind, Mirror, MirrorKind, Origin, OriginFields, OriginSighting,
-        ResourceFile, is_binary_arch, is_deb_package, is_flat_deb_filename, is_packages_directory,
-        valid_directory, valid_filename, valid_mirrorname, valid_path_segment,
+        ResourceFile, is_binary_arch, is_cached_pdiff_patch, is_deb_package, is_flat_deb_filename,
+        is_packages_directory, valid_directory, valid_filename, valid_mirrorname,
+        valid_path_segment,
     },
     flat_blocklist::path_collides_with_flat_layout,
     index_parser::HashAlgo,
@@ -80,8 +86,8 @@ use crate::{
 // Cache-flavor and connection types
 // ---------------------------------------------------------------------------
 
-/// Whether a cached resource is permanent (`.deb` / by-hash) or volatile
-/// (refresh-checked metadata like `Release` / `Packages*`).
+/// Whether a cached resource is permanent (`.deb` / by-hash / pdiff patch)
+/// or volatile (refresh-checked metadata like `Release` / `Packages*`).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CachedFlavor {
     Permanent,
@@ -121,6 +127,9 @@ pub(crate) enum ResourceKind {
     FlatPool,
     /// Flat-repository content-addressed `by-hash/SHA*/<hex>`.
     FlatByHash(HashAlgo, ByHashContent),
+    /// Structured by-name pdiff patch `dists/.../<index>.diff/T-…-F-….gz`:
+    /// index data, but never changed under its name.
+    Pdiff,
 }
 
 /// What a content-addressed object may be, judged by the directory its
@@ -157,7 +166,7 @@ impl ResourceKind {
     #[must_use]
     const fn cached_flavor(self) -> CachedFlavor {
         match self {
-            Self::Pool | Self::ByHash(..) | Self::FlatPool | Self::FlatByHash(..) => {
+            Self::Pool | Self::ByHash(..) | Self::FlatPool | Self::FlatByHash(..) | Self::Pdiff => {
                 CachedFlavor::Permanent
             }
             Self::Release
@@ -179,7 +188,8 @@ impl ResourceKind {
             | Self::Packages
             | Self::Sources
             | Self::Translation
-            | Self::Icon => CacheLayout::Dists,
+            | Self::Icon
+            | Self::Pdiff => CacheLayout::Dists,
             Self::ByHash(..) => CacheLayout::DistsByHash,
             Self::FlatMetadata | Self::FlatPool => CacheLayout::Flat,
             Self::FlatByHash(..) => CacheLayout::FlatByHash,
@@ -190,7 +200,7 @@ impl ResourceKind {
     const fn lookup_bucket(self) -> LookupBucket {
         match self {
             Self::Pool | Self::FlatPool => LookupBucket::Package,
-            Self::ByHash(..) | Self::FlatByHash(..) => LookupBucket::ByHash,
+            Self::ByHash(..) | Self::FlatByHash(..) | Self::Pdiff => LookupBucket::ByHash,
             Self::Release
             | Self::ComponentRelease
             | Self::Packages
@@ -211,8 +221,9 @@ enum LookupBucket {
     /// A `.deb` from a structured or flat pool: `PACKAGE_HITS` /
     /// `PACKAGE_MISSES` under `CACHE_HITS` / `CACHE_MISSES`.
     Package,
-    /// A content-addressed by-hash index: `BYHASH_HITS` / `BYHASH_MISSES`
-    /// under `CACHE_HITS` / `CACHE_MISSES`.
+    /// A content-addressed by-hash index, or a by-name pdiff patch (index
+    /// data whose every change is a new name too): `BYHASH_HITS` /
+    /// `BYHASH_MISSES` under `CACHE_HITS` / `CACHE_MISSES`.
     ByHash,
     /// A refresh-checked index: `VOLATILE_HIT` / `VOLATILE_REFETCHED`.
     Index,
@@ -993,6 +1004,47 @@ pub(crate) fn classify_request<'a>(
                 origin_fields,
             })
         }
+        ResourceFile::Pdiff {
+            mirror_path,
+            distribution,
+            component,
+            architecture,
+            index,
+            patch,
+        } => {
+            let mirror_path = decode_validate(mirror_path, ValidateKind::MirrorPath)?;
+            let distribution = decode_validate(distribution, ValidateKind::Distribution)?;
+            let component = decode_validate(component, ValidateKind::Component)?;
+            // The parser admits no `%` in either, so decoding is the identity.
+            let index = decode_validate(index, ValidateKind::Filename)?;
+            let patch = decode_validate(patch, ValidateKind::Filename)?;
+            let leaf = format!("{index}.diff_{patch}");
+
+            trace!(
+                "Decoded mirror path: `{mirror_path}`; Decoded distribution: `{distribution}`; Decoded component: `{component}`; Decoded pdiff patch: `{leaf}` (client {client})"
+            );
+
+            // Only a `Packages` patch carries its slot, which joins the
+            // name exactly where it does for the `Packages` index itself.
+            let debname = match architecture {
+                Some(architecture) => {
+                    let architecture = decode_validate(architecture, ValidateKind::Architecture)?;
+                    if !is_packages_directory(&architecture) {
+                        return Err(ClassifyError::PackagesOutsideArchitecture { architecture });
+                    }
+                    dists_debname(&distribution, &component, &architecture, &leaf)
+                }
+                None => format!("{distribution}_{component}_{leaf}"),
+            };
+
+            // A patch is no per-binary origin: the index it patches is.
+            Ok(RequestClass {
+                mirror_path: Arc::from(mirror_path),
+                debname,
+                resource_kind: ResourceKind::Pdiff,
+                origin_fields: None,
+            })
+        }
         ResourceFile::Flat {
             kind,
             mirror_path,
@@ -1053,9 +1105,21 @@ fn classify_component_scoped<'a>(
         "Decoded mirror path: `{mirror_path}`; Decoded distribution: `{distribution}`; Decoded component: `{component}`; Decoded filename: `{filename}` (client {client})"
     );
 
+    let debname = format!("{distribution}_{component}_{filename}");
+    // A filename that decodes to a cached pdiff patch's name
+    // (`Translation-en%2Ediff_T-…`) would share the patch's file as a
+    // volatile entry: refuse it like any name that would cache one resource
+    // under another's.
+    if is_cached_pdiff_patch(&debname) {
+        return Err(ClassifyError::InvalidValue {
+            kind: ValidateKind::Filename,
+            decoded: filename,
+        });
+    }
+
     Ok(RequestClass {
         mirror_path: Arc::from(mirror_path),
-        debname: format!("{distribution}_{component}_{filename}"),
+        debname,
         resource_kind,
         origin_fields: None,
     })
@@ -1126,12 +1190,13 @@ mod tests {
             | ResourceKind::ByHash(..)
             | ResourceKind::FlatMetadata
             | ResourceKind::FlatPool
-            | ResourceKind::FlatByHash(..) => {}
+            | ResourceKind::FlatByHash(..)
+            | ResourceKind::Pdiff => {}
         }
     }
 
     /// Every kind, one per variant (the by-hash payloads do not matter).
-    const ALL_KINDS: [ResourceKind; 11] = [
+    const ALL_KINDS: [ResourceKind; 12] = [
         ResourceKind::Pool,
         ResourceKind::Release,
         ResourceKind::ComponentRelease,
@@ -1143,25 +1208,28 @@ mod tests {
         ResourceKind::FlatMetadata,
         ResourceKind::FlatPool,
         ResourceKind::FlatByHash(HashAlgo::Sha256, ByHashContent::MaybePackages),
+        ResourceKind::Pdiff,
     ];
 
     /// The lookup buckets are the flavor/layout split, not a second opinion:
     /// an index is exactly a volatile kind, a package a permanent pool file,
-    /// a by-hash object a permanent by-hash file.
+    /// a by-hash object a permanent by-hash file or a pdiff patch.
     #[test]
     fn lookup_buckets_agree_with_flavor_and_layout() {
         for kind in ALL_KINDS {
             listed_in_all_kinds(kind);
-            // No permanent kind lives under `dists/` itself: `None` fails.
             let expected = match (kind.cached_flavor(), kind.layout()) {
                 (CachedFlavor::Volatile, _) => Some(LookupBucket::Index),
                 (CachedFlavor::Permanent, CacheLayout::StructuredPool | CacheLayout::Flat) => {
                     Some(LookupBucket::Package)
                 }
-                (CachedFlavor::Permanent, CacheLayout::DistsByHash | CacheLayout::FlatByHash) => {
-                    Some(LookupBucket::ByHash)
-                }
-                (CachedFlavor::Permanent, CacheLayout::Dists) => None,
+                // The one permanent kind directly under `dists/` is a pdiff
+                // patch: immutable index data whose every change is a new
+                // name, like a by-hash object.
+                (
+                    CachedFlavor::Permanent,
+                    CacheLayout::DistsByHash | CacheLayout::FlatByHash | CacheLayout::Dists,
+                ) => Some(LookupBucket::ByHash),
             };
             assert_eq!(Some(kind.lookup_bucket()), expected, "{kind:?}");
         }
@@ -1533,6 +1601,83 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn classify_pdiff_patches() {
+        const P: &str = "T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz";
+        for (dir, debname) in [
+            (
+                "binary-amd64/Packages.diff",
+                "sid_main_binary-amd64_Packages.diff_",
+            ),
+            ("source/Sources.diff", "sid_main_Sources.diff_"),
+            ("i18n/Translation-en.diff", "sid_main_Translation-en.diff_"),
+            (
+                "i18n/Translation-zh_CN.diff",
+                "sid_main_Translation-zh_CN.diff_",
+            ),
+        ] {
+            let path = format!("debian/dists/sid/main/{dir}/{P}");
+            let res = parse_request_path(&path).expect("parses");
+            let class = classify_request(&res, &local_client()).expect(&path);
+            assert_eq!(class.debname, format!("{debname}{P}"), "{path}");
+            assert_eq!(class.resource_kind, ResourceKind::Pdiff, "{path}");
+            assert!(class.origin_fields.is_none(), "{path}");
+        }
+
+        let path = format!("debian/dists/sid/main/Translation-en/Packages.diff/{P}");
+        let res = parse_request_path(&path).expect("parses");
+        assert!(
+            matches!(
+                classify_request(&res, &local_client()),
+                Err(ClassifyError::PackagesOutsideArchitecture { .. })
+            ),
+            "{path}"
+        );
+        for path in [
+            format!("debian/dists/sid_x/main/binary-amd64/Packages.diff/{P}"),
+            format!("debian/dists/sid/main/binary-amd64%5Fx/Packages.diff/{P}"),
+        ] {
+            let res = parse_request_path(&path).expect("parses");
+            assert!(
+                matches!(
+                    classify_request(&res, &local_client()),
+                    Err(ClassifyError::JoinedFieldUnderscore { .. })
+                ),
+                "{path}"
+            );
+        }
+    }
+
+    /// A component-scoped filename that is, or only decodes to, a cached
+    /// patch's name would share the patch's file as a volatile entry.
+    #[test]
+    fn component_scoped_name_decoding_to_a_patch_is_refused() {
+        for path in [
+            "debian/dists/sid/main/i18n/Translation-en.diff_T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz",
+            "debian/dists/sid/main/i18n/Translation-en%2Ediff_T-2024-09-24-2005%2E48-F-2024-09-23-2021%2E00.gz",
+            "debian/dists/sid/main/dep11/icons-x%2Ediff_T-2024-09-24-2005%2E48-F-2024-09-23-2021%2E00.gz",
+        ] {
+            let res = parse_request_path(path).expect("parses");
+            assert!(
+                matches!(
+                    res,
+                    ResourceFile::Translation { .. } | ResourceFile::Icon { .. }
+                ),
+                "{path}: {res:?}"
+            );
+            assert!(
+                matches!(
+                    classify_request(&res, &local_client()),
+                    Err(ClassifyError::InvalidValue {
+                        kind: ValidateKind::Filename,
+                        ..
+                    })
+                ),
+                "{path}"
+            );
+        }
+    }
+
     /// The whole `ResourceKind -> (CachedFlavor, CacheLayout)` table as one
     /// literal, so a new kind (or a moved one) is decided here, not defaulted.
     #[test]
@@ -1564,6 +1709,7 @@ mod tests {
                 Permanent,
                 FlatByHash,
             ),
+            (ResourceKind::Pdiff, Permanent, Dists),
         ] {
             assert_eq!(kind.cached_flavor(), flavor, "{kind:?} flavor");
             assert_eq!(kind.layout(), layout, "{kind:?} layout");

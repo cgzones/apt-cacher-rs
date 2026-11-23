@@ -1661,11 +1661,13 @@ fn ingest_kind(file: &IndexFile<'_>) -> Option<IngestKind> {
         // Like `FlatMetadata`: nothing reads a flat repository's digests.
         ResourceKind::FlatByHash(_, ByHashContent::MaybePackages | ByHashContent::Other)
         | ResourceKind::ByHash(_, ByHashContent::Other) => None,
+        // A pdiff patch is an ed script, not an index to ingest.
         ResourceKind::Pool
         | ResourceKind::Sources
         | ResourceKind::Translation
         | ResourceKind::Icon
-        | ResourceKind::FlatPool => None,
+        | ResourceKind::FlatPool
+        | ResourceKind::Pdiff => None,
     };
     kind
 }
@@ -1784,13 +1786,17 @@ fn digest_source<'a>(
         // `release_dir` `ingest_release_file` inserted it under
         // ("<release_dir>/<rel>").
         ResourceKind::Packages => DigestSource::Registry(registry_path_from_uri(raw_uri_path)),
+        // A pdiff patch: APT checks it against `SHA256-Download` in its
+        // `Packages.diff/Index`; ingesting that `Index` to verify here too is
+        // a possible follow-up.
         ResourceKind::Release
         | ResourceKind::ComponentRelease
         | ResourceKind::Sources
         | ResourceKind::Translation
         | ResourceKind::Icon
         | ResourceKind::FlatMetadata
-        | ResourceKind::FlatPool => DigestSource::Absent,
+        | ResourceKind::FlatPool
+        | ResourceKind::Pdiff => DigestSource::Absent,
     }
 }
 
@@ -2282,6 +2288,7 @@ mod tests {
             ResourceKind::Icon,
             ResourceKind::FlatMetadata,
             ResourceKind::FlatPool,
+            ResourceKind::Pdiff,
         ] {
             assert_eq!(
                 digest_source(kind, "hello_1.0_amd64.deb", POOL, true),

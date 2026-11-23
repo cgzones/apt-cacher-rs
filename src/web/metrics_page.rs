@@ -335,11 +335,11 @@ fn build_requests_group(g: &mut Groups) {
             .figure(status_3xx)
             .value(warn_if(Count(status_3xx), status_304 > status_3xx));
         t.entry("Client 4xx")
-            .tip("Client-error responses. Not highlighted: pdiff rejections, missing packages relayed from a mirror and web-interface 404 probes land here routinely.")
+            .tip("Client-error responses. Not highlighted: missing packages relayed from a mirror, web-interface 404 probes and, with reject_pdiff_requests set, pdiff rejections land here routinely.")
             .parts(|p| {
                 p.count_tip(
                     "Client 410 Gone",
-                    "Mostly pdiff requests refused by reject_pdiff_requests (Rejected (pdiff)); a mirror's own 410 is relayed too.",
+                    "With reject_pdiff_requests set, mostly the pdiff requests it refuses (Rejected (pdiff)); a mirror's own 410 is relayed too.",
                     metrics::CLIENT_STATUS_410.get(),
                 );
                 p.count(
@@ -465,7 +465,7 @@ fn build_refusals_group(g: &mut Groups, shown: Shown) {
         if shown.pdiff_rejection {
             t.count_tip(
                 "Rejected (pdiff)",
-                "Client requests for pdiff resources, refused with 410 because reject_pdiff_requests is set. Not highlighted: apt falls back to the full index.",
+                "Client requests for pdiff patches, refused with 410 because reject_pdiff_requests is set. Not highlighted: apt currently falls back to the full index (newer apt may not). reject_pdiff_requests = false caches patches instead; setting Acquire::PDiffs to false on the clients avoids them.",
                 metrics::PDIFF_REJECTED.get(),
             );
         }
@@ -834,7 +834,7 @@ fn build_cache_group(g: &mut Groups) {
             });
         }
         t.entry("Hits / Misses")
-            .tip("Cache lookups for permanent resources (packages and by-hash indexes) that found a usable file vs. those that did not, late joiners of an in-flight download counted as misses. The kinds beneath sum to it; it warns only if they exceed it, which is a counting bug.")
+            .tip("Cache lookups for permanent resources (packages, by-hash indexes and pdiff patches) that found a usable file vs. those that did not, late joiners of an in-flight download counted as misses. The kinds beneath sum to it; it warns only if they exceed it, which is a counting bug.")
             .parts(|p| {
                 p.row_tip(
                     "Packages (.deb)",
@@ -843,7 +843,7 @@ fn build_cache_group(g: &mut Groups) {
                 );
                 p.row_tip(
                     "By-Hash Indexes",
-                    "Content-addressed index lookups (Acquire-By-Hash). Every index change is a new name and so a miss; hits come from clients updating after one another.",
+                    "Content-addressed index lookups (Acquire-By-Hash) and pdiff patch lookups. Every index change is a new name and so a miss; hits come from clients updating after one another.",
                     byhash,
                 );
             })
