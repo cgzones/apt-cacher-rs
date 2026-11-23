@@ -64,6 +64,12 @@ Install the Debian package via dpkg on a local network server and add the follow
 Acquire::http::Proxy "http://<proxy_ip>:3142/";
 ```
 
+Debian testing and unstable publish *pdiffs*: small patches (`Packages.diff/`, `Sources.diff/`, `Translation-*.diff/`) that let APT update its package lists without downloading them whole.
+The proxy caches these patches like packages, though without checking them against their published checksums (APT does), and deletes them about two days after download, since the mirrors replace them within hours.
+On a local network, fetching the full, already cached lists is often faster than fetching and applying patches; to turn pdiffs off, add `Acquire::PDiffs "false";` to the client configuration above.
+Alternatively, `reject_pdiff_requests = true` makes the proxy answer patch requests with *410 Gone*: APT then falls back to the full list with no client change, and no patches are kept in the cache.
+Newer APT releases may drop that fallback, which is why caching is the default and the client setting is the more durable way to avoid pdiffs.
+
 To cache packages from a repository whose source URL uses *https://*, change that URL to *http://*.
 This leaves the connection from the client to the proxy unencrypted, but APT still rejects altered packages: it authenticates the signed repository metadata and checks each download against the hashes listed there (individual `.deb` packages normally carry no GPG signature).
 The proxy's default `https_upgrade_mode = 'Auto'` tries HTTPS to upstream mirrors but falls back to HTTP, which an attacker on the path can force.

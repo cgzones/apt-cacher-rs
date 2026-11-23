@@ -1086,7 +1086,7 @@ impl Default for Config {
             db_batch_flush_max_count: nonzero!(256),
             db_batch_flush_interval_secs: nonzero!(15),
             upstream_tcp_nodelay: true,
-            reject_pdiff_requests: true,
+            reject_pdiff_requests: false,
             verify_checksums: true,
             verify_checksums_max_entries: nonzero!(500_000),
             verify_checksums_throttle_base: Duration::from_secs(30),
@@ -2593,6 +2593,12 @@ mod test {
             std::ptr::from_ref(client.as_str()).addr(),
             std::ptr::from_ref(cache_view.as_str()).addr(),
         );
+    }
+
+    #[test]
+    fn pdiff_patches_are_cached_by_default() {
+        let cfg = Config::from_toml("").expect("empty config parses");
+        assert!(!cfg.reject_pdiff_requests);
     }
 
     #[test]

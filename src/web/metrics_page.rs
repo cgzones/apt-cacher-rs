@@ -1561,7 +1561,6 @@ mod tests {
         off.https_tunnel_enabled = false;
         off.verify_checksums = false;
         off.min_download_rate = None;
-        off.reject_pdiff_requests = false;
         assert_eq!(
             Shown::new(&off),
             Shown {
@@ -1576,12 +1575,14 @@ mod tests {
             let mut on = Config::default();
             on.https_upgrade_mode = mode;
             on.https_tunnel_enabled = true;
+            on.reject_pdiff_requests = true;
             assert_eq!(
                 Shown::new(&on),
                 Shown {
                     https_upgrade: true,
                     tunnels: true,
-                    // The defaults verify, rate-check and refuse pdiffs.
+                    // The defaults verify and rate-check; pdiff rejection is
+                    // opt-in.
                     verify_checksums: true,
                     rate_checks: true,
                     pdiff_rejection: true,

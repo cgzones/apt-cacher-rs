@@ -1204,7 +1204,7 @@ mod tests {
             None,
             &local_client(),
             &[],
-            true,
+            false,
             never_flat_blocked,
             PreciseInstant::now(),
         )
@@ -1358,15 +1358,10 @@ mod tests {
             "b".repeat(128),
             "c".repeat(120)
         );
-        // The pdiff gate fires before parsing, and therefore before the
-        // unsafe-path gate.
-        let unsafe_pdiff = "/debian/dists/sid/main/binary-amd64/Packages.diff/T-example/../escape";
-        assert!(is_diff_request_path(unsafe_pdiff));
-        assert!(is_unsafe_proxy_path(unsafe_pdiff));
         let pool = |rest: &str| format!("/debian/pool/main/{rest}");
         let dists = |rest: &str| format!("/debian/dists/{rest}");
 
-        let cases: [(&str, Verdict); 25] = [
+        let cases: [(&str, Verdict); 23] = [
             ("/foo/bar.txt", Passthrough(P::Unrecognized)),
             // The query does not change the verdict for anything uncacheable.
             ("/foo/bar.txt?x=1", Passthrough(P::Unrecognized)),
@@ -1410,11 +1405,6 @@ mod tests {
             ("/flatter/pool/main/f/foo/foo_1.0_amd64.deb", Cache),
             // A flat request the blocklist does not hit.
             ("/apt/Packages.gz", Cache),
-            (
-                &dists("sid/main/binary-amd64/Packages.diff/T-12345"),
-                Reject(R::DiffRequest),
-            ),
-            (unsafe_pdiff, Reject(R::DiffRequest)),
             ("/foo/../etc/passwd", Reject(R::UnsafePath)),
             // Cache poisoning: the traversal would reach the cache as
             // `debian/victim_1.0_amd64.deb` while the upstream is asked for
@@ -1459,6 +1449,37 @@ mod tests {
             verdict(&decision),
             Verdict::Passthrough(PassthroughReason::FlatBlocked)
         );
+    }
+
+    /// With `reject_pdiff_requests` set, the pdiff gate fires before parsing:
+    /// before the parser could cache a strict patch name, and before the
+    /// unsafe-path gate.
+    #[test]
+    fn pdiff_gate_rejects_before_parsing_when_configured() {
+        let unsafe_pdiff = "/debian/dists/sid/main/binary-amd64/Packages.diff/T-example/../escape";
+        assert!(is_diff_request_path(unsafe_pdiff));
+        assert!(is_unsafe_proxy_path(unsafe_pdiff));
+        for path in [
+            "/debian/dists/sid/main/binary-amd64/Packages.diff/T-12345",
+            unsafe_pdiff,
+            "/debian/dists/sid/main/binary-amd64/Packages.diff/T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz",
+        ] {
+            let decision = decide_request(
+                path,
+                fake_host(),
+                None,
+                &local_client(),
+                &[],
+                true,
+                never_flat_blocked,
+                PreciseInstant::now(),
+            );
+            assert_eq!(
+                verdict(&decision),
+                Verdict::Reject(RejectReason::DiffRequest),
+                "{path}"
+            );
+        }
     }
 
     /// With the pdiff gate disabled a strict patch name is cached as a
