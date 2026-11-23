@@ -10,7 +10,8 @@
 //!
 //! The request-classification pipeline, in order:
 //!
-//!   1. diff-request gate          - reject (410) pdiff URLs when configured;
+//!   1. diff-request gate          - reject (410) pdiff URLs when configured
+//!      (judged on the step-2 form, so `//` / `.` spellings cannot bypass it);
 //!      else a strict patch name is cached and any other `.diff/T-` shape
 //!      falls through silently as `Unrecognized`
 //!   2. [`normalize_uri_path`]     - collapse `//` runs / strip `.` segments
@@ -592,8 +593,12 @@ fn decide_request(
     // Detect pdiff URLs first: refused with 410 when configured, before the
     // parser would cache a strict patch name; otherwise a shape the parser
     // does not match passes through without a misleading "Unrecognized
-    // resource path" warning.
-    let is_diff = LazyCell::new(|| is_diff_request_path(uri_path));
+    // resource path" warning.  Checked on the normalized path the parser
+    // reads, so a `Packages.diff//T-...` spelling cannot reach the cache
+    // past the gate; normalizing only drops empty and `.` segments, so every
+    // raw match still matches.
+    let normalized = normalize_uri_path(uri_path);
+    let is_diff = LazyCell::new(|| is_diff_request_path(&normalized));
 
     if reject_pdiff_requests && *is_diff {
         // Several per `apt update`; the count lives in PDIFF_REJECTED.
@@ -611,7 +616,6 @@ fn decide_request(
     let canonical_host =
         || aliased_host.map_or_else(|| requested_host.clone(), CacheHost::to_client_host);
 
-    let normalized = normalize_uri_path(uri_path);
     let passthrough_reason: PassthroughReason = match parse_request_path(&normalized) {
         None => {
             if !*is_diff {
@@ -1463,6 +1467,11 @@ mod tests {
             "/debian/dists/sid/main/binary-amd64/Packages.diff/T-12345",
             unsafe_pdiff,
             "/debian/dists/sid/main/binary-amd64/Packages.diff/T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz",
+            // Spellings the parser normalizes into a cacheable patch name
+            // must not slip past the gate.
+            "/debian/dists/sid/main/binary-amd64/Packages.diff//T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz",
+            "/debian/dists/sid/main/binary-amd64/Packages.diff/./T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz",
+            "/debian/dists/sid/main/i18n/Translation-en.diff//T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz",
         ] {
             let decision = decide_request(
                 path,
