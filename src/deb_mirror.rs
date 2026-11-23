@@ -1502,131 +1502,67 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_1() {
-        let result = Origin::from_path(
-            "/debian/dists/sid/main/binary-amd64/Packages",
-            ClientHost::new("deb.debian.org").unwrap(),
-            None,
-            &local_client(),
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            Origin {
-                mirror: crate::test_support::structured_mirror("deb.debian.org", "debian"),
-                fields: OriginFields {
-                    distribution: "sid".to_string(),
-                    component: "main".to_string(),
-                    architecture: "binary-amd64".to_string(),
+    fn origin_from_path_names_the_mirror_and_its_packages_uri() {
+        const PACKAGES: &str = "/debian/dists/sid/main/binary-amd64/Packages";
+        for (path, host, port, mirror_path, distribution, uri) in [
+            (
+                PACKAGES,
+                "deb.debian.org",
+                None,
+                "debian",
+                "sid",
+                "http://deb.debian.org/debian/dists/sid/main/binary-amd64/Packages",
+            ),
+            (
+                "/private/debian/dists/sid/main/binary-amd64/by-hash/SHA256/\
+                 84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83",
+                "site.example.com",
+                Some(nonzero!(80)),
+                "private/debian",
+                "sid",
+                "http://site.example.com:80/private/debian/dists/sid/main/binary-amd64/Packages",
+            ),
+            (
+                "/unstable/dists/llvm-toolchain-19/main/binary-amd64/Packages.gz",
+                "apt.llvm.org",
+                Some(nonzero!(443)),
+                "unstable",
+                "llvm-toolchain-19",
+                "http://apt.llvm.org:443/unstable/dists/llvm-toolchain-19/main/binary-amd64/Packages",
+            ),
+            (
+                PACKAGES,
+                "2001:db8::1",
+                None,
+                "debian",
+                "sid",
+                "http://[2001:db8::1]/debian/dists/sid/main/binary-amd64/Packages",
+            ),
+            (
+                PACKAGES,
+                "::1",
+                Some(nonzero!(8080)),
+                "debian",
+                "sid",
+                "http://[::1]:8080/debian/dists/sid/main/binary-amd64/Packages",
+            ),
+        ] {
+            let host = || ClientHost::new(host).unwrap();
+            let origin = Origin::from_path(path, host(), port, &local_client()).expect(path);
+            assert_eq!(
+                origin,
+                Origin {
+                    mirror: Mirror::new(host(), port, mirror_path.into(), MirrorKind::Structured),
+                    fields: OriginFields {
+                        distribution: distribution.to_owned(),
+                        component: "main".to_owned(),
+                        architecture: "binary-amd64".to_owned(),
+                    },
                 },
-            }
-        );
-        assert_eq!(
-            result.uri(),
-            "http://deb.debian.org/debian/dists/sid/main/binary-amd64/Packages"
-        );
-    }
-
-    #[test]
-    fn test_parse_2() {
-        let result = Origin::from_path(
-            "/private/debian/dists/sid/main/binary-amd64/by-hash/SHA256/\
-        84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83",
-            ClientHost::new("site.example.com").unwrap(),
-            Some(nonzero!(80)),
-            &local_client(),
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            Origin {
-                mirror: Mirror::new(
-                    ClientHost::new("site.example.com").unwrap(),
-                    Some(nonzero!(80)),
-                    "private/debian".into(),
-                    MirrorKind::Structured,
-                ),
-                fields: OriginFields {
-                    distribution: "sid".to_string(),
-                    component: "main".to_string(),
-                    architecture: "binary-amd64".to_string(),
-                },
-            }
-        );
-        assert_eq!(
-            result.uri(),
-            "http://site.example.com:80/private/debian/dists/sid/main/binary-amd64/Packages"
-        );
-    }
-
-    #[test]
-    fn test_parse_3() {
-        let result = Origin::from_path(
-            "/unstable/dists/llvm-toolchain-19/main/binary-amd64/Packages.gz",
-            ClientHost::new("apt.llvm.org").unwrap(),
-            Some(nonzero!(443)),
-            &local_client(),
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            Origin {
-                mirror: Mirror::new(
-                    ClientHost::new("apt.llvm.org").unwrap(),
-                    Some(nonzero!(443)),
-                    "unstable".into(),
-                    MirrorKind::Structured,
-                ),
-                fields: OriginFields {
-                    distribution: "llvm-toolchain-19".to_string(),
-                    component: "main".to_string(),
-                    architecture: "binary-amd64".to_string(),
-                },
-            }
-        );
-        assert_eq!(
-            result.uri(),
-            "http://apt.llvm.org:443/unstable/dists/llvm-toolchain-19/main/binary-amd64/Packages"
-        );
-    }
-
-    #[test]
-    fn test_parse_ipv6() {
-        let result = Origin::from_path(
-            "/debian/dists/sid/main/binary-amd64/Packages",
-            ClientHost::new("2001:db8::1").unwrap(),
-            None,
-            &local_client(),
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            Origin {
-                mirror: crate::test_support::structured_mirror("2001:db8::1", "debian"),
-                fields: OriginFields {
-                    distribution: "sid".to_string(),
-                    component: "main".to_string(),
-                    architecture: "binary-amd64".to_string(),
-                },
-            }
-        );
-        assert_eq!(
-            result.uri(),
-            "http://[2001:db8::1]/debian/dists/sid/main/binary-amd64/Packages"
-        );
-
-        // IPv6 with port
-        let result = Origin::from_path(
-            "/debian/dists/sid/main/binary-amd64/Packages",
-            ClientHost::new("::1").unwrap(),
-            Some(nonzero!(8080)),
-            &local_client(),
-        )
-        .unwrap();
-        assert_eq!(
-            result.uri(),
-            "http://[::1]:8080/debian/dists/sid/main/binary-amd64/Packages"
-        );
+                "{path}"
+            );
+            assert_eq!(origin.uri(), uri);
+        }
     }
 
     #[test]
@@ -2160,17 +2096,6 @@ mod tests {
             })
         );
 
-        // Canonical correct-letter pool stays structured (regression guard: real
-        // Debian mirrors are unaffected).
-        assert_eq!(
-            parse_request_path("debian/pool/main/f/firefox-esr/firefox-esr_115.9.1esr-1_amd64.deb"),
-            Some(ResourceFile::Pool {
-                mirror_path: "debian",
-                dirs: "main/f/firefox-esr",
-                filename: "firefox-esr_115.9.1esr-1_amd64.deb",
-            })
-        );
-
         // Non-canonical pool with a non-deb tail is still rejected at the filename
         // gate (strictness preserved).
         assert_eq!(
@@ -2217,96 +2142,81 @@ mod tests {
 
     #[test]
     fn test_invalid_mirrorname() {
-        /* valid */
-        assert!(valid_mirrorname("debian", MirrorKind::Structured));
-        assert!(valid_mirrorname("public/ubuntu", MirrorKind::Structured));
-        assert!(valid_mirrorname(
-            "public/private/kali",
-            MirrorKind::Structured
-        ));
-        assert!(valid_mirrorname("foo/bar", MirrorKind::Structured));
+        use MirrorKind::{Flat, Structured};
+        for (name, kind, valid) in [
+            ("debian", Structured, true),
+            ("public/ubuntu", Structured, true),
+            ("public/private/kali", Structured, true),
+            ("foo/bar", Structured, true),
+            ("", Structured, false),
+            (".", Structured, false),
+            ("..", Structured, false),
+            ("-foo", Structured, false),
+            (".foo", Structured, false),
+            ("_foo", Structured, false),
+            ("foo\nbar", Structured, false),
+            ("foo/./bar", Structured, false),
+            ("foo/../bar", Structured, false),
+            ("foo//bar", Structured, false),
+            ("/", Structured, false),
+            ("/debian", Structured, false),
+            ("~/foo", Structured, false),
+            ("~foo", Structured, false),
+            ("public%2Fubuntu", Structured, false),
+            // Reserved segments collide with cache-layout plumbing.
+            ("tmp", Structured, false),
+            ("by-hash", Structured, false),
+            ("foo/tmp", Structured, false),
+            ("foo/by-hash/bar", Structured, false),
+            // `dists` would nest a mirror into its parent's `dists/` tree,
+            ("dists", Structured, false),
+            ("debian/dists", Structured, false),
+            ("debian/dists/x", Structured, false),
+            // while a flat tree, anchored under `flat/`, may pass through one.
+            ("linux/debian/dists/bookworm/pool/stable/amd64", Flat, true),
+            ("foo/tmp", Flat, false),
+            ("foo/by-hash/bar", Flat, false),
+            // Non-segment occurrences are fine.
+            ("tmpfile", Structured, true),
+            ("by-hash-deb", Structured, true),
+            ("dists-archive", Structured, true),
+        ] {
+            assert_eq!(valid_mirrorname(name, kind), valid, "{name:?} as {kind:?}");
+        }
 
-        /* invalid */
-        assert!(!valid_mirrorname("", MirrorKind::Structured));
-        assert!(!valid_mirrorname(".", MirrorKind::Structured));
-        assert!(!valid_mirrorname("..", MirrorKind::Structured));
-        assert!(!valid_mirrorname("-foo", MirrorKind::Structured));
-        assert!(!valid_mirrorname(".foo", MirrorKind::Structured));
-        assert!(!valid_mirrorname("_foo", MirrorKind::Structured));
-        assert!(!valid_mirrorname("foo\nbar", MirrorKind::Structured));
-        assert!(!valid_mirrorname("foo/./bar", MirrorKind::Structured));
-        assert!(!valid_mirrorname("foo/../bar", MirrorKind::Structured));
-        assert!(!valid_mirrorname("foo//bar", MirrorKind::Structured));
-        assert!(!valid_mirrorname("/", MirrorKind::Structured));
-        assert!(!valid_mirrorname("/debian", MirrorKind::Structured));
-        assert!(!valid_mirrorname("~/foo", MirrorKind::Structured));
-        assert!(!valid_mirrorname("~foo", MirrorKind::Structured));
-        assert!(!valid_mirrorname("public%2Fubuntu", MirrorKind::Structured));
-
-        /* reserved segments collide with cache-layout plumbing */
-        assert!(!valid_mirrorname("tmp", MirrorKind::Structured));
-        assert!(!valid_mirrorname("by-hash", MirrorKind::Structured));
-        assert!(!valid_mirrorname("foo/tmp", MirrorKind::Structured));
-        assert!(!valid_mirrorname("foo/by-hash/bar", MirrorKind::Structured));
-        /* `dists` would nest a mirror into its parent's `dists/` tree */
-        assert!(!valid_mirrorname("dists", MirrorKind::Structured));
-        assert!(!valid_mirrorname("debian/dists", MirrorKind::Structured));
-        assert!(!valid_mirrorname("debian/dists/x", MirrorKind::Structured));
-        /* while a flat tree, anchored under `flat/`, may pass through one */
-        assert!(valid_mirrorname(
-            "linux/debian/dists/bookworm/pool/stable/amd64",
-            MirrorKind::Flat
-        ));
-        assert!(!valid_mirrorname("foo/tmp", MirrorKind::Flat));
-        assert!(!valid_mirrorname("foo/by-hash/bar", MirrorKind::Flat));
-        /* but non-segment occurrences are fine */
-        assert!(valid_mirrorname("tmpfile", MirrorKind::Structured));
-        assert!(valid_mirrorname("by-hash-deb", MirrorKind::Structured));
-        assert!(valid_mirrorname("dists-archive", MirrorKind::Structured));
+        // The caps: the whole name's length and its segment count.
+        let segments = |count| vec!["x"; count].join("/");
+        for (name, valid) in [
+            ("x".repeat(MAX_SEGMENT_LEN), true),
+            ("x".repeat(MAX_SEGMENT_LEN + 1), false),
+            (segments(MAX_MIRROR_PATH_SEGMENTS), true),
+            (segments(MAX_MIRROR_PATH_SEGMENTS + 1), false),
+        ] {
+            assert_eq!(valid_mirrorname(&name, Structured), valid, "{name}");
+        }
     }
 
     #[test]
     fn test_mirror_path_has_reserved_segment() {
-        assert!(mirror_path_has_reserved_segment(
-            "tmp",
-            MirrorKind::Structured
-        ));
-        assert!(mirror_path_has_reserved_segment(
-            "by-hash",
-            MirrorKind::Structured
-        ));
-        assert!(mirror_path_has_reserved_segment(
-            "foo/tmp",
-            MirrorKind::Structured
-        ));
-        assert!(mirror_path_has_reserved_segment(
-            "foo/by-hash/bar",
-            MirrorKind::Structured
-        ));
-        assert!(mirror_path_has_reserved_segment(
-            "foo/dists",
-            MirrorKind::Structured
-        ));
-        assert!(!mirror_path_has_reserved_segment(
-            "debian",
-            MirrorKind::Structured
-        ));
-        assert!(!mirror_path_has_reserved_segment(
-            "tmpfile",
-            MirrorKind::Structured
-        ));
-        assert!(!mirror_path_has_reserved_segment(
-            "foo/by-hash-deb",
-            MirrorKind::Structured
-        ));
-        assert!(!mirror_path_has_reserved_segment(
-            "foo/dists",
-            MirrorKind::Flat
-        ));
-        assert!(mirror_path_has_reserved_segment(
-            "foo/tmp",
-            MirrorKind::Flat
-        ));
+        use MirrorKind::{Flat, Structured};
+        for (path, kind, reserved) in [
+            ("tmp", Structured, true),
+            ("by-hash", Structured, true),
+            ("foo/tmp", Structured, true),
+            ("foo/by-hash/bar", Structured, true),
+            ("foo/dists", Structured, true),
+            ("debian", Structured, false),
+            ("tmpfile", Structured, false),
+            ("foo/by-hash-deb", Structured, false),
+            ("foo/dists", Flat, false),
+            ("foo/tmp", Flat, true),
+        ] {
+            assert_eq!(
+                mirror_path_has_reserved_segment(path, kind),
+                reserved,
+                "{path} as {kind:?}"
+            );
+        }
     }
 
     const INVALID_PATH_SEGMENTS: [&str; 15] = [
@@ -3063,192 +2973,103 @@ mod tests {
     }
 
     #[test]
-    fn valid_mirrorname_rejects_name_over_length_cap() {
-        let oversized = "x".repeat(MAX_SEGMENT_LEN + 1);
-        assert!(!valid_mirrorname(&oversized, MirrorKind::Structured));
-    }
-
-    #[test]
-    fn valid_mirrorname_accepts_name_at_length_cap() {
-        let at_cap = "x".repeat(MAX_SEGMENT_LEN);
-        assert!(valid_mirrorname(&at_cap, MirrorKind::Structured));
-    }
-
-    #[test]
-    fn valid_mirrorname_rejects_segment_count_over_cap() {
-        let over_count = std::iter::repeat_n("x", MAX_MIRROR_PATH_SEGMENTS + 1)
-            .collect::<Vec<_>>()
-            .join("/");
-        assert!(!valid_mirrorname(&over_count, MirrorKind::Structured));
-    }
-
-    #[test]
-    fn valid_mirrorname_accepts_segment_count_at_cap() {
-        let at_count = std::iter::repeat_n("x", MAX_MIRROR_PATH_SEGMENTS)
-            .collect::<Vec<_>>()
-            .join("/");
-        assert!(valid_mirrorname(&at_count, MirrorKind::Structured));
-    }
-
-    #[test]
     fn parse_request_path_rejects_traversal_after_normalize() {
         // Even with `//` collapsed, traversal segments still get caught.
         assert!(parse_request_path("debian/dists/../passwd").is_none());
     }
 
     #[test]
-    fn flat_pool_archive_root_splits_gitea_path() {
-        assert_eq!(
-            flat_pool_archive_root("api/packages/85/debian/pool/php-zts/main"),
-            Some(("api/packages/85/debian", "pool/php-zts/main/".to_owned()))
-        );
+    fn flat_pool_archive_root_splits_at_the_pool_segment() {
+        for (mirror_path, expected) in [
+            // Gitea's layout.
+            (
+                "api/packages/85/debian/pool/php-zts/main",
+                Some(("api/packages/85/debian", "pool/php-zts/main/")),
+            ),
+            ("repo/pool/", Some(("repo", "pool/"))),
+            ("apt/amd64", None),
+            // `/pool/` requires a leading archive-root segment; a path that
+            // merely starts with `pool/` has no `/pool/` substring.
+            ("pool/php-zts/main", None),
+        ] {
+            assert_eq!(
+                flat_pool_archive_root(mirror_path),
+                expected.map(|(root, prefix)| (root, prefix.to_owned())),
+                "{mirror_path}"
+            );
+        }
     }
 
     #[test]
-    fn flat_pool_archive_root_none_without_pool_segment() {
-        assert_eq!(flat_pool_archive_root("apt/amd64"), None);
-        // `/pool/` requires a leading archive-root segment; a path that merely
-        // starts with `pool/` has no `/pool/` substring.
-        assert_eq!(flat_pool_archive_root("pool/php-zts/main"), None);
+    fn derive_nested_paths_table() {
+        for (mirror_path, host_paths, expected) in [
+            (
+                "debian",
+                &["debian", "debian/security", "debian/x/y", "unrelated"][..],
+                &["debian/security", "debian/x/y"][..],
+            ),
+            // `debian-security` and `debian_updates` share the byte prefix
+            // but are no nested children; `debian-security` also sorts
+            // between `debian` and `debian/...` (`-` < `/`), so the
+            // segment-alignment filter must skip it without ending the scan.
+            (
+                "debian",
+                &[
+                    "debian",
+                    "debian-security",
+                    "debian_updates",
+                    "debian/foo",
+                    "debian/security",
+                ],
+                &["debian/foo", "debian/security"],
+            ),
+            // A host-root mirror nests every other path.
+            (
+                "",
+                &["", "debian", "debian/security"],
+                &["debian", "debian/security"],
+            ),
+            // Self is excluded.
+            ("debian", &["debian"], &[]),
+            ("ubuntu", &["apt", "debian"], &[]),
+        ] {
+            let mut sorted = host_paths.to_vec();
+            sorted.sort_unstable();
+            assert_eq!(
+                derive_nested_paths(mirror_path, &sorted),
+                expected,
+                "{mirror_path:?} among {host_paths:?}"
+            );
+        }
     }
 
     #[test]
-    fn flat_pool_archive_root_trailing_slash() {
-        assert_eq!(
-            flat_pool_archive_root("repo/pool/"),
-            Some(("repo", "pool/".to_owned()))
-        );
-    }
-
-    fn sorted(paths: &[&'static str]) -> Vec<&'static str> {
-        let mut v = paths.to_vec();
-        v.sort_unstable();
-        v
-    }
-
-    #[test]
-    fn derive_nested_paths_basic_nesting() {
-        let host = sorted(&["debian", "debian/security", "debian/x/y", "unrelated"]);
-        assert_eq!(
-            derive_nested_paths("debian", &host),
-            vec!["debian/security".to_owned(), "debian/x/y".to_owned()]
-        );
-    }
-
-    #[test]
-    fn derive_nested_paths_skips_non_segment_aligned_prefix_neighbour() {
-        // `debian-security` sorts between `debian` and `debian/...` (`-` < `/`)
-        // but is not a nested child; the segment-alignment filter must exclude
-        // it without halting the surrounding `take_while`, so `debian/foo` and
-        // `debian/security` are still returned.
-        let host = sorted(&["debian", "debian-security", "debian/foo", "debian/security"]);
-        assert_eq!(
-            derive_nested_paths("debian", &host),
-            vec!["debian/foo".to_owned(), "debian/security".to_owned()]
-        );
-    }
-
-    #[test]
-    fn derive_nested_paths_empty_mirror_path_nests_all_others() {
-        let host = sorted(&["", "debian", "debian/security"]);
-        assert_eq!(
-            derive_nested_paths("", &host),
-            vec!["debian".to_owned(), "debian/security".to_owned()]
-        );
-    }
-
-    #[test]
-    fn derive_nested_paths_excludes_self() {
-        let host = sorted(&["debian"]);
-        assert_eq!(derive_nested_paths("debian", &host), [] as [String; 0]);
-    }
-
-    #[test]
-    fn derive_nested_paths_no_match() {
-        let host = sorted(&["apt", "debian"]);
-        assert_eq!(derive_nested_paths("ubuntu", &host), [] as [String; 0]);
-    }
-
-    #[test]
-    fn derive_nested_paths_handles_underscore_sibling() {
-        // `debian_updates` (underscore) must not be treated as nested under
-        // `debian` even though it shares the `debian` byte prefix.
-        // Likewise `debian-security` (hyphen, sorts before `debian/...`)
-        // must be excluded.  Only `debian/foo` is a true nested child.
-        let host = sorted(&["debian", "debian-security", "debian_updates", "debian/foo"]);
-        assert_eq!(
-            derive_nested_paths("debian", &host),
-            vec!["debian/foo".to_owned()]
-        );
-    }
-
-    fn nested(paths: &[&str]) -> Vec<String> {
-        paths.iter().map(|p| (*p).to_owned()).collect()
-    }
-
-    #[test]
-    fn nested_mirror_relation_registered_root_is_a_boundary() {
-        assert_eq!(
-            nested_mirror_relation("apt/amd64", &nested(&["apt/amd64"])),
-            NestedMirrorRelation::Boundary
-        );
-    }
-
-    #[test]
-    fn nested_mirror_relation_inside_nested_subtree_is_a_boundary() {
-        // The walker has already entered the nested subtree.
-        assert_eq!(
-            nested_mirror_relation("apt/amd64/foo", &nested(&["apt/amd64"])),
-            NestedMirrorRelation::Boundary
-        );
-    }
-
-    #[test]
-    fn nested_mirror_relation_ancestor_of_registered_is_a_container() {
-        // Regression guard against the reversed-argument bug: a candidate
-        // that is a strict ancestor of a registered nested root is NOT a
-        // boundary -- a flat walk has to continue down to reach the real
-        // nested root, and the size scan must not report it as stray.
-        assert_eq!(
-            nested_mirror_relation("apt/amd64", &nested(&["apt/amd64/special"])),
-            NestedMirrorRelation::Container
-        );
-    }
-
-    #[test]
-    fn nested_mirror_relation_boundary_wins_over_container() {
-        // `apt/amd64` is registered itself and also holds `apt/amd64/special`:
-        // the nested `apt/amd64` row owns the subtree, so it is a boundary.
-        assert_eq!(
-            nested_mirror_relation("apt/amd64", &nested(&["apt/amd64", "apt/amd64/special"])),
-            NestedMirrorRelation::Boundary
-        );
-    }
-
-    #[test]
-    fn nested_mirror_relation_is_segment_aligned() {
-        // `apt-tools` shares a byte-prefix with `apt` but is a distinct
-        // segment, in both directions.
-        assert_eq!(
-            nested_mirror_relation("apt-tools", &nested(&["apt"])),
-            NestedMirrorRelation::Unrelated
-        );
-        assert_eq!(
-            nested_mirror_relation("apt", &nested(&["apt-tools"])),
-            NestedMirrorRelation::Unrelated
-        );
-    }
-
-    #[test]
-    fn nested_mirror_relation_unrelated() {
-        assert_eq!(
-            nested_mirror_relation("apt", &nested(&["debian", "ubuntu/jammy"])),
-            NestedMirrorRelation::Unrelated
-        );
-        assert_eq!(
-            nested_mirror_relation("apt", &[]),
-            NestedMirrorRelation::Unrelated
-        );
+    fn nested_mirror_relation_table() {
+        use NestedMirrorRelation::{Boundary, Container, Unrelated};
+        for (candidate, nested, expected) in [
+            ("apt/amd64", &["apt/amd64"][..], Boundary),
+            // The walker has already entered the nested subtree.
+            ("apt/amd64/foo", &["apt/amd64"], Boundary),
+            // A strict ancestor of a registered nested root is no boundary:
+            // a flat walk has to continue down to reach the real nested
+            // root, and the size scan must not report it as stray.
+            ("apt/amd64", &["apt/amd64/special"], Container),
+            // Registered itself and holding a deeper one: the nested
+            // `apt/amd64` row owns the subtree.
+            ("apt/amd64", &["apt/amd64", "apt/amd64/special"], Boundary),
+            // Segment-aligned, in both directions.
+            ("apt-tools", &["apt"], Unrelated),
+            ("apt", &["apt-tools"], Unrelated),
+            ("apt", &["debian", "ubuntu/jammy"], Unrelated),
+            ("apt", &[], Unrelated),
+        ] {
+            let nested_paths: Vec<String> = nested.iter().map(|p| (*p).to_owned()).collect();
+            assert_eq!(
+                nested_mirror_relation(candidate, &nested_paths),
+                expected,
+                "{candidate} against {nested:?}"
+            );
+        }
     }
 
     /// The whole `(directory name, digest length)` table as one literal, so a

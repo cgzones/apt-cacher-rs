@@ -2743,46 +2743,34 @@ mod conn_action_tests {
     }
 
     #[test]
-    fn close_wins_over_keep_alive_in_one_field() {
-        assert_eq!(
-            action(b"GET / HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n"),
-            ConnectionAction::Close
-        );
-    }
+    fn connection_options_and_protocol_defaults() {
+        use ConnectionAction::{Close, KeepAlive};
 
-    #[test]
-    fn close_on_a_later_connection_line_wins() {
-        assert_eq!(
-            action(b"GET / HTTP/1.1\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n"),
-            ConnectionAction::Close
-        );
-    }
-
-    /// A deliberate divergence: hyper lets the later `keep-alive` line reopen
-    /// this HTTP/1.1 connection. Closing is the RFC reading and the safe side
-    /// (the request takes the whole-connection handoff).
-    #[test]
-    fn close_on_an_earlier_connection_line_still_wins() {
-        assert_eq!(
-            action(b"GET / HTTP/1.1\r\nConnection: close\r\nConnection: keep-alive\r\n\r\n"),
-            ConnectionAction::Close
-        );
-    }
-
-    #[test]
-    fn keep_alive_after_other_options_keeps_an_http10_connection() {
-        assert_eq!(
-            action(b"GET / HTTP/1.0\r\nConnection: Upgrade, keep-alive\r\n\r\n"),
-            ConnectionAction::KeepAlive
-        );
-    }
-
-    #[test]
-    fn protocol_defaults_apply_without_a_connection_option() {
-        assert_eq!(
-            action(b"GET / HTTP/1.1\r\nConnection: ,\r\n\r\n"),
-            ConnectionAction::KeepAlive
-        );
-        assert_eq!(action(b"GET / HTTP/1.0\r\n\r\n"), ConnectionAction::Close);
+        for (head, expected) in [
+            (
+                &b"GET / HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n"[..],
+                Close,
+            ),
+            (
+                b"GET / HTTP/1.1\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n",
+                Close,
+            ),
+            // A deliberate divergence: hyper lets the later `keep-alive` line
+            // reopen this HTTP/1.1 connection. Closing is the RFC reading and
+            // the safe side (the request takes the whole-connection handoff).
+            (
+                b"GET / HTTP/1.1\r\nConnection: close\r\nConnection: keep-alive\r\n\r\n",
+                Close,
+            ),
+            (
+                b"GET / HTTP/1.0\r\nConnection: Upgrade, keep-alive\r\n\r\n",
+                KeepAlive,
+            ),
+            // Without a connection option the protocol default applies.
+            (b"GET / HTTP/1.1\r\nConnection: ,\r\n\r\n", KeepAlive),
+            (b"GET / HTTP/1.0\r\n\r\n", Close),
+        ] {
+            assert_eq!(action(head), expected, "{}", head.escape_ascii());
+        }
     }
 }

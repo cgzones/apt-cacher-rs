@@ -465,13 +465,6 @@ mod tests {
     fn plan_without_headers_serves_full_file() {
         let plan = info(Some(ETAG)).plan(SIZE, &RangeRequestHeaders::default(), &local_client());
         assert_eq!(plan, full());
-        let params = if let ServePlan::Serve(params) = plan {
-            Some(params)
-        } else {
-            None
-        };
-        let params = params.expect("asserted above");
-        assert!(!params.is_partial());
     }
 
     #[test]
@@ -520,28 +513,16 @@ mod tests {
             range: Some("bytes=100-199"),
             ..RangeRequestHeaders::default()
         };
-        let plan = info(Some(ETAG)).plan(SIZE, &headers, &local_client());
-        assert!(
-            matches!(plan, ServePlan::Serve(_)),
-            "expected Serve, got {plan:?}"
+        let params = ServeParams::Partial(
+            crate::http_range::parse_content_range("bytes 100-199/1000").expect("valid range"),
         );
-        let params = if let ServePlan::Serve(params) = plan {
-            Some(params)
-        } else {
-            None
-        };
-        let params = params.expect("asserted above");
         assert!(params.is_partial());
         assert_eq!(params.content_start(), 100);
         assert_eq!(params.content_length(), 100);
         assert_eq!(
-            params
-                .content_range()
-                .map(|range| range.to_string())
-                .as_deref(),
-            Some("bytes 100-199/1000")
+            info(Some(ETAG)).plan(SIZE, &headers, &local_client()),
+            ServePlan::Serve(params)
         );
-        assert!(params.is_partial());
     }
 
     #[test]

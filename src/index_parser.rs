@@ -1021,19 +1021,19 @@ mod tests {
     }
 
     #[test]
-    fn stanza_chosen_falls_back_to_sha512() {
+    fn stanza_chosen_prefers_sha256_and_falls_back_to_sha512() {
         let mut s = Stanza::new();
-        s.sha512 = Some([0x33u8; 64]);
+        assert_eq!(s.chosen(), None);
+        s.sha512 = Some([0x22u8; 64]);
         assert_eq!(
             s.chosen(),
-            Some((HashAlgo::Sha512, [0x33u8; 64].as_slice()))
+            Some((HashAlgo::Sha512, [0x22u8; 64].as_slice()))
         );
-    }
-
-    #[test]
-    fn stanza_chosen_returns_none_without_hash() {
-        let s = Stanza::new();
-        assert_eq!(s.chosen(), None);
+        s.sha256 = Some([0x11u8; 32]);
+        assert_eq!(
+            s.chosen(),
+            Some((HashAlgo::Sha256, [0x11u8; 32].as_slice()))
+        );
     }
 
     #[test]
@@ -1163,18 +1163,6 @@ mod tests {
         assert_eq!(s.filename.capacity(), capacity);
     }
 
-    #[test]
-    fn stanza_chosen_prefers_sha256_over_sha512() {
-        let mut s = Stanza::new();
-        s.sha256 = Some([0x11u8; 32]);
-        s.sha512 = Some([0x22u8; 64]);
-        assert_eq!(
-            s.chosen(),
-            Some((HashAlgo::Sha256, [0x11u8; 32].as_slice()))
-        );
-    }
-
-    /// Drain a stream into `(filename, chosen digest)` pairs.
     async fn collect_stanzas(input: &[u8], stanza: Stanza) -> Vec<(String, Option<HashAlgo>)> {
         let mut stream = StanzaStream::new(input, stanza);
         let mut out = Vec::new();
@@ -1462,19 +1450,18 @@ mod tests {
     }
 
     #[test]
-    fn byhash_digest_sha256() {
-        let hex = "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba";
-        let digest = byhash_digest_for_algo(HashAlgo::Sha256, hex).expect("valid sha256 hex");
-        assert_eq!(digest.len(), 32);
-        assert_eq!(hex_encode(&digest), hex);
-    }
-
-    #[test]
-    fn byhash_digest_sha512() {
-        let hex = &"a".repeat(128);
-        let digest = byhash_digest_for_algo(HashAlgo::Sha512, hex).expect("valid sha512 hex");
-        assert_eq!(digest.len(), 64);
-        assert_eq!(hex_encode(&digest), *hex);
+    fn byhash_digest_decodes_each_algorithm() {
+        for (algo, hex) in [
+            (
+                HashAlgo::Sha256,
+                "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba".to_owned(),
+            ),
+            (HashAlgo::Sha512, "a".repeat(128)),
+        ] {
+            let digest = byhash_digest_for_algo(algo, &hex).expect("valid hex");
+            assert_eq!(digest.algo(), algo);
+            assert_eq!(hex_encode(&digest), hex);
+        }
     }
 
     #[test]

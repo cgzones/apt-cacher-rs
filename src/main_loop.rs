@@ -836,34 +836,26 @@ fn is_transient_accept_error(err: &std::io::Error) -> bool {
 mod accept_error_tests {
     use super::*;
 
+    /// Load conditions, then accept(2)'s errors already pending on the
+    /// accepted connection, which concern that one peer only.
     #[test]
-    fn fd_and_buffer_exhaustion_are_transient() {
+    fn load_and_pending_network_errors_are_transient() {
+        use nix::errno::Errno;
         for errno in [
-            nix::errno::Errno::EMFILE,
-            nix::errno::Errno::ENFILE,
-            nix::errno::Errno::ENOBUFS,
-            nix::errno::Errno::ENOMEM,
-            nix::errno::Errno::ECONNABORTED,
-        ] {
-            let err = std::io::Error::from_raw_os_error(errno as i32);
-            assert!(is_transient_accept_error(&err), "{errno}");
-        }
-    }
-
-    /// accept(2): an error already pending on the accepted connection is
-    /// reported by the call and concerns that one peer only.
-    #[test]
-    fn pending_network_errors_are_transient() {
-        for errno in [
-            nix::errno::Errno::EINTR,
-            nix::errno::Errno::ENETDOWN,
-            nix::errno::Errno::EPROTO,
-            nix::errno::Errno::ENOPROTOOPT,
-            nix::errno::Errno::EHOSTDOWN,
-            nix::errno::Errno::ENONET,
-            nix::errno::Errno::EHOSTUNREACH,
-            nix::errno::Errno::EOPNOTSUPP,
-            nix::errno::Errno::ENETUNREACH,
+            Errno::EMFILE,
+            Errno::ENFILE,
+            Errno::ENOBUFS,
+            Errno::ENOMEM,
+            Errno::ECONNABORTED,
+            Errno::EINTR,
+            Errno::ENETDOWN,
+            Errno::EPROTO,
+            Errno::ENOPROTOOPT,
+            Errno::EHOSTDOWN,
+            Errno::ENONET,
+            Errno::EHOSTUNREACH,
+            Errno::EOPNOTSUPP,
+            Errno::ENETUNREACH,
         ] {
             let err = std::io::Error::from_raw_os_error(errno as i32);
             assert!(is_transient_accept_error(&err), "{errno}");

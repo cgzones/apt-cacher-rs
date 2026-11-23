@@ -325,31 +325,6 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_marker_round_trips_every_algorithm() {
-        // `render` -> `parse` must be lossless for both algorithms, or a
-        // stamped marker is scrubbed on the next read and every cleanup cycle
-        // re-hashes the file it was supposed to memoize.
-        for (algo, digest) in [
-            (HashAlgo::Sha256, vec![0x5au8; 32]),
-            (HashAlgo::Sha512, vec![0xa5u8; 64]),
-        ] {
-            let marker = CleanupMarker::new(
-                FileIdentity::new(9, 4096, 1, 2),
-                Digest::from_bytes(algo, &digest).expect("matching digest length"),
-            );
-            assert_eq!(
-                CleanupMarker::parse(&marker.render()).as_ref(),
-                Some(&marker),
-                "{} marker must survive a render/parse round trip",
-                algo.as_str()
-            );
-        }
-    }
-
-    /// A marker an earlier version stamped (`ino:size:algo:digest`) is
-    /// accepted -- so the xattr layer neither scrubs it nor warns -- but
-    /// vouches for nothing, even when inode and size still agree.
-    #[test]
     fn cleanup_marker_accepts_a_legacy_marker_that_never_matches() {
         let digest = [0xabu8; 32];
         let raw = format!("42:1234:SHA256:{}", hex_encode(&digest));

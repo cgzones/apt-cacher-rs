@@ -1368,8 +1368,35 @@ mod tests {
 
     const DAY: u64 = 24 * 60 * 60;
 
-    fn byhash_test_mirror() -> Mirror {
-        structured_mirror("deb.example.org", "debian")
+    /// Sweep the by-hash directory `dir` with a 3-day grace and a 90-day
+    /// backstop.
+    async fn sweep(
+        dir: &Path,
+        reference: Option<&ByHashReferenceSet>,
+        now: SystemTime,
+    ) -> UnitStats {
+        sweep_byhash_dir(
+            dir,
+            dir,
+            reference,
+            Duration::from_secs(3 * DAY),
+            Duration::from_secs(90 * DAY),
+            now,
+            &structured_mirror("deb.example.org", "debian"),
+            CacheLayout::DistsByHash,
+        )
+        .await
+        .expect("sweep ok")
+    }
+
+    /// A reference set covering SHA256 only, referencing `digest`.
+    fn sha256_only(digest: [u8; 32]) -> ByHashReferenceSet {
+        ByHashReferenceSet {
+            sha256: HashSet::from_iter([digest]),
+            sha512: HashSet::new(),
+            complete_sha256: true,
+            complete_sha512: false,
+        }
     }
 
     #[tokio::test]
@@ -1381,27 +1408,10 @@ mod tests {
         for d in [&referenced, &unref_a, &unref_b] {
             std::fs::write(dir.path().join(hex_encode(d)), b"index-bytes").expect("write");
         }
-        let mut set = ByHashReferenceSet {
-            sha256: HashSet::new(),
-            sha512: HashSet::new(),
-            complete_sha256: true,
-            complete_sha512: false,
-        };
-        set.sha256.insert(referenced);
+        let set = sha256_only(referenced);
 
         let now = SystemTime::now() + Duration::from_secs(10 * DAY);
-        let outcome = sweep_byhash_dir(
-            dir.path(),
-            dir.path(),
-            Some(&set),
-            Duration::from_secs(3 * DAY),
-            Duration::from_secs(90 * DAY),
-            now,
-            &byhash_test_mirror(),
-            CacheLayout::DistsByHash,
-        )
-        .await
-        .expect("sweep ok");
+        let outcome = sweep(dir.path(), Some(&set), now).await;
 
         assert_eq!(outcome.retained(), 1);
         assert_eq!(outcome.removed, 2);
@@ -1447,18 +1457,12 @@ mod tests {
             // Birthtime cannot be backdated; advance the sweep's injected clock.
             let now = SystemTime::now();
             for (age_days, expected_removed) in [(10, 0), (91, 2)] {
-                let outcome = sweep_byhash_dir(
-                    files.path(),
+                let outcome = sweep(
                     files.path(),
                     references.as_ref(),
-                    Duration::from_secs(3 * DAY),
-                    Duration::from_secs(90 * DAY),
                     now + Duration::from_secs(age_days * DAY),
-                    &byhash_test_mirror(),
-                    CacheLayout::DistsByHash,
                 )
-                .await
-                .expect("sweep");
+                .await;
                 assert_eq!(outcome.removed, expected_removed);
                 assert_eq!(outcome.removed_unreferenced, 0);
                 for digest in [&unindented, &following] {
@@ -1476,18 +1480,7 @@ mod tests {
         let link = dir.path().join(hex_encode(&[0x0au8; 32]));
         std::os::unix::fs::symlink("/nonexistent", &link).expect("symlink");
 
-        let outcome = sweep_byhash_dir(
-            dir.path(),
-            dir.path(),
-            None,
-            Duration::from_secs(3 * DAY),
-            Duration::from_secs(90 * DAY),
-            SystemTime::now(),
-            &byhash_test_mirror(),
-            CacheLayout::DistsByHash,
-        )
-        .await
-        .expect("sweep ok");
+        let outcome = sweep(dir.path(), None, SystemTime::now()).await;
 
         assert!(link.symlink_metadata().is_err(), "the symlink is unlinked");
         assert_eq!(outcome.removed, 0);
@@ -1499,31 +1492,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let unref = [0x07u8; 32];
         std::fs::write(dir.path().join(hex_encode(&unref)), b"x").expect("write");
-        // Empty set "covers" nothing -> classify yields (Sha256, false) with
-        // covers(Sha256) false, so the file would fall to the backstop. To
-        // exercise the grace path the algo must be covered, so seed an
-        // unrelated referenced digest.
-        let mut set = ByHashReferenceSet {
-            sha256: HashSet::new(),
-            sha512: HashSet::new(),
-            complete_sha256: true,
-            complete_sha512: false,
-        };
-        set.sha256.insert([0x09u8; 32]);
+        // An unrelated referenced digest: the grace path needs the algo
+        // covered.
+        let set = sha256_only([0x09u8; 32]);
 
         let now = SystemTime::now() + Duration::from_secs(DAY);
-        let outcome = sweep_byhash_dir(
-            dir.path(),
-            dir.path(),
-            Some(&set),
-            Duration::from_secs(3 * DAY),
-            Duration::from_secs(90 * DAY),
-            now,
-            &byhash_test_mirror(),
-            CacheLayout::DistsByHash,
-        )
-        .await
-        .expect("sweep ok");
+        let outcome = sweep(dir.path(), Some(&set), now).await;
 
         assert_eq!(outcome.retained(), 1);
         assert_eq!(outcome.removed, 0);
@@ -1536,42 +1510,17 @@ mod tests {
         for d in [[0x21u8; 32], [0x22u8; 32]] {
             std::fs::write(dir.path().join(hex_encode(&d)), b"x").expect("write");
         }
-        let grace = Duration::from_secs(3 * DAY);
-        let backstop = Duration::from_secs(90 * DAY);
-
         let now = SystemTime::now();
 
         // Young files are kept in fallback mode.
         let young = now + Duration::from_secs(DAY);
-        let outcome = sweep_byhash_dir(
-            dir.path(),
-            dir.path(),
-            None,
-            grace,
-            backstop,
-            young,
-            &byhash_test_mirror(),
-            CacheLayout::DistsByHash,
-        )
-        .await
-        .expect("sweep ok");
+        let outcome = sweep(dir.path(), None, young).await;
         assert_eq!(outcome.removed, 0);
         assert_eq!(outcome.retained(), 2);
 
         // Past the backstop with no reference set -> aged out, not "unreferenced".
         let old = now + Duration::from_secs(91 * DAY);
-        let outcome = sweep_byhash_dir(
-            dir.path(),
-            dir.path(),
-            None,
-            grace,
-            backstop,
-            old,
-            &byhash_test_mirror(),
-            CacheLayout::DistsByHash,
-        )
-        .await
-        .expect("sweep ok");
+        let outcome = sweep(dir.path(), None, old).await;
         assert_eq!(outcome.removed, 2);
         assert_eq!(outcome.removed_unreferenced, 0);
     }

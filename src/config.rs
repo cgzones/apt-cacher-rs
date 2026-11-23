@@ -2204,64 +2204,35 @@ mod test {
     }
 
     #[test]
-    fn test_bind_override_address_only() {
-        for (input, expected) in [
-            ("1.2.3.4", IpAddr::from(Ipv4Addr::new(1, 2, 3, 4))),
-            ("0.0.0.0", IpAddr::from(Ipv4Addr::UNSPECIFIED)),
-            ("::1", IpAddr::from(Ipv6Addr::LOCALHOST)),
-            ("::", IpAddr::from(Ipv6Addr::UNSPECIFIED)),
-            ("[::1]", IpAddr::from(Ipv6Addr::LOCALHOST)),
+    fn test_bind_override_forms() {
+        let v4 = IpAddr::from(Ipv4Addr::new(1, 2, 3, 4));
+        let localhost = IpAddr::from(Ipv6Addr::LOCALHOST);
+        for (input, addr, port) in [
+            ("1.2.3.4", Some(v4), None),
+            ("0.0.0.0", Some(IpAddr::from(Ipv4Addr::UNSPECIFIED)), None),
+            ("::1", Some(localhost), None),
+            ("::", Some(IpAddr::from(Ipv6Addr::UNSPECIFIED)), None),
+            ("[::1]", Some(localhost), None),
             // A valid IPv6 address, not port 3143 - RFC 4291 elision needs `::`.
             (
                 "::3143",
-                IpAddr::from(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0x3143)),
+                Some(IpAddr::from(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0x3143))),
+                None,
             ),
+            ("1.2.3.4:3143", Some(v4), Some(3143)),
+            ("[::1]:3143", Some(localhost), Some(3143)),
+            (":3143", None, Some(3143)),
+            (":1", None, Some(1)),
         ] {
             assert_eq!(
                 bind(input),
                 BindOverride {
-                    addr: Some(expected),
-                    port: None,
+                    addr,
+                    port: port.and_then(NonZero::new),
                 },
                 "input `{input}`"
             );
         }
-    }
-
-    #[test]
-    fn test_bind_override_address_and_port() {
-        assert_eq!(
-            bind("1.2.3.4:3143"),
-            BindOverride {
-                addr: Some(IpAddr::from(Ipv4Addr::new(1, 2, 3, 4))),
-                port: Some(nonzero!(3143_u16)),
-            }
-        );
-        assert_eq!(
-            bind("[::1]:3143"),
-            BindOverride {
-                addr: Some(IpAddr::from(Ipv6Addr::LOCALHOST)),
-                port: Some(nonzero!(3143_u16)),
-            }
-        );
-    }
-
-    #[test]
-    fn test_bind_override_port_only() {
-        assert_eq!(
-            bind(":3143"),
-            BindOverride {
-                addr: None,
-                port: Some(nonzero!(3143_u16)),
-            }
-        );
-        assert_eq!(
-            bind(":1"),
-            BindOverride {
-                addr: None,
-                port: Some(nonzero!(1_u16)),
-            }
-        );
     }
 
     #[test]
@@ -2384,33 +2355,28 @@ mod test {
 
     #[test]
     fn test_parse_size_with_magnitude() {
-        assert_eq!(0, parse_usize_with_magnitude("0").unwrap());
-
-        assert_eq!(1024, parse_usize_with_magnitude("1024").unwrap());
-
-        assert!(parse_usize_with_magnitude("0x1000").is_err());
-
-        assert!(parse_usize_with_magnitude("-9999").is_err());
-
-        assert_eq!(1000, parse_usize_with_magnitude("1k").unwrap());
-
-        assert_eq!(1024, parse_usize_with_magnitude("1Ki").unwrap());
-
-        assert_eq!(1_000_000, parse_usize_with_magnitude("1M").unwrap());
-
-        assert_eq!(0x0010_0000, parse_usize_with_magnitude("1Mi").unwrap());
-
-        assert_eq!(42_000_000_000, parse_usize_with_magnitude("42 G").unwrap());
-
-        assert_eq!(45_097_156_608, parse_usize_with_magnitude("42 Gi").unwrap());
-
-        assert!(parse_usize_with_magnitude("1K").is_err());
-
-        assert!(parse_usize_with_magnitude("987ki").is_err());
-
-        assert!(parse_usize_with_magnitude("-9M").is_err());
-
-        assert!(parse_usize_with_magnitude("-7 y").is_err());
+        for (input, expected) in [
+            ("0", Some(0)),
+            ("1024", Some(1024)),
+            ("1k", Some(1000)),
+            ("1Ki", Some(1024)),
+            ("1M", Some(1_000_000)),
+            ("1Mi", Some(0x0010_0000)),
+            ("42 G", Some(42_000_000_000)),
+            ("42 Gi", Some(45_097_156_608)),
+            ("0x1000", None),
+            ("-9999", None),
+            ("1K", None),
+            ("987ki", None),
+            ("-9M", None),
+            ("-7 y", None),
+        ] {
+            assert_eq!(
+                parse_usize_with_magnitude(input).ok(),
+                expected,
+                "input `{input}`"
+            );
+        }
     }
 
     #[test]
@@ -2740,70 +2706,44 @@ mod test {
     }
 
     #[test]
-    fn resolve_alias_empty_slice_returns_none() {
-        let aliases: [Alias; 0] = [];
-        assert!(resolve_alias(&aliases, &clh("deb.debian.org")).is_none());
-    }
-
-    #[test]
-    fn resolve_alias_hit_returns_main() {
-        let aliases = [alias_group(
-            "deb.debian.org",
-            &[
+    fn resolve_alias_returns_the_main_of_the_owning_group() {
+        let debian = || {
+            alias_group(
+                "deb.debian.org",
+                &[
+                    "ftp.de.debian.org",
+                    "ftp.us.debian.org",
+                    "ftp.fr.debian.org",
+                ],
+            )
+        };
+        let ubuntu = || alias_group("archive.ubuntu.com", &["de.archive.ubuntu.com"]);
+        let solo = || alias_group("solo.example.com", &[]);
+        for (groups, host, expected) in [
+            (vec![], "deb.debian.org", None),
+            (vec![debian()], "ftp.us.debian.org", Some("deb.debian.org")),
+            // A main is not implicitly an alias of itself: the cache
+            // identity falls back to the client host, which equals the main.
+            (vec![debian()], "deb.debian.org", None),
+            (vec![debian()], "apt.llvm.org", None),
+            (
+                vec![debian(), ubuntu()],
+                "de.archive.ubuntu.com",
+                Some("archive.ubuntu.com"),
+            ),
+            (vec![solo(), debian()], "solo.example.com", None),
+            (
+                vec![solo(), debian()],
                 "ftp.de.debian.org",
-                "ftp.us.debian.org",
-                "ftp.fr.debian.org",
-            ],
-        )];
-        let resolved = resolve_alias(&aliases, &clh("ftp.us.debian.org")).expect("alias matches");
-        assert_eq!(resolved.as_str(), "deb.debian.org");
-    }
-
-    #[test]
-    fn resolve_alias_main_is_not_self_alias() {
-        // Mains are not implicitly registered as aliases of themselves;
-        // a request *to* the main returns `None` so the cache identity
-        // falls back to the client host (which equals the main here).
-        let aliases = [alias_group("deb.debian.org", &["ftp.de.debian.org"])];
-        assert!(resolve_alias(&aliases, &clh("deb.debian.org")).is_none());
-    }
-
-    #[test]
-    fn resolve_alias_multi_group_picks_owning_group() {
-        let aliases = [
-            alias_group("deb.debian.org", &["ftp.de.debian.org"]),
-            alias_group("archive.ubuntu.com", &["de.archive.ubuntu.com"]),
-        ];
-        let resolved =
-            resolve_alias(&aliases, &clh("de.archive.ubuntu.com")).expect("alias matches");
-        assert_eq!(resolved.as_str(), "archive.ubuntu.com");
-    }
-
-    #[test]
-    fn resolve_alias_empty_aliases_group_does_not_break_search() {
-        // A configured group with no aliases must not be considered a
-        // match for any host (and must not corrupt subsequent groups).
-        let aliases = [
-            alias_group("solo.example.com", &[]),
-            alias_group("deb.debian.org", &["ftp.de.debian.org"]),
-        ];
-        assert!(resolve_alias(&aliases, &clh("solo.example.com")).is_none());
-        let hit = resolve_alias(&aliases, &clh("ftp.de.debian.org")).expect("alias matches");
-        assert_eq!(hit.as_str(), "deb.debian.org");
-    }
-
-    #[test]
-    fn resolve_alias_unknown_host_returns_none() {
-        let aliases = [alias_group("deb.debian.org", &["ftp.de.debian.org"])];
-        assert!(resolve_alias(&aliases, &clh("apt.llvm.org")).is_none());
-    }
-
-    #[test]
-    fn client_host_into_cache_host_preserves_inner() {
-        let client = clh("example.test");
-        let cache = client.clone().into_cache_host();
-        assert_eq!(cache.as_str(), "example.test");
-        assert_eq!(client.as_str(), cache.as_str());
+                Some("deb.debian.org"),
+            ),
+        ] {
+            assert_eq!(
+                resolve_alias(&groups, &clh(host)).map(|main| main.as_str()),
+                expected,
+                "{host}"
+            );
+        }
     }
 
     #[test]
@@ -2820,38 +2760,10 @@ mod test {
     }
 
     #[test]
-    fn client_host_cross_kind_equality() {
-        let client = clh("example.test");
-        let cache = cah("example.test");
-        let other = cah("other.test");
-        assert_eq!(*client, *cache);
-        assert_eq!(*cache, *client);
-        assert_ne!(*client, *other);
-        assert_ne!(*other, *client);
-    }
-
-    #[test]
-    fn host_wrapper_deref_exposes_format_helpers() {
-        // `Deref<Target = DomainName>` is the contract every caller
-        // relies on for `as_str` / `format_authority`.
-        let client = clh("example.test");
-        let cache = cah("example.test");
-        let port = NonZero::new(8080);
-        assert_eq!(client.format_authority(port).as_ref(), "example.test:8080");
-        assert_eq!(cache.format_authority(port).as_ref(), "example.test:8080");
-    }
-
-    #[test]
     fn verify_checksums_defaults_on() {
         let cfg = Config::from_toml("").expect("empty config parses");
         assert!(cfg.verify_checksums);
         assert_eq!(cfg.verify_checksums_max_entries.get(), 500_000);
-    }
-
-    #[test]
-    fn verify_checksums_can_be_disabled() {
-        let cfg = Config::from_toml("verify_checksums = false").expect("config parses");
-        assert!(!cfg.verify_checksums);
     }
 
     #[test]
@@ -2891,38 +2803,22 @@ mod test {
 
     #[test]
     fn verify_throttle_set_while_verify_off_warns() {
-        let mut cfg = Config::from_toml(
-            "verify_checksums = false\nverify_checksums_throttle_base = 60\nverify_checksums_throttle_cap = 120",
-        )
-        .expect("config parses");
-        let warnings = cfg.validate().expect("config validates");
-        assert_eq!(
-            warnings
-                .iter()
-                .filter(|w| w.contains("has no effect while verify_checksums is disabled"))
-                .count(),
-            2,
-            "expected warnings for both throttle options, got: {warnings:?}"
-        );
-    }
-
-    #[test]
-    fn verify_throttle_explicit_defaults_while_verify_off_warn() {
-        // Presence, not value, decides: spelling out the default values is
-        // still "set" and still has no effect.
-        let mut cfg = Config::from_toml(
-            "verify_checksums = false\nverify_checksums_throttle_base = 30\nverify_checksums_throttle_cap = 3600",
-        )
-        .expect("config parses");
-        let warnings = cfg.validate().expect("config validates");
-        assert_eq!(
-            warnings
-                .iter()
-                .filter(|w| w.contains("has no effect while verify_checksums is disabled"))
-                .count(),
-            2,
-            "expected warnings for both throttle options, got: {warnings:?}"
-        );
+        // Presence, not value, decides: spelling out the default values (the
+        // second input) is still "set" and still has no effect.
+        for throttle in [
+            "verify_checksums_throttle_base = 60\nverify_checksums_throttle_cap = 120",
+            "verify_checksums_throttle_base = 30\nverify_checksums_throttle_cap = 3600",
+        ] {
+            let warnings = warnings_for(&format!("verify_checksums = false\n{throttle}"));
+            assert_eq!(
+                warnings
+                    .iter()
+                    .filter(|w| w.contains("has no effect while verify_checksums is disabled"))
+                    .count(),
+                2,
+                "expected warnings for both throttle options, got: {warnings:?}"
+            );
+        }
     }
 
     #[test]

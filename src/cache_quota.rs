@@ -1141,123 +1141,48 @@ mod tests {
     }
 
     #[test]
-    fn fresh_download_under_quota_accepts() {
-        let quota = CacheQuota::new(b(80), Some(nz(100)));
-        let reservation = quota
-            .try_acquire(exact(10), 0, None, "fresh-under")
-            .expect("fresh download under quota should be accepted");
-        assert_eq!(quota.current_size(), b(90));
-        drop(reservation);
-        // Drop reverts the reservation since `finalize` was not called.
-        assert_eq!(quota.current_size(), b(80));
+    fn admission_compares_the_projected_size_against_the_quota() {
+        // Blocks, against a quota of 100: the accounted size while the
+        // reservation lives, `None` when it is refused.
+        for (case, initial, download, replaced, reserved_size) in [
+            ("fresh, under the quota", 80, 10, 0, Some(90)),
+            ("fresh, exactly at the quota", 90, 10, 0, Some(100)),
+            ("fresh, one block over", 91, 10, 0, None),
+            ("fresh, cache already full", 100, 10, 0, None),
+            ("same-size overwrite", 80, 10, 10, Some(80)),
+            // Accepted so volatile re-fetches can shrink an over-quota cache.
+            ("smaller overwrite while over quota", 110, 5, 20, Some(95)),
+            ("growing overwrite past the quota", 80, 40, 10, None),
+        ] {
+            let quota = CacheQuota::new(b(initial), Some(nz(100)));
+            let reservation = quota
+                .try_acquire(exact(download), b(replaced), None, case)
+                .ok();
+            assert_eq!(
+                reservation.as_ref().map(|_| quota.current_size()),
+                reserved_size.map(b),
+                "{case}"
+            );
+            drop(reservation);
+            assert_eq!(quota.current_size(), b(initial), "{case}: reverted");
+        }
     }
 
     #[test]
-    fn fresh_download_over_quota_rejects() {
-        let quota = CacheQuota::new(b(100), Some(nz(100)));
-        let res = quota.try_acquire(exact(10), 0, None, "fresh-over");
-        assert!(
-            res.is_err(),
-            "fresh download that would exceed quota must be rejected"
-        );
-        assert_eq!(quota.current_size(), b(100));
-    }
-
-    #[test]
-    fn fresh_download_exactly_at_quota_accepts() {
-        // The projected size may equal the quota (`> quota` rejects, not
-        // `>=`); one byte past it is refused.
-        let quota = CacheQuota::new(b(90), Some(nz(100)));
-        let reservation = quota
-            .try_acquire(exact(10), 0, None, "fresh-at")
-            .expect("projected size equal to the quota must be accepted");
-        assert_eq!(quota.current_size(), b(100));
-        drop(reservation);
-        assert_eq!(quota.current_size(), b(90));
-
-        let quota = CacheQuota::new(b(91), Some(nz(100)));
-        assert!(
-            quota.try_acquire(exact(10), 0, None, "fresh-past").is_err(),
-            "projected size one byte over the quota must be rejected"
-        );
-        assert_eq!(quota.current_size(), b(91));
-    }
-
-    #[test]
-    fn overwrite_same_size_under_quota_accepts() {
-        let quota = CacheQuota::new(b(80), Some(nz(100)));
-        let reservation = quota
-            .try_acquire(exact(10), b(10), None, "overwrite-same")
-            .expect("same-size overwrite under quota should be accepted");
-        // Reserve adds 10, subtracts prev 10: net 0.
-        assert_eq!(quota.current_size(), b(80));
-        drop(reservation);
-        assert_eq!(quota.current_size(), b(80));
-    }
-
-    #[test]
-    fn overwrite_smaller_while_over_quota_accepts() {
-        // Cache is currently over quota, and the replacement would actually
-        // shrink it: `curr - prev + reserved = 110 - 20 + 5 = 95 <= 100`.
-        let quota = CacheQuota::new(b(110), Some(nz(100)));
-        let reservation = quota
-            .try_acquire(exact(5), b(20), None, "shrink-while-over")
-            .expect("smaller overwrite must be accepted to allow self-heal");
-        assert_eq!(quota.current_size(), b(95));
-        drop(reservation);
-        assert_eq!(quota.current_size(), b(110));
-    }
-
-    #[test]
-    fn overwrite_larger_that_would_push_over_rejects() {
-        let quota = CacheQuota::new(b(80), Some(nz(100)));
-        // 80 - 10 + 40 = 110 > 100 → reject.
-        let res = quota.try_acquire(exact(40), b(10), None, "grow-over");
-        assert!(
-            res.is_err(),
-            "overwrite that would push past quota must be rejected"
-        );
-        assert_eq!(quota.current_size(), b(80));
-    }
-
-    #[test]
-    fn release_round_trip_finalize_exact() {
-        let quota = CacheQuota::new(b(50), Some(nz(100)));
-        let reservation = quota
-            .try_acquire(exact(20), b(5), None, "round-trip")
-            .expect("must accept");
-        // 50 - 5 + 20 = 65 in flight.
-        assert_eq!(quota.current_size(), b(65));
-        // Finalize with the announced size: no further adjustment.
-        reservation.finalize(b(20));
-        assert_eq!(quota.current_size(), b(65));
-    }
-
-    #[test]
-    fn release_round_trip_finalize_under_delivers() {
-        let quota = CacheQuota::new(b(50), Some(nz(100)));
-        let reservation = quota
-            .try_acquire(exact(20), 0, None, "under-deliver")
-            .expect("must accept");
-        assert_eq!(quota.current_size(), b(70));
-        // Upstream sent only 12 bytes — the unused 8-byte reservation
-        // must be reclaimed.
-        reservation.finalize(b(12));
-        assert_eq!(quota.current_size(), b(62));
-    }
-
-    #[test]
-    fn release_round_trip_finalize_over_delivers() {
-        let quota = CacheQuota::new(b(50), Some(nz(100)));
-        let reservation = quota
-            .try_acquire(exact(20), 0, None, "over-deliver")
-            .expect("must accept");
-        assert_eq!(quota.current_size(), b(70));
-        // Upstream sent 25 bytes despite announcing 20; the accounted size
-        // must follow the bytes that actually landed on disk, not the
-        // reservation, or the quota under-counts the cache forever.
-        reservation.finalize(b(25));
-        assert_eq!(quota.current_size(), b(75));
+    fn finalize_settles_on_the_bytes_received() {
+        for (case, replaced, received, settled) in [
+            ("exact", 5, 20, 65),
+            ("under-delivers", 0, 12, 62),
+            ("over-delivers", 0, 25, 75),
+        ] {
+            let quota = CacheQuota::new(b(50), Some(nz(100)));
+            let reservation = quota
+                .try_acquire(exact(20), b(replaced), None, case)
+                .expect("must accept");
+            assert_eq!(quota.current_size(), b(70 - replaced), "{case}");
+            reservation.finalize(b(received));
+            assert_eq!(quota.current_size(), b(settled), "{case}");
+        }
     }
 
     #[test]

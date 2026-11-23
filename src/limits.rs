@@ -565,29 +565,18 @@ mod tests {
     }
 
     #[test]
-    fn decompressed_limit_ratio_caps_small_input() {
-        // A tiny compressed file: the ratio cap (size * MAX_DECOMPRESSION_RATIO) dominates.
-        assert_eq!(
-            decompressed_limit(Some(nonzero!(1000))),
-            MAX_DECOMPRESSION_RATIO.checked_mul(nonzero!(1000)).unwrap()
-        );
-    }
-
-    #[test]
-    fn decompressed_limit_absolute_caps_large_input() {
-        // A huge compressed file: the absolute cap dominates, and the ratio
-        // multiply must saturate rather than wrap.
-        assert_eq!(
-            decompressed_limit(Some(nonzero!(u64::MAX))),
-            MAX_DECOMPRESSED_PACKAGES_SIZE
-        );
-    }
-
-    #[test]
-    fn decompressed_limit_unknown_size_is_absolute_cap() {
-        // Zero-length, or a size the caller could not stat: the ratio bound has
-        // no anchor, so only the absolute cap applies.
-        assert_eq!(decompressed_limit(None), MAX_DECOMPRESSED_PACKAGES_SIZE);
+    fn decompressed_limit_is_the_ratio_up_to_the_absolute_cap() {
+        for (compressed_size, expected) in [
+            (
+                Some(nonzero!(1000)),
+                MAX_DECOMPRESSION_RATIO.checked_mul(nonzero!(1000)).unwrap(),
+            ),
+            // The ratio multiply must saturate rather than wrap.
+            (Some(nonzero!(u64::MAX)), MAX_DECOMPRESSED_PACKAGES_SIZE),
+            (None, MAX_DECOMPRESSED_PACKAGES_SIZE),
+        ] {
+            assert_eq!(decompressed_limit(compressed_size), expected);
+        }
     }
 
     #[test]
@@ -622,42 +611,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn limited_reader_allows_within_limit() {
+    async fn limited_reader_fails_past_its_limit() {
         use tokio::io::AsyncReadExt as _;
-        let data = b"hello world";
-        let mut reader = LimitedReader::decompressed(&data[..], nonzero!(100));
-        let mut out = Vec::new();
-        reader
-            .read_to_end(&mut out)
-            .await
-            .expect("read within limit");
-        assert_eq!(out, data);
-    }
-
-    #[tokio::test]
-    async fn limited_reader_rejects_over_limit() {
-        use tokio::io::AsyncReadExt as _;
-        let data = vec![0u8; 1000];
-        let mut reader = LimitedReader::decompressed(&data[..], nonzero!(100));
-        let mut out = Vec::new();
-        let err = reader
-            .read_to_end(&mut out)
-            .await
-            .expect_err("must exceed limit");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[tokio::test]
-    async fn limited_reader_allows_exact_limit() {
-        use tokio::io::AsyncReadExt as _;
-        let data = [0u8; 100];
-        let mut reader = LimitedReader::decompressed(&data[..], nonzero!(100));
-        let mut out = Vec::new();
-        reader
-            .read_to_end(&mut out)
-            .await
-            .expect("reading exactly `limit` bytes must succeed");
-        assert_eq!(out.len(), 100);
+        for (len, within) in [(11, true), (100, true), (101, false), (1000, false)] {
+            let data = vec![0u8; len];
+            let mut reader = LimitedReader::decompressed(&data[..], nonzero!(100));
+            let mut out = Vec::new();
+            let result = reader.read_to_end(&mut out).await;
+            if within {
+                assert_eq!(result.expect("within the limit"), len);
+                assert_eq!(out, data);
+            } else {
+                let err = result.expect_err("past the limit");
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{len}");
+            }
+        }
     }
 
     /// Decodes `encoded` through [`wrap_packages`] with `input_cap`.
@@ -691,16 +659,7 @@ mod tests {
     /// one byte over it fails, one exactly at it decodes.
     #[tokio::test]
     async fn compressed_input_is_held_to_the_cap() {
-        use async_compression::tokio::write::GzipEncoder;
-        use tokio::io::AsyncWriteExt as _;
-
-        let mut encoder = GzipEncoder::new(Vec::new());
-        encoder
-            .write_all(b"hello world\n")
-            .await
-            .expect("gzip write");
-        encoder.shutdown().await.expect("gzip finish");
-        let gz = encoder.into_inner();
+        let gz = crate::test_support::gzip(b"hello world\n").await;
         let xz = crate::xz_stream::tests::HELLO_XZ;
 
         for (compression, encoded) in [
@@ -763,168 +722,76 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn read_line_capped_keeps_blank_lines() {
-        let input = b"first\n\nsecond\n";
-        let mut reader = tokio::io::BufReader::new(&input[..]);
+    /// Every result of reading `input` to EOF through a `BufReader` of
+    /// `capacity` bytes, the final `Eof` left out.
+    async fn capped_lines(input: &[u8], capacity: usize, max_len: usize) -> Vec<Option<Vec<u8>>> {
+        let mut reader = tokio::io::BufReader::with_capacity(capacity, input);
         let mut line_buf = Vec::new();
-
-        let result = read_line_capped(&mut reader, &mut line_buf, 64)
-            .await
-            .expect("ok");
-        assert!(matches!(result, CappedLine::Line(b"first\n")), "{result:?}");
-
-        let result = read_line_capped(&mut reader, &mut line_buf, 64)
-            .await
-            .expect("ok");
-        // `StanzaStream` flushes its stanza on a blank line, so a blank line
-        // must arrive as a `Line` carrying "\n" - never as `Eof`.
-        assert!(matches!(result, CappedLine::Line(b"\n")), "{result:?}");
+        let mut lines = Vec::new();
+        loop {
+            match read_line_capped(&mut reader, &mut line_buf, max_len)
+                .await
+                .expect("an in-memory read cannot fail")
+            {
+                CappedLine::Eof => return lines,
+                CappedLine::Line(line) => lines.push(Some(line.to_vec())),
+                CappedLine::Skipped => lines.push(None),
+            }
+        }
     }
 
     #[tokio::test]
-    async fn read_line_capped_reads_short_line() {
-        let input = b"short line\nnext";
-        let mut reader = tokio::io::BufReader::new(&input[..]);
-        let mut line_buf = Vec::new();
-        let result = read_line_capped(&mut reader, &mut line_buf, 64)
-            .await
-            .expect("ok");
-        assert!(
-            matches!(result, CappedLine::Line(b"short line\n")),
-            "{result:?}"
-        );
-    }
+    async fn read_line_capped_cuts_lines_and_skips_overlong_ones() {
+        /// Input, reader capacity, `max_len`, expected lines (`None` = skipped).
+        type Case<'a> = (&'a [u8], usize, usize, &'a [Option<&'a [u8]>]);
 
-    /// A line split across several `fill_buf` refills is joined whole.
-    #[tokio::test]
-    async fn read_line_capped_joins_a_line_across_buffer_refills() {
-        let input = b"a line longer than eight bytes\nnext\n";
-        let mut reader = tokio::io::BufReader::with_capacity(8, &input[..]);
-        let mut line_buf = Vec::new();
-        let result = read_line_capped(&mut reader, &mut line_buf, 64)
-            .await
-            .expect("ok");
-        assert!(
-            matches!(
-                result,
-                CappedLine::Line(b"a line longer than eight bytes\n")
+        let long = [b'a'; 1000];
+        let long_then_next = [&long[..], b"\nnext\n"].concat();
+        let cases: [Case<'_>; 9] = [
+            (b"", 8192, 64, &[]),
+            (
+                b"short line\nnext",
+                8192,
+                64,
+                &[Some(b"short line\n"), Some(b"next")],
             ),
-            "{result:?}"
-        );
-        let result = read_line_capped(&mut reader, &mut line_buf, 64)
-            .await
-            .expect("ok");
-        assert!(matches!(result, CappedLine::Line(b"next\n")), "{result:?}");
-    }
-
-    #[tokio::test]
-    async fn read_line_capped_skips_long_line() {
-        let mut input = vec![b'a'; 1000];
-        input.push(b'\n');
-        input.extend_from_slice(b"next\n");
-        let mut reader = tokio::io::BufReader::new(&input[..]);
-        let mut line_buf = Vec::new();
-        let result = read_line_capped(&mut reader, &mut line_buf, 64)
-            .await
-            .expect("over-length line must be skipped, not errored");
-        assert!(matches!(result, CappedLine::Skipped));
-
-        // The drain must consume past the newline so the next call sees the
-        // following line.
-        let result = read_line_capped(&mut reader, &mut line_buf, 64)
-            .await
-            .expect("follow-on read");
-        assert!(matches!(result, CappedLine::Line(b"next\n")), "{result:?}");
-    }
-
-    #[tokio::test]
-    async fn read_line_capped_skips_long_line_without_newline() {
-        // No trailing newline anywhere — the drain reaches EOF.
-        let input = vec![b'a'; 1000];
-        let mut reader = tokio::io::BufReader::new(&input[..]);
-        let mut line_buf = Vec::new();
-        let result = read_line_capped(&mut reader, &mut line_buf, 64)
-            .await
-            .expect("ok");
-        assert!(matches!(result, CappedLine::Skipped));
-
-        let result = read_line_capped(&mut reader, &mut line_buf, 64)
-            .await
-            .expect("follow-on read");
-        assert!(matches!(result, CappedLine::Eof));
-    }
-
-    #[tokio::test]
-    async fn read_line_capped_eof_returns_eof() {
-        let input: &[u8] = b"";
-        let mut reader = tokio::io::BufReader::new(input);
-        let mut line_buf = Vec::new();
-        let result = read_line_capped(&mut reader, &mut line_buf, 64)
-            .await
-            .expect("ok");
-        assert!(matches!(result, CappedLine::Eof));
-    }
-
-    #[tokio::test]
-    async fn read_line_capped_accepts_exact_limit() {
-        // 4 data bytes + '\n' = 5 bytes total == max_len
-        let input = b"abcd\nmore";
-        let mut reader = tokio::io::BufReader::new(&input[..]);
-        let mut line_buf = Vec::new();
-        let result = read_line_capped(&mut reader, &mut line_buf, 5)
-            .await
-            .expect("exact limit must be accepted");
-        assert!(matches!(result, CappedLine::Line(b"abcd\n")), "{result:?}");
-    }
-
-    #[tokio::test]
-    async fn read_line_capped_skips_one_past_limit() {
-        // 5 data bytes + '\n' = 6 bytes total, one over max_len: the line
-        // (newline included) is consumed and skipped, and the reader is left
-        // at EOF.
-        let input = b"abcde\n";
-        let mut reader = tokio::io::BufReader::new(&input[..]);
-        let mut line_buf = Vec::new();
-        let result = read_line_capped(&mut reader, &mut line_buf, 5)
-            .await
-            .expect("one past the limit must be skipped, not errored");
-        assert!(matches!(result, CappedLine::Skipped));
-
-        let result = read_line_capped(&mut reader, &mut line_buf, 5)
-            .await
-            .expect("follow-on read");
-        assert!(matches!(result, CappedLine::Eof));
-    }
-
-    /// The line is handed out as bytes; whether they must be UTF-8 is the
-    /// caller's decision (`index_parser` decodes only the fields it reads).
-    #[tokio::test]
-    async fn read_line_capped_hands_out_non_utf8_bytes() {
-        let input = b"\xff\xfe\n";
-        let mut reader = tokio::io::BufReader::new(&input[..]);
-        let mut line_buf = Vec::new();
-        let result = read_line_capped(&mut reader, &mut line_buf, 64)
-            .await
-            .expect("bytes are not validated");
-        assert!(
-            matches!(result, CappedLine::Line(b"\xff\xfe\n")),
-            "{result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn read_line_capped_partial_eof() {
-        let input = b"no newline";
-        let mut reader = tokio::io::BufReader::new(&input[..]);
-        let mut line_buf = Vec::new();
-        let result = read_line_capped(&mut reader, &mut line_buf, 64)
-            .await
-            .expect("ok");
-        assert!(
-            matches!(result, CappedLine::Line(b"no newline")),
-            "{result:?}"
-        );
+            // `StanzaStream` flushes its stanza on a blank line, so a blank
+            // line must arrive as a line carrying "\n" - never as `Eof`.
+            (
+                b"first\n\nsecond\n",
+                8192,
+                64,
+                &[Some(b"first\n"), Some(b"\n"), Some(b"second\n")],
+            ),
+            // A line joined across buffer refills.
+            (
+                b"a line longer than eight bytes\nnext\n",
+                8,
+                64,
+                &[Some(b"a line longer than eight bytes\n"), Some(b"next\n")],
+            ),
+            (&long_then_next, 8192, 64, &[None, Some(b"next\n")]),
+            // Over-length without a newline: drained to EOF.
+            (&long, 8192, 64, &[None]),
+            // 4 data bytes + '\n' is exactly `max_len`.
+            (b"abcd\nmore", 8192, 5, &[Some(b"abcd\n"), Some(b"more")]),
+            // One byte over `max_len`.
+            (b"abcde\n", 8192, 5, &[None]),
+            // The bytes are not validated as UTF-8.
+            (b"\xff\xfe\n", 8192, 64, &[Some(b"\xff\xfe\n")]),
+        ];
+        for (input, capacity, max_len, expected) in cases {
+            let expected: Vec<_> = expected
+                .iter()
+                .map(|line| line.map(<[u8]>::to_vec))
+                .collect();
+            assert_eq!(
+                capped_lines(input, capacity, max_len).await,
+                expected,
+                "{:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
     }
 
     #[tokio::test]

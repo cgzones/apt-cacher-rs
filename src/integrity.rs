@@ -2403,16 +2403,79 @@ mod tests {
     }
 
     #[test]
-    fn byhash_match_returns_proceed() {
-        let f = temp_file_with(b"hello world");
-        let plan = VerifyInput {
-            kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
-            file: f.as_file(),
-            meta: &f.as_file().metadata().unwrap(),
-            temp_path: f.path(),
-            streamed: None,
+    fn verify_temp_file_table() {
+        let expected = || byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256);
+        let hello = || {
+            index_parser::byhash_digest_for_algo(HashAlgo::Sha256, HELLO_SHA256)
+                .expect("HELLO_SHA256 is valid hex")
         };
-        assert!(matches!(verify_temp_file(&plan), Ok(())));
+        let zero256 = || Digest::Sha256(Box::new([0u8; 32]));
+        let zero512 = || Digest::Sha512(Box::new([0u8; 64]));
+        let streamed = |digest, bytes| Some(StreamedDigest { digest, bytes });
+        for (label, content, kind, streamed, matches) in [
+            ("by-hash match", "hello world", expected(), None, true),
+            ("by-hash mismatch", "tampered", expected(), None, false),
+            // The on-disk body is wrong, so passing proves it was not re-read.
+            (
+                "streamed digest used instead of a re-read",
+                "not hello at all",
+                expected(),
+                streamed(hello(), 16),
+                true,
+            ),
+            (
+                "streamed digest mismatch",
+                "hello world",
+                expected(),
+                streamed(zero256(), 11),
+                false,
+            ),
+            (
+                "streamed digest of another algorithm: re-read",
+                "hello world",
+                expected(),
+                streamed(zero512(), 11),
+                true,
+            ),
+            (
+                "streamed digest over more bytes than the file holds: re-read",
+                "hello world",
+                expected(),
+                streamed(zero256(), 999),
+                true,
+            ),
+            (
+                "unverifiable kind",
+                "anything",
+                VerifyKind::Unverifiable,
+                None,
+                true,
+            ),
+            (
+                "unknown digest",
+                "some deb",
+                VerifyKind::Unknown,
+                None,
+                true,
+            ),
+        ] {
+            let f = temp_file_with(content.as_bytes());
+            let result = verify_temp_file(&VerifyInput {
+                kind,
+                file: f.as_file(),
+                meta: &f.as_file().metadata().unwrap(),
+                temp_path: f.path(),
+                streamed,
+            });
+            if matches {
+                assert!(matches!(result, Ok(())), "{label}: {result:?}");
+            } else {
+                assert!(
+                    matches!(result, Err(CommitError::ChecksumMismatch)),
+                    "{label}: {result:?}"
+                );
+            }
+        }
     }
 
     /// The one digest-source table both the commit-time decision and the
@@ -2482,105 +2545,6 @@ mod tests {
         }
     }
 
-    /// A streamed digest of the right algorithm is trusted: the file's own
-    /// bytes are never read, so a deliberately wrong on-disk body still
-    /// passes. That is the whole point (the download already hashed what it
-    /// wrote) and is also what proves the re-read was skipped.
-    #[test]
-    fn streamed_digest_is_used_instead_of_rereading() {
-        let f = temp_file_with(b"not hello at all");
-        let plan = VerifyInput {
-            kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
-            file: f.as_file(),
-            meta: &f.as_file().metadata().unwrap(),
-            temp_path: f.path(),
-            streamed: Some(StreamedDigest {
-                digest: index_parser::byhash_digest_for_algo(HashAlgo::Sha256, HELLO_SHA256)
-                    .expect("HELLO_SHA256 is valid hex"),
-                bytes: b"not hello at all".len() as u64,
-            }),
-        };
-        assert!(matches!(verify_temp_file(&plan), Ok(())));
-    }
-
-    #[test]
-    fn streamed_digest_mismatch_returns_reject() {
-        let f = temp_file_with(b"hello world");
-        let plan = VerifyInput {
-            kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
-            file: f.as_file(),
-            meta: &f.as_file().metadata().unwrap(),
-            temp_path: f.path(),
-            streamed: Some(StreamedDigest {
-                digest: Digest::Sha256(Box::new([0u8; 32])),
-                bytes: b"hello world".len() as u64,
-            }),
-        };
-        assert!(matches!(
-            verify_temp_file(&plan),
-            Err(CommitError::ChecksumMismatch)
-        ));
-    }
-
-    /// A digest computed with a different algorithm than the one the expected
-    /// digest needs is ignored, and the file is re-read and hashed instead --
-    /// so the correct on-disk bytes still verify.
-    #[test]
-    fn streamed_digest_of_wrong_algo_falls_back_to_reread() {
-        let f = temp_file_with(b"hello world");
-        let plan = VerifyInput {
-            kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
-            file: f.as_file(),
-            meta: &f.as_file().metadata().unwrap(),
-            temp_path: f.path(),
-            // Right length for SHA-512, wrong algorithm for this resource.
-            streamed: Some(StreamedDigest {
-                digest: Digest::Sha512(Box::new([0u8; 64])),
-                bytes: b"hello world".len() as u64,
-            }),
-        };
-        assert!(matches!(verify_temp_file(&plan), Ok(())));
-    }
-
-    /// A digest that covered a different number of bytes than the file holds
-    /// cannot describe that file, whatever the algorithm says. It is dropped
-    /// and the file re-read, so the correct on-disk bytes still verify -- and
-    /// the bogus digest never reaches the cleanup verification marker.
-    #[test]
-    fn streamed_digest_of_wrong_length_falls_back_to_reread() {
-        let f = temp_file_with(b"hello world");
-        let plan = VerifyInput {
-            kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
-            file: f.as_file(),
-            meta: &f.as_file().metadata().unwrap(),
-            temp_path: f.path(),
-            // Right algorithm, but it saw more bytes than the file holds.
-            streamed: Some(StreamedDigest {
-                digest: Digest::Sha256(Box::new([0u8; 32])),
-                bytes: 999,
-            }),
-        };
-        assert!(matches!(verify_temp_file(&plan), Ok(())));
-    }
-
-    #[test]
-    fn byhash_mismatch_returns_reject() {
-        let f = temp_file_with(b"tampered");
-        let plan = VerifyInput {
-            kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
-            file: f.as_file(),
-            meta: &f.as_file().metadata().unwrap(),
-            temp_path: f.path(),
-            streamed: None,
-        };
-        assert!(matches!(
-            verify_temp_file(&plan),
-            Err(CommitError::ChecksumMismatch)
-        ));
-    }
-
-    /// Verification off: no kind has a digest, so a tampered by-hash file
-    /// becomes [`VerifyKind::Unverifiable`] and proceeds unhashed.
     #[test]
     fn disabled_yields_no_digest_source() {
         const BYHASH: ResourceKind = ResourceKind::ByHash(HashAlgo::Sha256, ByHashContent::Other);
@@ -2594,21 +2558,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn non_verifiable_kind_returns_proceed() {
-        let f = temp_file_with(b"anything");
-        let plan = VerifyInput {
-            kind: VerifyKind::Unverifiable,
-            file: f.as_file(),
-            meta: &f.as_file().metadata().unwrap(),
-            temp_path: f.path(),
-            streamed: None,
-        };
-        assert!(matches!(verify_temp_file(&plan), Ok(())));
-    }
-
-    /// A descriptor the hash cannot read from -- here a write-only one --
-    /// rejects the download rather than caching it unverified.
     #[test]
     fn unreadable_temp_file_returns_reject_verifyio() {
         let f = temp_file_with(b"hello world");
@@ -2630,21 +2579,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_with_unknown_digest_proceeds_best_effort() {
-        let f = temp_file_with(b"some deb");
-        let plan = VerifyInput {
-            kind: VerifyKind::Unknown,
-            file: f.as_file(),
-            meta: &f.as_file().metadata().unwrap(),
-            temp_path: f.path(),
-            streamed: None,
-        };
-        assert!(matches!(verify_temp_file(&plan), Ok(())));
-    }
-
-    #[test]
     fn registry_insert_and_lookup() {
-        use std::num::NonZero;
         let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
         reg.insert(
             "deb.debian.org",
@@ -2673,7 +2608,6 @@ mod tests {
 
     #[test]
     fn registry_discriminates_mirrors_on_same_host() {
-        use std::num::NonZero;
         let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
         // Same host, same basename, different mirror_path -> distinct entries.
         reg.insert("host", "m1", "foo_1_amd64.deb", [1u8; 32]);
@@ -2687,7 +2621,6 @@ mod tests {
     /// family, which is what tells a cold registry from an unlisted key.
     #[test]
     fn registry_explains_a_miss_by_what_the_scope_holds() {
-        use std::num::NonZero;
         const INDEX: &str = "dists/sid/main/binary-arm64/Packages.xz";
         let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
         let miss = |kind, held| RegistryMiss {
@@ -2737,7 +2670,6 @@ mod tests {
 
     #[test]
     fn registry_miss_counts_survive_eviction() {
-        use std::num::NonZero;
         let reg = ChecksumRegistry::new(NonZero::new(8).unwrap());
         assert!(reg.insert_release(
             "h",
@@ -2803,7 +2735,6 @@ mod tests {
 
     #[test]
     fn registry_evicts_oldest_at_cap() {
-        use std::num::NonZero;
         let reg = ChecksumRegistry::new(NonZero::new(4).unwrap());
         for i in 0..4u8 {
             reg.insert("h", "m", &format!("p{i}"), [i; 32]);
@@ -2822,7 +2753,6 @@ mod tests {
 
     #[test]
     fn registry_evicts_from_the_largest_scope_first() {
-        use std::num::NonZero;
         // One hostile index (scope B) must not evict another mirror's
         // digests (scope A): at the cap, the largest scope pays.
         let reg = ChecksumRegistry::new(NonZero::new(8).unwrap());
@@ -2849,7 +2779,6 @@ mod tests {
     /// would (`cap + 1 - cap / 4`).
     #[test]
     fn registry_evicts_once_per_batch_including_the_overshoot() {
-        use std::num::NonZero;
         let reg = ChecksumRegistry::new(NonZero::new(8).unwrap());
         for i in 0..4u8 {
             reg.insert("a", "m", &format!("a{i}"), [i; 32]);
@@ -2904,7 +2833,6 @@ mod tests {
 
     #[test]
     fn eviction_shrinks_the_scope_it_drains() {
-        use std::num::NonZero;
         // One scope fills the cap, then another mirror's inserts make it pay
         // for the evictions: its index and slot log must give the memory back
         // instead of keeping the footprint of 1000 entries.
@@ -2966,7 +2894,6 @@ mod tests {
 
     #[test]
     fn eviction_bumps_the_epoch_of_each_drained_scope() {
-        use std::num::NonZero;
         let reg = ChecksumRegistry::new(NonZero::new(8).unwrap());
         for i in 0..8u32 {
             reg.insert("big", "m", &format!("b{i}"), [0; 32]);
@@ -2999,7 +2926,6 @@ mod tests {
 
     #[test]
     fn registry_reinsert_refreshes_value() {
-        use std::num::NonZero;
         let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
         reg.insert("h", "m", "p", [1u8; 32]);
         reg.insert("h", "m", "p", [2u8; 32]);
@@ -3169,8 +3095,6 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_release_populates_packages_digests() {
-        use std::num::NonZero;
-
         let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
         let pkg_sha = [0x77u8; 32];
         let release = format!(
@@ -3218,7 +3142,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_newer_release_date_wins_whatever_the_ingest_order() {
-        use std::num::NonZero;
         let newer = "Sun, 20 Sep 2026 08:53:33 UTC";
         let older = "Sat, 19 Sep 2026 08:53:33 UTC";
         let new_hex = "11".repeat(32);
@@ -3249,7 +3172,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_undated_release_never_overwrites_a_dated_one() {
-        use std::num::NonZero;
         let dir = tempfile::tempdir().expect("tempdir");
         let dated = release_file(
             &dir,
@@ -3330,7 +3252,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_future_dated_release_is_treated_as_undated() {
-        use std::num::NonZero;
         use time::format_description::well_known::Rfc2822;
 
         let now = time::OffsetDateTime::now_utc();
@@ -3455,8 +3376,6 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_packages_populates_registry() {
-        use std::num::NonZero;
-
         let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
         // Two minimal Packages stanzas (raw, uncompressed).
         let sha_a = [0xaau8; 32];
@@ -3586,8 +3505,6 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_scopes_digests_by_port() {
-        use std::num::NonZero;
-
         use crate::{
             config::ClientHost,
             deb_mirror::{Mirror, MirrorKind},
@@ -3625,8 +3542,6 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_packages_skips_filenames_no_cache_file_can_have() {
-        use std::num::NonZero;
-
         let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
         let digest = index_parser::hex_encode(&[0xaau8; 32]);
         // A basename up to the 8 KiB line cap: before the length gate it was
@@ -3658,8 +3573,6 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_packages_refuses_an_oversized_compressed_index_unread() {
-        use std::num::NonZero;
-
         // A sparse file one byte past the compressed cap: refused on its
         // size, so nothing (not even the xz header) is decoded.
         let f = tempfile::NamedTempFile::new().expect("temp file");
@@ -3683,11 +3596,6 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_packages_rejects_decompression_bomb() {
-        use std::num::NonZero;
-        // Registry ingest shares `limits::packages_reader` with cleanup's
-        // reduce, so the ratio cap must bound it too: a gzip stream whose
-        // decompressed size exceeds `compressed * MAX_DECOMPRESSION_RATIO` has
-        // to fail rather than populate the registry from a bomb.
         let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
 
         // Highly-compressible payload: ~4 MiB of zero bytes gzips to a few KiB,
@@ -3739,7 +3647,6 @@ mod tests {
 
     #[test]
     fn registry_reinsert_does_not_evict_live_under_stale_pressure() {
-        use std::num::NonZero;
         let reg = ChecksumRegistry::new(NonZero::new(4).unwrap());
         let d = [0u8; 32];
         reg.insert("h", "m", "a", d);
@@ -3770,8 +3677,6 @@ mod tests {
 
     #[test]
     fn verify_temp_file_stamps_the_cleanup_marker_on_a_registry_match() {
-        use std::io::Write as _;
-
         use crate::verified_marker::has_valid_marker;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3815,7 +3720,6 @@ mod tests {
 
     #[test]
     fn registry_slot_compaction_bounds_memory() {
-        use std::num::NonZero;
         let reg = ChecksumRegistry::new(NonZero::new(4).unwrap());
         let d = [0u8; 32];
         reg.insert("h", "m", "a", d);
@@ -3863,44 +3767,24 @@ mod tests {
     }
 
     #[test]
-    fn rename_into_cache_uses_an_existing_directory() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let src = dir.path().join("src.partial");
-        std::fs::write(&src, b"payload").expect("write source");
-        let dest = dir.path().join("dest.deb");
-
-        rename_into_cache(&src, &dest).expect("rename into an existing directory");
-
-        assert!(!src.exists(), "the source must be gone after the rename");
-        assert_eq!(
-            std::fs::read(&dest).expect("read destination"),
-            b"payload",
-            "the destination must hold the source's bytes"
-        );
-    }
-
-    #[test]
-    fn rename_into_cache_creates_a_missing_directory() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let src = dir.path().join("src.partial");
-        std::fs::write(&src, b"payload").expect("write source");
+    fn rename_into_cache_creates_the_directory_only_when_missing() {
         // Two missing levels: `entry_dir` can be several segments below the
         // mirror anchor (`dists/<suite>/<component>/by-hash/SHA256`).
-        let dest = dir.path().join("dists/suite/by-hash/dest.deb");
+        for dest in ["dest.deb", "dists/suite/by-hash/dest.deb"] {
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let src = dir.path().join("src.partial");
+            std::fs::write(&src, b"payload").expect("write source");
+            let dest = dir.path().join(dest);
 
-        rename_into_cache(&src, &dest).expect("rename into a missing directory");
+            rename_into_cache(&src, &dest).expect("rename");
 
-        assert!(!src.exists(), "the source must be gone after the rename");
-        assert_eq!(
-            std::fs::read(&dest).expect("read destination"),
-            b"payload",
-            "the destination must hold the source's bytes"
-        );
+            assert!(!src.exists(), "{dest:?}: the source must be gone");
+            assert_eq!(std::fs::read(&dest).expect("read destination"), b"payload");
+        }
     }
 
     #[test]
     fn ingest_filesystem_errors_retry_but_decode_errors_remain_failed() {
-        use crate::ingest_ledger::Outcome;
         let os = std::io::Error::from_raw_os_error(nix::libc::EIO);
         let gone = std::io::Error::from_raw_os_error(nix::libc::ENOENT);
         let cap = limits::check_packages_file_size(PackagesCompression::Xz, u64::MAX)
@@ -3924,7 +3808,6 @@ mod tests {
     /// holds more `Running` entries than there are slots.
     #[test]
     fn admission_is_bounded_by_the_slots_and_refusal_is_retryable() {
-        use crate::ingest_ledger::{IngestLedger, Outcome};
         let ledger = IngestLedger::new(1024);
         let slots = Semaphore::new(2);
         let path = |i: usize| PathBuf::from(format!("/cache/idx{i}"));

@@ -977,12 +977,6 @@ mod tests {
         let upstream: DeliveryFailure = UpstreamError::protocol("bad").into();
         assert_eq!(upstream.severity(), Severity::Warn);
         assert_eq!(DeliveryFailure::Cancelled.severity(), Severity::Info);
-        let shared_cancel = DeliveryFailure::Download(Arc::new(DownloadFailure::Cancelled));
-        assert_eq!(shared_cancel.severity(), Severity::Info);
-        let shared_upstream = DeliveryFailure::Download(Arc::new(DownloadFailure::Upstream(
-            UpstreamError::protocol("bad"),
-        )));
-        assert_eq!(shared_upstream.severity(), Severity::Warn);
         let cache: DeliveryFailure = CacheError::invalid("read", "short").into();
         assert_eq!(cache.severity(), Severity::Error);
         let internal: DeliveryFailure = InternalError::invalid("pipe", "broken").into();

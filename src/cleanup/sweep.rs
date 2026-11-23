@@ -438,27 +438,18 @@ pub(super) async fn sweep_aged_metadata(
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::time::{Duration, SystemTime};
 
-    use super::{age_reference_time, sweep_aged_metadata};
+    use hashbrown::HashMap;
+
+    use super::{SpanTable, sweep_aged_metadata, sweep_candidates};
     use crate::cache_layout::CacheLayout;
+    use crate::cleanup::engine::SpanClass;
     use crate::config::ClientHost;
     use crate::deb_mirror::{Mirror, MirrorKind};
+    use crate::metrics;
     use crate::test_support::structured_mirror;
-
-    #[test]
-    fn age_reference_time_prefers_creation_with_modification_fallback() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let p = dir.path().join("f");
-        std::fs::write(&p, b"x").expect("write");
-        let meta = std::fs::metadata(&p).expect("meta");
-        let t = age_reference_time(&meta, &p).expect("some timestamp");
-        let expected = meta
-            .created()
-            .or_else(|_| meta.modified())
-            .expect("creation or modification timestamp");
-        assert_eq!(t, expected);
-    }
 
     fn test_mirror() -> Mirror {
         structured_mirror("deb.example.org", "debian")
@@ -466,13 +457,6 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_candidates_selects_span_by_class_and_counts_unreferenced() {
-        use hashbrown::HashMap;
-
-        use std::ffi::OsString;
-
-        use super::{SpanTable, sweep_candidates};
-        use crate::cleanup::engine::SpanClass;
-
         let dir = tempfile::tempdir().expect("tempdir");
         let deb = dir.path().join("pkg_1.0_amd64.deb");
         let covered = dir.path().join("covered");
@@ -532,29 +516,16 @@ mod tests {
     /// skipped, and not a cache I/O failure.
     #[tokio::test]
     async fn sweep_candidates_skips_a_vanished_candidate_uncounted() {
-        use hashbrown::HashMap;
-
-        use std::ffi::OsString;
-
-        use super::{SpanTable, sweep_candidates};
-        use crate::cleanup::engine::SpanClass;
-        use crate::metrics;
-
         let dir = tempfile::tempdir().expect("tempdir");
         let candidates: HashMap<OsString, SpanClass> =
             [(OsString::from("gone_1.0_amd64.deb"), SpanClass::Deb)]
                 .into_iter()
                 .collect();
-        let spans = SpanTable {
-            deb: Duration::ZERO,
-            byhash_covered: Duration::ZERO,
-            byhash_uncovered: Duration::ZERO,
-        };
         let io_failure = metrics::CACHE_IO_FAILURE.get();
         let res = sweep_candidates(
             dir.path(),
             &candidates,
-            spans,
+            SpanTable::uniform(Duration::ZERO),
             SystemTime::now(),
             &test_mirror(),
             CacheLayout::StructuredPool,

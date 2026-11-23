@@ -130,102 +130,46 @@ mod tests {
             .collect()
     }
 
+    /// Every case whose probability is exactly 0 or 1.
     #[test]
-    fn disabled_config_never_nudges() {
-        let mut config = enabled_config();
-        config.experimental_parallel_hack_enabled = false;
-        assert!(
-            nudges(&config, CachedFlavor::Permanent, 1, nonzero!(1_000_000_u64))
-                .iter()
-                .all(|nudged| !nudged),
-            "a disabled hack must never nudge"
-        );
-    }
+    fn deterministic_cases_always_or_never_nudge() {
+        use CachedFlavor::{Permanent, Volatile};
 
-    #[test]
-    fn volatile_resources_are_never_nudged() {
-        let config = enabled_config();
-        assert!(
-            nudges(&config, CachedFlavor::Volatile, 1, nonzero!(1_000_000_u64))
-                .iter()
-                .all(|nudged| !nudged),
-            "a volatile resource must never be nudged"
-        );
-    }
-
-    #[test]
-    fn a_file_at_or_below_minsize_is_not_nudged() {
-        let config = enabled_config();
-        for total in [nonzero!(1_u64), nonzero!(1023_u64), nonzero!(1024_u64)] {
+        let check = |what: &str, config: &Config, flavor, curr, total: u64, expected: bool| {
+            let total = NonZero::new(total).expect("nonzero size");
             assert!(
-                nudges(&config, CachedFlavor::Permanent, 1, total)
+                nudges(config, flavor, curr, total)
                     .iter()
-                    .all(|nudged| !nudged),
-                "{total} is not above the 1024 byte minsize"
+                    .all(|nudged| *nudged == expected),
+                "{what} ({curr} downloads, {total} bytes): expected {expected}"
             );
-        }
-        assert!(
-            nudges(&config, CachedFlavor::Permanent, 1, nonzero!(1025_u64))
-                .iter()
-                .all(|nudged| *nudged),
-            "one byte above minsize is nudged"
-        );
-    }
+        };
 
-    #[test]
-    fn more_downloads_than_maxparallel_are_not_nudged() {
-        let config = enabled_config();
-        assert!(
-            nudges(&config, CachedFlavor::Permanent, 4, nonzero!(1_000_000_u64))
-                .iter()
-                .all(|nudged| !nudged),
-            "4 downloads exceed the maxparallel of 3"
-        );
-    }
+        let enabled = enabled_config();
+        check("volatile", &enabled, Volatile, 1, 1_000_000, false);
+        check("first download", &enabled, Permanent, 1, 1_000_000, true);
+        check("below minsize", &enabled, Permanent, 1, 1, false);
+        check("below minsize", &enabled, Permanent, 1, 1023, false);
+        check("at minsize", &enabled, Permanent, 1, 1024, false);
+        check("above minsize", &enabled, Permanent, 1, 1025, true);
+        check("past maxparallel", &enabled, Permanent, 4, 1_000_000, false);
 
-    #[test]
-    fn the_first_download_is_always_nudged() {
-        let config = enabled_config();
-        assert!(
-            nudges(&config, CachedFlavor::Permanent, 1, nonzero!(1_000_000_u64))
-                .iter()
-                .all(|nudged| *nudged),
-            "the first download has probability 1"
-        );
-    }
+        let mut disabled = enabled_config();
+        disabled.experimental_parallel_hack_enabled = false;
+        check("disabled", &disabled, Permanent, 1, 1_000_000, false);
 
-    #[test]
-    fn a_probability_decayed_to_zero_never_nudges() {
         // factor 0.5 with 3 downloads in flight: 1 - 2 * 0.5 == 0.
-        let mut config = enabled_config();
-        config.experimental_parallel_hack_factor = 0.5;
-        assert!(
-            nudges(&config, CachedFlavor::Permanent, 3, nonzero!(1_000_000_u64))
-                .iter()
-                .all(|nudged| !nudged),
-            "a decayed probability of 0 must never nudge"
-        );
-    }
+        let mut decayed = enabled_config();
+        decayed.experimental_parallel_hack_factor = 0.5;
+        check("decayed to zero", &decayed, Permanent, 3, 1_000_000, false);
 
-    #[test]
-    fn absent_limits_skip_their_checks() {
-        let mut config = enabled_config();
-        config.experimental_parallel_hack_maxparallel = None;
-        config.experimental_parallel_hack_minsize = None;
-        // Way past what maxparallel would have allowed, and a one-byte file:
-        // only the probability decides, and factor 0.2 with 1 download is 1.
-        assert!(
-            nudges(&config, CachedFlavor::Permanent, 1, nonzero!(1_u64))
-                .iter()
-                .all(|nudged| *nudged),
-            "without limits the first download is still nudged"
-        );
-        assert!(
-            nudges(&config, CachedFlavor::Permanent, 999, nonzero!(1_u64))
-                .iter()
-                .all(|nudged| !nudged),
-            "without maxparallel the probability decay is the only brake"
-        );
+        // Without limits only the probability decides: factor 0.2 with one
+        // download is 1, and the decay is the only brake.
+        let mut unlimited = enabled_config();
+        unlimited.experimental_parallel_hack_maxparallel = None;
+        unlimited.experimental_parallel_hack_minsize = None;
+        check("no limits, first", &unlimited, Permanent, 1, 1, true);
+        check("no limits, decayed", &unlimited, Permanent, 999, 1, false);
     }
 
     #[test]

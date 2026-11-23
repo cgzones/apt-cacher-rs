@@ -632,172 +632,80 @@ mod tests {
         fallback: Duration::from_secs(2),
     };
 
-    // ReferencedOrBail (structured pool)
-
     #[test]
-    fn bail_no_groups_is_grace() {
-        assert_eq!(decide_sweep(BAIL, &[]), grace());
-    }
+    fn decide_sweep_referenced_or_bail() {
+        use GroupOutcome::{Complete, FetchFailed, NotApplicable, ParseError};
 
-    #[test]
-    fn bail_complete_is_grace() {
-        assert_eq!(decide_sweep(BAIL, &[gr(GroupOutcome::Complete)]), grace());
-    }
-
-    #[test]
-    fn bail_fetch_failed_bails() {
-        assert_eq!(
-            decide_sweep(BAIL, &[gr(GroupOutcome::FetchFailed(ff(404)))]),
-            SweepAction::Bail
-        );
-    }
-
-    #[test]
-    fn bail_db_error_bails() {
-        // The reference set is unknown rather than empty, so a grace sweep
-        // could delete a deb the unread origins still reference.
-        assert_eq!(
-            decide_sweep(
-                BAIL,
-                &[gr(GroupOutcome::NotApplicable(SkipReason::DbError))]
+        for (groups, expected) in [
+            (vec![], grace()),
+            (vec![gr(Complete)], grace()),
+            (
+                vec![gr(NotApplicable(SkipReason::NoActiveOrigins))],
+                grace(),
             ),
-            SweepAction::Bail
-        );
-    }
-
-    #[test]
-    fn bail_no_active_origins_is_grace() {
-        assert_eq!(
-            decide_sweep(
-                BAIL,
-                &[gr(GroupOutcome::NotApplicable(SkipReason::NoActiveOrigins))]
+            (vec![gr(FetchFailed(ff(404)))], SweepAction::Bail),
+            // The reference set is unknown rather than empty, so a grace
+            // sweep could delete a deb the unread origins still reference.
+            (
+                vec![gr(NotApplicable(SkipReason::DbError))],
+                SweepAction::Bail,
             ),
-            grace()
-        );
+            (vec![gr(ParseError)], SweepAction::Bail),
+        ] {
+            assert_eq!(decide_sweep(BAIL, &groups), expected, "{groups:?}");
+        }
     }
 
+    /// Group order is `[hybrid?, root?, colocated]`, colocated always last.
     #[test]
-    fn bail_parse_error_bails() {
-        assert_eq!(
-            decide_sweep(BAIL, &[gr(GroupOutcome::ParseError)]),
-            SweepAction::Bail
-        );
-    }
+    fn decide_sweep_referenced_or_age() {
+        use GroupOutcome::{Complete, FetchFailed, NotApplicable, ParseError};
 
-    // ReferencedOrAge (flat; group order = [hybrid?, root?, colocated], colocated ALWAYS last)
-
-    #[test]
-    fn age_colocated_only_complete_is_grace() {
-        assert_eq!(decide_sweep(AGE, &[gr(GroupOutcome::Complete)]), grace());
-    }
-
-    #[test]
-    fn age_colocated_only_fetch_failed_falls_back() {
-        assert_eq!(
-            decide_sweep(AGE, &[gr(GroupOutcome::FetchFailed(ff(404)))]),
-            age_back(ff(404), None)
-        );
-    }
-
-    #[test]
-    fn age_colocated_only_parse_error_falls_back_with_bad_gateway() {
-        assert_eq!(
-            decide_sweep(AGE, &[gr(GroupOutcome::ParseError)]),
-            age_back(ff(502), None)
-        );
-    }
-
-    #[test]
-    fn age_root_complete_is_grace() {
-        assert_eq!(
-            decide_sweep(
-                AGE,
-                &[
-                    root("apt", GroupOutcome::Complete),
-                    gr(GroupOutcome::FetchFailed(ff(404)))
-                ]
+        let no_row = || {
+            NotApplicable(SkipReason::NoRow {
+                seg: "apt".to_owned(),
+            })
+        };
+        for (groups, expected) in [
+            (vec![gr(Complete)], grace()),
+            (vec![gr(FetchFailed(ff(404)))], age_back(ff(404), None)),
+            (vec![gr(ParseError)], age_back(ff(502), None)),
+            // A completed root group stands when the co-located fetch fails.
+            (
+                vec![root("apt", Complete), gr(FetchFailed(ff(404)))],
+                grace(),
             ),
-            grace()
-        );
-    }
-
-    #[test]
-    fn age_root_failed_and_colocated_failed_falls_back_with_root_context() {
-        assert_eq!(
-            decide_sweep(
-                AGE,
-                &[
-                    root("apt", GroupOutcome::FetchFailed(ff(403))),
-                    gr(GroupOutcome::FetchFailed(ff(404)))
-                ]
+            // A failed root fetch rides along as the warn's root context.
+            (
+                vec![root("apt", FetchFailed(ff(403))), gr(FetchFailed(ff(404)))],
+                age_back(ff(404), Some(("apt".to_owned(), ff(403)))),
             ),
-            age_back(ff(404), Some(("apt".to_owned(), ff(403))))
-        );
-    }
-
-    #[test]
-    fn age_root_not_applicable_falls_back_without_root_context() {
-        assert_eq!(
-            decide_sweep(
-                AGE,
-                &[
-                    root(
-                        "apt",
-                        GroupOutcome::NotApplicable(SkipReason::NoRow {
-                            seg: "apt".to_owned()
-                        })
-                    ),
-                    gr(GroupOutcome::FetchFailed(ff(404)))
-                ]
+            (
+                vec![root("apt", no_row()), gr(FetchFailed(ff(404)))],
+                age_back(ff(404), None),
             ),
-            age_back(ff(404), None)
-        );
-    }
-
-    #[test]
-    fn age_root_parse_error_falls_back_without_root_context() {
-        assert_eq!(
-            decide_sweep(
-                AGE,
-                &[
-                    root("apt", GroupOutcome::ParseError),
-                    gr(GroupOutcome::FetchFailed(ff(404)))
-                ]
+            (
+                vec![root("apt", ParseError), gr(FetchFailed(ff(404)))],
+                age_back(ff(404), None),
             ),
-            age_back(ff(404), None)
-        );
-    }
-
-    /// Quirk row: a co-located parse error falls back to age retention even
-    /// when the root index reduced fine — behavior preserved from the
-    /// previous implementation's colocated-Err arm.
-    #[test]
-    fn age_colocated_parse_error_ignores_completed_root() {
-        assert_eq!(
-            decide_sweep(
-                AGE,
-                &[
-                    root("apt", GroupOutcome::Complete),
-                    gr(GroupOutcome::ParseError)
-                ]
+            // Quirk: a co-located parse error falls back to age retention
+            // even when the root index reduced fine.
+            (
+                vec![root("apt", Complete), gr(ParseError)],
+                age_back(ff(502), None),
             ),
-            age_back(ff(502), None)
-        );
-    }
-
-    #[test]
-    fn age_failed_strict_defers_without_prejudice() {
-        assert_eq!(
-            decide_sweep(
-                AGE,
-                &[
-                    gr(GroupOutcome::FetchFailed(ff(404))),
-                    root("apt", GroupOutcome::Complete),
-                    gr(GroupOutcome::FetchFailed(ff(404)))
-                ]
+            // A failed hybrid group does not prejudice a completed root.
+            (
+                vec![
+                    gr(FetchFailed(ff(404))),
+                    root("apt", Complete),
+                    gr(FetchFailed(ff(404))),
+                ],
+                grace(),
             ),
-            grace()
-        );
+        ] {
+            assert_eq!(decide_sweep(AGE, &groups), expected, "{groups:?}");
+        }
     }
 
     // classify_mirror

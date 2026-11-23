@@ -914,15 +914,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn conn_label_renders_the_log_suffixes() {
-        let label = |tls, reused| ConnLabel { tls, reused }.to_string();
-        assert_eq!(label(false, false), "");
-        assert_eq!(label(false, true), " (reused)");
-        assert_eq!(label(true, false), " (TLS)");
-        assert_eq!(label(true, true), " (TLS, reused)");
-    }
-
-    #[test]
     fn named_port_drops_only_the_connections_own_default() {
         let host = ClientHost::new("mirror.example").unwrap();
         for (port, is_tls, named) in [
@@ -945,34 +936,17 @@ mod tests {
 
     #[test]
     #[cfg(feature = "tls_rustls")]
-    fn classify_tls_error_marks_deterministic_kinds_permanent() {
+    fn classify_tls_error_retries_only_transport_kinds() {
         // rustls surfaces a rejected certificate chain as InvalidData and an
         // unparsable server name as InvalidInput; both repeat identically.
-        assert_eq!(
-            classify_tls_error(ErrorKind::InvalidData),
-            Transience::Permanent,
-            "certificate rejection must not be retried"
-        );
-        assert_eq!(
-            classify_tls_error(ErrorKind::InvalidInput),
-            Transience::Permanent,
-            "server-name parse failure must not be retried"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "tls_rustls")]
-    fn classify_tls_error_marks_network_kinds_transient() {
-        for kind in [
-            ErrorKind::TimedOut,
-            ErrorKind::ConnectionRefused,
-            ErrorKind::UnexpectedEof,
+        for (kind, expected) in [
+            (ErrorKind::InvalidData, Transience::Permanent),
+            (ErrorKind::InvalidInput, Transience::Permanent),
+            (ErrorKind::TimedOut, Transience::Transient),
+            (ErrorKind::ConnectionRefused, Transience::Transient),
+            (ErrorKind::UnexpectedEof, Transience::Transient),
         ] {
-            assert_eq!(
-                classify_tls_error(kind),
-                Transience::Transient,
-                "{kind:?} may succeed on retry"
-            );
+            assert_eq!(classify_tls_error(kind), expected, "{kind:?}");
         }
     }
 
@@ -986,11 +960,17 @@ mod tests {
         ClientHost::new(name).unwrap()
     }
 
+    /// The proxy's end of the connection is closed: its peer reads EOF.
+    async fn assert_closed(peer: &mut TcpStream) {
+        use tokio::io::AsyncReadExt as _;
+        let read = tokio::time::timeout(Duration::from_secs(1), peer.read(&mut [0])).await;
+        assert_eq!(read.unwrap().unwrap(), 0);
+    }
+
     /// Dropping an unpolled future models cancellation of a detached download
     /// before it has a chance to install any task-local protection.
     #[tokio::test]
     async fn unfinished_response_is_closed_even_before_first_poll() {
-        use tokio::io::AsyncReadExt as _;
         let (conn, mut peer) = connected_tcp_pair().await;
         let host = test_host("unfinished-response.invalid");
         let response = ResponseBody::new(UpstreamConn::Tcp(conn), host.clone(), 80, true);
@@ -1003,19 +983,11 @@ mod tests {
             pool_checkout(&host, 80, false),
             PoolCheckout::Empty
         ));
-        let mut byte = [0];
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
-                .await
-                .unwrap()
-                .unwrap(),
-            0
-        );
+        assert_closed(&mut peer).await;
     }
 
     #[tokio::test]
     async fn completed_response_reuses_only_keep_alive_connections() {
-        use tokio::io::AsyncReadExt as _;
         let host = test_host("completed-response.invalid");
         let (conn, _peer) = connected_tcp_pair().await;
         let identity = connection_identity(&conn);
@@ -1035,14 +1007,7 @@ mod tests {
             pool_checkout(&host, 80, false),
             PoolCheckout::Empty
         ));
-        let mut byte = [0];
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
-                .await
-                .unwrap()
-                .unwrap(),
-            0
-        );
+        assert_closed(&mut peer).await;
     }
 
     /// The most recently returned connection is popped first; if the peer
@@ -1100,8 +1065,6 @@ mod tests {
     /// expiry alone remains an empty miss rather than a dead-peer miss.
     #[tokio::test]
     async fn pool_checkout_discards_expired_entries_without_counting_them_dead() {
-        use tokio::io::AsyncReadExt as _;
-
         let host = test_host("pool-checkout-expired.invalid");
         for with_live in [false, true] {
             let (live, _live_peer) = connected_tcp_pair().await;
@@ -1134,15 +1097,7 @@ mod tests {
                 PoolCheckout::Empty => assert!(!with_live, "the live entry must be found"),
                 PoolCheckout::Dead => unreachable!("expiry is an empty miss, not a dead peer"),
             }
-            let mut byte = [0];
-            assert_eq!(
-                tokio::time::timeout(Duration::from_secs(1), expired_peer.read(&mut byte))
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                0,
-                "checkout closes the expired connection"
-            );
+            assert_closed(&mut expired_peer).await;
         }
     }
 

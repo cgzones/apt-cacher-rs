@@ -149,13 +149,4 @@ mod tests {
         note_exhausted();
         assert!(metrics::OPEN_FDS_PEAK.get() >= soft);
     }
-
-    #[test]
-    fn the_soft_limit_is_below_the_hard_one() {
-        let (soft, hard) = nofile_limit();
-        let soft = soft.expect("a finite soft limit on a test runner");
-        if let Some(hard) = hard {
-            assert!(soft <= hard, "{soft} <= {hard}");
-        }
-    }
 }

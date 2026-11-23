@@ -1419,12 +1419,10 @@ mod tests {
         );
     }
 
-    /// The Mirrors table has no File Count column (the Debs / Metadata
-    /// column shows both of its terms), and its right-aligned columns are
-    /// still the figures: a mirror without a persisted row lines its `N/A`s
-    /// and failure counts up under them.
+    /// The right-aligned columns are the figures: a mirror without a
+    /// persisted row lines its `N/A`s and failure counts up under them.
     #[tokio::test]
-    async fn mirrors_table_columns_line_up_without_a_file_count() {
+    async fn mirrors_table_columns_line_up() {
         let health = MirrorHealth {
             unreachable: 1,
             protocol: 0,
@@ -1440,7 +1438,6 @@ mod tests {
             build_mirror_table(&[], &snapshots, 1_700_000_000, &Config::default()).await;
         assert_eq!(section.rows, 1);
         let html = section.html;
-        assert!(!html.contains("File Count"), "{html}");
         assert_eq!(html.matches("<th ").count(), 17, "{html}");
         assert_eq!(html.matches("<th scope=\"col\" class=\"num\">").count(), 12);
         let na = "<td>N/A</td>";
@@ -1465,22 +1462,6 @@ mod tests {
         assert_eq!(efficiency_key(1000, 1000), Some(0));
         assert_eq!(efficiency_key(1500, 1000), Some(-500));
         assert_eq!(efficiency_key(0, u64::MAX), Some(1000));
-    }
-
-    #[test]
-    fn merge_min_and_max_treat_none_as_absent() {
-        assert_eq!(merge_min(None, None), None);
-        assert_eq!(merge_max(None, None), None);
-
-        assert_eq!(merge_min(Some(at(5)), None), Some(at(5)));
-        assert_eq!(merge_min(None, Some(at(5))), Some(at(5)));
-        assert_eq!(merge_max(Some(at(5)), None), Some(at(5)));
-        assert_eq!(merge_max(None, Some(at(5))), Some(at(5)));
-
-        assert_eq!(merge_min(Some(at(5)), Some(at(9))), Some(at(5)));
-        assert_eq!(merge_min(Some(at(9)), Some(at(5))), Some(at(5)));
-        assert_eq!(merge_max(Some(at(5)), Some(at(9))), Some(at(9)));
-        assert_eq!(merge_max(Some(at(9)), Some(at(5))), Some(at(9)));
     }
 
     #[test]

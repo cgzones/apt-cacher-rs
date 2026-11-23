@@ -500,10 +500,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_query_theme_light_dark() {
-        assert_eq!(parse_query(Some("theme=light")).theme, Theme::Light);
-        assert_eq!(parse_query(Some("theme=dark")).theme, Theme::Dark);
-        assert_eq!(parse_query(Some("theme=auto")).theme, Theme::Auto);
+    fn parse_query_theme() {
+        for (query, theme) in [
+            ("theme=light", Theme::Light),
+            ("theme=dark", Theme::Dark),
+            ("theme=auto", Theme::Auto),
+            ("theme=neon", Theme::Unset),
+        ] {
+            assert_eq!(parse_query(Some(query)).theme, theme, "{query}");
+        }
     }
 
     /// An explicit `theme=auto` renders like no theme, but survives in the
@@ -535,29 +540,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_query_theme_unknown_value_keeps_default() {
-        assert_eq!(parse_query(Some("theme=neon")).theme, Theme::Unset);
-    }
-
-    #[test]
-    fn parse_query_refresh_in_range() {
-        assert_eq!(parse_query(Some("refresh=1")).refresh_secs, Some(1));
-        assert_eq!(parse_query(Some("refresh=30")).refresh_secs, Some(30));
-        assert_eq!(parse_query(Some("refresh=3600")).refresh_secs, Some(3600));
-    }
-
-    #[test]
-    fn parse_query_refresh_out_of_range() {
-        assert_eq!(parse_query(Some("refresh=0")).refresh_secs, None);
-        assert_eq!(parse_query(Some("refresh=3601")).refresh_secs, None);
-        assert_eq!(parse_query(Some("refresh=99999999")).refresh_secs, None);
-    }
-
-    #[test]
-    fn parse_query_refresh_non_numeric() {
-        assert_eq!(parse_query(Some("refresh=abc")).refresh_secs, None);
-        assert_eq!(parse_query(Some("refresh=-5")).refresh_secs, None);
-        assert_eq!(parse_query(Some("refresh=")).refresh_secs, None);
+    fn parse_query_refresh_accepts_one_second_to_one_hour() {
+        for (query, secs) in [
+            ("refresh=1", Some(1)),
+            ("refresh=30", Some(30)),
+            ("refresh=3600", Some(3600)),
+            ("refresh=0", None),
+            ("refresh=3601", None),
+            ("refresh=99999999", None),
+            ("refresh=abc", None),
+            ("refresh=-5", None),
+            ("refresh=", None),
+        ] {
+            assert_eq!(parse_query(Some(query)).refresh_secs, secs, "{query}");
+        }
     }
 
     #[test]

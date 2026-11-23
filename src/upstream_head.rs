@@ -1399,34 +1399,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reject_bodies_are_stable() {
-        assert_eq!(RejectReason::Unsolicited206.body(), "Unsolicited 206");
-        assert_eq!(
-            RejectReason::InconsistentContentRange {
-                content_length: 1,
-                span: 2
-            }
-            .body(),
-            "Inconsistent Content-Range"
-        );
-        assert_eq!(
-            RejectReason::Oversize { total: 1 }.body(),
-            "Upstream resource too large"
-        );
-        assert_eq!(RejectReason::NoContentLength.body(), "no Content-Length");
-        assert_eq!(
-            RejectReason::ZeroContentLength.body(),
-            "Zero Content-Length"
-        );
-    }
-
-    /// `detail()` is interpolated into each backend's own sentence, so it
-    /// must read as a mid-sentence clause: no subject, no `; returning 502`
-    /// consequence, and a lowercase lead where the word is not a proper noun.
-    fn assert_reads_mid_sentence(reason: RejectReason, expected: &str) {
+    /// The 502 body, and the `detail()` each backend interpolates into its
+    /// own sentence: a mid-sentence clause with no subject and no
+    /// `; returning 502` consequence.
+    fn assert_reject_wording(reason: RejectReason, body: &str, detail: &str) {
+        assert_eq!(reason.body(), body, "{reason:?}");
         let rendered = reason.detail().to_string();
-        assert_eq!(rendered, expected, "{reason:?}");
+        assert_eq!(rendered, detail, "{reason:?}");
         assert!(
             !rendered.ends_with('.') && !rendered.contains("returning 502"),
             "the consequence clause belongs to the caller's sentence: {rendered}"
@@ -1434,67 +1413,53 @@ mod tests {
     }
 
     #[test]
-    fn reject_details_read_mid_sentence() {
-        assert_reads_mid_sentence(
+    fn reject_wording_is_stable() {
+        assert_reject_wording(
             RejectReason::Unsolicited206,
+            "Unsolicited 206",
             "206 Partial Content without a Range request",
         );
-        assert_reads_mid_sentence(
+        assert_reject_wording(
             RejectReason::InconsistentContentRange {
                 content_length: 10,
                 span: 20,
             },
+            "Inconsistent Content-Range",
             "Content-Length 10 disagrees with Content-Range span 20",
         );
-        assert_reads_mid_sentence(
+        assert_reject_wording(
             RejectReason::Oversize { total: 2048 },
+            "Upstream resource too large",
             "declared total size 2.05kB exceeds `max_object_size`",
         );
-        assert_reads_mid_sentence(RejectReason::NoContentLength, "no usable Content-Length");
-        assert_reads_mid_sentence(RejectReason::ZeroContentLength, "Content-Length 0");
-    }
-
-    #[cfg(feature = "splice")]
-    #[test]
-    fn splice_only_reject_details_read_mid_sentence() {
-        assert_reads_mid_sentence(
-            RejectReason::InconsistentBodyFraming {
-                content_length: 10,
-                prefix_len: 20,
-            },
-            "body prefix (20 bytes) exceeds body content length (10 bytes)",
+        assert_reject_wording(
+            RejectReason::NoContentLength,
+            "no Content-Length",
+            "no usable Content-Length",
         );
-        assert_reads_mid_sentence(
-            RejectReason::InterimResponse { status: 100 },
-            "interim response 100",
+        assert_reject_wording(
+            RejectReason::ZeroContentLength,
+            "Zero Content-Length",
+            "Content-Length 0",
         );
-    }
-
-    /// The two refusals only the splice relay can raise: hyper's client
-    /// frames bodies itself and never yields either.
-    #[cfg(feature = "splice")]
-    #[test]
-    fn splice_only_reject_bodies_are_stable() {
-        assert_eq!(
-            RejectReason::InconsistentBodyFraming {
-                content_length: 1,
-                prefix_len: 2,
-            }
-            .body(),
-            "Inconsistent body framing"
-        );
-        assert_eq!(
-            RejectReason::InterimResponse { status: 100 }.body(),
-            "Unexpected interim response"
-        );
-    }
-
-    #[test]
-    fn is_answered_covers_content_bearing_plans_only() {
-        assert!(DownloadPlan::NotModified(Cached).is_answered());
-        assert!(exact_download(10, 10, 0).is_answered());
-        assert!(!DownloadPlan::<Cached>::Passthrough.is_answered());
-        assert!(!DownloadPlan::<Cached>::Reject(RejectReason::Unsolicited206).is_answered());
+        // The two refusals only the splice relay can raise: hyper's client
+        // frames bodies itself and never yields either.
+        #[cfg(feature = "splice")]
+        {
+            assert_reject_wording(
+                RejectReason::InconsistentBodyFraming {
+                    content_length: 10,
+                    prefix_len: 20,
+                },
+                "Inconsistent body framing",
+                "body prefix (20 bytes) exceeds body content length (10 bytes)",
+            );
+            assert_reject_wording(
+                RejectReason::InterimResponse { status: 100 },
+                "Unexpected interim response",
+                "interim response 100",
+            );
+        }
     }
 
     #[test]

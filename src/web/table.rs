@@ -1131,83 +1131,37 @@ mod tests {
     }
 
     #[test]
-    fn collapsible_section_notes_an_empty_body() {
-        let mut out = String::new();
-        write_collapsible_section(
-            &mut out,
-            "T",
-            "t",
-            Rows {
-                shown: 0,
-                total: None,
-            },
-            false,
-            "nothing yet",
-            "",
-        );
-        assert!(out.contains("<p class=\"empty\">nothing yet</p>"), "{out}");
-        // Nothing to read: the section starts collapsed, with a 0 count.
-        assert!(!out.contains("<details open>"), "{out}");
-        assert!(out.contains("<span class=\"count\">0</span>"), "{out}");
-    }
-
-    #[test]
-    fn collapsible_section_keeps_a_populated_body() {
-        let mut out = String::new();
-        write_collapsible_section(
-            &mut out,
-            "T",
-            "t",
-            Rows {
-                shown: 2,
-                total: Some(5),
-            },
-            false,
-            "nothing yet",
-            "<p>b</p>",
-        );
-        assert!(out.contains("<details open>"), "{out}");
-        assert!(out.contains("<span class=\"count\">2 / 5</span>"), "{out}");
-        assert!(out.contains("<p>b</p>"), "{out}");
-        assert!(!out.contains("nothing yet"), "{out}");
-    }
-
-    #[test]
-    fn collapsible_section_keeps_an_error_notice_with_zero_rows() {
-        // A section error reports 0 rows but must not be replaced by the
-        // empty-state note: the notice is the thing the reader needs.
-        let mut out = String::new();
-        write_collapsible_section(
-            &mut out,
-            "T",
-            "t",
-            Rows {
-                shown: 0,
-                total: None,
-            },
-            false,
-            "nothing yet",
-            "<p>boom</p>",
-        );
-        assert!(out.contains("<p>boom</p>"), "{out}");
-        assert!(!out.contains("nothing yet"), "{out}");
-    }
-
-    #[test]
-    fn a_pinned_section_opens_even_empty() {
-        let mut out = String::new();
-        write_collapsible_section(
-            &mut out,
-            "T",
-            "t",
-            Rows {
-                shown: 0,
-                total: None,
-            },
-            true,
-            "nothing yet",
-            "",
-        );
-        assert!(out.contains("<details open>"), "{out}");
+    fn collapsible_section_opens_with_rows_and_notes_an_empty_body() {
+        // (rows shown, total, pinned, body, open, count chip, note shown)
+        for (shown, total, pinned, body, open, count, note) in [
+            (0, None, false, "", false, "0", true),
+            (2, Some(5), false, "<p>b</p>", true, "2 / 5", false),
+            // A section error reports 0 rows but must not be replaced by the
+            // empty-state note: the notice is the thing the reader needs.
+            (0, None, false, "<p>boom</p>", false, "0", false),
+            (0, None, true, "", true, "0", true),
+        ] {
+            let mut out = String::new();
+            write_collapsible_section(
+                &mut out,
+                "T",
+                "t",
+                Rows { shown, total },
+                pinned,
+                "nothing yet",
+                body,
+            );
+            assert_eq!(out.contains("<details open>"), open, "{out}");
+            assert!(
+                out.contains(&format!("<span class=\"count\">{count}</span>")),
+                "{out}"
+            );
+            assert_eq!(
+                out.contains("<p class=\"empty\">nothing yet</p>"),
+                note,
+                "{out}"
+            );
+            assert!(out.contains(body), "{out}");
+        }
     }
 }

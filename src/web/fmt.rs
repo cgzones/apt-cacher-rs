@@ -1197,45 +1197,28 @@ mod tests {
     }
 
     #[test]
-    fn ratio_class_zero_limit_is_normal() {
-        // Division-by-zero guard: any value with limit=0 must be Normal.
-        assert!(matches!(RatioClass::new(0, 0), RatioClass::Normal));
-        assert!(matches!(RatioClass::new(u64::MAX, 0), RatioClass::Normal));
-    }
-
-    #[test]
-    fn ratio_class_normal_zone() {
-        // Below 50%.
-        assert!(matches!(RatioClass::new(0, 100), RatioClass::Normal));
-        assert!(matches!(RatioClass::new(49, 100), RatioClass::Normal));
-    }
-
-    #[test]
-    fn ratio_class_warn_zone() {
-        // [50%, 80%).
-        assert!(matches!(RatioClass::new(50, 100), RatioClass::Warn));
-        assert!(matches!(RatioClass::new(79, 100), RatioClass::Warn));
-    }
-
-    #[test]
-    fn ratio_class_alert_zone() {
-        // >= 80%, including over-quota (value > limit).
-        assert!(matches!(RatioClass::new(80, 100), RatioClass::Alert));
-        assert!(matches!(RatioClass::new(100, 100), RatioClass::Alert));
-        assert!(matches!(RatioClass::new(200, 100), RatioClass::Alert));
-    }
-
-    #[test]
-    fn ratio_class_saturation_safe() {
-        // value*5 and limit*4 saturate without panicking; the saturated
-        // value*5 == u64::MAX clearly exceeds limit*4 so this is Alert.
-        assert!(matches!(
-            RatioClass::new(u64::MAX, u64::MAX),
-            RatioClass::Alert
-        ));
-        assert!(matches!(RatioClass::new(u64::MAX, 1), RatioClass::Alert));
-        // Tiny value, huge limit: the multiplications do not overflow.
-        assert!(matches!(RatioClass::new(1, u64::MAX), RatioClass::Normal));
+    fn ratio_class_warns_from_half_and_alerts_from_four_fifths() {
+        for (value, limit, class) in [
+            (0, 0, None),
+            (u64::MAX, 0, None),
+            (0, 100, None),
+            (49, 100, None),
+            (50, 100, Some("warn")),
+            (79, 100, Some("warn")),
+            (80, 100, Some("alert")),
+            (100, 100, Some("alert")),
+            (200, 100, Some("alert")),
+            // The multiplications saturate instead of overflowing.
+            (u64::MAX, u64::MAX, Some("alert")),
+            (u64::MAX, 1, Some("alert")),
+            (1, u64::MAX, None),
+        ] {
+            assert_eq!(
+                RatioClass::new(value, limit).span_class(),
+                class,
+                "{value} of {limit}"
+            );
+        }
     }
 
     #[test]

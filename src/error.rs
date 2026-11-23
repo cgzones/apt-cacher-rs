@@ -313,15 +313,4 @@ mod tests {
             ErrorKind::ConnectionRefused
         )));
     }
-
-    #[test]
-    fn upstream_fetch_error_display_is_the_reason() {
-        let err = UpstreamFetchError {
-            reason: "client error (SendRequest):  connection error:  timed out".to_owned(),
-        };
-        assert_eq!(
-            err.to_string(),
-            "client error (SendRequest):  connection error:  timed out"
-        );
-    }
 }

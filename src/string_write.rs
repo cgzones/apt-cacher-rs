@@ -31,29 +31,21 @@ macro_rules! swrite {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn appends_to_owned_string() {
-        let mut s = String::from("a=");
-        swrite!(s, "{}{:03}", 'b', 7);
-        swrite!(s, "!");
-        assert_eq!(s, "a=b007!", "appends without replacing");
-    }
-
-    #[test]
-    fn accepts_a_mutable_reference() {
+    fn appends_to_any_string_place() {
+        struct Holder {
+            out: String,
+        }
         fn append(out: &mut String) {
             swrite!(out, "x{}", 1);
         }
 
-        let mut s = String::new();
-        append(&mut s);
-        assert_eq!(s, "x1", "reborrows through a &mut String");
-    }
+        let mut s = String::from("a=");
+        swrite!(s, "{}{:03}", 'b', 7);
+        swrite!(s, "!");
+        assert_eq!(s, "a=b007!", "appends without replacing");
 
-    #[test]
-    fn appends_to_a_struct_field() {
-        struct Holder {
-            out: String,
-        }
+        append(&mut s);
+        assert_eq!(s, "a=b007!x1", "reborrows through a &mut String");
 
         let mut h = Holder { out: String::new() };
         swrite!(h.out, "{}", 42);

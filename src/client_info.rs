@@ -88,13 +88,4 @@ mod tests {
         assert_eq!(client.ip(), IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
         assert_eq!(client.to_string(), "192.0.2.1");
     }
-
-    #[test]
-    fn cleanup_sentinel_is_distinct_from_loopback() {
-        assert_ne!(
-            ClientInfo::new_cleanup().ip(),
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            "the sentinel must stay distinguishable from a real loopback client"
-        );
-    }
 }

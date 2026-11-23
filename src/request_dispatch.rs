@@ -466,10 +466,8 @@ pub(crate) fn preflight_target<'a, 'h>(
 }
 
 /// Why the cache pipeline declined and the request must be forwarded
-/// uncached.  The sendfile backend uses this to name the reason in its
-/// `NotApplicable` handoff to hyper; hyper's simple proxy and
-/// `splice_simple_proxy` forward regardless of the reason.
-#[derive(Clone, Copy, Debug)]
+/// uncached.  Only named in logs: the relays forward regardless of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PassthroughReason {
     /// The parser did not recognise a known archive shape.
     Unrecognized,
@@ -1384,99 +1382,33 @@ mod tests {
         }
     }
 
-    #[test]
-    fn passthrough_unrecognized_when_parser_declines() {
-        let decision = decide_default("/foo/bar.txt");
-        assert!(
-            matches!(
-                decision,
-                DispatchOutcome::Passthrough(PassthroughRequest {
-                    reason: PassthroughReason::Unrecognized,
-                    ..
-                })
-            ),
-            "expected Unrecognized passthrough, got {decision:?}"
-        );
+    #[derive(Debug, PartialEq, Eq)]
+    enum Verdict {
+        Cache,
+        Reject(RejectReason),
+        Passthrough(PassthroughReason),
     }
 
-    /// The query is no part of the cache name, so a cacheable path carrying
-    /// one is relayed uncached rather than cached under the plain name.
-    #[test]
-    fn passthrough_query_string_on_a_cacheable_path() {
-        // Query handling precedes the constructed name/layout checks.
-        let too_long = format!(
-            "/debian/pool/main/f/foo/{}_1_all.deb?x=1",
-            "f".repeat(MAX_DEBNAME_LEN + 1 - "_1_all.deb".len())
-        );
-        for target in [
-            "/debian/pool/main/f/firefox/firefox_1.0_amd64.deb?x=1",
-            "/debian/dists/sid/main/binary-amd64/Packages.gz?",
-            "/apt/Packages.gz?a=b&c=d",
-            &too_long,
-            "/flat/dists/sid/InRelease?x=1",
-        ] {
-            let decision = decide_default(target);
-            assert!(
-                matches!(
-                    decision,
-                    DispatchOutcome::Passthrough(PassthroughRequest {
-                        reason: PassthroughReason::QueryString,
-                        ..
-                    })
-                ),
-                "{target}: expected QueryString passthrough, got {decision:?}"
-            );
+    fn verdict(decision: &DispatchOutcome) -> Verdict {
+        match decision {
+            DispatchOutcome::Cache(_) => Verdict::Cache,
+            DispatchOutcome::Reject(reason) => Verdict::Reject(*reason),
+            DispatchOutcome::Passthrough(passthrough) => Verdict::Passthrough(passthrough.reason),
         }
-
-        // The query does not change the verdict for anything uncacheable.
-        let decision = decide_default("/foo/bar.txt?x=1");
-        assert!(
-            matches!(
-                decision,
-                DispatchOutcome::Passthrough(PassthroughRequest {
-                    reason: PassthroughReason::Unrecognized,
-                    ..
-                })
-            ),
-            "expected Unrecognized passthrough, got {decision:?}"
-        );
     }
 
     #[test]
-    fn passthrough_underscore_in_a_joined_field() {
-        let decision = decide_default("/debian/dists/sid_main_binary-amd64/Release");
-        assert!(
-            matches!(
-                decision,
-                DispatchOutcome::Passthrough(PassthroughRequest {
-                    reason: PassthroughReason::JoinedFieldUnderscore,
-                    ..
-                })
-            ),
-            "expected JoinedFieldUnderscore passthrough, got {decision:?}"
-        );
-    }
+    fn routing_verdicts() {
+        use PassthroughReason as P;
+        use RejectReason as R;
+        use Verdict::{Cache, Passthrough, Reject};
 
-    #[test]
-    fn passthrough_packages_index_outside_an_architecture() {
-        let decision = decide_default("/debian/dists/sid/main/Translation-en/Packages");
-        assert!(
-            matches!(
-                decision,
-                DispatchOutcome::Passthrough(PassthroughRequest {
-                    reason: PassthroughReason::PackagesOutsideArchitecture,
-                    ..
-                })
-            ),
-            "expected PackagesOutsideArchitecture passthrough, got {decision:?}"
-        );
-    }
-
-    /// A cache name longer than [`MAX_DEBNAME_LEN`] could not be created (its
-    /// `.partial` would pass `NAME_MAX`), so the request is relayed uncached;
-    /// one at the limit still caches.
-    #[test]
-    fn passthrough_cache_name_too_long() {
+        let pool_at = |len: usize| {
+            let stem = "f".repeat(len - "_1_all.deb".len());
+            format!("/debian/pool/main/f/foo/{stem}_1_all.deb")
+        };
+        let (at_limit, too_long) = (pool_at(MAX_DEBNAME_LEN), pool_at(MAX_DEBNAME_LEN + 1));
+        let (name_max, too_long_query) = (pool_at(255), format!("{too_long}?x=1"));
         // Each field within its own cap, the joined name far past NAME_MAX.
         let joined = format!(
             "/debian/dists/{}/{}/binary-{}/Release",
@@ -1484,71 +1416,89 @@ mod tests {
             "b".repeat(128),
             "c".repeat(120)
         );
-        let pool_at = |len: usize| {
-            let stem = "f".repeat(len - "_1_all.deb".len());
-            format!("/debian/pool/main/f/foo/{stem}_1_all.deb")
-        };
-        for path in [joined, pool_at(MAX_DEBNAME_LEN + 1), pool_at(255)] {
-            let decision = decide_default(&path);
-            assert!(
-                matches!(
-                    decision,
-                    DispatchOutcome::Passthrough(PassthroughRequest {
-                        reason: PassthroughReason::NameTooLong,
-                        ..
-                    })
-                ),
-                "{path}: expected NameTooLong passthrough, got {decision:?}"
-            );
-        }
-        let decision = decide_default(&pool_at(MAX_DEBNAME_LEN));
-        assert!(
-            matches!(decision, DispatchOutcome::Cache(_)),
-            "expected Cache at the limit, got {decision:?}"
-        );
-    }
+        // The pdiff gate fires before parsing, and therefore before the
+        // unsafe-path gate.
+        let unsafe_pdiff = "/debian/dists/sid/main/binary-amd64/Packages.diff/T-example/../escape";
+        assert!(is_diff_request_path(unsafe_pdiff));
+        assert!(is_unsafe_proxy_path(unsafe_pdiff));
+        let pool = |rest: &str| format!("/debian/pool/main/{rest}");
+        let dists = |rest: &str| format!("/debian/dists/{rest}");
 
-    #[test]
-    fn passthrough_non_deb_pool_for_pool_with_text_filename() {
-        let decision = decide_default("/debian/pool/main/f/foo/README.txt");
-        assert!(
-            matches!(
-                decision,
-                DispatchOutcome::Passthrough(PassthroughRequest {
-                    reason: PassthroughReason::NonDebPool,
-                    ..
-                })
+        let cases: [(&str, Verdict); 25] = [
+            ("/foo/bar.txt", Passthrough(P::Unrecognized)),
+            // The query does not change the verdict for anything uncacheable.
+            ("/foo/bar.txt?x=1", Passthrough(P::Unrecognized)),
+            (&pool("f/foo/README.txt"), Passthrough(P::NonDebPool)),
+            (
+                &dists("sid_main_binary-amd64/Release"),
+                Passthrough(P::JoinedFieldUnderscore),
             ),
-            "expected NonDebPool passthrough, got {decision:?}"
-        );
-    }
-
-    /// A structured mirror path under `flat` maps onto the host's flat
-    /// tree: `/flat/x/pool/main/f/foo/foo_1_amd64.deb` would be cached as
-    /// the flat entry `/x/foo_1_amd64.deb`.
-    #[test]
-    fn passthrough_structured_mirror_path_under_flat() {
-        for path in [
-            "/flat/x/pool/main/f/foo/foo_1.0_amd64.deb",
-            "/flat/dists/sid/InRelease",
-        ] {
-            let decision = decide_default(path);
-            assert!(
-                matches!(
-                    decision,
-                    DispatchOutcome::Passthrough(PassthroughRequest {
-                        reason: PassthroughReason::FlatAnchoredMirror,
-                        ..
-                    })
-                ),
-                "{path}: expected FlatAnchoredMirror passthrough, got {decision:?}"
-            );
+            (
+                &dists("sid/main/Translation-en/Packages"),
+                Passthrough(P::PackagesOutsideArchitecture),
+            ),
+            // Query handling precedes the constructed name/layout checks.
+            (
+                &pool("f/firefox/firefox_1.0_amd64.deb?x=1"),
+                Passthrough(P::QueryString),
+            ),
+            (
+                &dists("sid/main/binary-amd64/Packages.gz?"),
+                Passthrough(P::QueryString),
+            ),
+            ("/apt/Packages.gz?a=b&c=d", Passthrough(P::QueryString)),
+            (&too_long_query, Passthrough(P::QueryString)),
+            ("/flat/dists/sid/InRelease?x=1", Passthrough(P::QueryString)),
+            (&joined, Passthrough(P::NameTooLong)),
+            (&too_long, Passthrough(P::NameTooLong)),
+            (&name_max, Passthrough(P::NameTooLong)),
+            (&at_limit, Cache),
+            // A structured mirror path under `flat` maps onto the host's flat
+            // tree: `/flat/x/pool/main/f/foo/foo_1_amd64.deb` would be cached
+            // as the flat entry `/x/foo_1_amd64.deb`.
+            (
+                "/flat/x/pool/main/f/foo/foo_1.0_amd64.deb",
+                Passthrough(P::FlatAnchoredMirror),
+            ),
+            (
+                "/flat/dists/sid/InRelease",
+                Passthrough(P::FlatAnchoredMirror),
+            ),
+            // Only the `flat` segment itself is reserved.
+            ("/flatter/pool/main/f/foo/foo_1.0_amd64.deb", Cache),
+            // A flat request the blocklist does not hit.
+            ("/apt/Packages.gz", Cache),
+            (
+                &dists("sid/main/binary-amd64/Packages.diff/T-12345"),
+                Reject(R::DiffRequest),
+            ),
+            (unsafe_pdiff, Reject(R::DiffRequest)),
+            ("/foo/../etc/passwd", Reject(R::UnsafePath)),
+            // Cache poisoning: the traversal would reach the cache as
+            // `debian/victim_1.0_amd64.deb` while the upstream is asked for
+            // `/victim_1.0_amd64.deb`.
+            (
+                "/debian/pool/updates/../../../victim_1.0_amd64.deb",
+                Reject(R::InvalidValue),
+            ),
+            (
+                &pool("%2e%2e/%2e%2e/victim_1.0_amd64.deb"),
+                Reject(R::InvalidValue),
+            ),
+            (
+                "/debian/dists/../../evil/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
+                Reject(R::InvalidValue),
+            ),
+            // `%ff%fe` survives `parse_request_path` (percent-escapes are kept
+            // raw there) and fails UTF-8 validation in `classify_request`.
+            (
+                &pool("f/foo/foo%ff%fe_1.0_amd64.deb"),
+                Reject(R::BadEncoding),
+            ),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(verdict(&decide_default(path)), expected, "{path}");
         }
-        let decision = decide_default("/flatter/pool/main/f/foo/foo_1.0_amd64.deb");
-        assert!(
-            matches!(decision, DispatchOutcome::Cache(_)),
-            "only the `flat` segment itself is reserved, got {decision:?}"
-        );
     }
 
     #[test]
@@ -1563,36 +1513,14 @@ mod tests {
             |_, _| true,
             PreciseInstant::now(),
         );
-        assert!(
-            matches!(
-                decision,
-                DispatchOutcome::Passthrough(PassthroughRequest {
-                    reason: PassthroughReason::FlatBlocked,
-                    ..
-                })
-            ),
-            "expected FlatBlocked passthrough, got {decision:?}"
+        assert_eq!(
+            verdict(&decision),
+            Verdict::Passthrough(PassthroughReason::FlatBlocked)
         );
     }
 
-    #[test]
-    fn flat_request_caches_when_blocklist_does_not_hit() {
-        let decision = decide_default("/apt/Packages.gz");
-        assert!(
-            matches!(decision, DispatchOutcome::Cache(_)),
-            "expected Cache, got {decision:?}"
-        );
-    }
-
-    #[test]
-    fn reject_pdiff_request_when_configured() {
-        let decision = decide_default("/debian/dists/sid/main/binary-amd64/Packages.diff/T-12345");
-        assert!(
-            matches!(decision, DispatchOutcome::Reject(RejectReason::DiffRequest)),
-            "expected DiffRequest reject, got {decision:?}"
-        );
-    }
-
+    /// With the pdiff gate disabled the path, which the parser does not
+    /// match, is a plain unrecognized passthrough.
     #[test]
     fn pdiff_request_passes_through_when_not_configured() {
         let decision = decide_request(
@@ -1605,111 +1533,34 @@ mod tests {
             never_flat_blocked,
             PreciseInstant::now(),
         );
-        // Path is not a recognised structured shape (parser rejects), and the
-        // pdiff gate is disabled, so this falls through to a plain Unrecognized
-        // passthrough.
-        assert!(
-            matches!(
-                decision,
-                DispatchOutcome::Passthrough(PassthroughRequest {
-                    reason: PassthroughReason::Unrecognized,
-                    ..
-                })
-            ),
-            "expected Unrecognized passthrough, got {decision:?}"
+        assert_eq!(
+            verdict(&decision),
+            Verdict::Passthrough(PassthroughReason::Unrecognized)
         );
     }
 
+    /// A field the safety validator refuses is an unsafe-path rejection.
     #[test]
-    fn reject_unsafe_traversal_path() {
-        let decision = decide_default("/foo/../etc/passwd");
-        assert!(
-            matches!(decision, DispatchOutcome::Reject(RejectReason::UnsafePath)),
-            "expected UnsafePath reject, got {decision:?}"
-        );
-    }
-
-    /// Regression (cache poisoning): the traversal used to reach the cache
-    /// as `debian/victim_1.0_amd64.deb` while the upstream was asked for
-    /// `/victim_1.0_amd64.deb`.
-    #[test]
-    fn reject_dot_segments_on_a_cached_route() {
+    fn a_refused_field_counts_as_an_unsafe_path() {
         for path in [
-            "/debian/pool/updates/../../../victim_1.0_amd64.deb",
-            "/debian/pool/main/%2e%2e/%2e%2e/victim_1.0_amd64.deb",
-            "/debian/dists/../../evil/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
+            // `%2F` decodes to `/`, which `valid_filename` refuses; the
+            // decode happens per field, so the structural parse succeeds.
+            "/debian/pool/main/f/foo/foo%2Fbar_1.0_amd64.deb",
+            // Decoded, `public%2Fubuntu` would name the same cache file as
+            // `public/ubuntu` while the upstream is asked for the `%2F` form.
+            "/public%2Fubuntu/dists/noble/InRelease",
         ] {
-            let decision = decide_default(path);
-            assert!(
-                matches!(
-                    decision,
-                    DispatchOutcome::Reject(RejectReason::InvalidValue)
-                ),
-                "{path}: expected InvalidValue reject, got {decision:?}"
+            let unsafe_before = metrics::UNSAFE_PATH_REJECTED.get();
+            assert_eq!(
+                verdict(&decide_default(path)),
+                Verdict::Reject(RejectReason::InvalidValue),
+                "{path}"
+            );
+            assert_eq!(
+                metrics::UNSAFE_PATH_REJECTED.get(),
+                unsafe_before + 1,
+                "{path}"
             );
         }
-    }
-
-    #[test]
-    fn reject_bad_encoding_in_pool_filename() {
-        // `%ff%fe` survives `parse_request_path` (percent-escapes are kept
-        // raw there) and fails UTF-8 validation in `classify_request`.
-        let decision = decide_default("/debian/pool/main/f/foo/foo%ff%fe_1.0_amd64.deb");
-        assert!(
-            matches!(decision, DispatchOutcome::Reject(RejectReason::BadEncoding)),
-            "expected BadEncoding reject, got {decision:?}"
-        );
-    }
-
-    #[test]
-    fn reject_invalid_value_in_pool_filename() {
-        // `%2F` decodes to `/`, which `valid_filename` refuses; the decode
-        // happens per field, so the structural parse above it still succeeds.
-        let unsafe_before = metrics::UNSAFE_PATH_REJECTED.get();
-        let decision = decide_default("/debian/pool/main/f/foo/foo%2Fbar_1.0_amd64.deb");
-        assert!(
-            matches!(
-                decision,
-                DispatchOutcome::Reject(RejectReason::InvalidValue)
-            ),
-            "expected InvalidValue reject, got {decision:?}"
-        );
-        assert_eq!(
-            metrics::UNSAFE_PATH_REJECTED.get(),
-            unsafe_before + 1,
-            "a field the safety validator refuses is an unsafe-path rejection"
-        );
-    }
-
-    #[test]
-    fn reject_encoded_separator_in_mirror_path() {
-        // Decoded, `public%2Fubuntu` would name the same cache file as
-        // `public/ubuntu` while the upstream is asked for the `%2F` form.
-        let unsafe_before = metrics::UNSAFE_PATH_REJECTED.get();
-        let decision = decide_default("/public%2Fubuntu/dists/noble/InRelease");
-        assert!(
-            matches!(
-                decision,
-                DispatchOutcome::Reject(RejectReason::InvalidValue)
-            ),
-            "expected InvalidValue reject, got {decision:?}"
-        );
-        assert_eq!(metrics::UNSAFE_PATH_REJECTED.get(), unsafe_before + 1);
-    }
-
-    #[test]
-    fn pdiff_rejection_wins_over_unsafe_path_check() {
-        // The pdiff gate fires before parsing (and therefore before the
-        // unsafe-path gate), so a path that triggers both is rejected as a
-        // DiffRequest.  This locks in precedence: future refactors that move
-        // the pdiff gate after the unsafe-path gate will fail this test.
-        let path = "/debian/dists/sid/main/binary-amd64/Packages.diff/T-example/../escape";
-        assert!(is_diff_request_path(path));
-        assert!(is_unsafe_proxy_path(path));
-        let decision = decide_default(path);
-        assert!(
-            matches!(decision, DispatchOutcome::Reject(RejectReason::DiffRequest)),
-            "expected DiffRequest reject, got {decision:?}"
-        );
     }
 }

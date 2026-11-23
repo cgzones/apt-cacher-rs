@@ -1013,6 +1013,10 @@ mod tests {
         structured_mirror("deb.debian.org", "")
     }
 
+    fn key<'a>(mirror: &'a Mirror, debname: &'a str) -> CacheEntryKeyRef<'a> {
+        CacheEntryKeyRef::new(mirror, debname, CacheLayout::StructuredPool)
+    }
+
     #[test]
     fn fifo_joiner_releases_the_status_lock_for_the_writer() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1077,33 +1081,21 @@ mod tests {
         ));
         let failure = Arc::new(DownloadFailure::Cancelled);
         let incomplete = ActiveDownloadStatus::Aborted(AbortReason::Failed(Arc::clone(&failure)));
-        let actual = match incomplete.attached_reader() {
-            AttachedReaderState::Failed(failure) => Some(failure),
-            AttachedReaderState::Incomplete | AttachedReaderState::Drainable => None,
+        let AttachedReaderState::Failed(actual) = incomplete.attached_reader() else {
+            unreachable!("incomplete failure must propagate");
         };
-        assert!(actual.is_some(), "incomplete failure must propagate");
-        assert!(Arc::ptr_eq(&actual.expect("asserted above"), &failure));
+        assert!(Arc::ptr_eq(&actual, &failure));
     }
 
     #[test]
     fn lookup_or_insert_late_joiner_peak_counts_per_entry() {
         let ad = ActiveDownloads::new();
         let mirror = test_mirror();
-        // 1 originator + 3 late joiners. After 4 calls total, the
-        // entry's late_joiners field should equal 3.
-        let _orig = ad.lookup_or_insert(
-            CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-            None,
-        );
+        let _orig = ad.lookup_or_insert(key(&mirror, "foo.deb"), None);
         for _ in 0..3 {
-            let _join = ad.lookup_or_insert(
-                CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-                None,
-            );
+            let _join = ad.lookup_or_insert(key(&mirror, "foo.deb"), None);
         }
-        // Read back via the inner lock (test-only access is fine).
-        // Use a short-lived scope so the read guard is released promptly.
-        let key = CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool);
+        let key = key(&mirror, "foo.deb");
         let late_joiners = ad
             .inner
             .read()
@@ -1115,27 +1107,32 @@ mod tests {
     }
 
     #[test]
-    fn lookup_or_insert_rejects_new_origination_at_cap() {
-        let ad = ActiveDownloads::new();
+    fn lookup_or_insert_originates_up_to_the_cap_and_rejects_past_it() {
         let mirror = test_mirror();
-        let max = NonZero::new(1).expect("nonzero");
-        let first = ad.lookup_or_insert(
-            CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
-            Some(max),
-        );
-        assert!(matches!(first, Admission::Originator(_)));
-        let second = ad.lookup_or_insert(
-            CacheEntryKeyRef::new(&mirror, "b.deb", CacheLayout::StructuredPool),
-            Some(max),
-        );
-        assert!(matches!(second, Admission::AtCapacity { max: m } if m == max));
-        // The refused origination must not have registered anything.
-        assert_eq!(ad.len(), 1, "rejected origination must not insert");
-        assert_eq!(
-            ad.upstream_slots(),
-            1,
-            "rejected origination must not mint a slot"
-        );
+        let names = ["a.deb", "b.deb", "c.deb"];
+        for cap in [1, 2] {
+            let ad = ActiveDownloads::new();
+            let max = NonZero::new(cap).expect("nonzero");
+            let (below, at) = names.split_at(cap);
+            // Held: dropping an origination frees its slot.
+            let admitted: Vec<_> = below
+                .iter()
+                .map(|name| ad.lookup_or_insert(key(&mirror, name), Some(max)))
+                .collect();
+            assert!(
+                admitted
+                    .iter()
+                    .all(|admission| matches!(admission, Admission::Originator(_)))
+            );
+            let rejected = ad.lookup_or_insert(key(&mirror, at[0]), Some(max));
+            assert!(matches!(rejected, Admission::AtCapacity { max: m } if m == max));
+            assert_eq!(ad.len(), cap, "rejected origination must not insert");
+            assert_eq!(
+                ad.upstream_slots(),
+                cap,
+                "rejected origination must not mint a slot"
+            );
+        }
     }
 
     #[test]
@@ -1143,41 +1140,11 @@ mod tests {
         let ad = ActiveDownloads::new();
         let mirror = test_mirror();
         let max = NonZero::new(1).expect("nonzero");
-        let first = ad.lookup_or_insert(
-            CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
-            Some(max),
-        );
+        let first = ad.lookup_or_insert(key(&mirror, "a.deb"), Some(max));
         assert!(matches!(first, Admission::Originator(_)));
-        // Same key at cap: joins the in-flight download, no new upstream
-        // connection — exempt from the cap.
-        let join = ad.lookup_or_insert(
-            CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
-            Some(max),
-        );
+        let join = ad.lookup_or_insert(key(&mirror, "a.deb"), Some(max));
         assert!(matches!(join, Admission::LateJoiner { .. }));
         assert_eq!(ad.upstream_slots(), 1, "a join mints no slot");
-    }
-
-    #[test]
-    fn lookup_or_insert_originates_below_cap() {
-        let ad = ActiveDownloads::new();
-        let mirror = test_mirror();
-        let max = NonZero::new(2).expect("nonzero");
-        let first = ad.lookup_or_insert(
-            CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
-            Some(max),
-        );
-        assert!(matches!(first, Admission::Originator(_)));
-        let second = ad.lookup_or_insert(
-            CacheEntryKeyRef::new(&mirror, "b.deb", CacheLayout::StructuredPool),
-            Some(max),
-        );
-        assert!(matches!(second, Admission::Originator(_)));
-        let third = ad.lookup_or_insert(
-            CacheEntryKeyRef::new(&mirror, "c.deb", CacheLayout::StructuredPool),
-            Some(max),
-        );
-        assert!(matches!(third, Admission::AtCapacity { max: _ }));
     }
 
     /// The cap follows the slot, not the entry: an entry whose slot is gone
@@ -1189,56 +1156,27 @@ mod tests {
         let ad = ActiveDownloads::new();
         let mirror = test_mirror();
         let max = NonZero::new(1).expect("nonzero");
-        let first = ad.lookup_or_insert(
-            CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
-            Some(max),
-        );
-        let slot = if let Admission::Originator(Origination {
-            key: _,
-            init_tx: _,
-            status: _,
-            slot,
-        }) = first
-        {
-            Some(slot)
-        } else {
-            None
+        let first = ad.lookup_or_insert(key(&mirror, "a.deb"), Some(max));
+        let Admission::Originator(Origination { slot, .. }) = first else {
+            unreachable!("an empty registry originates");
         };
-        let slot = slot.expect("an empty registry originates");
 
         // Slot released, entry still mapped: the download is committing.
         drop(slot);
         assert_eq!(ad.len(), 1, "the entry outlives its slot");
         assert_eq!(ad.upstream_slots(), 0, "dropping the slot frees it");
-        let second = ad.lookup_or_insert(
-            CacheEntryKeyRef::new(&mirror, "b.deb", CacheLayout::StructuredPool),
-            Some(max),
-        );
-        let second_slot = if let Admission::Originator(Origination {
-            key: _,
-            init_tx: _,
-            status: _,
-            slot,
+        let second = ad.lookup_or_insert(key(&mirror, "b.deb"), Some(max));
+        let Admission::Originator(Origination {
+            slot: second_slot, ..
         }) = second
-        {
-            Some(slot)
-        } else {
-            None
+        else {
+            unreachable!("a committing entry holds no slot, so the cap admits the origination");
         };
-        let second_slot = second_slot
-            .expect("a committing entry holds no slot, so the cap admits the origination");
 
         // Entry retired, slot still held: nothing the cap counts changed.
-        ad.remove(CacheEntryKeyRef::new(
-            &mirror,
-            "b.deb",
-            CacheLayout::StructuredPool,
-        ));
+        ad.remove(key(&mirror, "b.deb"));
         assert_eq!(ad.upstream_slots(), 1, "remove() does not touch the slot");
-        let third = ad.lookup_or_insert(
-            CacheEntryKeyRef::new(&mirror, "c.deb", CacheLayout::StructuredPool),
-            Some(max),
-        );
+        let third = ad.lookup_or_insert(key(&mirror, "c.deb"), Some(max));
         assert!(matches!(third, Admission::AtCapacity { max: _ }));
         drop(second_slot);
         assert_eq!(ad.upstream_slots(), 0);
@@ -1291,10 +1229,7 @@ mod tests {
         let mirror = test_mirror();
         let mut admissions = Vec::new();
         for name in ["a.deb", "b.deb", "c.deb", "d.deb"] {
-            let result = ad.lookup_or_insert(
-                CacheEntryKeyRef::new(&mirror, name, CacheLayout::StructuredPool),
-                None,
-            );
+            let result = ad.lookup_or_insert(key(&mirror, name), None);
             assert!(matches!(result, Admission::Originator(_)));
             admissions.push(result);
         }

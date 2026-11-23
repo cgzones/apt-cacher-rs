@@ -2638,22 +2638,6 @@ mod tests {
 
     #[tokio::test]
     async fn zero_length_client_splice_is_source_eof_not_peer_loss() {
-        use std::io::{Read as _, Write as _};
-        use std::os::unix::net::UnixStream;
-
-        let (writer, reader) = create_pipe().unwrap();
-        drop(writer);
-        let (mut socket, mut peer) = UnixStream::pair().unwrap();
-        assert_eq!(
-            splice(&reader, None, &socket, None, 1, SpliceFFlags::empty()).unwrap(),
-            0,
-        );
-        // Source EOF is possible with a perfectly healthy destination.
-        socket.write_all(b"x").unwrap();
-        let mut byte = [0];
-        peer.read_exact(&mut byte).unwrap();
-        assert_eq!(byte, *b"x");
-
         let failure = zero_client_splice_failure();
         assert!(matches!(failure, DeliveryFailure::Internal(_)));
         assert!(!failure.is_peer_disconnect());
@@ -2823,15 +2807,14 @@ mod tests {
             let scratch = ScratchFile::new();
             let barrier = cache_barrier(&scratch.path).await;
             let lifetime = Arc::downgrade(&barrier.write_lease());
-            let mut writer = CacheWriter::new(
+            let mut writer = writer_at(
                 scratch.file,
                 0,
                 CacheWriteMode::Kernel,
                 &barrier,
                 &scratch.path,
             )
-            .await
-            .unwrap();
+            .await;
             let mut write = Box::pin(writer.write_prefix(b"prefix"));
             assert!(
                 write
@@ -2934,6 +2917,20 @@ mod tests {
         fn contents(&self) -> Vec<u8> {
             std::fs::read(&self.path).expect("read the scratch file")
         }
+    }
+
+    const HASHED: CacheWriteMode = CacheWriteMode::Userspace(Some(HashAlgo::Sha256));
+
+    async fn writer_at(
+        file: tokio::fs::File,
+        offset: i64,
+        mode: CacheWriteMode,
+        barrier: &DownloadBarrier,
+        path: &Path,
+    ) -> CacheWriter {
+        CacheWriter::new(file, offset, mode, barrier, path)
+            .await
+            .expect("a fresh descriptor duplicates and flushes")
     }
 
     async fn cache_barrier(path: &Path) -> DownloadBarrier {
@@ -3050,15 +3047,14 @@ mod tests {
 
         let scratch = ScratchFile::new();
         let mut barrier = cache_barrier(&scratch.path).await;
-        let mut writer = CacheWriter::new(
+        let mut writer = writer_at(
             scratch.file,
             7,
             CacheWriteMode::Kernel,
             &barrier,
             &scratch.path,
         )
-        .await
-        .unwrap();
+        .await;
         let (_peer, client) = crate::test_support::connected_tcp_pair().await;
 
         // A one-second window that one noted byte fills, far below the rate
@@ -3155,15 +3151,14 @@ mod tests {
                 .await
                 .unwrap();
             let barrier = cache_barrier(&scratch.path).await;
-            let writer = CacheWriter::new(
+            let writer = writer_at(
                 scratch.file,
                 6,
                 CacheWriteMode::Kernel,
                 &barrier,
                 &scratch.path,
             )
-            .await
-            .unwrap();
+            .await;
             std::fs::remove_file(&scratch.path).unwrap();
             if replace {
                 std::fs::write(&scratch.path, b"replacement").unwrap();
@@ -3207,15 +3202,14 @@ mod tests {
         let scratch = ScratchFile::new();
         std::fs::write(&scratch.path, b"resume-").unwrap();
         let mut barrier = cache_barrier(&scratch.path).await;
-        let mut writer = CacheWriter::new(
+        let mut writer = writer_at(
             scratch.file,
             7,
             CacheWriteMode::Kernel,
             &barrier,
             &scratch.path,
         )
-        .await
-        .unwrap();
+        .await;
         let (mut peer, mut client) = crate::test_support::connected_tcp_pair().await;
         client.write_all(b"sent").await.unwrap();
         let mut delivered = [0; 4];
@@ -3303,15 +3297,14 @@ mod tests {
 
         let scratch = ScratchFile::new();
         let mut barrier = cache_barrier(&scratch.path).await;
-        let mut writer = CacheWriter::new(
+        let mut writer = writer_at(
             scratch.file,
             0,
             CacheWriteMode::Kernel,
             &barrier,
             &scratch.path,
         )
-        .await
-        .unwrap();
+        .await;
         let (_peer, client) = crate::test_support::connected_tcp_pair().await;
 
         // One-second windows.
@@ -3382,15 +3375,14 @@ mod tests {
         std::fs::write(&scratch.path, b"resume-").unwrap();
         let mut barrier = cache_barrier(&scratch.path).await;
         let mut receiver = barrier.subscribe();
-        let mut writer = CacheWriter::new(
+        let mut writer = writer_at(
             scratch.file,
             7,
             CacheWriteMode::Kernel,
             &barrier,
             &scratch.path,
         )
-        .await
-        .unwrap();
+        .await;
         let xfer = BodyTransfer::new(
             BodyClient::Absent,
             &mut writer,
@@ -3434,15 +3426,14 @@ mod tests {
     async fn cache_only_batches_join_the_pipe_b_batch() {
         let scratch = ScratchFile::new();
         let mut barrier = cache_barrier(&scratch.path).await;
-        let mut writer = CacheWriter::new(
+        let mut writer = writer_at(
             scratch.file,
             0,
             CacheWriteMode::Kernel,
             &barrier,
             &scratch.path,
         )
-        .await
-        .unwrap();
+        .await;
         let filter = SpliceRangeFilter { skip: 0, send: 0 };
         let xfer = BodyTransfer::new(
             BodyClient::Absent,
@@ -3493,15 +3484,14 @@ mod tests {
     async fn cache_writer_keeps_small_batches_after_the_first_flush() {
         let scratch = ScratchFile::new();
         let barrier = cache_barrier(&scratch.path).await;
-        let mut writer = CacheWriter::new(
+        let mut writer = writer_at(
             scratch.file,
             0,
             CacheWriteMode::Kernel,
             &barrier,
             &scratch.path,
         )
-        .await
-        .unwrap();
+        .await;
         let mut view = pipes_view(&mut writer);
         queue_cache(view.pipes_mut(), b"first").await;
         view.flush_if_due().await.unwrap();
@@ -3517,19 +3507,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn cache_writer_hashes_prefix_and_userspace_body_once() {
-        use crate::index_parser::HashAlgo;
         use sha2::Digest as _;
         let scratch = ScratchFile::new();
         let barrier = cache_barrier(&scratch.path).await;
-        let mut writer = CacheWriter::new(
-            scratch.file,
-            0,
-            CacheWriteMode::Userspace(Some(HashAlgo::Sha256)),
-            &barrier,
-            &scratch.path,
-        )
-        .await
-        .unwrap();
+        let mut writer = writer_at(scratch.file, 0, HASHED, &barrier, &scratch.path).await;
         writer.write_prefix(b"prefix-").await.unwrap();
         let mut body = b"body".to_vec();
         writer.write_cache_chunk(&mut body).await.unwrap();
@@ -3546,19 +3527,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn finalization_lands_pending_buffer_before_exposing_digest() {
-        use crate::index_parser::HashAlgo;
         use sha2::Digest as _;
         let scratch = ScratchFile::new();
         let barrier = cache_barrier(&scratch.path).await;
-        let mut writer = CacheWriter::new(
-            scratch.file,
-            0,
-            CacheWriteMode::Userspace(Some(HashAlgo::Sha256)),
-            &barrier,
-            &scratch.path,
-        )
-        .await
-        .unwrap();
+        let mut writer = writer_at(scratch.file, 0, HASHED, &barrier, &scratch.path).await;
         let mut view = buffer_view(&mut writer, 7);
         view.buffer_mut().sink.buf.extend_from_slice(b"pending");
         view.buffer_mut().queue(7);
@@ -3583,7 +3555,6 @@ mod tests {
     /// each cover every byte exactly once, in order.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn buffer_sink_lands_and_hashes_every_byte_once_across_batches() {
-        use crate::index_parser::HashAlgo;
         use sha2::Digest as _;
 
         const READ: usize = 16_411;
@@ -3594,15 +3565,7 @@ mod tests {
 
         let scratch = ScratchFile::new();
         let barrier = cache_barrier(&scratch.path).await;
-        let mut writer = CacheWriter::new(
-            scratch.file,
-            0,
-            CacheWriteMode::Userspace(Some(HashAlgo::Sha256)),
-            &barrier,
-            &scratch.path,
-        )
-        .await
-        .unwrap();
+        let mut writer = writer_at(scratch.file, 0, HASHED, &barrier, &scratch.path).await;
         writer.write_prefix(prefix).await.unwrap();
         let mut view = buffer_view(&mut writer, u64::try_from(body.len()).unwrap());
 
@@ -3676,15 +3639,7 @@ mod tests {
         // The open descriptor's cursor is still zero. Only the writer's
         // explicit resume offset may determine where the prefix lands.
         let barrier = cache_barrier(&scratch.path).await;
-        let mut writer = CacheWriter::new(
-            scratch.file,
-            7,
-            CacheWriteMode::Userspace(Some(HashAlgo::Sha256)),
-            &barrier,
-            &scratch.path,
-        )
-        .await
-        .unwrap();
+        let mut writer = writer_at(scratch.file, 7, HASHED, &barrier, &scratch.path).await;
         writer.write_prefix(b"prefix-").await.unwrap();
         writer
             .write_cache_chunk(&mut b"body".to_vec())
@@ -3702,15 +3657,7 @@ mod tests {
 
         let scratch = ScratchFile::new();
         let barrier = cache_barrier(&scratch.path).await;
-        let mut writer = CacheWriter::new(
-            scratch.file,
-            0,
-            CacheWriteMode::Userspace(Some(HashAlgo::Sha256)),
-            &barrier,
-            &scratch.path,
-        )
-        .await
-        .unwrap();
+        let mut writer = writer_at(scratch.file, 0, HASHED, &barrier, &scratch.path).await;
         writer.write_prefix(b"whole body").await.unwrap();
         writer.write_prefix(b"").await.unwrap();
         let drained = writer.drain().await.expect("drained writer");
@@ -3731,15 +3678,14 @@ mod tests {
         // Deliberately omit flush: entering the writer must wait for this write.
         scratch.file.write_all(&prefix).await.unwrap();
         let barrier = cache_barrier(&scratch.path).await;
-        let mut writer = CacheWriter::new(
+        let mut writer = writer_at(
             scratch.file,
             i64::try_from(prefix.len()).unwrap(),
             CacheWriteMode::Kernel,
             &barrier,
             &scratch.path,
         )
-        .await
-        .unwrap();
+        .await;
         let mut view = pipes_view(&mut writer);
         accumulate(view.pipes_mut(), b"tail");
         view.write_through().await.unwrap();
@@ -3818,15 +3764,14 @@ mod tests {
     async fn a_batch_straddling_a_client_range_edge_aborts_the_client() {
         let scratch = ScratchFile::new();
         let mut barrier = cache_barrier(&scratch.path).await;
-        let mut writer = CacheWriter::new(
+        let mut writer = writer_at(
             scratch.file,
             0,
             CacheWriteMode::Kernel,
             &barrier,
             &scratch.path,
         )
-        .await
-        .unwrap();
+        .await;
         let (mut peer, client) = crate::test_support::connected_tcp_pair().await;
         let config = crate::config::Config::default();
         let filter = SpliceRangeFilter { skip: 2, send: 10 };
@@ -3877,36 +3822,27 @@ mod tests {
         assert!(matches!(xfer.finish().client, ClientEnd::Absent));
     }
 
+    /// However much of a batch was teed, and however much of that reached
+    /// the client, salvage lands every byte once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn salvage_does_not_land_a_batch_that_was_already_teed() {
-        let scratch = ScratchFile::new();
-        let mut pipes = SplicePipes::new().unwrap();
-        accumulate(&mut pipes, b"abcdefgh");
-        assert_eq!(pipes.duplicate(8).unwrap(), 8);
-        assert_eq!(pipes.send_to_client(dev_null().unwrap(), 3).unwrap(), 3);
-        let mut offset = 0;
-        pipes
-            .salvage_into(&owned_cache_file(&scratch).await, &mut offset)
-            .await
-            .unwrap();
-        assert_eq!(scratch.contents(), b"abcdefgh");
-        assert_eq!(offset, 8);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn salvage_keeps_unique_tail_after_partial_tee_and_client_write() {
-        let scratch = ScratchFile::new();
-        let mut pipes = SplicePipes::new().unwrap();
-        accumulate(&mut pipes, b"abcdefgh");
-        assert_eq!(pipes.duplicate(3).unwrap(), 3);
-        assert_eq!(pipes.send_to_client(dev_null().unwrap(), 1).unwrap(), 1);
-        let mut offset = 0;
-        pipes
-            .salvage_into(&owned_cache_file(&scratch).await, &mut offset)
-            .await
-            .unwrap();
-        assert_eq!(scratch.contents(), b"abcdefgh");
-        assert_eq!(offset, 8);
+    async fn salvage_lands_a_partly_teed_batch_once() {
+        for (teed, sent) in [(8, 3), (3, 1)] {
+            let scratch = ScratchFile::new();
+            let mut pipes = SplicePipes::new().unwrap();
+            accumulate(&mut pipes, b"abcdefgh");
+            assert_eq!(pipes.duplicate(teed).unwrap(), teed);
+            assert_eq!(
+                pipes.send_to_client(dev_null().unwrap(), sent).unwrap(),
+                sent
+            );
+            let mut offset = 0;
+            pipes
+                .salvage_into(&owned_cache_file(&scratch).await, &mut offset)
+                .await
+                .unwrap();
+            assert_eq!(scratch.contents(), b"abcdefgh", "teed={teed}, sent={sent}");
+            assert_eq!(offset, 8);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

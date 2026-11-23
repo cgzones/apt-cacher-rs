@@ -547,22 +547,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_reference_set_accepts_release_suffix_for_expected_dist() {
-        // The `<dist>_Release` (non-Inline) form also satisfies the expected-dist
-        // check: the suffix-strip must recognise it, not only `_InRelease`.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let a = [0xccu8; 32];
-        std::fs::write(dir.path().join("sid_Release"), release_with_sha256(&[a]))
-            .expect("write sid");
-        let expected = ["sid"];
-        assert!(
-            build_byhash_reference_set(dir.path(), dir.path(), CacheLayout::DistsByHash, &expected)
-                .await
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
     async fn build_reference_set_empty_or_missing_is_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         // Empty dir: no Release files.

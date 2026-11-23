@@ -612,64 +612,48 @@ mod tests {
 
     use crate::nonzero;
 
-    #[test]
-    fn quota_none_passes() {
-        assert_eq!(check_quota(u64::MAX, None), CheckResult::Pass);
+    fn fail(detail: &str) -> CheckResult {
+        CheckResult::Fail(detail.to_owned())
     }
 
     #[test]
-    fn quota_below_limit_passes() {
-        assert_eq!(check_quota(99, Some(nonzero!(100_u64))), CheckResult::Pass);
+    fn quota_fails_from_the_limit_on() {
+        let limit = Some(nonzero!(100_u64));
+        for (size, limit, expected) in [
+            (u64::MAX, None, CheckResult::Pass),
+            (99, limit, CheckResult::Pass),
+            (
+                100,
+                limit,
+                fail("disk quota exhausted: cache size 100 of 100 bytes"),
+            ),
+            (
+                101,
+                limit,
+                fail("disk quota exhausted: cache size 101 of 100 bytes"),
+            ),
+        ] {
+            assert_eq!(check_quota(size, limit), expected, "{size}");
+        }
     }
 
     #[test]
-    fn quota_at_limit_fails() {
-        assert_eq!(
-            check_quota(100, Some(nonzero!(100_u64))),
-            CheckResult::Fail(String::from(
-                "disk quota exhausted: cache size 100 of 100 bytes"
-            ))
-        );
-    }
-
-    #[test]
-    fn quota_above_limit_fails() {
-        assert_eq!(
-            check_quota(101, Some(nonzero!(100_u64))),
-            CheckResult::Fail(String::from(
-                "disk quota exhausted: cache size 101 of 100 bytes"
-            ))
-        );
-    }
-
-    #[test]
-    fn disk_free_at_or_above_minimum_passes() {
-        assert_eq!(
-            check_disk_free(Some(100), nonzero!(100_u64)),
-            CheckResult::Pass
-        );
-        assert_eq!(
-            check_disk_free(Some(101), nonzero!(100_u64)),
-            CheckResult::Pass
-        );
-    }
-
-    #[test]
-    fn disk_free_below_minimum_fails() {
-        assert_eq!(
-            check_disk_free(Some(99), nonzero!(100_u64)),
-            CheckResult::Fail(String::from(
-                "low disk space: 99 bytes free, minimum 100 bytes"
-            ))
-        );
-    }
-
-    #[test]
-    fn disk_free_unknown_fails() {
-        assert_eq!(
-            check_disk_free(None, nonzero!(100_u64)),
-            CheckResult::Fail(String::from("could not determine free disk space"))
-        );
+    fn disk_free_fails_below_the_minimum_or_unmeasured() {
+        for (free, expected) in [
+            (Some(100), CheckResult::Pass),
+            (Some(101), CheckResult::Pass),
+            (
+                Some(99),
+                fail("low disk space: 99 bytes free, minimum 100 bytes"),
+            ),
+            (None, fail("could not determine free disk space")),
+        ] {
+            assert_eq!(
+                check_disk_free(free, nonzero!(100_u64)),
+                expected,
+                "{free:?}"
+            );
+        }
     }
 
     #[expect(clippy::unnecessary_wraps, reason = "used for unit testing")]
@@ -681,44 +665,32 @@ mod tests {
     }
 
     #[test]
-    fn inodes_free_above_both_floors_passes() {
-        // 10% of the table and above the absolute floor.
-        assert_eq!(
-            check_inodes_free(inodes(10_000, 100_000)),
-            CheckResult::Pass
-        );
-    }
-
-    #[test]
-    fn inodes_free_below_absolute_floor_fails() {
-        // Above 10% of a small table, but under the absolute floor.
-        assert_eq!(
-            check_inodes_free(inodes(MIN_FREE_INODES - 1, 2000)),
-            CheckResult::Fail(format!(
-                "low free inodes: {} of 2000 total, minimum {MIN_FREE_INODES}",
-                MIN_FREE_INODES - 1
-            ))
-        );
-        assert!(!check_inodes_free(inodes(0, 2000)).ok());
-    }
-
-    #[test]
-    fn inodes_free_below_fraction_fails() {
-        // Comfortably above the absolute floor, but under 10% of the table.
-        assert_eq!(
-            check_inodes_free(inodes(9_999, 100_000)),
-            CheckResult::Fail(String::from(
-                "low free inodes: 9999 of 100000 total, minimum 10% of the inode table"
-            ))
-        );
-    }
-
-    #[test]
-    fn inodes_free_unmeasured_passes() {
-        // No inode limit (btrfs) and a failed probe both fail open: unlike
-        // free bytes there is no configured policy making the figure
-        // required.
-        assert_eq!(check_inodes_free(None), CheckResult::Pass);
+    fn inodes_free_fails_below_either_floor() {
+        for (space, expected) in [
+            (inodes(10_000, 100_000), CheckResult::Pass),
+            // Above 10% of a small table, but under the absolute floor.
+            (
+                inodes(MIN_FREE_INODES - 1, 2000),
+                fail(&format!(
+                    "low free inodes: {} of 2000 total, minimum {MIN_FREE_INODES}",
+                    MIN_FREE_INODES - 1
+                )),
+            ),
+            (
+                inodes(0, 2000),
+                fail(&format!(
+                    "low free inodes: 0 of 2000 total, minimum {MIN_FREE_INODES}"
+                )),
+            ),
+            // Comfortably above the absolute floor, but under 10% of the table.
+            (
+                inodes(9_999, 100_000),
+                fail("low free inodes: 9999 of 100000 total, minimum 10% of the inode table"),
+            ),
+            (None, CheckResult::Pass),
+        ] {
+            assert_eq!(check_inodes_free(space), expected, "{space:?}");
+        }
     }
 
     /// The production deadline through a slot of the test's own, so tests
@@ -767,24 +739,16 @@ mod tests {
     }
 
     #[test]
-    fn json_escape_plain_passthrough() {
-        let mut out = String::new();
-        json_escape_into(&mut out, "plain ascii and umlauts");
-        assert_eq!(out, "plain ascii and umlauts");
-    }
-
-    #[test]
-    fn json_escape_specials() {
-        let mut out = String::new();
-        json_escape_into(&mut out, "a\"b\\c\nd\te");
-        assert_eq!(out, "a\\\"b\\\\c\\u000ad\\u0009e");
-    }
-
-    #[test]
-    fn json_escape_empty() {
-        let mut out = String::new();
-        json_escape_into(&mut out, "");
-        assert_eq!(out, "");
+    fn json_escape_escapes_quotes_backslashes_and_controls() {
+        for (raw, escaped) in [
+            ("", ""),
+            ("plain ascii and umlauts", "plain ascii and umlauts"),
+            ("a\"b\\c\nd\te", "a\\\"b\\\\c\\u000ad\\u0009e"),
+        ] {
+            let mut out = String::new();
+            json_escape_into(&mut out, raw);
+            assert_eq!(out, escaped);
+        }
     }
 
     /// [`check_cache_write`] through a slot of the test's own (see

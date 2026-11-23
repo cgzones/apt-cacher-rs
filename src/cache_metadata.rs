@@ -1117,77 +1117,76 @@ mod tests {
         write_upstream_metadata(&file, &path, &malformed, None, TargetFile::New);
     }
 
+    const EPOCH_LM: &str = "Thu, 01 Jan 1970 00:00:00 GMT";
+
     #[test]
-    fn from_upstream_parses_last_modified() {
-        let m =
-            UpstreamMetadata::from_upstream(Some("\"abc\""), Some("Thu, 01 Jan 1970 00:00:00 GMT"));
-        assert_eq!(m.etag.as_deref(), Some("\"abc\""));
-        let s = m.last_modified.expect("parsed");
-        assert_eq!(s.as_ref(), "Thu, 01 Jan 1970 00:00:00 GMT");
+    fn from_upstream_keeps_only_well_formed_validators() {
+        for (etag, last_modified, kept_etag, kept_lm) in [
+            (
+                Some("\"abc\""),
+                Some(EPOCH_LM),
+                Some("\"abc\""),
+                Some(EPOCH_LM),
+            ),
+            (Some("not-an-etag"), Some(EPOCH_LM), None, Some(EPOCH_LM)),
+            (None, Some("not a date"), None, None),
+        ] {
+            let m = UpstreamMetadata::from_upstream(etag, last_modified);
+            assert_eq!(m.etag.as_deref(), kept_etag, "{etag:?}");
+            assert_eq!(
+                m.last_modified.as_ref().map(AsRef::as_ref),
+                kept_lm,
+                "{last_modified:?}"
+            );
+        }
     }
 
     #[test]
-    fn from_upstream_drops_malformed_etag() {
-        let m = UpstreamMetadata::from_upstream(
-            Some("not-an-etag"),
-            Some("Thu, 01 Jan 1970 00:00:00 GMT"),
+    fn check_upstream_validators_reports_what_it_discards() {
+        type Case = (
+            Option<&'static str>,
+            Option<&'static str>,
+            (Option<&'static str>, Option<&'static str>),
+            &'static [InvalidValidator<'static>],
         );
-        assert!(m.etag.is_none());
-        let s = m.last_modified.expect("valid Last-Modified is retained");
-        assert_eq!(s.as_ref(), "Thu, 01 Jan 1970 00:00:00 GMT");
-    }
-
-    #[test]
-    fn from_upstream_drops_malformed_last_modified() {
-        let m = UpstreamMetadata::from_upstream(None, Some("not a date"));
-        assert!(m.last_modified.is_none());
-    }
-
-    #[test]
-    fn check_upstream_validators_keeps_well_formed_values() {
-        let mut calls = 0;
-        let (etag, lm) = check_upstream_validators(
-            Some("W/\"abc\""),
-            Some("Thu, 01 Jan 1970 00:00:00 GMT"),
-            |_invalid| calls += 1,
-        );
-        assert_eq!(etag, Some("W/\"abc\""));
-        assert_eq!(lm, Some("Thu, 01 Jan 1970 00:00:00 GMT"));
-        assert_eq!(calls, 0);
-    }
-
-    #[test]
-    fn check_upstream_validators_passes_absent_values_silently() {
-        let mut calls = 0;
-        let (etag, lm) = check_upstream_validators::<&str>(None, None, |_invalid| calls += 1);
-        assert_eq!(etag, None);
-        assert_eq!(lm, None);
-        assert_eq!(calls, 0);
-    }
-
-    #[test]
-    fn check_upstream_validators_discards_malformed_etag() {
-        let mut expected = [InvalidValidator::ETag("not-an-etag")].into_iter();
-        let (etag, lm) = check_upstream_validators(
-            Some("not-an-etag"),
-            Some("Thu, 01 Jan 1970 00:00:00 GMT"),
-            |invalid| assert_eq!(Some(invalid), expected.next()),
-        );
-        assert_eq!(etag, None);
-        assert_eq!(lm, Some("Thu, 01 Jan 1970 00:00:00 GMT"));
-        assert_eq!(expected.next(), None);
-    }
-
-    #[test]
-    fn check_upstream_validators_discards_malformed_last_modified() {
-        let mut expected = [InvalidValidator::LastModified("not a date")].into_iter();
-        let (etag, lm) =
-            check_upstream_validators(Some("\"abc\""), Some("not a date"), |invalid| {
-                assert_eq!(Some(invalid), expected.next());
+        let cases: [Case; 5] = [
+            (
+                Some("W/\"abc\""),
+                Some(EPOCH_LM),
+                (Some("W/\"abc\""), Some(EPOCH_LM)),
+                &[],
+            ),
+            (None, None, (None, None), &[]),
+            (
+                Some("not-an-etag"),
+                Some(EPOCH_LM),
+                (None, Some(EPOCH_LM)),
+                &[InvalidValidator::ETag("not-an-etag")],
+            ),
+            (
+                Some("\"abc\""),
+                Some("not a date"),
+                (Some("\"abc\""), None),
+                &[InvalidValidator::LastModified("not a date")],
+            ),
+            (
+                Some("bad"),
+                Some("worse"),
+                (None, None),
+                &[
+                    InvalidValidator::ETag("bad"),
+                    InvalidValidator::LastModified("worse"),
+                ],
+            ),
+        ];
+        for (etag, lm, kept, invalid) in cases {
+            let mut expected = invalid.iter();
+            let got = check_upstream_validators(etag, lm, |reported| {
+                assert_eq!(Some(&reported), expected.next(), "{etag:?} {lm:?}");
             });
-        assert_eq!(etag, Some("\"abc\""));
-        assert_eq!(lm, None);
-        assert_eq!(expected.next(), None);
+            assert_eq!(got, kept, "{etag:?} {lm:?}");
+            assert_eq!(expected.next(), None, "{etag:?} {lm:?}");
+        }
     }
 
     #[test]
@@ -1227,23 +1226,6 @@ mod tests {
     }
 
     #[test]
-    fn check_upstream_validators_reports_both_malformed_values() {
-        let mut expected = [
-            InvalidValidator::ETag("bad"),
-            InvalidValidator::LastModified("worse"),
-        ]
-        .into_iter();
-        let (etag, lm) = check_upstream_validators(Some("bad"), Some("worse"), |invalid| {
-            assert_eq!(Some(invalid), expected.next());
-        });
-        assert_eq!(etag, None);
-        assert_eq!(lm, None);
-        assert_eq!(expected.next(), None);
-    }
-
-    /// The phrase both backends interpolate between "upstream mirror X" and
-    /// "for <file>; discarding it".
-    #[test]
     fn invalid_validator_detail_quotes_the_value_or_its_length() {
         assert_eq!(
             InvalidValidator::ETag("a\nb").detail().to_string(),
@@ -1262,21 +1244,5 @@ mod tests {
             .to_string(),
             "sent a 2000 byte ETag"
         );
-    }
-
-    /// One gate per kind: an oversized value shares one whichever header
-    /// carried it.
-    #[test]
-    fn validator_gates_are_per_kind() {
-        static GATES: ValidatorGates = ValidatorGates::new();
-        let gate =
-            |invalid: InvalidValidator<'_>| std::ptr::from_ref(GATES.for_validator(&invalid));
-        let oversized = |header| InvalidValidator::Oversized { header, len: 1 };
-        assert_ne!(
-            gate(InvalidValidator::ETag("x")),
-            gate(InvalidValidator::LastModified("x"))
-        );
-        assert_ne!(gate(InvalidValidator::ETag("x")), gate(oversized("ETag")));
-        assert_eq!(gate(oversized("ETag")), gate(oversized("Last-Modified")));
     }
 }

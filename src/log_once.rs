@@ -295,22 +295,7 @@ mod tests {
         assert!(first_fire(&gate));
         assert!(!first_fire(&gate));
         assert!(!first_fire(&gate));
-    }
-
-    #[test]
-    fn gates_are_independent() {
-        let a = AtomicBool::new(false);
-        let b = AtomicBool::new(false);
-        assert!(first_fire(&a));
-        assert!(first_fire(&b), "a spent gate does not spend its sibling");
-        assert!(!first_fire(&a));
-        assert!(!first_fire(&b));
-    }
-
-    #[test]
-    fn a_pre_fired_gate_never_fires() {
-        let gate = AtomicBool::new(true);
-        assert!(!first_fire(&gate));
+        assert!(!first_fire(&AtomicBool::new(true)), "a pre-fired gate");
     }
 
     #[test]

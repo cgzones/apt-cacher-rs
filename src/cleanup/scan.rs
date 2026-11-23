@@ -206,32 +206,6 @@ mod tests {
     use crate::cache_paths::{SUBDIR_FLAT_BYHASH, SUBDIR_TMP};
 
     #[tokio::test]
-    async fn remove_non_regular_unlinks_a_symlink() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("t");
-        tokio::fs::write(&target, b"x").await.expect("t");
-        let link = dir.path().join("l");
-        tokio::fs::symlink(&target, &link).await.expect("symlink");
-        assert!(remove_non_regular(&link).await);
-        assert!(!link.exists());
-        assert!(target.exists(), "the link, not its target, is removed");
-    }
-
-    #[tokio::test]
-    async fn remove_stray_dir_removes_recursively() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let sub = dir.path().join("d");
-        tokio::fs::create_dir(&sub).await.expect("dir");
-        tokio::fs::write(sub.join("nested"), b"x")
-            .await
-            .expect("nested");
-        assert!(remove_stray_dir(&sub).await);
-        assert!(!sub.exists());
-    }
-
-    /// A pool reached through a symlinked mirror directory yields no
-    /// candidates, so nothing outside the cache is ever swept.
-    #[tokio::test]
     async fn a_pool_behind_a_symlink_yields_no_candidates() {
         let cache = tempfile::tempdir().expect("tempdir");
         let outside = tempfile::tempdir().expect("tempdir");

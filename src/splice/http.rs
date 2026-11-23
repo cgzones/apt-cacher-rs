@@ -1549,59 +1549,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_upstream_response_no_content_length() {
-        let headers = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
-            .expect("should parse");
-        assert_eq!(resp.status_code, 200);
-        assert_eq!(resp.content_length(), None);
-        assert_eq!(resp.framing, BodyFraming::Chunked);
-    }
-
-    #[test]
-    fn parse_upstream_response_chunked_takes_precedence_over_content_length() {
-        // RFC 9112 §6.1: a Content-Length sent alongside chunked must be
-        // ignored. The parser resolves the precedence so no consumer can
-        // observe both at once.
-        let headers = b"HTTP/1.1 200 OK\r\n\
-                        Content-Length: 42\r\n\
-                        Transfer-Encoding: chunked\r\n\
-                        \r\n";
-        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
-            .expect("should parse");
-        assert_eq!(resp.framing, BodyFraming::Chunked);
-        assert_eq!(resp.content_length(), None);
-    }
-
-    #[test]
-    fn parse_upstream_response_close_delimited_without_framing_headers() {
-        let headers = b"HTTP/1.1 200 OK\r\n\r\n";
-        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
-            .expect("should parse");
-        assert_eq!(resp.framing, BodyFraming::CloseDelimited);
-        assert_eq!(resp.content_length(), None);
-    }
-
-    #[test]
-    fn parse_upstream_response_304_is_bodyless() {
-        // RFC 9112 §6.3: a 304 never carries a body even with Content-Length.
-        let headers = b"HTTP/1.1 304 Not Modified\r\nContent-Length: 500\r\n\r\n";
-        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
-            .expect("should parse");
-        assert_eq!(resp.framing, BodyFraming::ContentLength(0));
-        assert_eq!(resp.content_length(), Some(0));
-    }
-
-    #[test]
-    fn parse_upstream_response_204_is_bodyless() {
-        // RFC 9112 §6.3: a 204 never carries a body even with chunked framing.
-        let headers = b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n";
-        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
-            .expect("should parse");
-        assert_eq!(resp.framing, BodyFraming::ContentLength(0));
-    }
-
-    #[test]
     fn test_parse_upstream_response_keeps_raw_validators() {
         // The parser forwards validators verbatim; `discard_invalid_validators`
         // filters them once the driver knows the file they belong to.
@@ -1710,52 +1657,25 @@ mod tests {
         assert!(!resp.connection_close);
     }
 
-    /// Builds a minimal well-formed HTTP/1.1 response: a `200 OK` status line
-    /// followed by a single `X-Pad` header whose value is `pad_len` bytes of
-    /// `'a'` (an empty value when `pad_len == 0`).
-    fn make_padded_response(pad_len: usize) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"HTTP/1.1 200 OK\r\nX-Pad: ");
-        buf.extend(std::iter::repeat_n(b'a', pad_len));
-        buf.extend_from_slice(b"\r\n\r\n");
-        buf
-    }
-
-    /// `parse_upstream_response` accepts a response whose headers fit exactly
-    /// at `MAX_UPSTREAM_HEADER_SIZE` bytes without error.
-    #[test]
-    fn test_parse_upstream_response_at_max_header_size() {
-        // The read-loop enforces `> MAX_UPSTREAM_HEADER_SIZE`, so a response
-        // whose total header block is exactly MAX_UPSTREAM_HEADER_SIZE bytes
-        // must parse successfully.
-        let preamble = b"HTTP/1.1 200 OK\r\nX-Pad: \r\n\r\n";
-        let pad_len = MAX_UPSTREAM_HEADER_SIZE - preamble.len();
-        let buf = make_padded_response(pad_len);
-        assert_eq!(buf.len(), MAX_UPSTREAM_HEADER_SIZE);
-        let result = parse_upstream_response(&buf, buf.len(), PreciseInstant::now());
-        assert!(
-            result.is_ok(),
-            "expected Ok for response at exact cap, got Err"
-        );
-    }
-
     /// The byte cap is enforced by `read_upstream_response_headers`, not by
-    /// the parser: handed a head one byte over `MAX_UPSTREAM_HEADER_SIZE`,
-    /// `parse_upstream_response` still parses it.
+    /// the parser: a head of exactly `MAX_UPSTREAM_HEADER_SIZE` bytes and one
+    /// a byte over both parse.
     #[test]
     fn test_parse_upstream_response_is_not_size_capped() {
-        let preamble = b"HTTP/1.1 200 OK\r\nX-Pad: \r\n\r\n";
-        let pad_len = MAX_UPSTREAM_HEADER_SIZE - preamble.len() + 1;
-        let buf = make_padded_response(pad_len);
-        assert_eq!(buf.len(), MAX_UPSTREAM_HEADER_SIZE + 1);
-        let resp = parse_upstream_response(&buf, buf.len(), PreciseInstant::now())
-            .expect("the parser itself applies no size cap");
-        assert_eq!(resp.status_code, StatusCode::OK);
+        for size in [MAX_UPSTREAM_HEADER_SIZE, MAX_UPSTREAM_HEADER_SIZE + 1] {
+            let mut buf = b"HTTP/1.1 200 OK\r\nX-Pad: ".to_vec();
+            buf.resize(size - 4, b'a');
+            buf.extend_from_slice(b"\r\n\r\n");
+            let resp = parse_upstream_response(&buf, buf.len(), PreciseInstant::now())
+                .expect("the parser itself applies no size cap");
+            assert_eq!(resp.status_code, StatusCode::OK, "{size} bytes");
+        }
     }
 
-    /// Header-value edge cases the parser resolves itself: identical
+    /// The framing and connection fate the parser resolves itself: identical
     /// `Content-Length` duplicates (folded or on separate lines) collapse to
-    /// one value, a 1xx head is bodyless whatever it claims, a lone
+    /// one value, a 1xx, 204 or 304 head is bodyless whatever it claims (RFC
+    /// 9112 §6.3), no framing header at all is close-delimited, a lone
     /// `chunked` coding (empty list elements aside) wins over
     /// `Content-Length`, a `close` token anywhere in `Connection` -- on any
     /// of its lines -- closes, and an HTTP/1.0 response persists only with
@@ -1768,6 +1688,31 @@ mod tests {
             connection_close: bool,
         }
         let cases = [
+            Case {
+                head: b"HTTP/1.1 200 OK\r\n\r\n",
+                framing: BodyFraming::CloseDelimited,
+                connection_close: false,
+            },
+            Case {
+                head: b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+                framing: BodyFraming::Chunked,
+                connection_close: false,
+            },
+            Case {
+                head: b"HTTP/1.1 200 OK\r\nContent-Length: 42\r\nTransfer-Encoding: chunked\r\n\r\n",
+                framing: BodyFraming::Chunked,
+                connection_close: false,
+            },
+            Case {
+                head: b"HTTP/1.1 304 Not Modified\r\nContent-Length: 500\r\n\r\n",
+                framing: BodyFraming::ContentLength(0),
+                connection_close: false,
+            },
+            Case {
+                head: b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n",
+                framing: BodyFraming::ContentLength(0),
+                connection_close: false,
+            },
             Case {
                 head: b"HTTP/1.1 200 OK\r\nContent-Length: 100, 100\r\n\r\n",
                 framing: BodyFraming::ContentLength(100),
@@ -2002,60 +1947,30 @@ mod tests {
         );
     }
 
+    /// A whole frame in one buffer decodes to its payload, chunk extensions
+    /// ignored, and is consumed to its last byte: the closing CRLF must not
+    /// stay on the upstream socket of a connection returning to the pool.
     #[test]
-    fn test_chunk_decoder_consumes_closing_crlf() {
-        // Well-formed chunked body: one 5-byte chunk "hello", then terminator.
-        // The decoder must consume every byte (including the final \r\n) so
-        // the upstream socket buffer is left empty and the connection can be
-        // returned to the pool.
-        let input: &[u8] = b"5\r\nhello\r\n0\r\n\r\n";
-        let (body, consumed) = dechunk_once(input, 1024).expect("decode succeeds");
-        assert_eq!(body, b"hello");
-        assert_eq!(
-            consumed,
-            Consumed {
-                raw: input.len(),
-                framed: input.len() - 2,
-                done: true
-            },
-            "decoder must consume every byte of the chunked frame, including the closing CRLF",
-        );
-    }
-
-    #[test]
-    fn test_chunk_decoder_empty_body() {
-        // `0\r\n\r\n` -- a body that is purely the terminal chunk. Must
-        // consume all 5 bytes and produce an empty body.
-        let input: &[u8] = b"0\r\n\r\n";
-        let (body, consumed) = dechunk_once(input, 1024).expect("decode succeeds");
-        assert!(
-            body.is_empty(),
-            "empty chunked body should decode to no bytes"
-        );
-        assert_eq!(
-            consumed,
-            Consumed {
-                raw: 5,
-                framed: 3,
-                done: true
-            }
-        );
-    }
-
-    #[test]
-    fn test_chunk_decoder_multi_chunk() {
-        // Two data chunks then terminator.
-        let input: &[u8] = b"3\r\nfoo\r\n4\r\nbarz\r\n0\r\n\r\n";
-        let (body, consumed) = dechunk_once(input, 1024).expect("decode succeeds");
-        assert_eq!(body, b"foobarz");
-        assert_eq!(
-            consumed,
-            Consumed {
-                raw: input.len(),
-                framed: input.len() - 2,
-                done: true
-            }
-        );
+    fn test_chunk_decoder_decodes_whole_frames() {
+        for (input, payload) in [
+            (&b"5\r\nhello\r\n0\r\n\r\n"[..], &b"hello"[..]),
+            (b"0\r\n\r\n", b""),
+            (b"3\r\nfoo\r\n4\r\nbarz\r\n0\r\n\r\n", b"foobarz"),
+            (b"5;ext=foo\r\nhello\r\n0;final\r\n\r\n", b"hello"),
+        ] {
+            let (body, consumed) = dechunk_once(input, 1024).expect("decode succeeds");
+            assert_eq!(body, payload, "{:?}", input.escape_ascii().to_string());
+            assert_eq!(
+                consumed,
+                Consumed {
+                    raw: input.len(),
+                    framed: input.len() - 2,
+                    done: true
+                },
+                "{:?}",
+                input.escape_ascii().to_string()
+            );
+        }
     }
 
     #[test]
@@ -2160,23 +2075,6 @@ mod tests {
         }
         .ensure_no_trailing_bytes(3)
         .expect("unfinished frames are not checked for trailing bytes");
-    }
-
-    #[test]
-    fn test_chunk_decoder_chunk_extensions_ignored() {
-        // RFC 9112 allows chunk extensions after `;` on the chunk-size
-        // line; they must be parsed and ignored.
-        let input: &[u8] = b"5;ext=foo\r\nhello\r\n0;final\r\n\r\n";
-        let (body, consumed) = dechunk_once(input, 1024).expect("decode succeeds");
-        assert_eq!(body, b"hello");
-        assert_eq!(
-            consumed,
-            Consumed {
-                raw: input.len(),
-                framed: input.len() - 2,
-                done: true
-            }
-        );
     }
 
     /// The chunk-size line is RFC 9112 §7.1's `1*HEXDIG [ BWS ";" chunk-ext ]

@@ -232,6 +232,10 @@ mod tests {
         structured_mirror("deb.debian.org", "")
     }
 
+    fn key<'a>(mirror: &'a Mirror, debname: &'a str) -> CacheEntryKeyRef<'a> {
+        CacheEntryKeyRef::new(mirror, debname, CacheLayout::StructuredPool)
+    }
+
     fn throttle() -> VerifyThrottle {
         VerifyThrottle::new(std_secs(BASE_SECS), std_secs(CAP_SECS))
     }
@@ -241,11 +245,8 @@ mod tests {
         let t = throttle();
         let mirror = test_mirror();
         assert!(
-            t.check_at(
-                CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-                Instant::now()
-            )
-            .is_none()
+            t.check_at(key(&mirror, "foo.deb"), Instant::now())
+                .is_none()
         );
     }
 
@@ -256,30 +257,21 @@ mod tests {
         let t0 = Instant::now();
 
         let (window, failures) = t
-            .record_failure_at(
-                CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-                t0,
-            )
+            .record_failure_at(key(&mirror, "foo.deb"), t0)
             .expect("throttle enabled");
         assert_eq!(window, std_secs(BASE_SECS));
         assert_eq!(failures, 1);
 
         let throttled = t
             .check_at(
-                CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
+                key(&mirror, "foo.deb"),
                 t0 + Duration::from_secs(BASE_SECS / 2),
             )
             .expect("inside the window");
         assert_eq!(throttled.failures, 1);
         assert_eq!(throttled.remaining, std_secs(BASE_SECS / 2));
 
-        assert!(
-            t.check_at(
-                CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-                t0 + BASE
-            )
-            .is_none()
-        );
+        assert!(t.check_at(key(&mirror, "foo.deb"), t0 + BASE).is_none());
     }
 
     #[test]
@@ -307,10 +299,7 @@ mod tests {
 
         for (want_secs, want_failures) in EXPECTED {
             let (window, failures) = t
-                .record_failure_at(
-                    CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-                    now,
-                )
+                .record_failure_at(key(&mirror, "foo.deb"), now)
                 .expect("throttle enabled");
             assert_eq!(window, std_secs(want_secs), "failure #{want_failures}");
             assert_eq!(failures, want_failures);
@@ -318,26 +307,30 @@ mod tests {
         }
     }
 
+    /// The first window ends at `t0 + base`; the streak survives until
+    /// exactly `cap` after that (`now <= until + cap`).
     #[test]
-    fn streak_ttl_boundary_is_inclusive() {
-        let t = throttle();
-        let mirror = test_mirror();
-        let t0 = Instant::now();
+    fn a_failure_within_the_ttl_of_the_previous_window_continues_the_streak() {
+        for (delay, want_secs, want_failures) in [
+            (BASE + SECOND, 2 * BASE_SECS, 2),
+            (BASE + CAP, 2 * BASE_SECS, 2),
+            (BASE + CAP + SECOND, BASE_SECS, 1),
+        ] {
+            let t = throttle();
+            let mirror = test_mirror();
+            let t0 = Instant::now();
 
-        t.record_failure_at(
-            CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-            t0,
-        );
-        // The first window ends at t0 + base; the streak survives until
-        // exactly cap after that (`now <= until + cap`).
-        let (window, failures) = t
-            .record_failure_at(
-                CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-                t0 + BASE + CAP,
-            )
-            .expect("throttle enabled");
-        assert_eq!(window, std_secs(2 * BASE_SECS));
-        assert_eq!(failures, 2);
+            t.record_failure_at(key(&mirror, "foo.deb"), t0);
+            let (window, failures) = t
+                .record_failure_at(key(&mirror, "foo.deb"), t0 + delay)
+                .expect("throttle enabled");
+            assert_eq!(
+                (window, failures),
+                (std_secs(want_secs), want_failures),
+                "second failure {}s after the first",
+                delay.as_secs()
+            );
+        }
     }
 
     #[test]
@@ -346,76 +339,16 @@ mod tests {
         let mirror = test_mirror();
         let t0 = Instant::now();
 
-        t.record_failure_at(
-            CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-            t0,
-        );
-        t.record_failure_at(
-            CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-            t0 + SECOND,
-        );
-        t.record_success(CacheEntryKeyRef::new(
-            &mirror,
-            "foo.deb",
-            CacheLayout::StructuredPool,
-        ));
-        assert!(
-            t.check_at(
-                CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-                t0 + SECOND
-            )
-            .is_none()
-        );
+        t.record_failure_at(key(&mirror, "foo.deb"), t0);
+        t.record_failure_at(key(&mirror, "foo.deb"), t0 + SECOND);
+        t.record_success(key(&mirror, "foo.deb"));
+        assert!(t.check_at(key(&mirror, "foo.deb"), t0 + SECOND).is_none());
 
         let (window, failures) = t
-            .record_failure_at(
-                CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-                t0 + SECOND * 2,
-            )
+            .record_failure_at(key(&mirror, "foo.deb"), t0 + SECOND * 2)
             .expect("throttle enabled");
         assert_eq!(window, std_secs(BASE_SECS));
         assert_eq!(failures, 1);
-    }
-
-    #[test]
-    fn streak_resets_after_ttl() {
-        let t = throttle();
-        let mirror = test_mirror();
-        let t0 = Instant::now();
-
-        t.record_failure_at(
-            CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-            t0,
-        );
-        let (window, failures) = t
-            .record_failure_at(
-                CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-                t0 + BASE + CAP + SECOND,
-            )
-            .expect("throttle enabled");
-        assert_eq!(window, std_secs(BASE_SECS));
-        assert_eq!(failures, 1);
-    }
-
-    #[test]
-    fn streak_survives_window_expiry_within_ttl() {
-        let t = throttle();
-        let mirror = test_mirror();
-        let t0 = Instant::now();
-
-        t.record_failure_at(
-            CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-            t0,
-        );
-        // Window (base) expired, but the streak-reset TTL (cap) has not.
-        let (window, failures) = t
-            .record_failure_at(
-                CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-                t0 + BASE + SECOND,
-            )
-            .expect("throttle enabled");
-        assert_eq!(window, std_secs(2 * BASE_SECS));
-        assert_eq!(failures, 2);
     }
 
     #[test]
@@ -424,21 +357,9 @@ mod tests {
         let mirror = test_mirror();
         let now = Instant::now();
 
-        assert!(
-            t.record_failure_at(
-                CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-                now
-            )
-            .is_none()
-        );
+        assert!(t.record_failure_at(key(&mirror, "foo.deb"), now).is_none());
         assert!(t.map.read().is_empty());
-        assert!(
-            t.check_at(
-                CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-                now
-            )
-            .is_none()
-        );
+        assert!(t.check_at(key(&mirror, "foo.deb"), now).is_none());
     }
 
     #[test]
@@ -448,17 +369,11 @@ mod tests {
         let now = Instant::now();
 
         let (window, _) = t
-            .record_failure_at(
-                CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-                now,
-            )
+            .record_failure_at(key(&mirror, "foo.deb"), now)
             .expect("throttle enabled");
         assert_eq!(window, std_secs(BASE_SECS));
         let (window, _) = t
-            .record_failure_at(
-                CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-                now + SECOND,
-            )
+            .record_failure_at(key(&mirror, "foo.deb"), now + SECOND)
             .expect("throttle enabled");
         assert_eq!(
             window,
@@ -474,47 +389,25 @@ mod tests {
         let t0 = Instant::now();
 
         for i in 0..MAX_THROTTLE_ENTRIES {
-            t.record_failure_at(
-                CacheEntryKeyRef::new(&mirror, &format!("pkg{i}.deb"), CacheLayout::StructuredPool),
-                t0,
-            );
+            t.record_failure_at(key(&mirror, &format!("pkg{i}.deb")), t0);
         }
         assert_eq!(t.map.read().len(), MAX_THROTTLE_ENTRIES);
 
         // All existing streaks are past their reset TTL: the new insert
         // purges them instead of clearing.
         let later = t0 + BASE + CAP + SECOND;
-        t.record_failure_at(
-            CacheEntryKeyRef::new(&mirror, "fresh.deb", CacheLayout::StructuredPool),
-            later,
-        );
+        t.record_failure_at(key(&mirror, "fresh.deb"), later);
         assert_eq!(t.map.read().len(), 1);
 
         for i in 0..MAX_THROTTLE_ENTRIES - 1 {
-            t.record_failure_at(
-                CacheEntryKeyRef::new(
-                    &mirror,
-                    &format!("live{i}.deb"),
-                    CacheLayout::StructuredPool,
-                ),
-                later,
-            );
+            t.record_failure_at(key(&mirror, &format!("live{i}.deb")), later);
         }
         assert_eq!(t.map.read().len(), MAX_THROTTLE_ENTRIES);
 
         // All entries live: cap-and-clear, leaving only the new insert.
-        t.record_failure_at(
-            CacheEntryKeyRef::new(&mirror, "over.deb", CacheLayout::StructuredPool),
-            later,
-        );
+        t.record_failure_at(key(&mirror, "over.deb"), later);
         assert_eq!(t.map.read().len(), 1);
-        assert!(
-            t.check_at(
-                CacheEntryKeyRef::new(&mirror, "over.deb", CacheLayout::StructuredPool),
-                later
-            )
-            .is_some()
-        );
+        assert!(t.check_at(key(&mirror, "over.deb"), later).is_some());
     }
 
     #[test]
@@ -529,17 +422,8 @@ mod tests {
         );
         let now = Instant::now();
 
-        t.record_failure_at(
-            CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-            now,
-        );
-        assert!(
-            t.check_at(
-                CacheEntryKeyRef::new(&other_mirror, "foo.deb", CacheLayout::StructuredPool),
-                now
-            )
-            .is_none()
-        );
+        t.record_failure_at(key(&mirror, "foo.deb"), now);
+        assert!(t.check_at(key(&other_mirror, "foo.deb"), now).is_none());
         assert!(
             t.check_at(
                 CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::Flat),
@@ -547,13 +431,7 @@ mod tests {
             )
             .is_none()
         );
-        assert!(
-            t.check_at(
-                CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
-                now
-            )
-            .is_some()
-        );
+        assert!(t.check_at(key(&mirror, "foo.deb"), now).is_some());
     }
 
     #[test]
@@ -562,14 +440,8 @@ mod tests {
         let mirror = test_mirror();
         let t0 = Instant::now();
 
-        t.record_failure_at(
-            CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
-            t0,
-        );
-        t.record_failure_at(
-            CacheEntryKeyRef::new(&mirror, "b.deb", CacheLayout::StructuredPool),
-            t0,
-        );
+        t.record_failure_at(key(&mirror, "a.deb"), t0);
+        t.record_failure_at(key(&mirror, "b.deb"), t0);
         assert_eq!(t.active_len_at(t0 + SECOND), 2);
         assert_eq!(t.active_len_at(t0 + BASE), 0);
     }
