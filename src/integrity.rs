@@ -3402,9 +3402,11 @@ mod tests {
         let release = temp_file_with(
             b"Date: Sun, 20 Sep 2026 08:53:33 UTC\nValid-Until: Sun, 27 Sep 2026 08:53:33 UTC\nSHA256:\n",
         );
-        filetime::set_file_mtime(
+        std::fs::set_times(
             release.path(),
-            filetime::FileTime::from_unix_time(1_789_900_000, 0),
+            std::fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_789_900_000),
+            ),
         )
         .expect("set mtime");
         let seen = ingest_release_file(&reg, "h", "debian", release.path(), "debian/dists/sid")

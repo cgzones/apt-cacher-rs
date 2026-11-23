@@ -284,10 +284,9 @@ pub(super) struct TmpReap {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::{FileTimes, set_times};
     use std::path::Path;
     use std::time::{Duration, SystemTime};
-
-    use filetime::{FileTime, set_file_mtime};
 
     use crate::metrics;
 
@@ -304,7 +303,7 @@ mod tests {
     fn plant_file(tmp: &Path, name: &str, content: &[u8], now: SystemTime, age: Duration) {
         let path = tmp.join(name);
         std::fs::write(&path, content).expect("write tmp entry");
-        set_file_mtime(&path, FileTime::from_system_time(now - age)).expect("backdate mtime");
+        set_times(&path, FileTimes::new().set_modified(now - age)).expect("backdate mtime");
     }
 
     /// Create the directory `name` under `tmp` with its mtime backdated by
@@ -312,7 +311,7 @@ mod tests {
     fn plant_dir(tmp: &Path, name: &str, now: SystemTime, age: Duration) {
         let path = tmp.join(name);
         std::fs::create_dir(&path).expect("create stray dir");
-        set_file_mtime(&path, FileTime::from_system_time(now - age)).expect("backdate mtime");
+        set_times(&path, FileTimes::new().set_modified(now - age)).expect("backdate mtime");
     }
 
     /// A `tmp/` reached through a symlinked mirror directory is not reaped:
@@ -424,14 +423,17 @@ mod tests {
         );
         let walked = stat();
         // Written to since the walk: no longer stale.
-        set_file_mtime(&path, FileTime::from_system_time(now)).expect("touch");
+        set_times(&path, FileTimes::new().set_modified(now)).expect("touch");
         assert_eq!(reap_partial(&path, &walked, cutoffs), Reaped::Kept);
         assert!(path.exists());
 
         // Replaced by a new, equally aged file (the old inode held open so
         // its number is not reused).
-        set_file_mtime(&path, FileTime::from_system_time(now - PARTIAL_MAX_AGE * 2))
-            .expect("backdate mtime");
+        set_times(
+            &path,
+            FileTimes::new().set_modified(now - PARTIAL_MAX_AGE * 2),
+        )
+        .expect("backdate mtime");
         let walked = stat();
         let old = std::fs::File::open(&path).expect("open old");
         std::fs::remove_file(&path).expect("unlink old");
@@ -532,9 +534,9 @@ mod tests {
         // Contents do not shield an aged stray directory (adding the entry
         // bumps the directory's mtime, so backdate it again afterwards).
         std::fs::write(tmp.join("eight-days").join("inner"), b"x").expect("write inner");
-        set_file_mtime(
+        set_times(
             tmp.join("eight-days"),
-            FileTime::from_system_time(now - ONE_DAY * 8),
+            FileTimes::new().set_modified(now - ONE_DAY * 8),
         )
         .expect("backdate mtime");
 

@@ -441,9 +441,11 @@ mod tests {
             file.rewind().expect("rewind");
             file.write_all(&payload.map(|_| b'X')).expect("rewrite");
         }
-        filetime::set_file_mtime(
+        std::fs::set_times(
             &path,
-            filetime::FileTime::from_unix_time(stamped.mtime() + 60, 0),
+            std::fs::FileTimes::new().set_modified(
+                stamped.modified().expect("mtime") + std::time::Duration::from_secs(60),
+            ),
         )
         .expect("set mtime");
         let rewritten = std::fs::metadata(&path).expect("stat");
