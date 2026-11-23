@@ -1601,43 +1601,36 @@ impl Config {
             );
         }
 
-        {
-            for alias in &mut self.aliases {
-                alias.aliases.sort_unstable();
+        for alias in &mut self.aliases {
+            alias.aliases.sort_unstable();
+        }
+
+        for (pos, alias) in self.aliases.iter().enumerate() {
+            let lists = |group: &Alias, host: &CacheHost| {
+                group
+                    .aliases
+                    .binary_search_by_key(&host.as_str(), |a| a.as_str())
+                    .is_ok()
+            };
+
+            // A main listed as its own alias names one mirror row as both
+            // the alias row and its main: `Database::merge_alias_rows`
+            // would fold that row into itself and delete it, with its
+            // origins, on every start.
+            if lists(alias, &alias.main) {
+                invalid!("Alias {} lists itself as one of its aliases", alias.main);
             }
 
-            for (pos, alias) in self.aliases.iter().enumerate() {
-                // A main listed as its own alias names one mirror row as both
-                // the alias row and its main: `Database::merge_alias_rows`
-                // would fold that row into itself and delete it, with its
-                // origins, on every start.
-                if alias
-                    .aliases
-                    .binary_search_by_key(&alias.main.as_str(), |a| a.as_str())
-                    .is_ok()
-                {
-                    invalid!("Alias {} lists itself as one of its aliases", alias.main);
-                }
-
-                let remaining_aliases = &self.aliases.as_slice()[pos + 1..];
-
-                if let Some(falias) = remaining_aliases.iter().find(|ialias| {
-                    ialias.main == alias.main
-                        || ialias
-                            .aliases
-                            .binary_search_by_key(&alias.main.as_str(), |a| a.as_str())
-                            .is_ok()
-                        || alias
-                            .aliases
-                            .binary_search_by_key(&ialias.main.as_str(), |a| a.as_str())
-                            .is_ok()
-                        || ialias
-                            .aliases
-                            .iter()
-                            .any(|a| alias.aliases.binary_search(a).is_ok())
-                }) {
-                    invalid!("Alias {} conflicts with alias {}", alias.main, falias.main);
-                }
+            if let Some(falias) = self.aliases[pos + 1..].iter().find(|ialias| {
+                ialias.main == alias.main
+                    || lists(ialias, &alias.main)
+                    || lists(alias, &ialias.main)
+                    || ialias
+                        .aliases
+                        .iter()
+                        .any(|a| alias.aliases.binary_search(a).is_ok())
+            }) {
+                invalid!("Alias {} conflicts with alias {}", alias.main, falias.main);
             }
         }
 
@@ -1657,9 +1650,7 @@ impl Config {
                     ));
                 }
             }
-        }
 
-        if !self.allowed_mirrors.is_empty() {
             for alias in &self.aliases {
                 if !self.allowed_mirrors.iter().any(|a| a.permits(&alias.main)) {
                     warnings.push(format!(

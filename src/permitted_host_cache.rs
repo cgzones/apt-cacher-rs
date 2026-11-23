@@ -15,11 +15,6 @@ use crate::{
 };
 
 #[must_use]
-fn is_host_allowed(requested_host: &DomainName) -> bool {
-    host_allowed(global_config(), requested_host)
-}
-
-#[must_use]
 fn host_allowed(config: &Config, host: &DomainName) -> bool {
     config
         .allowed_mirrors
@@ -121,7 +116,7 @@ pub(crate) fn permitted_host(raw_host: &str) -> Result<ClientHost, HostReject> {
 
     // Every outcome is cached, rejections included.
     let result = match ClientHost::new(raw_host) {
-        Ok(c) if is_host_allowed(&c) => Ok(c),
+        Ok(c) if host_allowed(global_config(), &c) => Ok(c),
         Ok(_) => Err(HostReject::Forbidden),
         Err(err) => Err(HostReject::Unsupported(err)),
     };

@@ -149,12 +149,9 @@ mod sticky {
             self.0
         }
 
-        /// Returns the old value.
         #[inline]
-        pub(crate) const fn set(&mut self) -> bool {
-            let old = self.0;
+        pub(crate) const fn set(&mut self) {
             self.0 = true;
-            old
         }
     }
 }
@@ -251,13 +248,16 @@ struct ReopenableLogFile {
 }
 
 impl ReopenableLogFile {
-    fn new(path: &Path) -> std::io::Result<Self> {
-        let file = fs_open::nofollow_options()
+    fn open(path: &Path) -> std::io::Result<std::fs::File> {
+        fs_open::nofollow_options()
             .append(true)
             .create(true)
-            .open(path)?;
+            .open(path)
+    }
+
+    fn new(path: &Path) -> std::io::Result<Self> {
         Ok(Self {
-            file,
+            file: Self::open(path)?,
             control: Arc::new(LogReopen {
                 path: path.to_path_buf(),
                 requested: AtomicBool::new(false),
@@ -266,11 +266,7 @@ impl ReopenableLogFile {
     }
 
     fn reopen(&mut self) -> std::io::Result<()> {
-        let file = fs_open::nofollow_options()
-            .append(true)
-            .create(true)
-            .open(&self.control.path)?;
-        self.file = file;
+        self.file = Self::open(&self.control.path)?;
         Ok(())
     }
 }
@@ -683,10 +679,6 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
     );
 
     if is_run_as_root {
-        assert!(
-            args.permit_running_daemon_as_root,
-            "should not reach if not permitted"
-        );
         warn!("!! Running as root is not recommended !!");
     }
 

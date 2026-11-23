@@ -156,13 +156,6 @@ type DirStatsCache = parking_lot::Mutex<HashMap<PathBuf, SlotEntry>>;
 static DIR_STATS_CACHE: LazyLock<DirStatsCache> =
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
-async fn cached_footprint_stats(key: &Path, footprint: Footprint) -> DirStats {
-    cached_dir_stats(key, footprint, |footprint| async move {
-        walk_footprint(&footprint).await
-    })
-    .await
-}
-
 /// The footprint check keeps a fresh result from being summed with a stale
 /// one that still counts its files: a row that gains a nested mirror changes
 /// footprint, and so does one whose directory a refresh for an older mirror
@@ -173,8 +166,8 @@ fn fresh_dir_stats(cached: Option<&CachedStats>, footprint: &Footprint) -> Optio
         .map(|c| c.stats)
 }
 
-/// [`cached_footprint_stats`] with the walk passed in, so the single-flight
-/// refresh is testable without a mirror tree.
+/// The walk is passed in, so the single-flight refresh is testable without a
+/// mirror tree.
 ///
 /// A refresh runs as its own task holding the slot, so a dashboard load
 /// cancelled mid-walk (the browser went away) does not throw the walk away:
@@ -697,7 +690,11 @@ pub(super) async fn build_mirror_table(
         let chunk_stats = futures_util::future::join_all(
             keys.iter()
                 .zip(footprints.by_ref().take(keys.len()))
-                .map(|(key, footprint)| cached_footprint_stats(key, footprint)),
+                .map(|(key, footprint)| {
+                    cached_dir_stats(key, footprint, |footprint| async move {
+                        walk_footprint(&footprint).await
+                    })
+                }),
         )
         .await;
         dir_stats.extend(chunk_stats);

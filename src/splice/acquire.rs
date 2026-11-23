@@ -150,15 +150,6 @@ impl UpstreamExchange {
     }
 }
 
-fn cache_scheme(endpoint: UpstreamEndpoint<'_>, scheme: Scheme) {
-    if scheme_cache::record_success(endpoint.into(), scheme) {
-        debug!(
-            "splice proxy: cached {scheme} scheme for {}",
-            endpoint.format_authority()
-        );
-    }
-}
-
 /// Standard upstream connect→request→read-headers→parse pipeline.
 /// Tries a pooled connection first; falls back to a fresh connection on failure.
 ///
@@ -332,7 +323,12 @@ pub(super) async fn standard_upstream_connect(
     };
     let scheme = up.scheme();
     if let Some(decision) = decision {
-        cache_scheme(endpoint, scheme);
+        if scheme_cache::record_success(endpoint.into(), scheme) {
+            debug!(
+                "splice proxy: cached {scheme} scheme for {}",
+                endpoint.format_authority()
+            );
+        }
         if decision.is_upgrade_attempt() {
             match scheme {
                 Scheme::Https => metrics::HTTPS_UPGRADE_SUCCEEDED.increment(),

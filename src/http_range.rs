@@ -321,18 +321,6 @@ pub(crate) fn http_parse_range(
         }
     };
 
-    debug_assert!(start <= end, "start {start} must not exceed end {end}");
-    debug_assert!(
-        end < file_size,
-        "end {end} must be less than file_size {file_size}"
-    );
-
-    let content_length = end - start + 1;
-    debug_assert!(
-        start + content_length <= file_size,
-        "range {start}+{content_length} must not exceed file_size {file_size}"
-    );
-
     ParsedRange::Satisfiable(
         ContentRange::new(start, end, file_size).expect("resolved range is bounded"),
     )

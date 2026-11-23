@@ -616,21 +616,6 @@ impl RateTimestamps {
     }
 }
 
-/// The pre-upstream verify-throttle gate: declines the download and answers
-/// `503 Recently failed checksum verification` (`Ok(true)`) while the file's
-/// recent checksum failures keep it throttled ([`verify_throttle::refusal`]).
-async fn reject_if_verify_throttled(
-    ibarrier: &mut InitBarrier,
-    client: ClientConn<'_>,
-    conn_details: &ConnectionDetails,
-) -> Result<bool, SpliceProxyError> {
-    let Some(why) = verify_throttle::refusal(conn_details, "splice proxy: rejecting") else {
-        return Ok(false);
-    };
-    client.decline(ibarrier, why, "verify-throttle 503").await?;
-    Ok(true)
-}
-
 /// Check for a partial download file to resume (permanent files only).
 ///
 /// See [`partial_file::PartialDownload`] for the open-once and keep-on-drop
@@ -1260,7 +1245,12 @@ pub(crate) async fn splice_proxy(
         upstream_path,
     );
 
-    if reject_if_verify_throttled(&mut ibarrier, client, conn_details).await? {
+    // Before anything goes upstream: a file whose recent checksum failures
+    // keep it throttled is declined.
+    if let Some(why) = verify_throttle::refusal(conn_details, "splice proxy: rejecting") {
+        client
+            .decline(&mut ibarrier, why, "verify-throttle 503")
+            .await?;
         return Ok(SpliceProxyOutcome::Served);
     }
 

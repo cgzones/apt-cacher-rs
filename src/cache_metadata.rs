@@ -382,7 +382,12 @@ impl Inner {
     /// map does not hold.
     fn make_room(&mut self) {
         if self.map.len() >= CACHE_METADATA_MAX_ENTRIES {
-            log_metadata_cache_cleared();
+            // Logged because on a cache larger than the cap the clear
+            // repeats indefinitely, and the dashboard only ever shows the
+            // post-clear count, which looks idle.
+            warn_once_or_info!(
+                "Cache metadata store reached {CACHE_METADATA_MAX_ENTRIES} entries; clearing it (xattr reads resume until it refills)"
+            );
             self.map.clear();
             self.mirrors.clear();
         }
@@ -430,15 +435,6 @@ impl Inner {
 /// holds, so the table never doubles for a last eighth of entries and sits
 /// half empty at the cap.
 pub(crate) const CACHE_METADATA_MAX_ENTRIES: usize = 7 * (1 << 16) / 8;
-
-/// Logged because on a cache larger than the cap the clear repeats
-/// indefinitely, and the dashboard only ever shows the post-clear count,
-/// which looks idle.
-fn log_metadata_cache_cleared() {
-    warn_once_or_info!(
-        "Cache metadata store reached {CACHE_METADATA_MAX_ENTRIES} entries; clearing it (xattr reads resume until it refills)"
-    );
-}
 
 impl std::fmt::Debug for CacheMetadataStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

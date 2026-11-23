@@ -786,22 +786,6 @@ fn handle_connect(client: ClientInfo, target: &str) -> ZeroCopyResult {
     }
 }
 
-/// Answer a CONNECT whose upstream connect failed, then close.
-async fn write_tunnel_upstream_error(
-    conn: ClientConn<'_>,
-    client: ClientInfo,
-    rejection: ConnectReject,
-) {
-    if let Err(err) = conn
-        .write_invalid(rejection.status, rejection.msg, None)
-        .await
-    {
-        log_client_write_failure(client, "tunnel 502 response", &err);
-        return;
-    }
-    graceful_close(conn.stream).await;
-}
-
 /// Drive a policy-accepted CONNECT tunnel to completion, consuming the
 /// connection. The upstream is connected before `200 Connection Established`
 /// is sent, so an unreachable upstream gets a real `502 Bad Gateway`.
@@ -829,8 +813,12 @@ async fn run_connect_tunnel(
 
     let mut upstream = match connect_upstream(config, &client, &target).await {
         Ok(upstream) => upstream,
-        Err(rejection) => {
-            write_tunnel_upstream_error(conn, client, rejection).await;
+        Err(ConnectReject { status, msg }) => {
+            if let Err(err) = conn.write_invalid(status, msg, None).await {
+                log_client_write_failure(client, "tunnel 502 response", &err);
+            } else {
+                graceful_close(&stream).await;
+            }
             return;
         }
     };
@@ -1463,14 +1451,14 @@ async fn serve_planned(
     // and hyper's `REQUESTS_*` count it: a failed head write is a request
     // that started and did not complete.
     metrics::REQUESTS_SENDFILE.increment();
-    if let Err(err) = conn
-        .write_response_headers(
-            &params,
-            content_type_for_cached_file(&conn_details.debname),
-            cache_info,
-        )
-        .await
-    {
+    // `Follows`: `MSG_MORE` lets the kernel coalesce the head with the first
+    // sendfile(2) bytes.
+    let head = ResponseHead::cached(
+        (&params).into(),
+        content_type_for_cached_file(&conn_details.debname),
+        cache_info,
+    );
+    if let Err(err) = head.write_to(conn, WireBody::Follows).await {
         info_or_warn!(
             is_expected_client_end(&err),
             "Failed to write response headers to {who} {client}; closing the connection:  {}",
@@ -1497,43 +1485,22 @@ async fn serve_planned(
         }
     };
 
-    if finish_sendfile_serve(
-        conn_details,
-        role,
-        content_length,
-        partial,
-        start.elapsed(),
-        transfer_result,
-    )
-    .await
-    {
-        SendfileResult::Served(conn.action)
-    } else {
-        SendfileResult::Closed
-    }
-}
-
-/// Returns whether the body was fully delivered.
-async fn finish_sendfile_serve(
-    conn_details: &ConnectionDetails,
-    role: Role,
-    size: u64,
-    partial: bool,
-    elapsed: std::time::Duration,
-    transfer_result: TransferOutcome,
-) -> bool {
-    let complete = matches!(transfer_result.end, DeliveryEnd::Complete);
+    let TransferOutcome { transferred, end } = transfer_result;
+    let result = match end {
+        DeliveryEnd::Complete => SendfileResult::Served(conn.action),
+        DeliveryEnd::Aborted(_) => SendfileResult::Closed,
+    };
     let outcome = ServeOutcome {
-        size,
-        transferred: transfer_result.transferred,
+        size: content_length,
+        transferred,
         partial,
-        elapsed,
-        end: transfer_result.end,
+        elapsed: start.elapsed(),
+        end,
     };
     if let Some(cmd) = finish_cached_serve(conn_details, Mechanism::Sendfile, role, outcome) {
         send_db_command(DatabaseCommand::Transfer(cmd)).await;
     }
-    complete
+    result
 }
 
 /// The readiness primitive is shared, but its public adapters identify the
@@ -1802,10 +1769,8 @@ async fn sendfile_chunk_loop(
     amount: u64,
     rate_checker: &mut Option<RateChecker>,
 ) -> Result<(ChunkLoopOutcome, SendfileFds), DeliveryFailure> {
-    // Per-syscall cap to avoid exceeding system limits.  Always within
-    // usize range since it fits in 31 bits.
+    // Per-syscall cap to avoid exceeding system limits.
     const MAX_PER_SYSCALL: usize = 0x7fff_f000;
-    static_assert!(MAX_PER_SYSCALL < usize::MAX);
 
     fn credit(
         moved: usize,
@@ -2102,13 +2067,6 @@ pub(crate) async fn async_sendfile_unfinished(
     }
 }
 
-/// The stat reports actual cache state; the shared helper owns the EINTR
-/// retry and the anomaly counters. Every other failure ends only this
-/// delivery and retains its original error.
-fn growing_file_size(file: &tokio::fs::File, path: &Path) -> Result<u64, CacheError> {
-    regular_file_metadata_typed(file, path, "growing-file metadata").map(|md| md.len())
-}
-
 async fn sendfile_unfinished_transfer(
     socket: &TcpStream,
     file: &tokio::fs::File,
@@ -2147,7 +2105,8 @@ async fn sendfile_unfinished_transfer(
         // writer task keeps the inode hot, so there is no disk wait to shield
         // against. A failure ends only this delivery: a joiner cannot serve
         // bytes whose presence it cannot learn.
-        let file_size = growing_file_size(file, file_path)?;
+        let file_size =
+            regular_file_metadata_typed(file, file_path, "growing-file metadata")?.len();
 
         let available = file_size.saturating_sub(offset_u64);
 

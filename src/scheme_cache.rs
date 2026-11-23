@@ -11,7 +11,7 @@
 
 use std::fmt::Display;
 use std::num::NonZero;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use coarsetime::Instant;
 use hashbrown::{Equivalent, HashMap, hash_map::EntryRef};
@@ -88,13 +88,13 @@ impl<'a> From<&'a Mirror> for SchemeKeyRef<'a> {
 /// The authority's host keys the cache in the bare canonical text a
 /// `Mirror` host carries: an IPv6 literal loses the brackets its URI
 /// spelling needs (RFC 3986 §3.2.2) by slicing, so the lookup stays
-/// allocation-free. The authority must already be canonical (hyper's
-/// `request_with_retry` passes it through [`canonical_authority`] first), or
-/// the two backends would key one host under two spellings.
+/// allocation-free. The authority must already be canonical (hyper rewrites
+/// its upstream URI through `canonical_upstream_authority` first), or the
+/// two backends would key one host under two spellings.
 impl<'a> From<&'a Authority> for SchemeKeyRef<'a> {
     fn from(auth: &'a Authority) -> Self {
         debug_assert!(
-            canonical_authority(auth).is_none(),
+            canonicalize(auth, None).is_none(),
             "scheme-cache key from the non-canonical authority `{auth}`"
         );
         let host = auth.host();
@@ -111,24 +111,9 @@ impl<'a> From<&'a Authority> for SchemeKeyRef<'a> {
     }
 }
 
-/// The canonical spelling of `auth`, or `None` when it already is canonical
-/// (or its host or port is invalid, which the callers' own gates
-/// reject): a DNS name lowercased, an IPv6 literal in its RFC 5952 text
-/// (`[0:0::1]` and `[::1]` are one host), the port kept as its number
-/// (`:080` is `:80`).
-///
-/// Every host the proxy keys state on is the canonical [`DomainName`] text.
-/// A client URI or a redirect `Location` may spell the same host otherwise,
-/// and hyper's upstream request would then key the scheme cache, and match
-/// `http_only_mirrors`, under a name no `Mirror` carries.
-#[must_use]
-fn canonical_authority(auth: &Authority) -> Option<Authority> {
-    canonicalize(auth, None)
-}
-
 /// The canonical authority of the upstream `uri`, or `None` when it has none
-/// or it already is canonical: [`canonical_authority`], and for an `http` URI
-/// an explicit `:80` dropped too, as `request_dispatch::preflight_target`
+/// or it already is canonical: [`canonicalize`], where for an `http` URI
+/// an explicit `:80` is dropped too, as `request_dispatch::preflight_target`
 /// drops it from a proxied request. The default port names the same resource
 /// as none (RFC 3986 §6.2.3); kept, it would key the scheme cache apart from
 /// the port-less mirror and survive an HTTPS upgrade as TLS on port 80.
@@ -138,7 +123,17 @@ pub(crate) fn canonical_upstream_authority(uri: &http::Uri) -> Option<Authority>
     canonicalize(uri.authority()?, uri.scheme())
 }
 
-/// [`canonical_authority`], applying the URI scheme's default-port policy.
+/// The canonical spelling of `auth`, or `None` when it already is canonical
+/// (or its host or port is invalid, which the callers' own gates
+/// reject): a DNS name lowercased, an IPv6 literal in its RFC 5952 text
+/// (`[0:0::1]` and `[::1]` are one host), the port kept as its number
+/// (`:080` is `:80`), minus the default port of `scheme` when one is given.
+///
+/// Every host the proxy keys state on is the canonical [`DomainName`] text.
+/// A client URI or a redirect `Location` may spell the same host otherwise,
+/// and hyper's upstream request would then key the scheme cache, and match
+/// `http_only_mirrors`, under a name no `Mirror` carries.
+#[must_use]
 fn canonicalize(auth: &Authority, scheme: Option<&http::uri::Scheme>) -> Option<Authority> {
     let port = uri_authority::port(auth).ok()?;
     let normalized_port = uri_authority::normalize_http_port(port, scheme);
@@ -192,16 +187,13 @@ impl CachedScheme {
 }
 
 /// The scheme last known good for each upstream host.
-static SCHEME_CACHE: OnceLock<RwLock<HashMap<SchemeKey, CachedScheme>>> = OnceLock::new();
-
-fn cache() -> &'static RwLock<HashMap<SchemeKey, CachedScheme>> {
-    SCHEME_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
+static SCHEME_CACHE: LazyLock<RwLock<HashMap<SchemeKey, CachedScheme>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Hosts cached and the heap they take: the table and each key's host
 /// text.
 pub(crate) fn footprint() -> Footprint {
-    let map = cache().read();
+    let map = SCHEME_CACHE.read();
     let hosts: usize = map.keys().map(|key| key.host.capacity()).sum();
     Footprint {
         entries: map.len(),
@@ -211,7 +203,7 @@ pub(crate) fn footprint() -> Footprint {
 
 #[cfg(feature = "hyper")]
 pub(crate) fn debug_contents() -> String {
-    format!("{:?}", *cache().read())
+    format!("{:?}", *SCHEME_CACHE.read())
 }
 
 /// The scheme decision for one upstream request, richer than a bare `Scheme` so
@@ -268,7 +260,7 @@ fn decide(cached: Option<Scheme>, is_http_only: bool, mode: HttpsUpgradeMode) ->
 /// The scheme cached for `key` at `now`, if a live one. Taking the clock as
 /// a parameter keeps the TTL testable without sleeping.
 fn cached_scheme_at(key: SchemeKeyRef<'_>, now: Instant) -> Option<Scheme> {
-    cache()
+    SCHEME_CACHE
         .read()
         .get(&key)
         .and_then(|entry| entry.live_at(now))
@@ -336,7 +328,7 @@ fn live_entry(key: SchemeKeyRef<'_>) -> Option<LiveScheme> {
 }
 
 fn live_entry_at(key: SchemeKeyRef<'_>, now: Instant) -> Option<LiveScheme> {
-    let entry = *cache().read().get(&key)?;
+    let entry = *SCHEME_CACHE.read().get(&key)?;
     let scheme = entry.live_at(now)?;
     let expires_in = match scheme {
         Scheme::Https => None,
@@ -402,14 +394,11 @@ fn verdict(
     if is_http_only {
         return SchemeVerdict::HttpOnlyListed;
     }
-    if mode == HttpsUpgradeMode::Never {
-        return SchemeVerdict::HttpNever;
-    }
-    if !https_permitted {
-        return SchemeVerdict::HttpsPortRefused;
-    }
     match mode {
         HttpsUpgradeMode::Never => SchemeVerdict::HttpNever,
+        HttpsUpgradeMode::Always | HttpsUpgradeMode::Auto if !https_permitted => {
+            SchemeVerdict::HttpsPortRefused
+        }
         HttpsUpgradeMode::Always => SchemeVerdict::HttpsForced,
         HttpsUpgradeMode::Auto => match live {
             Some(LiveScheme {
@@ -462,7 +451,7 @@ fn record_success_at(key: SchemeKeyRef<'_>, scheme: Scheme, now: Instant) -> boo
         scheme,
         learned: now,
     };
-    match cache().write().entry_ref(&key) {
+    match SCHEME_CACHE.write().entry_ref(&key) {
         EntryRef::Occupied(mut occupied) => {
             // Re-checked under the write lock: a racing request may have
             // learned a scheme since the read above.
@@ -493,7 +482,7 @@ pub(crate) fn record_failure(key: SchemeKeyRef<'_>) -> Option<Scheme> {
 }
 
 fn record_failure_at(key: SchemeKeyRef<'_>, now: Instant) -> Option<Scheme> {
-    let removed = cache()
+    let removed = SCHEME_CACHE
         .write()
         .remove(&key)
         .and_then(|entry| entry.live_at(now));
@@ -550,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_authority_folds_every_spelling_of_a_host() {
+    fn canonicalize_folds_every_spelling_of_a_host() {
         for (raw, canonical) in [
             ("DEB.Debian.ORG", "deb.debian.org"),
             ("Deb.debian.org:8080", "deb.debian.org:8080"),
@@ -560,10 +549,10 @@ mod tests {
             ("[::ffff:192.0.2.1]:8080", "192.0.2.1:8080"),
         ] {
             let auth = Authority::try_from(raw).expect("valid authority");
-            let folded = canonical_authority(&auth).expect("non-canonical input");
+            let folded = canonicalize(&auth, None).expect("non-canonical input");
             assert_eq!(folded.as_str(), canonical, "{raw}");
             assert_eq!(
-                canonical_authority(&folded),
+                canonicalize(&folded, None),
                 None,
                 "{canonical} is a fixpoint"
             );
@@ -582,7 +571,7 @@ mod tests {
             "DEB.Debian.ORG:65536",
         ] {
             let auth = Authority::try_from(already).expect("valid authority");
-            assert_eq!(canonical_authority(&auth), None, "{already}");
+            assert_eq!(canonicalize(&auth, None), None, "{already}");
         }
     }
 

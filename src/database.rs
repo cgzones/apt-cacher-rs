@@ -872,9 +872,8 @@ impl Database {
         .fetch_all(&self.conn)
         .await?;
 
-        let capacity = usize::try_from(limit).unwrap_or(usize::MAX);
         let limit = i64::from(limit);
-        let mut by_count = Vec::with_capacity(rows.len().min(capacity));
+        let mut by_count = Vec::new();
         // (rank, entry) so the by-size ranking can be restored without
         // re-deriving it from the totals — the tie-break lives in SQL.
         let mut by_size: Vec<(i64, TopPackageEntry)> = Vec::new();
@@ -1401,13 +1400,6 @@ impl Database {
                             );
                         }
                         Some(main_row) => {
-                            // Folding a row into itself deletes it; the assert
-                            // above already rules this out.
-                            assert_ne!(
-                                main_row.id, alias_row.id,
-                                "mirror row {alias}/{} would be merged into itself",
-                                alias_row.path
-                            );
                             query!(
                                 r"INSERT INTO origins (mirror_id, distribution, component, architecture, first_seen, last_seen)
                                 SELECT ?, distribution, component, architecture, first_seen, last_seen

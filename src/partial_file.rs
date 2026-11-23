@@ -23,7 +23,6 @@ use std::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    Never,
     cache_metadata::{TargetFile, UpstreamMetadata},
     cache_paths::CachePaths,
     cache_quota::{CacheQuota, ReservedPartial, partial_len},
@@ -593,7 +592,8 @@ pub(crate) async fn tokio_tempfile(
             "buf is non-empty so adding a new extension must succeed"
         );
 
-        let _: Never = match nofollow_options()
+        // A retry's `set_extension` replaces the name that collided.
+        match nofollow_options()
             .create_new(true)
             .read(true)
             .write(true)
@@ -601,23 +601,11 @@ pub(crate) async fn tokio_tempfile(
             .open_async(&buf)
             .await
         {
-            Ok(file) => {
-                return Ok((file, TempPath::scratch(buf)));
-            }
-            Err(err) if err.kind() == tokio::io::ErrorKind::AlreadyExists => {
+            Ok(file) => return Ok((file, TempPath::scratch(buf))),
+            Err(err)
+                if err.kind() == tokio::io::ErrorKind::AlreadyExists && tries < MAX_RETRIES =>
+            {
                 tries += 1;
-                if tries > MAX_RETRIES {
-                    return Err(CacheError::counted_io(
-                        "create temporary cache file",
-                        &buf,
-                        err,
-                    ));
-                }
-                assert!(
-                    buf.set_extension(""),
-                    "buf is non-empty so removing an existing extension must succeed"
-                );
-                continue;
             }
             Err(err) => {
                 return Err(CacheError::counted_io(
@@ -626,7 +614,7 @@ pub(crate) async fn tokio_tempfile(
                     err,
                 ));
             }
-        };
+        }
     }
 }
 

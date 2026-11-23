@@ -101,6 +101,11 @@ pub(crate) struct ConnectReject {
     pub msg: &'static str,
 }
 
+const INVALID_ADDRESS: ConnectReject = ConnectReject {
+    status: StatusCode::BAD_REQUEST,
+    msg: "Invalid CONNECT address",
+};
+
 /// Admission owns both the optional per-IP slot and the unconditional count.
 /// Backends retain this permit through upgrade, dialing, and the whole relay.
 pub(crate) struct TunnelPermit {
@@ -213,10 +218,7 @@ fn validate_connect_target(
             "Oversized CONNECT authority from client {client} ({} bytes); rejecting the tunnel request with 400",
             auth.as_str().len()
         );
-        return Err(ConnectReject {
-            status: StatusCode::BAD_REQUEST,
-            msg: "Invalid CONNECT address",
-        });
+        return Err(INVALID_ADDRESS);
     }
 
     let Some((raw_host, port)) = uri
@@ -226,10 +228,7 @@ fn validate_connect_target(
         warn_once_or_info!(
             "Invalid CONNECT address `{uri}` from client {client}; rejecting the tunnel request with 400"
         );
-        return Err(ConnectReject {
-            status: StatusCode::BAD_REQUEST,
-            msg: "Invalid CONNECT address",
-        });
+        return Err(INVALID_ADDRESS);
     };
     // The same parser as a proxied request's host: an IPv6 target is
     // bracketed in the authority, and matches the list entry it names in
@@ -240,10 +239,7 @@ fn validate_connect_target(
             warn_once_or_info!(
                 "Invalid CONNECT address `{uri}` from client {client} ({err}); rejecting the tunnel request with 400"
             );
-            return Err(ConnectReject {
-                status: StatusCode::BAD_REQUEST,
-                msg: "Invalid CONNECT address",
-            });
+            return Err(INVALID_ADDRESS);
         }
     };
 

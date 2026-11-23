@@ -156,15 +156,14 @@ async fn send_upstream_request(
     upstream: &mut UpstreamConn,
     request: UpstreamRequest<'_>,
 ) -> std::io::Result<()> {
-    async fn write_and_flush(upstream: &mut UpstreamConn, data: &[u8]) -> std::io::Result<()> {
-        upstream.write_all(data).await?;
-        upstream.flush().await
-    }
-
     let request = format_http_request(request);
+    let write_and_flush = async {
+        upstream.write_all(request.as_bytes()).await?;
+        upstream.flush().await
+    };
 
     let http_timeout = global_config().http_timeout;
-    match tokio::time::timeout(http_timeout, write_and_flush(upstream, request.as_bytes())).await {
+    match tokio::time::timeout(http_timeout, write_and_flush).await {
         Ok(result) => result,
         Err(_timeout @ tokio::time::error::Elapsed { .. }) => Err(std::io::Error::new(
             ErrorKind::TimedOut,
@@ -905,10 +904,6 @@ impl ChunkDecoder {
         data: &[u8],
         mut on_payload: impl FnMut(Range<usize>),
     ) -> Result<Consumed, ChunkDecodeError> {
-        fn framing_violation(msg: &'static str) -> ChunkDecodeError {
-            ChunkDecodeError::Framing(msg)
-        }
-
         let mut i = 0usize;
         let mut trailer_start = None;
         while i < data.len() {
@@ -923,11 +918,12 @@ impl ChunkDecoder {
                         // (RFC 9112 §2.2 lets it) would read what follows
                         // as chunk data, a different boundary than ours.
                         let Some(line) = self.size_buf.strip_suffix(b"\r\n") else {
-                            return Err(framing_violation(
+                            return Err(ChunkDecodeError::Framing(
                                 "chunked encoding: bare LF in chunk-size line",
                             ));
                         };
-                        let chunk_size = parse_chunk_size_line(line).map_err(framing_violation)?;
+                        let chunk_size =
+                            parse_chunk_size_line(line).map_err(ChunkDecodeError::Framing)?;
                         self.size_buf.clear();
                         if chunk_size == 0 {
                             self.state = ChunkedState::Trailers;
@@ -944,7 +940,7 @@ impl ChunkDecoder {
                             };
                         }
                     } else if self.size_buf.len() > 64 {
-                        return Err(framing_violation(
+                        return Err(ChunkDecodeError::Framing(
                             "chunked encoding: chunk-size line too long",
                         ));
                     }
@@ -966,7 +962,7 @@ impl ChunkDecoder {
                     } else if *seen_cr && b == b'\n' {
                         self.state = ChunkedState::ReadingSize;
                     } else {
-                        return Err(framing_violation(
+                        return Err(ChunkDecodeError::Framing(
                             "chunked encoding: expected CRLF after chunk data",
                         ));
                     }
@@ -977,13 +973,15 @@ impl ChunkDecoder {
                     i += 1;
                     self.size_buf.push(byte);
                     if self.size_buf.len() > MAX_UPSTREAM_HEADER_SIZE {
-                        return Err(framing_violation(
+                        return Err(ChunkDecodeError::Framing(
                             "chunked encoding: trailer section too large",
                         ));
                     }
                     if byte == b'\n' {
                         if !self.size_buf.ends_with(b"\r\n") {
-                            return Err(framing_violation("chunked encoding: bare LF in trailers"));
+                            return Err(ChunkDecodeError::Framing(
+                                "chunked encoding: bare LF in trailers",
+                            ));
                         }
                         let mut headers = [httparse::EMPTY_HEADER; MAX_UPSTREAM_HEADERS];
                         match httparse::parse_headers(&self.size_buf, &mut headers) {
@@ -993,7 +991,7 @@ impl ChunkDecoder {
                             }
                             Ok(httparse::Status::Partial) => {}
                             Err(_) => {
-                                return Err(framing_violation(
+                                return Err(ChunkDecodeError::Framing(
                                     "chunked encoding: invalid trailers",
                                 ));
                             }

@@ -454,7 +454,7 @@ pub(crate) enum ResourceFile<'a> {
         /// part of the cache identity - it exists so
         /// [`crate::cache_layout::classify_request`] can mint the `Origin`
         /// row a literal `Packages*` request would.
-        scope: Option<ByHashScope<'a>>,
+        scope: Option<DistsScope<'a>>,
     },
     Icon {
         mirror_path: &'a str,
@@ -531,64 +531,40 @@ fn needs_normalization(path: &str) -> bool {
     path.split('/').any(|seg| seg == ".")
 }
 
-/// The `<dist>/<component>/<architecture>` scope a `by-hash` object sits
-/// under.  The architecture slot is the raw URL segment (`binary-amd64`, or
-/// a pseudo-arch such as `dep11`), as in the `Packages` variant.
+/// The `<dist>/<component>/<architecture>` scope an index file or a
+/// `by-hash` object sits under.  The architecture slot is the raw URL segment
+/// (`binary-amd64`, or a pseudo-arch such as `dep11`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ByHashScope<'a> {
+pub(crate) struct DistsScope<'a> {
     pub(crate) distribution: &'a str,
     pub(crate) component: &'a str,
     pub(crate) architecture: &'a str,
 }
 
-/// The `<dist>/<component>` pair a scoped `dists/` index sits under.  Named
-/// fields rather than a tuple: both segments are `&str`, so a swapped pair
-/// would parse every URL into a silently mislabelled cache entry.
-#[derive(Copy, Clone, Debug)]
-struct ScopedIndexPath<'a> {
-    distribution: &'a str,
-    component: &'a str,
-}
-
-/// Shared tail parse for the `dists/<dist>/<component>/<scope>/<file>` index
-/// families that differ only by their fixed scope segment (`source` for
-/// `Sources`, `i18n` for `Translation`, `dep11` for `Icon`).  `parts` is the
-/// `rsplit('/')` iterator positioned just after the filename; on success it has
-/// consumed the scope, component, and distribution segments and confirmed
-/// nothing precedes them.
-fn scoped_component_dist<'a>(
-    parts: &mut impl Iterator<Item = &'a str>,
-    scope: &str,
-) -> Option<ScopedIndexPath<'a>> {
-    if parts.next()? != scope {
-        return None;
-    }
-    let component = parts.next()?;
-    let distribution = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(ScopedIndexPath {
-        distribution,
-        component,
-    })
-}
-
-/// The `<dist>/<component>/<architecture>` scope of a `by-hash` path, if it
-/// has exactly that shape.  `parts` is the `rsplit('/')` iterator just past
-/// the `by-hash` segment, so the segments arrive innermost-first.
-fn byhash_scope<'a>(parts: &mut impl Iterator<Item = &'a str>) -> Option<ByHashScope<'a>> {
+/// The `<dist>/<component>/<slot>` run of a `dists/` path, if it has exactly
+/// that shape.  `parts` is the `rsplit('/')` iterator just past the segments
+/// to its right, so the segments arrive innermost-first.
+fn dists_scope<'a>(parts: &mut impl Iterator<Item = &'a str>) -> Option<DistsScope<'a>> {
     let architecture = parts.next()?;
     let component = parts.next()?;
     let distribution = parts.next()?;
     if parts.next().is_some() {
         return None;
     }
-    Some(ByHashScope {
+    Some(DistsScope {
         distribution,
         component,
         architecture,
     })
+}
+
+/// [`dists_scope`] for the index families that live under one fixed `slot`
+/// (`source` for `Sources`, `i18n` for `Translation`, `dep11` for `Icon`).
+fn dists_scope_in<'a>(
+    parts: &mut impl Iterator<Item = &'a str>,
+    slot: &str,
+) -> Option<DistsScope<'a>> {
+    dists_scope(parts).filter(|scope| scope.architecture == slot)
 }
 
 /// Parses a request path into the mirror path and the filename.
@@ -668,14 +644,11 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 }
             }
         } else if is_packages_filename(filename) {
-            let architecture = parts.next()?;
-            let component = parts.next()?;
-            let distribution = parts.next()?;
-
-            if parts.next().is_some() {
-                return None;
-            }
-
+            let DistsScope {
+                distribution,
+                component,
+                architecture,
+            } = dists_scope(&mut parts)?;
             return Some(ResourceFile::Packages {
                 mirror_path,
                 distribution,
@@ -684,10 +657,11 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 filename,
             });
         } else if is_sources_filename(filename) {
-            let ScopedIndexPath {
+            let DistsScope {
                 distribution,
                 component,
-            } = scoped_component_dist(&mut parts, "source")?;
+                architecture: _,
+            } = dists_scope_in(&mut parts, "source")?;
             return Some(ResourceFile::Sources {
                 mirror_path,
                 distribution,
@@ -695,10 +669,11 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 filename,
             });
         } else if is_translation_filename(filename) {
-            let ScopedIndexPath {
+            let DistsScope {
                 distribution,
                 component,
-            } = scoped_component_dist(&mut parts, "i18n")?;
+                architecture: _,
+            } = dists_scope_in(&mut parts, "i18n")?;
             return Some(ResourceFile::Translation {
                 mirror_path,
                 distribution,
@@ -706,10 +681,11 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 filename,
             });
         } else if filename.starts_with("icons-") {
-            let ScopedIndexPath {
+            let DistsScope {
                 distribution,
                 component,
-            } = scoped_component_dist(&mut parts, "dep11")?;
+                architecture: _,
+            } = dists_scope_in(&mut parts, "dep11")?;
             return Some(ResourceFile::Icon {
                 mirror_path,
                 distribution,
@@ -731,7 +707,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
             // an `Origin` is made of.  Any other depth yields no scope
             // rather than rejecting the request: the object is still
             // cacheable by its digest.
-            let scope = byhash_scope(&mut dirs.rsplit('/'));
+            let scope = dists_scope(&mut dirs.rsplit('/'));
 
             return Some(ResourceFile::ByHash {
                 mirror_path,
@@ -1341,7 +1317,7 @@ mod tests {
                 dirs: "sid/main/binary-amd64",
                 algorithm: HashAlgo::Sha256,
                 filename: SHA256,
-                scope: Some(ByHashScope {
+                scope: Some(DistsScope {
                     distribution: "sid",
                     component: "main",
                     architecture: "binary-amd64"
@@ -1639,7 +1615,7 @@ mod tests {
                 filename: "cf31e359ca5863e438c1b2d3ddaa1d473519ad26bd71e3dac7803dade82e4482",
                 // A pseudo-arch still yields a scope; the "no origin"
                 // rule is `is_binary_arch`, applied by `classify_request`.
-                scope: Some(ByHashScope {
+                scope: Some(DistsScope {
                     distribution: "sid",
                     component: "main",
                     architecture: "dep11"

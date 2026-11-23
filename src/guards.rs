@@ -532,7 +532,7 @@ impl DownloadBarrier {
     /// Retain the registry entry through salvage and every blocking write.
     /// The lease carries no progress sender, so failed readers wake promptly.
     pub(crate) fn write_lease(&self) -> Arc<DownloadWriteLease> {
-        Arc::clone(&self.data.as_ref().expect("live download barrier").lease)
+        Arc::clone(&self.data().lease)
     }
 
     pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {

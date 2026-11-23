@@ -172,7 +172,6 @@ async fn reduce_against(
     candidates: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
 ) -> Result<ReduceOutcome, ReduceError> {
-    let tree_root = ctx.tree_root();
     let &MirrorCtx {
         mirror: _,
         appstate,
@@ -195,7 +194,7 @@ async fn reduce_against(
     };
 
     let mut reduce_ctx = ReduceContext {
-        root: tree_root,
+        root: &ctx.unit.tree.root,
         mirror: plan.owner_mirror,
         layout: plan.cache_layout,
         tally,
@@ -331,15 +330,6 @@ async fn read_self_origins(appstate: &AppState, mirror: &Mirror) -> Option<Vec<O
 struct ReconcileCtx<'a> {
     mirror_ctx: &'a MirrorCtx<'a>,
     unit: &'a ReconcileUnit,
-}
-
-impl ReconcileCtx<'_> {
-    /// The unit's tree root, which candidate keys are relative to. Named
-    /// apart from the archive-root / flat-root *segments* the resolvers call
-    /// `root`.
-    fn tree_root(&self) -> &Path {
-        &self.unit.tree.root
-    }
 }
 
 /// Signal from a source-group resolver back to `run_reconcile_unit`.
@@ -607,12 +597,8 @@ async fn run_reconcile_unit(
 
     let mut tally = UnitStats {
         scanned: cached_files.len() as u64,
-        removed: 0,
-        bytes_removed: 0,
-        removed_unreferenced: 0,
-        tmp_bytes_removed: 0,
-        bailed: 0,
         io_failures,
+        ..UnitStats::default()
     };
 
     // Nothing to reconcile, so no index source runs. From here on the map
@@ -674,14 +660,25 @@ async fn run_reconcile_unit(
             swept.removed,
             HumanFmt::Size(swept.bytes_removed)
         ),
-        SweepReason::Grace => match owning_root {
-            Some(archive_root) => info!(
-                "Strict-reconciled flat-pool mirror {mirror} against archive root `{archive_root}`: removed {} unreferenced deb files ({})",
-                swept.removed,
-                HumanFmt::Size(swept.bytes_removed)
-            ),
-            None => log_reconcile_removed(unit.facet, mirror, &swept),
-        },
+        SweepReason::Grace => {
+            if let Some(archive_root) = owning_root {
+                info!(
+                    "Strict-reconciled flat-pool mirror {mirror} against archive root `{archive_root}`: removed {} unreferenced deb files ({})",
+                    swept.removed,
+                    HumanFmt::Size(swept.bytes_removed)
+                );
+            } else {
+                let flat = match unit.facet {
+                    ReconcileFacet::StructuredPool => "",
+                    ReconcileFacet::FlatTree => "flat ",
+                };
+                info!(
+                    "Removed {} unreferenced {flat}deb files for mirror {mirror} ({})",
+                    swept.removed,
+                    HumanFmt::Size(swept.bytes_removed)
+                );
+            }
+        }
     }
     tally.accumulate(swept);
 
@@ -1033,21 +1030,6 @@ async fn resolve_origin_packages_self(
     }
 
     GroupResolution::Ran(GroupOutcome::Complete)
-}
-
-fn log_reconcile_removed(facet: ReconcileFacet, mirror: &Mirror, swept: &UnitStats) {
-    match facet {
-        ReconcileFacet::StructuredPool => info!(
-            "Removed {} unreferenced deb files for mirror {mirror} ({})",
-            swept.removed,
-            HumanFmt::Size(swept.bytes_removed)
-        ),
-        ReconcileFacet::FlatTree => info!(
-            "Removed {} unreferenced flat deb files for mirror {mirror} ({})",
-            swept.removed,
-            HumanFmt::Size(swept.bytes_removed)
-        ),
-    }
 }
 
 #[cfg(test)]

@@ -44,10 +44,6 @@ pub(crate) fn record_uncacheable(host: &ClientHost, port: Option<NonZero<u16>>, 
         .position(|entry| entry.host == *host && entry.port == port && entry.path == path)
     {
         let entry = uncacheables.remove(idx).expect("entry exists");
-        debug_assert_eq!(entry.host, *host, "host was used as lookup key");
-        debug_assert_eq!(entry.port, port, "port was used as lookup key");
-        debug_assert_eq!(entry.path, path, "path was used as lookup key");
-
         uncacheables.push(entry);
     } else {
         uncacheables.push(Uncacheable {

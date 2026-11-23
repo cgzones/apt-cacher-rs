@@ -305,12 +305,6 @@ pub(crate) async fn request_with_retry(
     // either way.)
     static_assert!(upstream_retry::MAX_ATTEMPTS > HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS);
 
-    debug_assert_eq!(
-        request.body().size_hint().exact(),
-        Some(0),
-        "Invariant of Empty"
-    );
-
     let (mut parts, _body) = request.into_parts();
 
     // Key the scheme cache, and the `http_only_mirrors` match
@@ -1080,10 +1074,6 @@ async fn serve_cached_file(
 
     let start = params.content_start();
     let content_length = params.content_length();
-    debug_assert!(
-        start + content_length <= file_size,
-        "range {start}+{content_length} must not exceed file size {file_size}"
-    );
 
     let config = global_config();
 

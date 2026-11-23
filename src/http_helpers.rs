@@ -4,9 +4,7 @@ use http::{HeaderName, StatusCode};
 use tokio::net::TcpStream;
 
 use crate::{
-    Never,
-    cache_conditional::{CacheInfo, ServeParams},
-    global_config,
+    Never, global_config,
     humanfmt::HumanFmt,
     metrics,
     response_head::{ResponseHead, WireBody, retry_after_secs},
@@ -184,20 +182,6 @@ impl<'a> ClientConn<'a> {
         let head =
             ResponseHead::error_body(status, msg.len() as u64, retry_after.map(retry_after_secs));
         head.write_to(self, WireBody::Inline(msg)).await
-    }
-
-    /// Write the head of a cache-hit file response whose body follows via
-    /// `sendfile(2)`. Uses `send(MSG_MORE)` so the kernel coalesces the head
-    /// with the first body bytes.
-    pub(crate) async fn write_response_headers(
-        self,
-        params: &ServeParams,
-        content_type: &'static str,
-        cache_info: &CacheInfo,
-    ) -> std::io::Result<()> {
-        ResponseHead::cached(params.into(), content_type, cache_info)
-            .write_to(self, WireBody::Follows)
-            .await
     }
 }
 

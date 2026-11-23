@@ -65,7 +65,7 @@ use crate::{
     config::ClientHost,
     database_task::{DatabaseCommand, send_db_command_nonblocking},
     deb_mirror::{
-        ByHashScope, FlatKind, Mirror, MirrorKind, Origin, OriginFields, OriginSighting,
+        DistsScope, FlatKind, Mirror, MirrorKind, Origin, OriginFields, OriginSighting,
         ResourceFile, is_binary_arch, is_deb_package, is_flat_deb_filename, is_packages_directory,
         valid_directory, valid_filename, valid_mirrorname, valid_path_segment,
     },
@@ -869,7 +869,7 @@ pub(crate) fn classify_request<'a>(
             // validated here because it reaches the upstream, the database
             // and cleanup's index-fetch URLs.  A run of any other depth
             // reaches only the upstream, and is validated just the same.
-            let (origin_fields, content) = if let Some(ByHashScope {
+            let (origin_fields, content) = if let Some(DistsScope {
                 distribution,
                 component,
                 architecture,
