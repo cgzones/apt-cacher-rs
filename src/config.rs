@@ -37,6 +37,7 @@ use std::{
 use hashbrown::HashSet;
 use http::StatusCode;
 use ipnet::IpNet;
+use ref_cast::{RefCastCustom, ref_cast_custom};
 use serde::{Deserialize, Deserializer};
 use tracing::level_filters::LevelFilter;
 
@@ -516,11 +517,10 @@ impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for DomainName {
 // raw one (and vice versa) — the invariant used to rest on careful variable
 // naming alone.
 //
-// `#[repr(transparent)]` on both wrappers guarantees they share the
-// layout of the inner [`DomainName`].  [`ClientHost::as_cache_host`]
-// relies on this to return a zero-alloc `&CacheHost` borrow via a
-// reference cast (the only `unsafe` block introduced by these
-// newtypes).
+// [`ClientHost::as_cache_host`] returns a zero-alloc `&CacheHost` borrow
+// through `ref-cast`, which checks the `#[repr(transparent)]` layout
+// itself; the private `CacheHost::from_domain_ref` keeps that cast inside
+// this module.
 
 /// Host name as supplied by the client on the wire (post-validation).
 ///
@@ -528,7 +528,6 @@ impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for DomainName {
 /// `mirrors_v2.host` column; threaded into the upstream-connection path
 /// (TCP connect, TLS SNI, outgoing `Host:` header).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, sqlx::Type)]
-#[repr(transparent)]
 #[sqlx(transparent)]
 pub(crate) struct ClientHost(DomainName);
 
@@ -539,7 +538,7 @@ pub(crate) struct ClientHost(DomainName);
 /// client host.  Used by [`crate::cache_layout::ConnectionDetails`] for
 /// path construction and by [`crate::flat_blocklist`] as the collision
 /// key.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, RefCastCustom)]
 #[repr(transparent)]
 pub(crate) struct CacheHost(DomainName);
 
@@ -573,33 +572,14 @@ impl ClientHost {
     /// the borrow would mislabel a non-canonical name as canonical.
     #[must_use]
     pub(crate) fn as_cache_host(&self) -> &CacheHost {
-        // Tripwire for a future edit that adds a second field to either
-        // wrapper or swaps the inner type for one with different
-        // align/size.  The soundness of the cast below rests on
-        // `#[repr(transparent)]` being present on both wrappers; that
-        // attribute is not directly checkable in `const`, but layout
-        // equivalence implies these two equalities.
-        const _: () = assert!(
-            size_of::<ClientHost>() == size_of::<CacheHost>()
-                && align_of::<ClientHost>() == align_of::<CacheHost>(),
-            "ClientHost and CacheHost must share layout - one of them lost its #[repr(transparent)] or gained a second field",
-        );
-        // The assert above only relates the two wrappers to each other:
-        // if both grew the same extra field they would still match.
-        // `transmute` type-checks only between equal-sized types, so
-        // anchoring each wrapper to `DomainName` catches that.
-        const _: fn() = || {
-            let _ = std::mem::transmute::<ClientHost, DomainName>;
-            let _ = std::mem::transmute::<CacheHost, DomainName>;
-        };
-        // SAFETY: both wrappers are `#[repr(transparent)]` over
-        // `DomainName`, so `&ClientHost` and `&CacheHost` share an
-        // identical in-memory layout.
-        unsafe { &*std::ptr::from_ref(self).cast::<CacheHost>() }
+        CacheHost::from_domain_ref(&self.0)
     }
 }
 
 impl CacheHost {
+    #[ref_cast_custom]
+    fn from_domain_ref(domain: &DomainName) -> &Self;
+
     /// The same name as a wire-side [`ClientHost`]: the identity a
     /// canonical `Mirror` carries after alias resolution.
     #[must_use]
@@ -2871,8 +2851,8 @@ mod test {
 
     #[test]
     fn client_host_as_cache_host_zero_alloc_view() {
-        // Both wrappers are `#[repr(transparent)]` around `DomainName`,
-        // so `as_cache_host` returns a borrow with identical bytes.
+        // `as_cache_host` reborrows the client's own `DomainName`, so the
+        // view shares its bytes.
         let client = clh("example.test");
         let cache_view = client.as_cache_host();
         assert_eq!(client.as_str(), cache_view.as_str());

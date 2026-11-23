@@ -70,6 +70,7 @@ openssl = { version = "0.10", optional = true }
 parking_lot = "0.13"
 pin-project = { version = "1.1.11", optional = true }
 percent-encoding = "2.3.2"
+ref-cast = "1.0.27"
 rustls = { version = "0.23", optional = true }
 rustls-native-certs = { version = "0.8.4", optional = true }
 tokio-native-tls = { version = "0.3", optional = true }
