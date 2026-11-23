@@ -354,9 +354,8 @@ pub(crate) fn check_packages_file_size(
 /// `compressed_size` bytes: the smaller of [`MAX_DECOMPRESSED_PACKAGES_SIZE`]
 /// and the size multiplied by [`MAX_DECOMPRESSION_RATIO`].
 ///
-/// `None` — an empty file, or a size the caller could not stat — yields the
-/// absolute cap: with no compressed size to anchor it, the ratio bound has
-/// nothing to say.
+/// `None` — an empty file — yields the absolute cap: with no compressed
+/// size to anchor it, the ratio bound has nothing to say.
 #[must_use]
 pub(crate) fn decompressed_limit(compressed_size: Option<NonZero<u64>>) -> NonZero<u64> {
     match compressed_size {
@@ -426,9 +425,9 @@ impl AsyncRead for InputReader {
 /// `limit` bounds the *decompressed* byte count (see [`decompressed_limit`]), so
 /// that [`LimitedReader`] sits above the decoder. A second one below the
 /// decoder holds a `.gz`/`.xz` input to [`packages_file_cap`] as it is read:
-/// the callers check the size they stat first, but integrity ingest decodes
-/// on when the stat fails, and a decoder does work per input byte that
-/// yields no output (xz's empty blocks), which no output cap sees. The gzip layer
+/// the callers check the size they stat first, and this layer holds the bytes
+/// actually read to the same bound, since a decoder does work per input byte
+/// that yields no output (xz's empty blocks), which no output cap sees. The gzip layer
 /// is fed from its own [`BufReader`](tokio::io::BufReader) because it benefits
 /// from amortising reads of its compressed input; raw bytes need no such inner
 /// buffer, and the xz decoder reads the input on its own blocking thread, in

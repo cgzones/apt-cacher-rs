@@ -34,8 +34,7 @@ use crate::partial_file;
 use crate::precise_instant::PreciseInstant;
 use crate::tcp_cork_guard::CorkGuard;
 use crate::transfer_error::{DeliveryFailure, EndsDelivery, ReportedDelivery};
-use crate::upstream_head::BodyFraming;
-use crate::{client_counter, limits::VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, metrics, warn_once};
+use crate::{client_counter, limits::VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, metrics};
 
 use super::commit::{CompletionBytes, CompletionClient, Served};
 use super::http::UpstreamResponse;
@@ -74,16 +73,8 @@ pub(super) async fn handle_volatile_buffered_download(
     // bypasses those and would otherwise undercount.
     let _client_count = client_counter::ClientDownload::new();
 
-    // Buffer the entire body into memory. This path is only reached without a
-    // usable Content-Length (the length-delimited case is spliced), so framing
-    // is chunked or close-delimited; a `ContentLength` body is still read
-    // correctly (to its declared length) but flags the routing slip.
-    if let BodyFraming::ContentLength(len) = upstream_resp.framing {
-        warn_once!(
-            "splice proxy: volatile buffered download of {} reached with a Content-Length body ({len} bytes)",
-            conn_details.debname
-        );
-    }
+    // Buffer the entire body into memory: chunked or close-delimited, since
+    // the planner sends every length-delimited body to the splice loops.
     // Boxed for size, not for the runner: `read_to_vec` carries the whole
     // buffered body state, and inlining it into the connection future pushes
     // `sendfile_conn::try_sendfile_request` past `clippy::large_futures`.

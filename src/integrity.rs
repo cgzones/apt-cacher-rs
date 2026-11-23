@@ -2091,34 +2091,17 @@ async fn ingest_packages_file(
         .read(true)
         .open_async(path)
         .await?;
-    let metadata = file.metadata().await;
-    // Reject a known nonregular descriptor before sniffing or decoding. Keep
-    // a stat failure until after sniffing, preserving its non-fatal fallback
-    // and the priority of any compression-sniff error.
-    if let Ok(metadata) = &metadata {
-        require_regular_index(metadata)?;
-    }
+    let metadata = file.metadata().await?;
+    // Before sniffing or decoding: a FIFO would block the read.
+    require_regular_index(&metadata)?;
     let compression = match compression {
         Some(compression) => compression,
         None => sniff_packages_compression(&mut file).await?,
     };
 
-    // Compute the decompressed-output ceiling from the compressed file size.
-    // Fall back to the absolute cap if stat fails (non-fatal).
-    let compressed_size = match metadata {
-        Ok(m) => {
-            limits::check_packages_file_size(compression, m.len())?;
-            m.len()
-        }
-        Err(err) => {
-            warn!(
-                "Failed to stat `{}` for the decompression-ratio guard during Packages ingestion; ingesting with the guard disabled:  {}",
-                path.display(),
-                ErrorReport(&err),
-            );
-            u64::MAX
-        }
-    };
+    // The decompressed-output ceiling follows the compressed file size.
+    let compressed_size = metadata.len();
+    limits::check_packages_file_size(compression, compressed_size)?;
     let reader = limits::packages_reader(
         limits::PackagesInput::File(file),
         compression,
