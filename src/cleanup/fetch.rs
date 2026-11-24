@@ -63,7 +63,7 @@ impl DebnameKind<'_> {
                 distribution,
                 component,
                 architecture,
-                &format!("Packages{}", fmt.extension()),
+                format_args!("Packages{}", fmt.extension()),
             ),
             Self::Flat => format!("Packages{}", fmt.extension()),
         }

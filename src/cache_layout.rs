@@ -712,7 +712,7 @@ pub(crate) fn dists_debname(
     distribution: &str,
     component: &str,
     architecture: &str,
-    filename: &str,
+    filename: impl std::fmt::Display,
 ) -> String {
     format!("{distribution}_{component}_{architecture}_{filename}")
 }
@@ -1030,10 +1030,9 @@ pub(crate) fn classify_request<'a>(
             // The parser admits no `%` in either, so decoding is the identity.
             let index = decode_validate(index, ValidateKind::Filename)?;
             let patch = decode_validate(patch, ValidateKind::Filename)?;
-            let leaf = format!("{index}{PDIFF_SEPARATOR}{patch}");
 
             trace!(
-                "Decoded mirror path: `{mirror_path}`; Decoded distribution: `{distribution}`; Decoded component: `{component}`; Decoded pdiff patch: `{leaf}` (client {client})"
+                "Decoded mirror path: `{mirror_path}`; Decoded distribution: `{distribution}`; Decoded component: `{component}`; Decoded pdiff patch: `{index}{PDIFF_SEPARATOR}{patch}` (client {client})"
             );
 
             // Only a `Packages` patch carries its slot, which joins the
@@ -1047,13 +1046,21 @@ pub(crate) fn classify_request<'a>(
                     if !is_packages_directory(&architecture) {
                         return Err(ClassifyError::PackagesOutsideArchitecture { architecture });
                     }
-                    let debname = dists_debname(&distribution, &component, &architecture, &leaf);
+                    let debname = dists_debname(
+                        &distribution,
+                        &component,
+                        &architecture,
+                        format_args!("{index}{PDIFF_SEPARATOR}{patch}"),
+                    );
                     (
                         debname,
                         OriginFields::of_scope(distribution, component, architecture),
                     )
                 }
-                None => (format!("{distribution}_{component}_{leaf}"), None),
+                None => (
+                    format!("{distribution}_{component}_{index}{PDIFF_SEPARATOR}{patch}"),
+                    None,
+                ),
             };
 
             Ok(RequestClass {
