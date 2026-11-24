@@ -894,23 +894,14 @@ pub(crate) fn valid_filename(name: &str) -> bool {
 /// - `http://deb.debian.org/debian/dists/sid/main/source/Sources.diff/T-2024-10-03-1409.04-F-2024-10-03-1409.04.gz`
 #[must_use]
 pub(crate) fn is_diff_request_path(uri_path: &str) -> bool {
-    uri_path.contains("/Packages.diff/T-")
-        || uri_path.contains("/Sources.diff/T-")
-        || contains_translation_diff(uri_path)
-}
-
-/// A `Translation-XX.diff/T-` segment pair, for any language.
-#[must_use]
-fn contains_translation_diff(uri_path: &str) -> bool {
     // Skip the first segment: a match requires the preceding slash. Looking
     // only at adjacent segments avoids rescanning the whole remaining path
     // for every malformed Translation prefix.
     let mut segments = uri_path.split('/').skip(1).peekable();
     while let Some(segment) = segments.next() {
-        if segment
-            .strip_suffix(".diff")
-            .is_some_and(is_pdiff_translation_base)
-            && segments.peek().is_some_and(|next| next.starts_with("T-"))
+        if segment.strip_suffix(".diff").is_some_and(|index| {
+            matches!(index, "Packages" | "Sources") || is_pdiff_translation_base(index)
+        }) && segments.peek().is_some_and(|next| next.starts_with("T-"))
         {
             return true;
         }
@@ -2782,22 +2773,25 @@ mod tests {
             "/Translation-zh_CN.diff/T-patch.gz",
             "/Translation-bad-lang.diff/T-x/Translation-en.diff/T-good",
         ] {
-            assert!(contains_translation_diff(path), "{path}");
+            assert!(is_diff_request_path(path), "{path}");
         }
         for path in [
             "Translation-en.diff/T-x",
+            "Packages.diff/T-x",
+            "/NotSources.diff/T-x",
+            "/Packages.diff//T-x",
             "/Translation-.diff/T-x",
             "/Translation-en-US.diff/T-x",
             "/Translation-en/else.diff/T-x",
             "/Translation-en.diff//T-x",
             "/Translation-en.diff/not-a-patch",
         ] {
-            assert!(!contains_translation_diff(path), "{path}");
+            assert!(!is_diff_request_path(path), "{path}");
         }
         let mut repeated = "/Translation-en".repeat(500);
-        assert!(!contains_translation_diff(&repeated));
+        assert!(!is_diff_request_path(&repeated));
         repeated.push_str("/Translation-en.diff/T-good");
-        assert!(contains_translation_diff(&repeated));
+        assert!(is_diff_request_path(&repeated));
     }
 
     #[test]
