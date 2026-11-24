@@ -652,7 +652,7 @@ mod tests {
                     layout: CacheLayout::Dists,
                     root: PathBuf::from("/cache/deb.debian.org/debian/dists"),
                     span: METADATA_KEEP_SPAN,
-                    pdiff_span: Some(PDIFF_KEEP_SPAN),
+                    pdiff_span: Some(Duration::from_hours(48)),
                 }),
                 CleanupUnit::Metadata(MetadataUnit {
                     layout: CacheLayout::Flat,
