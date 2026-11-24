@@ -7,6 +7,7 @@ use std::{borrow::Cow, io, str::Utf8Error};
 use tokio::io::AsyncBufRead;
 
 use crate::{
+    decimal::parse_digits,
     limits::{CappedLine, MAX_METADATA_LINE_LEN, read_line_capped},
     sticky, warn_once, warn_once_or_debug,
 };
@@ -541,7 +542,7 @@ fn release_hash_entries(
             if parts.next().is_some() {
                 return Some(Err("extra checksum fields"));
             }
-            if !size.bytes().all(|byte| byte.is_ascii_digit()) || size.parse::<u64>().is_err() {
+            if parse_digits::<u64>(size).is_none() {
                 return Some(Err("invalid checksum size"));
             }
             Some(Ok((section, hex, path)))

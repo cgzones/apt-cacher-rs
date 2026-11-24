@@ -39,6 +39,7 @@ mod content_type;
 mod database;
 mod database_task;
 mod deb_mirror;
+mod decimal;
 mod delivery;
 mod error;
 mod fd_usage;

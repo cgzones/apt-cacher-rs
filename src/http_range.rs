@@ -8,6 +8,7 @@ use time::format_description::well_known::Rfc2822;
 use time::macros::format_description;
 use time::{OffsetDateTime, macros::offset};
 
+use crate::decimal::parse_digits;
 use crate::http_etag::etag_strong_match;
 use crate::warn_once_or_info;
 
@@ -222,15 +223,6 @@ fn byte_range_value(header: &str, separator: char) -> Option<&str> {
     }
 }
 
-/// Byte positions and lengths contain only digits. Rust's unsigned integer
-/// parser also accepts a leading plus sign.
-fn range_number(value: &str) -> Option<u64> {
-    if value.starts_with('+') {
-        return None;
-    }
-    value.parse().ok()
-}
-
 /// A syntactically valid byte-range-spec, not yet resolved against the
 /// file size.
 enum RangeSpec {
@@ -269,7 +261,7 @@ pub(crate) fn http_parse_range(
     let start = if start.is_empty() {
         None
     } else {
-        let Some(s) = range_number(start) else {
+        let Some(s) = parse_digits(start) else {
             return ParsedRange::Invalid;
         };
         Some(s)
@@ -277,7 +269,7 @@ pub(crate) fn http_parse_range(
     let end = if end.is_empty() {
         None
     } else {
-        let Some(e) = range_number(end) else {
+        let Some(e) = parse_digits(end) else {
             return ParsedRange::Invalid;
         };
         Some(e)
@@ -401,9 +393,9 @@ pub(crate) fn parse_content_range(value: &str) -> Option<ContentRange> {
     let (range_part, total_str) = rest.split_once('/')?;
     let (start_str, end_str) = range_part.split_once('-')?;
 
-    let start = range_number(start_str)?;
-    let end = range_number(end_str)?;
-    let total = range_number(total_str)?;
+    let start = parse_digits(start_str)?;
+    let end = parse_digits(end_str)?;
+    let total = parse_digits(total_str)?;
 
     ContentRange::new(start, end, total)
 }

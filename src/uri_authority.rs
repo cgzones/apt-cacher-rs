@@ -4,6 +4,8 @@ use std::num::NonZero;
 
 use http::uri::Authority;
 
+use crate::decimal::parse_digits;
+
 /// The default port of the `http` scheme, which names the same resource as
 /// no port (RFC 3986 §6.2.3).
 pub(crate) const HTTP_DEFAULT_PORT: u16 = 80;
@@ -41,10 +43,7 @@ pub(crate) fn port(authority: &Authority) -> Result<Option<NonZero<u16>>, Invali
         return Ok(None);
     }
     let port = suffix.strip_prefix(':').ok_or(InvalidPort)?;
-    if !port.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(InvalidPort);
-    }
-    port.parse().map(Some).map_err(|_invalid_port| InvalidPort)
+    parse_digits(port).map(Some).ok_or(InvalidPort)
 }
 
 #[cfg(test)]

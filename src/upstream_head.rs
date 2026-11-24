@@ -23,7 +23,7 @@
 
 use std::{
     fmt::{self, Display, Formatter},
-    num::{NonZero, ParseIntError},
+    num::NonZero,
     str::Utf8Error,
     sync::atomic::AtomicBool,
 };
@@ -34,6 +34,7 @@ use tracing::info;
 use crate::{
     cache_layout::CachedFlavor,
     deb_mirror::Mirror,
+    decimal::parse_digits,
     http_etag::{etag_strong_match, is_valid_etag},
     http_range::ContentRange,
     humanfmt::HumanFmt,
@@ -153,13 +154,7 @@ pub(crate) fn parse_content_length_list(
     // An empty element is junk: Content-Length is a single 1*DIGIT. The
     // split yields at least one element, so an `Ok` always carries a value.
     for element in value.split(',').map(trim_ows) {
-        // `u64::from_str` alone would take a leading `+`.
-        if element.is_empty() || !element.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(ContentLengthError::Unparsable);
-        }
-        let len = element
-            .parse::<u64>()
-            .map_err(|_err @ ParseIntError { .. }| ContentLengthError::Unparsable)?;
+        let len: u64 = parse_digits(element).ok_or(ContentLengthError::Unparsable)?;
         if let Some(prev) = length
             && prev != len
         {
