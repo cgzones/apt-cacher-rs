@@ -384,16 +384,7 @@ async fn run_metadata_unit(unit: &MetadataUnit, ctx: &MirrorCtx<'_>) -> UnitStat
         unit.root.display()
     );
 
-    let swept = sweep_aged_metadata(
-        &ctx.config.cache_directory,
-        &unit.root,
-        unit.span,
-        unit.pdiff_span,
-        ctx.now,
-        mirror,
-        unit.layout,
-    )
-    .await;
+    let swept = sweep_aged_metadata(&ctx.config.cache_directory, unit, ctx.now, mirror).await;
 
     if swept.removed > 0 {
         info!(

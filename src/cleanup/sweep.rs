@@ -14,6 +14,7 @@ use crate::humanfmt::HumanFmt;
 use crate::{cache_metadata, info_once, metrics, warn_once_or_info};
 
 use super::engine::{SpanClass, UnitStats};
+use super::model::MetadataUnit;
 use super::scan::remove_non_regular;
 
 /// Drop the in-memory `cache_metadata` entry keyed by `(mirror, basename, layout)`.
@@ -315,18 +316,15 @@ static METADATA_WALK: WalkContext = WalkContext {
 /// `scanned` to the caller.
 pub(super) async fn sweep_aged_metadata(
     cache_root: &Path,
-    dir: &Path,
-    keep_span: Duration,
-    pdiff_span: Option<Duration>,
+    unit: &MetadataUnit,
     now: SystemTime,
     mirror: &Mirror,
-    layout: CacheLayout,
 ) -> UnitStats {
-    let skip_debs = layout.is_flat();
+    let skip_debs = unit.layout.is_flat();
 
     let mut result = UnitStats::default();
 
-    let mut walker = Walker::below(cache_root, dir, &METADATA_WALK, ());
+    let mut walker = Walker::below(cache_root, &unit.root, &METADATA_WALK, ());
 
     while let Some(mut entry) = walker.next().await {
         match entry.kind() {
@@ -352,11 +350,11 @@ pub(super) async fn sweep_aged_metadata(
 
         let path = entry.path();
 
-        let span = match pdiff_span {
+        let span = match unit.pdiff_span {
             Some(pdiff_span) if entry.name().to_str().is_some_and(is_cached_pdiff_patch) => {
-                keep_span.min(pdiff_span)
+                unit.span.min(pdiff_span)
             }
-            Some(_) | None => keep_span,
+            Some(_) | None => unit.span,
         };
 
         if !AgeSweep::Metadata.is_due(&path, &data, span, now) {
@@ -364,7 +362,14 @@ pub(super) async fn sweep_aged_metadata(
         }
 
         let unlinked = tokio::fs::remove_file(&path).await;
-        AgeSweep::Metadata.settle_unlink(&path, unlinked, data.len(), mirror, layout, &mut result);
+        AgeSweep::Metadata.settle_unlink(
+            &path,
+            unlinked,
+            data.len(),
+            mirror,
+            unit.layout,
+            &mut result,
+        );
     }
 
     result.io_failures += walker.io_failures();
@@ -378,7 +383,7 @@ mod tests {
 
     use hashbrown::HashMap;
 
-    use super::{SpanTable, sweep_aged_metadata, sweep_candidates};
+    use super::{MetadataUnit, SpanTable, sweep_aged_metadata, sweep_candidates};
     use crate::cache_layout::CacheLayout;
     use crate::cleanup::engine::SpanClass;
     use crate::config::ClientHost;
@@ -476,17 +481,13 @@ mod tests {
         std::fs::write(dir.path().join("by-hash/deadbeef"), b"x").expect("write byhash file");
 
         let mirror = test_mirror();
-        let keep_span = Duration::from_hours(90 * 24);
 
         let now = SystemTime::now() + Duration::from_hours(91 * 24);
         let res = sweep_aged_metadata(
             dir.path(),
-            dir.path(),
-            keep_span,
-            None,
+            &MetadataUnit::new(CacheLayout::Dists, dir.path().to_owned()),
             now,
             &mirror,
-            CacheLayout::Dists,
         )
         .await;
         assert_eq!(res.removed, 2);
@@ -506,12 +507,9 @@ mod tests {
         let now = SystemTime::now() + Duration::from_hours(24);
         let res = sweep_aged_metadata(
             dir.path(),
-            dir.path(),
-            keep_span,
-            None,
+            &MetadataUnit::new(CacheLayout::Dists, dir.path().to_owned()),
             now,
             &mirror,
-            CacheLayout::Dists,
         )
         .await;
         assert_eq!(res.removed, 0);
@@ -526,24 +524,14 @@ mod tests {
     async fn sweep_aged_metadata_ages_pdiff_patches_out_after_2_days() {
         const PATCH: &str =
             "sid_main_binary-amd64_Packages.diff_T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz";
-        let keep_span = Duration::from_hours(90 * 24);
         let mirror = test_mirror();
 
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(PATCH), b"p").expect("write patch");
         std::fs::write(dir.path().join("sid_Release"), b"r").expect("write release");
 
-        let sweep = |now| {
-            sweep_aged_metadata(
-                dir.path(),
-                dir.path(),
-                keep_span,
-                Some(Duration::from_hours(2 * 24)),
-                now,
-                &mirror,
-                CacheLayout::Dists,
-            )
-        };
+        let unit = MetadataUnit::new(CacheLayout::Dists, dir.path().to_owned());
+        let sweep = |now| sweep_aged_metadata(dir.path(), &unit, now, &mirror);
         let res = sweep(SystemTime::now() + Duration::from_hours(24)).await;
         assert_eq!(res.removed, 0);
         assert!(dir.path().join(PATCH).exists());
@@ -558,12 +546,9 @@ mod tests {
         std::fs::write(flat.path().join(flat_name), b"t").expect("write flat file");
         let res = sweep_aged_metadata(
             flat.path(),
-            flat.path(),
-            keep_span,
-            None,
+            &MetadataUnit::new(CacheLayout::Flat, flat.path().to_owned()),
             SystemTime::now() + Duration::from_hours(3 * 24),
             &mirror,
-            CacheLayout::Flat,
         )
         .await;
         assert_eq!(res.removed, 0);
@@ -581,7 +566,6 @@ mod tests {
         std::fs::write(&revalidated, b"r").expect("write revalidated");
         std::fs::write(&retired, b"r").expect("write retired");
 
-        let keep_span = Duration::from_hours(90 * 24);
         // Both files are 91 days old by birthtime at the injected `now`.
         let now = SystemTime::now() + Duration::from_hours(91 * 24);
         std::fs::set_times(
@@ -592,12 +576,9 @@ mod tests {
 
         let res = sweep_aged_metadata(
             dir.path(),
-            dir.path(),
-            keep_span,
-            None,
+            &MetadataUnit::new(CacheLayout::Dists, dir.path().to_owned()),
             now,
             &test_mirror(),
-            CacheLayout::Dists,
         )
         .await;
         assert_eq!(res.removed, 1, "only the index nobody revalidated is swept");
@@ -618,17 +599,13 @@ mod tests {
             "apt".into(),
             MirrorKind::Flat,
         );
-        let keep_span = Duration::from_hours(90 * 24);
         let now = SystemTime::now() + Duration::from_hours(91 * 24);
 
         let res = sweep_aged_metadata(
             dir.path(),
-            dir.path(),
-            keep_span,
-            None,
+            &MetadataUnit::new(CacheLayout::Flat, dir.path().to_owned()),
             now,
             &mirror,
-            CacheLayout::Flat,
         )
         .await;
         assert_eq!(res.removed, 2, "only the two index files are swept");
@@ -645,12 +622,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let res = sweep_aged_metadata(
             dir.path(),
-            &dir.path().join("does-not-exist"),
-            Duration::from_hours(90 * 24),
-            None,
+            &MetadataUnit::new(CacheLayout::Dists, dir.path().join("does-not-exist")),
             SystemTime::now() + Duration::from_hours(91 * 24),
             &test_mirror(),
-            CacheLayout::Dists,
         )
         .await;
         assert_eq!(res.removed, 0);

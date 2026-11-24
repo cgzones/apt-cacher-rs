@@ -138,6 +138,17 @@ pub(super) struct MetadataUnit {
     pub pdiff_span: Option<Duration>,
 }
 
+impl MetadataUnit {
+    pub(super) fn new(layout: CacheLayout, root: PathBuf) -> Self {
+        Self {
+            layout,
+            root,
+            span: METADATA_KEEP_SPAN,
+            pdiff_span: (layout == CacheLayout::Dists).then_some(PDIFF_KEEP_SPAN),
+        }
+    }
+}
+
 /// A pure age reap of one `tmp/` directory. Carries no [`CacheLayout`]:
 /// `tmp/` scratch files never enter the metadata store.
 #[derive(Debug, PartialEq, Eq)]
@@ -447,21 +458,17 @@ pub(super) fn classify_mirror(
 
     if !is_flat {
         let layout = CacheLayout::Dists;
-        units.push(CleanupUnit::Metadata(MetadataUnit {
+        units.push(CleanupUnit::Metadata(MetadataUnit::new(
             layout,
-            root: paths.entry_dir(layout, site),
-            span: METADATA_KEEP_SPAN,
-            pdiff_span: Some(PDIFF_KEEP_SPAN),
-        }));
+            paths.entry_dir(layout, site),
+        )));
     }
 
     let layout = CacheLayout::Flat;
-    units.push(CleanupUnit::Metadata(MetadataUnit {
+    units.push(CleanupUnit::Metadata(MetadataUnit::new(
         layout,
-        root: paths.entry_dir(layout, site),
-        span: METADATA_KEEP_SPAN,
-        pdiff_span: None,
-    }));
+        paths.entry_dir(layout, site),
+    )));
 
     if !is_flat {
         let layout = CacheLayout::DistsByHash;
