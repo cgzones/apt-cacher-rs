@@ -1496,31 +1496,14 @@ mod tests {
     /// parser does not match, stays a plain unrecognized passthrough.
     #[test]
     fn pdiff_requests_when_not_rejected() {
-        let decide = |path| {
-            decide_request(
-                path,
-                fake_host(),
-                None,
-                &local_client(),
-                &[],
-                false,
-                never_flat_blocked,
-                PreciseInstant::now(),
-            )
-        };
-
-        let details = match decide(
+        let details = expect_cache(decide_default(
             "/debian/dists/sid/main/binary-amd64/Packages.diff/T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz",
-        ) {
-            DispatchOutcome::Cache(details) => Some(details),
-            DispatchOutcome::Reject(_) | DispatchOutcome::Passthrough(_) => None,
-        }
-        .expect("a strict patch name is cached");
+        ));
         assert_eq!(details.layout(), CacheLayout::Dists);
         assert_eq!(details.cached_flavor(), CachedFlavor::Permanent);
 
         assert_eq!(
-            verdict(&decide(
+            verdict(&decide_default(
                 "/debian/dists/sid/main/binary-amd64/Packages.diff/T-12345"
             )),
             Verdict::Passthrough(PassthroughReason::Unrecognized)
