@@ -714,7 +714,7 @@ async fn gate_on_row(
     {
         Ok(true) => Ok(()),
         Ok(false) => Err(GroupResolution::Ran(GroupOutcome::NotApplicable(
-            SkipReason::NoRow,
+            SkipReason::NoReferenceSet,
         ))),
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
@@ -829,7 +829,7 @@ async fn resolve_origin_packages_archive_root(
         .collect();
 
     if active_origins.is_empty() {
-        return GroupResolution::Ran(GroupOutcome::NotApplicable(SkipReason::NoActiveOrigins));
+        return GroupResolution::Ran(GroupOutcome::NotApplicable(SkipReason::NoReferenceSet));
     }
 
     let archive_mirror = Mirror::new(

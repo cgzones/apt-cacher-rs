@@ -253,13 +253,13 @@ pub(super) enum GroupOutcome {
 /// Why a [`GroupOutcome::NotApplicable`] group never ran.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SkipReason {
-    /// The gating `mirrors_v2` row (e.g. the archive-root row for a hybrid
-    /// group) does not exist.
-    NoRow,
-    /// A DB lookup needed to resolve the group failed.
+    /// There is no reference set to be had: the gating `mirrors_v2` row
+    /// (e.g. the archive-root row for a hybrid group) does not exist, or it
+    /// has no active origins.
+    NoReferenceSet,
+    /// A DB lookup needed to resolve the group failed, so the reference set
+    /// is unknown rather than empty.
     DbError,
-    /// The gating row exists but has no active origins.
-    NoActiveOrigins,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,9 +300,7 @@ pub(super) fn decide_sweep(policy: ReconcilePolicy, groups: &[GroupOutcome]) -> 
                     // origins) means there is no reference set to be had, which
                     // the grace sweep already handles.
                     GroupOutcome::Complete
-                    | GroupOutcome::NotApplicable(
-                        SkipReason::NoRow | SkipReason::NoActiveOrigins,
-                    ) => {}
+                    | GroupOutcome::NotApplicable(SkipReason::NoReferenceSet) => {}
                     // A DB error is different: the reference set is *unknown*,
                     // not empty, so sweeping could delete a still-referenced
                     // deb. Bail like a failed fetch.
@@ -533,7 +531,7 @@ mod tests {
         for (groups, expected) in [
             (vec![], grace()),
             (vec![Complete], grace()),
-            (vec![NotApplicable(SkipReason::NoActiveOrigins)], grace()),
+            (vec![NotApplicable(SkipReason::NoReferenceSet)], grace()),
             (vec![FetchFailed(ff(404))], SweepAction::Bail),
             // The reference set is unknown rather than empty, so a grace
             // sweep could delete a deb the unread origins still reference.
@@ -560,7 +558,10 @@ mod tests {
                 age_back(ff(404)),
             ),
             (
-                vec![NotApplicable(SkipReason::NoRow), FetchFailed(ff(404))],
+                vec![
+                    NotApplicable(SkipReason::NoReferenceSet),
+                    FetchFailed(ff(404)),
+                ],
                 age_back(ff(404)),
             ),
             (vec![ParseError, FetchFailed(ff(404))], age_back(ff(404))),
