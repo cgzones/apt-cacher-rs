@@ -1651,6 +1651,9 @@ mod tests {
                 "sid_main_binary-amd64_Packages.diff_",
                 Some("binary-amd64"),
             ),
+            // A pseudo-architecture has no `Packages` index for cleanup to
+            // fetch, so its patch names no origin either.
+            ("i18n/Packages.diff", "sid_main_i18n_Packages.diff_", None),
             ("source/Sources.diff", "sid_main_Sources.diff_", None),
             (
                 "i18n/Translation-en.diff",

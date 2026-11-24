@@ -304,8 +304,8 @@ impl Origin {
     /// The [`Origin`] a request for `path` on `host`/`port` would register
     /// if it were cached: `path` is parsed, normalised, percent-decoded and
     /// validated exactly as `request_dispatch::decide_request` does it for
-    /// a cache request, so only `binary-<arch>` `Packages*` and `by-hash`
-    /// URLs yield one.
+    /// a cache request, so only `binary-<arch>` `Packages*`, `by-hash` and
+    /// `Packages` pdiff patch URLs yield one.
     ///
     /// For the passthrough relays, which forward what the classifier
     /// declined: an origin row names a mirror, feeds cleanup's index fetches
