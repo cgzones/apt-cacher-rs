@@ -561,7 +561,7 @@ pub(crate) struct DistsScope<'a> {
 /// The `<dist>/<component>/<slot>` run of a `dists/` path, if it has exactly
 /// that shape.  `parts` is the `rsplit('/')` iterator just past the segments
 /// to its right, so the segments arrive innermost-first.
-fn dists_scope<'a>(parts: &mut impl Iterator<Item = &'a str>) -> Option<DistsScope<'a>> {
+fn dists_scope<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<DistsScope<'a>> {
     let architecture = parts.next()?;
     let component = parts.next()?;
     let distribution = parts.next()?;
@@ -577,10 +577,7 @@ fn dists_scope<'a>(parts: &mut impl Iterator<Item = &'a str>) -> Option<DistsSco
 
 /// [`dists_scope`] for the index families that live under one fixed `slot`
 /// (`source` for `Sources`, `i18n` for `Translation`, `dep11` for `Icon`).
-fn dists_scope_in<'a>(
-    parts: &mut impl Iterator<Item = &'a str>,
-    slot: &str,
-) -> Option<DistsScope<'a>> {
+fn dists_scope_in<'a>(parts: impl Iterator<Item = &'a str>, slot: &str) -> Option<DistsScope<'a>> {
     dists_scope(parts).filter(|scope| scope.architecture == slot)
 }
 
@@ -665,7 +662,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 distribution,
                 component,
                 architecture,
-            } = dists_scope(&mut parts)?;
+            } = dists_scope(parts)?;
             return Some(ResourceFile::Packages {
                 mirror_path,
                 distribution,
@@ -678,7 +675,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 distribution,
                 component,
                 architecture: _,
-            } = dists_scope_in(&mut parts, "source")?;
+            } = dists_scope_in(parts, "source")?;
             return Some(ResourceFile::Sources {
                 mirror_path,
                 distribution,
@@ -690,7 +687,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 distribution,
                 component,
                 architecture: _,
-            } = dists_scope_in(&mut parts, "i18n")?;
+            } = dists_scope_in(parts, "i18n")?;
             return Some(ResourceFile::Translation {
                 mirror_path,
                 distribution,
@@ -702,7 +699,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 distribution,
                 component,
                 architecture: _,
-            } = dists_scope_in(&mut parts, "dep11")?;
+            } = dists_scope_in(parts, "dep11")?;
             return Some(ResourceFile::Icon {
                 mirror_path,
                 distribution,
@@ -724,7 +721,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
             // an `Origin` is made of.  Any other depth yields no scope
             // rather than rejecting the request: the object is still
             // cacheable by its digest.
-            let scope = dists_scope(&mut dirs.rsplit('/'));
+            let scope = dists_scope(parts);
 
             return Some(ResourceFile::ByHash {
                 mirror_path,
@@ -739,13 +736,11 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
             // `Translation-*` sit in a fixed scope directory.
             let (scope, architecture) = match index {
                 "Packages" => {
-                    let scope = dists_scope(&mut parts)?;
+                    let scope = dists_scope(parts)?;
                     (scope, Some(scope.architecture))
                 }
-                "Sources" => (dists_scope_in(&mut parts, "source")?, None),
-                _ if is_pdiff_translation_base(index) => {
-                    (dists_scope_in(&mut parts, "i18n")?, None)
-                }
+                "Sources" => (dists_scope_in(parts, "source")?, None),
+                _ if is_pdiff_translation_base(index) => (dists_scope_in(parts, "i18n")?, None),
                 _ => return None,
             };
             return Some(ResourceFile::Pdiff {
