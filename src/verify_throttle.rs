@@ -197,7 +197,7 @@ mod tests {
     use crate::cache_layout::CacheLayout;
     use crate::config::ClientHost;
     use crate::deb_mirror::{Mirror, MirrorKind};
-    use crate::test_support::structured_mirror;
+    use crate::test_support::{structured_mirror, structured_pool_key as key};
 
     const BASE_SECS: u64 = 30;
     const CAP_SECS: u64 = 3600;
@@ -211,10 +211,6 @@ mod tests {
 
     fn test_mirror() -> Mirror {
         structured_mirror("deb.debian.org", "")
-    }
-
-    fn key<'a>(mirror: &'a Mirror, debname: &'a str) -> CacheEntryKeyRef<'a> {
-        CacheEntryKeyRef::new(mirror, debname, CacheLayout::StructuredPool)
     }
 
     fn throttle() -> VerifyThrottle {

@@ -896,16 +896,11 @@ impl ActiveDownloads {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache_layout::CacheLayout;
     use crate::deb_mirror::Mirror;
-    use crate::test_support::structured_mirror;
+    use crate::test_support::{structured_mirror, structured_pool_key as key};
 
     fn test_mirror() -> Mirror {
         structured_mirror("deb.debian.org", "")
-    }
-
-    fn key<'a>(mirror: &'a Mirror, debname: &'a str) -> CacheEntryKeyRef<'a> {
-        CacheEntryKeyRef::new(mirror, debname, CacheLayout::StructuredPool)
     }
 
     #[test]

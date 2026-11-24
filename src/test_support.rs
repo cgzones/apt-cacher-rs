@@ -3,7 +3,7 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use crate::{
-    cache_layout::{ConnectionDetails, ResourceKind},
+    cache_layout::{CacheEntryKeyRef, CacheLayout, ConnectionDetails, ResourceKind},
     client_info::ClientInfo,
     config::ClientHost,
     deb_mirror::{Mirror, MirrorKind},
@@ -17,6 +17,13 @@ pub(crate) fn structured_mirror(host: &str, path: &str) -> Mirror {
         path.into(),
         MirrorKind::Structured,
     )
+}
+
+pub(crate) fn structured_pool_key<'a>(
+    mirror: &'a Mirror,
+    debname: &'a str,
+) -> CacheEntryKeyRef<'a> {
+    CacheEntryKeyRef::new(mirror, debname, CacheLayout::StructuredPool)
 }
 
 pub(crate) fn local_client() -> ClientInfo {
