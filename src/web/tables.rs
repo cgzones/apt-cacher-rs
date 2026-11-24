@@ -12,6 +12,7 @@ use std::{
 };
 
 use coarsetime::Instant;
+use futures_util::{StreamExt as _, stream};
 use hashbrown::HashMap;
 use tracing::error;
 
@@ -677,28 +678,27 @@ pub(super) async fn build_mirror_table(
         .map(|mirror| (mirror.site(), mirror.kind()))
         .collect();
     let footprints = plan_footprints(&rows, paths);
-    let keys: Vec<PathBuf> = rows
-        .iter()
-        .map(|(site, _)| paths.mirror_dir(*site))
+    // Collected rather than left a lazy `Map`: an adapter whose closure takes
+    // a `MirrorSite<'_>` held across the `.await` below makes rustc unable to
+    // prove the connection future `Send`.
+    let walks: Vec<_> = rows
+        .into_iter()
+        .zip(footprints)
+        .map(|((site, _kind), footprint)| {
+            let key = paths.mirror_dir(site);
+            async move {
+                cached_dir_stats(&key, footprint, |footprint| async move {
+                    walk_footprint(&footprint).await
+                })
+                .await
+            }
+        })
         .collect();
-
-    // Fixed-size chunks: at most `DIR_SCAN_CONCURRENCY` walks run at once
-    // and the collected order matches `footprints` (and therefore `sorted`).
-    let mut dir_stats: Vec<DirStats> = Vec::with_capacity(footprints.len());
-    let mut footprints = footprints.into_iter();
-    for keys in keys.chunks(DIR_SCAN_CONCURRENCY) {
-        let chunk_stats = futures_util::future::join_all(
-            keys.iter()
-                .zip(footprints.by_ref().take(keys.len()))
-                .map(|(key, footprint)| {
-                    cached_dir_stats(key, footprint, |footprint| async move {
-                        walk_footprint(&footprint).await
-                    })
-                }),
-        )
+    // Preserve the sorted row order while bounding concurrent directory walks.
+    let dir_stats: Vec<_> = stream::iter(walks)
+        .buffered(DIR_SCAN_CONCURRENCY)
+        .collect()
         .await;
-        dir_stats.extend(chunk_stats);
-    }
     evict_idle_dir_stats();
 
     // Complete before the first row is rendered: the Disk Space cell shows
