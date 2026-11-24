@@ -160,7 +160,7 @@ pub(super) async fn cleanup_tmp_dir(
     reaped
 }
 
-fn mtime_of(mdata: &Metadata) -> SystemTime {
+pub(super) fn mtime_of(mdata: &Metadata) -> SystemTime {
     mdata
         .modified()
         .expect("Platform should support modification timestamps via setup check")

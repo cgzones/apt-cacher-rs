@@ -15,6 +15,7 @@ use crate::{cache_metadata, info_once, metrics, warn_once_or_info};
 
 use super::engine::{SpanClass, UnitStats};
 use super::model::MetadataUnit;
+use super::partials::mtime_of;
 use super::scan::remove_non_regular;
 
 /// Drop the in-memory `cache_metadata` entry keyed by `(mirror, basename, layout)`.
@@ -59,8 +60,7 @@ fn age_reference_time(meta: &std::fs::Metadata, path: &Path) -> SystemTime {
             path.display(),
             ErrorReport(&created_err)
         );
-        meta.modified()
-            .expect("Platform should support modification timestamps via setup check")
+        mtime_of(meta)
     })
 }
 
@@ -89,9 +89,7 @@ impl AgeSweep {
         let created = age_reference_time(meta, path);
         match self {
             Self::Candidates => created,
-            Self::Metadata => meta
-                .modified()
-                .map_or(created, |modified| created.max(modified)),
+            Self::Metadata => created.max(mtime_of(meta)),
         }
     }
 
@@ -350,12 +348,10 @@ pub(super) async fn sweep_aged_metadata(
 
         let path = entry.path();
 
-        let span = match unit.pdiff_span {
-            Some(pdiff_span) if entry.name().to_str().is_some_and(is_cached_pdiff_patch) => {
-                unit.span.min(pdiff_span)
-            }
-            Some(_) | None => unit.span,
-        };
+        let span = unit
+            .pdiff_span
+            .filter(|_| entry.name().to_str().is_some_and(is_cached_pdiff_patch))
+            .unwrap_or(unit.span);
 
         if !AgeSweep::Metadata.is_due(&path, &data, span, now) {
             continue;

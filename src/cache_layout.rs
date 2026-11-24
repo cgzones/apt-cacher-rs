@@ -1237,9 +1237,9 @@ mod tests {
         for kind in ALL_KINDS {
             listed_in_all_kinds(kind);
             let expected = match (kind.cached_flavor(), kind.layout()) {
-                (CachedFlavor::Volatile, _) => Some(LookupBucket::Index),
+                (CachedFlavor::Volatile, _) => LookupBucket::Index,
                 (CachedFlavor::Permanent, CacheLayout::StructuredPool | CacheLayout::Flat) => {
-                    Some(LookupBucket::Package)
+                    LookupBucket::Package
                 }
                 // The one permanent kind directly under `dists/` is a pdiff
                 // patch: immutable index data whose every change is a new
@@ -1247,9 +1247,9 @@ mod tests {
                 (
                     CachedFlavor::Permanent,
                     CacheLayout::DistsByHash | CacheLayout::FlatByHash | CacheLayout::Dists,
-                ) => Some(LookupBucket::ByHash),
+                ) => LookupBucket::ByHash,
             };
-            assert_eq!(Some(kind.lookup_bucket()), expected, "{kind:?}");
+            assert_eq!(kind.lookup_bucket(), expected, "{kind:?}");
         }
     }
 
@@ -1667,6 +1667,9 @@ mod tests {
             let res = parse_request_path(&path).expect("parses");
             let class = classify_request(&res, &local_client()).expect(&path);
             assert_eq!(class.debname, format!("{debname}{P}"), "{path}");
+            // Cleanup's retention and the collision guard recognise the
+            // patch by the name minted here.
+            assert!(is_cached_pdiff_patch(&class.debname), "{path}");
             assert_eq!(class.resource_kind, ResourceKind::Pdiff, "{path}");
             let expected = origin_arch.map(|architecture| OriginFields {
                 distribution: "sid".to_owned(),

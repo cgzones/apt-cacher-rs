@@ -1724,20 +1724,6 @@ mod tests {
             })
         );
 
-        assert_eq!(
-            parse_request_path(
-                "debian/dists/sid/main/binary-amd64/Packages.diff/T-2024-04-16-1405.22-F-2024-04-15-2018.42.gz"
-            ),
-            Some(ResourceFile::Pdiff {
-                mirror_path: "debian",
-                distribution: "sid",
-                component: "main",
-                architecture: Some("binary-amd64"),
-                index: "Packages",
-                patch: "T-2024-04-16-1405.22-F-2024-04-15-2018.42.gz"
-            })
-        );
-
         /*
          * Flat (trivial) repository format
          */
@@ -2830,6 +2816,9 @@ mod tests {
         ] {
             let path = format!("debian/dists/sid/main/{dir}/{P}");
             assert_eq!(parse_request_path(&path), Some(expected), "{path}");
+            // Whatever the parser caches as a patch, the 410 gate must refuse:
+            // a patch family added to the parser needs its row here.
+            assert!(is_diff_request_path(&path), "{path}");
         }
         for path in [
             "debian/dists/sid/main/binary-amd64/Packages.diff/T-12345".to_owned(),
