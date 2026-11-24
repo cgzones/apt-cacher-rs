@@ -8,12 +8,10 @@
 //!
 //! # Blocking
 //!
-//! Every [`XattrTarget`] issues its syscall directly. The blanket impl (any
-//! [`xattr::FileExt`], such as a [`std::fs::File`]) is for callers already
-//! on a blocking thread; [`XattrFile`] wraps a
-//! tokio file for a caller that enters one [`tokio::task::block_in_place`]
-//! section around all the operations it batches on that file (which needs
-//! a multi-threaded runtime).
+//! Attribute operations issue blocking syscalls through [`FileExt`]. Callers
+//! on a blocking thread use [`std::fs::File`] directly. Async callers wrap
+//! their Tokio file in [`XattrFile`] and batch its operations in one
+//! [`tokio::task::block_in_place`] section on a multi-threaded runtime.
 
 use std::{
     borrow::Cow,
@@ -25,6 +23,7 @@ use std::{
 
 use nix::libc;
 use tracing::warn;
+use xattr::FileExt;
 
 use crate::{error::ErrorReport, log_once::warn_once_or_info_gated, warn_once_or_debug};
 
@@ -39,27 +38,7 @@ impl std::os::fd::AsRawFd for XattrFile<'_> {
     }
 }
 
-impl xattr::FileExt for XattrFile<'_> {}
-
-pub(crate) trait XattrTarget {
-    fn get(&self, key: &'static str) -> io::Result<Option<Vec<u8>>>;
-    fn set(&self, key: &'static str, value: &[u8]) -> io::Result<()>;
-    fn remove(&self, key: &'static str) -> io::Result<()>;
-}
-
-impl<T: xattr::FileExt> XattrTarget for T {
-    fn get(&self, key: &'static str) -> io::Result<Option<Vec<u8>>> {
-        self.get_xattr(key)
-    }
-
-    fn set(&self, key: &'static str, value: &[u8]) -> io::Result<()> {
-        self.set_xattr(key, value)
-    }
-
-    fn remove(&self, key: &'static str) -> io::Result<()> {
-        self.remove_xattr(key)
-    }
-}
+impl FileExt for XattrFile<'_> {}
 
 /// A value persisted as one `user.apt_cacher_rs.*` extended attribute.
 ///
@@ -117,11 +96,11 @@ enum Removal {
 
 /// Logs on failure but never propagates errors; an attribute that is not
 /// there (`ENODATA`) is silent.
-fn remove<V: XattrValue>(file: &impl XattrTarget, display_path: &Path, why: Removal) {
+fn remove<V: XattrValue>(file: &impl FileExt, display_path: &Path, why: Removal) {
     if !xattr_supported() {
         return;
     }
-    if let Err(err) = file.remove(V::KEY)
+    if let Err(err) = file.remove_xattr(V::KEY)
         && err.kind() != io::ErrorKind::Unsupported
         && err.raw_os_error() != Some(libc::ENODATA)
     {
@@ -141,7 +120,7 @@ fn remove<V: XattrValue>(file: &impl XattrTarget, display_path: &Path, why: Remo
 /// Remove a `V` the current download does not carry, so an attribute left
 /// by an earlier attempt on the same file (a resumed partial) cannot outlive
 /// the value it belonged to. An absent attribute is success and silent.
-pub(crate) fn remove_stale<V: XattrValue>(file: &impl XattrTarget, display_path: &Path) {
+pub(crate) fn remove_stale<V: XattrValue>(file: &impl FileExt, display_path: &Path) {
     remove::<V>(file, display_path, Removal::Stale);
 }
 
@@ -155,14 +134,14 @@ pub(crate) fn remove_stale<V: XattrValue>(file: &impl XattrTarget, display_path:
 /// - `Err(XattrIoError)` - transient syscall failure (warning is logged
 ///   here). Callers must NOT cache the absence; the next read may succeed.
 pub(crate) fn try_read<V: XattrValue>(
-    file: &impl XattrTarget,
+    file: &impl FileExt,
     display_path: &Path,
 ) -> Result<Option<V>, XattrIoError> {
     if !xattr_supported() {
         return Ok(None);
     }
 
-    let raw = match file.get(V::KEY) {
+    let raw = match file.get_xattr(V::KEY) {
         Ok(None) => return Ok(None),
         Ok(Some(raw)) => raw,
         Err(err) => {
@@ -204,17 +183,17 @@ pub(crate) fn try_read<V: XattrValue>(
 
 /// [`try_read`] with a transient I/O error collapsed to `None`.
 #[must_use]
-pub(crate) fn read<V: XattrValue>(file: &impl XattrTarget, display_path: &Path) -> Option<V> {
+pub(crate) fn read<V: XattrValue>(file: &impl FileExt, display_path: &Path) -> Option<V> {
     try_read::<V>(file, display_path).ok().flatten()
 }
 
 /// Logs on failure but never propagates errors; `ErrorKind::Unsupported` is
 /// silent (the startup probe already warned once for the filesystem).
-pub(crate) fn write<V: XattrValue>(file: &impl XattrTarget, display_path: &Path, value: &V) {
+pub(crate) fn write<V: XattrValue>(file: &impl FileExt, display_path: &Path, value: &V) {
     if !xattr_supported() {
         return;
     }
-    if let Err(err) = file.set(V::KEY, value.render().as_bytes())
+    if let Err(err) = file.set_xattr(V::KEY, value.render().as_bytes())
         && err.kind() != io::ErrorKind::Unsupported
     {
         warn_once_or_debug!(
@@ -257,8 +236,6 @@ impl XattrValue for ExpectedSize {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use xattr::FileExt as _;
-
     use super::*;
     use crate::test_support::levels_during;
 
