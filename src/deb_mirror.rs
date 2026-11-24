@@ -920,6 +920,11 @@ fn is_pdiff_translation_base(base: &str) -> bool {
     })
 }
 
+/// The byte length of a pdiff patch timestamp.
+const PDIFF_TIMESTAMP_LEN: usize = "YYYY-MM-DD-HHMM.SS".len();
+/// The byte length of every pdiff patch name, `T-<ts>-F-<ts>.gz`.
+pub(crate) const PDIFF_PATCH_NAME_LEN: usize = "T--F-.gz".len() + 2 * PDIFF_TIMESTAMP_LEN;
+
 /// Whether `name` is a merged pdiff patch as dak publishes it:
 /// `T-<ts>-F-<ts>.gz`, each timestamp exactly `YYYY-MM-DD-HHMM.SS`.  Strict
 /// on purpose: the name becomes part of a cache name, and holds no `%` or
@@ -935,7 +940,7 @@ pub(crate) fn is_pdiff_patch_name(name: &str) -> bool {
 /// `YYYY-MM-DD-HHMM.SS`, the timestamp in a pdiff patch name.
 #[must_use]
 fn is_pdiff_timestamp(stamp: &str) -> bool {
-    stamp.len() == 18
+    stamp.len() == PDIFF_TIMESTAMP_LEN
         && stamp.bytes().enumerate().all(|(i, b)| match i {
             4 | 7 | 10 => b == b'-',
             15 => b == b'.',

@@ -71,8 +71,9 @@ use crate::{
     database_task::{DatabaseCommand, send_db_command_nonblocking},
     deb_mirror::{
         DistsScope, FlatKind, Mirror, MirrorKind, Origin, OriginFields, OriginSighting,
-        ResourceFile, is_binary_arch, is_deb_package, is_flat_deb_filename, is_packages_directory,
-        is_pdiff_patch_name, valid_directory, valid_filename, valid_mirrorname, valid_path_segment,
+        PDIFF_PATCH_NAME_LEN, ResourceFile, is_binary_arch, is_deb_package, is_flat_deb_filename,
+        is_packages_directory, is_pdiff_patch_name, valid_directory, valid_filename,
+        valid_mirrorname, valid_path_segment,
     },
     flat_blocklist::path_collides_with_flat_layout,
     index_parser::HashAlgo,
@@ -725,9 +726,14 @@ const PDIFF_SEPARATOR: &str = ".diff_";
 /// cleanup gives these files their own, shorter retention.
 #[must_use]
 pub(crate) fn is_cached_pdiff_patch(debname: &str) -> bool {
+    // A patch name has one length, so the tail is cut rather than searched
+    // for: nearly every name asked about (each `Translation-*` request,
+    // each file of a `dists/` sweep) is shorter and leaves on the compare.
     debname
-        .rsplit_once(PDIFF_SEPARATOR)
-        .is_some_and(|(_, patch)| is_pdiff_patch_name(patch))
+        .len()
+        .checked_sub(PDIFF_PATCH_NAME_LEN)
+        .and_then(|at| debname.split_at_checked(at))
+        .is_some_and(|(head, patch)| head.ends_with(PDIFF_SEPARATOR) && is_pdiff_patch_name(patch))
 }
 
 /// The result of [`classify_request`], with every field decoded and
@@ -1641,6 +1647,8 @@ mod tests {
             "sid_InRelease",
             p,
             "sid_main_Packages.diff_T-12345",
+            // The patch-name tail would start inside a character.
+            &format!("\u{e9}{}", p.strip_prefix('T').unwrap()),
         ] {
             assert!(!is_cached_pdiff_patch(bad), "{bad}");
         }
