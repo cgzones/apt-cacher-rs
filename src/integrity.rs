@@ -788,8 +788,9 @@ impl RegistryInner {
     }
 
     /// Insert (or refresh) one scope's slots, resolving the scope once for
-    /// the batch, and return it. An empty batch creates no scope and returns
-    /// `None`. Never evicts: the caller does, once the whole batch is in
+    /// the batch, and return it. An empty batch creates no scope: it returns
+    /// the existing one, `None` if there is none. Never evicts: the caller
+    /// does, once the whole batch is in
     /// ([`ChecksumRegistry::evict_over_cap`]).
     fn insert(
         &mut self,
@@ -797,13 +798,14 @@ impl RegistryInner {
         mirror_path: &str,
         slots: &[Slot],
     ) -> Option<&mut ScopeState> {
-        if slots.is_empty() {
-            return None;
-        }
-        let state = match self.map.entry_ref(&RegistryScopeRef {
+        let scope = RegistryScopeRef {
             authority,
             mirror_path,
-        }) {
+        };
+        if slots.is_empty() {
+            return self.map.get_mut(&scope);
+        }
+        let state = match self.map.entry_ref(&scope) {
             EntryRef::Occupied(entry) => entry.into_mut(),
             EntryRef::Vacant(entry) => entry.insert_with_key(
                 Arc::new(RegistryScope {
@@ -2906,6 +2908,26 @@ mod tests {
                 "newer_first={newer_first}"
             );
         }
+    }
+
+    #[test]
+    fn a_release_listing_no_slots_still_records_its_date() {
+        const INDEX: &str = "debian/dists/sid/main/binary-amd64/Packages.xz";
+        let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
+        // The scope exists already (an earlier ingest).
+        reg.insert("h", "debian", "a_1_amd64.deb", [1; 32]);
+        // A newer source with no `Packages` slot it registers (say, a
+        // SHA512-only `InRelease`) still pins the directory's date ...
+        assert!(reg.insert_release("h", "debian", "debian/dists/sid", Some(200), &[]));
+        // ... so an older one cannot register its stale digests after it.
+        assert!(!reg.insert_release(
+            "h",
+            "debian",
+            "debian/dists/sid",
+            Some(100),
+            &[Slot::for_key(INDEX, [2; 32])]
+        ));
+        assert_eq!(reg.lookup("h", "debian", INDEX), None);
     }
 
     #[tokio::test]
