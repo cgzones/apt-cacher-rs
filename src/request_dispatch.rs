@@ -10,11 +10,10 @@
 //!
 //! The request-classification pipeline, in order:
 //!
-//!   1. diff-request gate          - reject (410) pdiff URLs when configured
-//!      (judged on the step-2 form, so `//` / `.` spellings cannot bypass it);
-//!      else a strict patch name is cached and any other `.diff/T-` shape
-//!      falls through silently as `Unrecognized`
-//!   2. [`normalize_uri_path`]     - collapse `//` runs / strip `.` segments
+//!   1. [`normalize_uri_path`]     - collapse `//` runs / strip `.` segments
+//!   2. diff-request gate          - reject (410) normalized pdiff URLs when
+//!      configured. Otherwise a strict patch name is cacheable and an
+//!      unrecognized `.diff/T-` shape passes through without a warning.
 //!   3. [`parse_request_path`]     - structural shape-match into `ResourceFile`
 //!   4. [`classify_request`]       - per-field URL-decode + allowlist validate
 //!   5. unsafe-cache-path gate     - empty/dot segments, control bytes once
