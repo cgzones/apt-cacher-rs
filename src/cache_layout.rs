@@ -71,9 +71,8 @@ use crate::{
     database_task::{DatabaseCommand, send_db_command_nonblocking},
     deb_mirror::{
         DistsScope, FlatKind, Mirror, MirrorKind, Origin, OriginFields, OriginSighting,
-        ResourceFile, is_binary_arch, is_cached_pdiff_patch, is_deb_package, is_flat_deb_filename,
-        is_packages_directory, valid_directory, valid_filename, valid_mirrorname,
-        valid_path_segment,
+        ResourceFile, is_binary_arch, is_deb_package, is_flat_deb_filename, is_packages_directory,
+        is_pdiff_patch_name, valid_directory, valid_filename, valid_mirrorname, valid_path_segment,
     },
     flat_blocklist::path_collides_with_flat_layout,
     index_parser::HashAlgo,
@@ -718,6 +717,19 @@ pub(crate) fn dists_debname(
     format!("{distribution}_{component}_{architecture}_{filename}")
 }
 
+const PDIFF_SEPARATOR: &str = ".diff_";
+
+/// Whether the cache name `debname` is that of a cached pdiff patch
+/// (`…<index>.diff_T-<ts>-F-<ts>.gz`, see [`ResourceFile::Pdiff`]).  The
+/// classifier refuses any other resource decoding to such a name, and
+/// cleanup gives these files their own, shorter retention.
+#[must_use]
+pub(crate) fn is_cached_pdiff_patch(debname: &str) -> bool {
+    debname
+        .rsplit_once(PDIFF_SEPARATOR)
+        .is_some_and(|(_, patch)| is_pdiff_patch_name(patch))
+}
+
 /// The result of [`classify_request`], with every field decoded and
 /// validated.
 #[derive(Debug)]
@@ -1018,7 +1030,7 @@ pub(crate) fn classify_request<'a>(
             // The parser admits no `%` in either, so decoding is the identity.
             let index = decode_validate(index, ValidateKind::Filename)?;
             let patch = decode_validate(patch, ValidateKind::Filename)?;
-            let leaf = format!("{index}.diff_{patch}");
+            let leaf = format!("{index}{PDIFF_SEPARATOR}{patch}");
 
             trace!(
                 "Decoded mirror path: `{mirror_path}`; Decoded distribution: `{distribution}`; Decoded component: `{component}`; Decoded pdiff patch: `{leaf}` (client {client})"
@@ -1599,6 +1611,26 @@ mod tests {
                 decoded,
             }) if decoded == "../escape"
         ));
+    }
+
+    #[test]
+    fn cached_pdiff_patch_debnames() {
+        let p = "T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz";
+        for ok in [
+            format!("sid_main_binary-amd64_Packages.diff_{p}"),
+            format!("sid_main_Sources.diff_{p}"),
+            format!("sid_main_Translation-zh_CN.diff_{p}"),
+        ] {
+            assert!(is_cached_pdiff_patch(&ok), "{ok}");
+        }
+        for bad in [
+            "sid_main_binary-amd64_Packages.xz",
+            "sid_InRelease",
+            p,
+            "sid_main_Packages.diff_T-12345",
+        ] {
+            assert!(!is_cached_pdiff_patch(bad), "{bad}");
+        }
     }
 
     #[test]

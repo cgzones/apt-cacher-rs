@@ -5,10 +5,10 @@ use std::time::{Duration, SystemTime};
 use hashbrown::HashMap;
 use tracing::{debug, error, warn};
 
-use crate::cache_layout::{CacheEntryKeyRef, CacheLayout};
+use crate::cache_layout::{CacheEntryKeyRef, CacheLayout, is_cached_pdiff_patch};
 use crate::cache_quota::accounted_size;
 use crate::cache_walk::{AnomalyLevel, DirFailure, EntryKind, WalkContext, Walker};
-use crate::deb_mirror::{Mirror, is_cached_pdiff_patch, is_deb_package};
+use crate::deb_mirror::{Mirror, is_deb_package};
 use crate::error::ErrorReport;
 use crate::humanfmt::HumanFmt;
 use crate::{cache_metadata, info_once, metrics, warn_once_or_info};

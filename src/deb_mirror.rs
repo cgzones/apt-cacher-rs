@@ -943,17 +943,6 @@ fn is_pdiff_timestamp(stamp: &str) -> bool {
         })
 }
 
-/// Whether the cache name `debname` is that of a cached pdiff patch
-/// (`…<index>.diff_T-<ts>-F-<ts>.gz`, see [`ResourceFile::Pdiff`]).  The
-/// classifier refuses any other resource decoding to such a name, and
-/// cleanup gives these files their own, shorter retention.
-#[must_use]
-pub(crate) fn is_cached_pdiff_patch(debname: &str) -> bool {
-    debname
-        .rsplit_once(".diff_")
-        .is_some_and(|(_, patch)| is_pdiff_patch_name(patch))
-}
-
 /// Check whether a raw URI path is safe to forward upstream
 /// (percent-decoding is applied internally before inspection).
 ///
@@ -2816,26 +2805,6 @@ mod tests {
             "",
         ] {
             assert!(!is_pdiff_patch_name(bad), "{bad}");
-        }
-    }
-
-    #[test]
-    fn cached_pdiff_patch_debnames() {
-        let p = "T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz";
-        for ok in [
-            format!("sid_main_binary-amd64_Packages.diff_{p}"),
-            format!("sid_main_Sources.diff_{p}"),
-            format!("sid_main_Translation-zh_CN.diff_{p}"),
-        ] {
-            assert!(is_cached_pdiff_patch(&ok), "{ok}");
-        }
-        for bad in [
-            "sid_main_binary-amd64_Packages.xz",
-            "sid_InRelease",
-            p,
-            "sid_main_Packages.diff_T-12345",
-        ] {
-            assert!(!is_cached_pdiff_patch(bad), "{bad}");
         }
     }
 
