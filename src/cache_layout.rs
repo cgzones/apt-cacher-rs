@@ -1038,23 +1038,29 @@ pub(crate) fn classify_request<'a>(
 
             // Only a `Packages` patch carries its slot, which joins the
             // name exactly where it does for the `Packages` index itself.
-            let debname = match architecture {
+            // It also carries the index's origin: a client updating by
+            // pdiff never fetches the full `Packages`, so without it the
+            // origin would expire and cleanup sweep the debs still in use.
+            let (debname, origin_fields) = match architecture {
                 Some(architecture) => {
                     let architecture = decode_validate(architecture, ValidateKind::Architecture)?;
                     if !is_packages_directory(&architecture) {
                         return Err(ClassifyError::PackagesOutsideArchitecture { architecture });
                     }
-                    dists_debname(&distribution, &component, &architecture, &leaf)
+                    let debname = dists_debname(&distribution, &component, &architecture, &leaf);
+                    (
+                        debname,
+                        OriginFields::of_scope(distribution, component, architecture),
+                    )
                 }
-                None => format!("{distribution}_{component}_{leaf}"),
+                None => (format!("{distribution}_{component}_{leaf}"), None),
             };
 
-            // A patch is no per-binary origin: the index it patches is.
             Ok(RequestClass {
                 mirror_path: Arc::from(mirror_path),
                 debname,
                 resource_kind: ResourceKind::Pdiff,
-                origin_fields: None,
+                origin_fields,
             })
         }
         ResourceFile::Flat {
@@ -1636,16 +1642,25 @@ mod tests {
     #[test]
     fn classify_pdiff_patches() {
         const P: &str = "T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz";
-        for (dir, debname) in [
+        // A client updating by pdiff never fetches the full `Packages`, so
+        // a `Packages` patch must carry its architecture's origin or the
+        // origin expires and cleanup sweeps the debs it still references.
+        for (dir, debname, origin_arch) in [
             (
                 "binary-amd64/Packages.diff",
                 "sid_main_binary-amd64_Packages.diff_",
+                Some("binary-amd64"),
             ),
-            ("source/Sources.diff", "sid_main_Sources.diff_"),
-            ("i18n/Translation-en.diff", "sid_main_Translation-en.diff_"),
+            ("source/Sources.diff", "sid_main_Sources.diff_", None),
+            (
+                "i18n/Translation-en.diff",
+                "sid_main_Translation-en.diff_",
+                None,
+            ),
             (
                 "i18n/Translation-zh_CN.diff",
                 "sid_main_Translation-zh_CN.diff_",
+                None,
             ),
         ] {
             let path = format!("debian/dists/sid/main/{dir}/{P}");
@@ -1653,7 +1668,12 @@ mod tests {
             let class = classify_request(&res, &local_client()).expect(&path);
             assert_eq!(class.debname, format!("{debname}{P}"), "{path}");
             assert_eq!(class.resource_kind, ResourceKind::Pdiff, "{path}");
-            assert!(class.origin_fields.is_none(), "{path}");
+            let expected = origin_arch.map(|architecture| OriginFields {
+                distribution: "sid".to_owned(),
+                component: "main".to_owned(),
+                architecture: architecture.to_owned(),
+            });
+            assert_eq!(class.origin_fields, expected, "{path}");
         }
 
         let path = format!("debian/dists/sid/main/Translation-en/Packages.diff/{P}");
