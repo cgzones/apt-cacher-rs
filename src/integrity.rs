@@ -1612,10 +1612,12 @@ pub(crate) async fn ingest_cached_indexes(database: &Database) {
 
 /// One suite of [`ingest_cached_indexes`]; how many `Packages` indexes it
 /// ingested. A cached `Packages` file is ingested only if cleanup's
-/// [`verify_cache_file`] matches it against a digest the cached `Release`
-/// lists for it (`InRelease` first, as apt prefers it): the by-hash file of
-/// that digest, or the by-name file. The verified marker a commit stamps
-/// spares a file the re-read.
+/// [`verify_cache_file`] matches it against a digest the freshest readable
+/// cached `InRelease`/`Release` lists for it: the by-hash file of that
+/// digest, or the by-name file. A dated source beats an undated one; the
+/// later clamped `Date:` wins, with ties going to `InRelease` as apt
+/// prefers it. Only that source is ingested, including for the dashboard.
+/// The verified marker a commit stamps spares a file the re-read.
 async fn ingest_cached_suite(
     registry: &ChecksumRegistry,
     cache: CachePaths<'_>,
@@ -1630,29 +1632,42 @@ async fn ingest_cached_suite(
     } else {
         format!("{mirror_path}/dists/{distribution}")
     };
-    let mut release = None;
+    let mut release: Option<(PathBuf, String, Option<i64>)> = None;
     for leaf in ["InRelease", "Release"] {
         let path = cache.entry_file(
             CacheLayout::Dists,
             mirror.site(),
             Path::new(&format!("{distribution}_{leaf}")),
         );
-        // Most suites cache only one of the two; a missing one is no failure.
-        if tokio::fs::symlink_metadata(&path).await.is_ok() {
-            let kind = IngestKind::Release {
-                release_dir: release_dir.clone(),
-            };
-            ingest_awaited(registry, &kind, mirror, &path, buffer_size).await;
-            release.get_or_insert(path);
+        // Most suites cache only one of the two; a missing one is no failure,
+        // an unreadable one is unusable.
+        let content = match read_release_to_string(&path).await {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                warn!(
+                    "Not using cached index `{}` to register digests at startup:  {}",
+                    path.display(),
+                    ErrorReport(&err)
+                );
+                continue;
+            }
+        };
+        let date = clamp_future_release_date(index_parser::parse_release_header(&content).date);
+        // Option ordering puts dated sources above undated ones. Keeping
+        // the first on a tie gives InRelease apt's preference.
+        if release
+            .as_ref()
+            .is_none_or(|(_, _, selected)| date > *selected)
+        {
+            release = Some((path, content, date));
         }
     }
-    let Some(release) = release else {
+    let Some((release, content, _date)) = release else {
         return 0;
     };
-    // A failed read was reported by the ingest of the same file.
-    let Ok(content) = read_release_to_string(&release).await else {
-        return 0;
-    };
+    let kind = IngestKind::Release { release_dir };
+    ingest_awaited(registry, &kind, mirror, &release, buffer_size).await;
 
     let mut ingested = 0;
     'scope: for &(component, architecture) in scopes {
@@ -3144,6 +3159,80 @@ mod tests {
             let lookup = reg.lookup("deb.debian.org", "debian", "hello_1.0_amd64.deb");
             assert_eq!(lookup, registered.then_some(deb_sha), "{label}");
             assert_eq!(ingested, usize::from(registered), "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restart_uses_the_freshest_cached_release_for_packages_and_dashboard() {
+        use sha2::Digest as _;
+
+        let newer = "Sun, 20 Sep 2026 08:53:33 UTC";
+        let older = "Sat, 19 Sep 2026 08:53:33 UTC";
+        let deb_sha = [0x5au8; 32];
+        let packages = format!(
+            "Package: hello\nFilename: pool/main/h/hello/hello_1.0_amd64.deb\nSHA256: {}\n",
+            index_parser::hex_encode(&deb_sha),
+        );
+        let packages_sha: [u8; 32] = sha2::Sha256::digest(&packages).into();
+        let sha256 = index_parser::hex_encode(&packages_sha);
+        let stale = "00".repeat(32);
+        for (host, inrelease_date, release_date, chosen) in [
+            ("restart-new-release.test", older, newer, "Release"),
+            ("restart-new-inrelease.test", newer, older, "InRelease"),
+            ("restart-tied-release.test", newer, newer, "InRelease"),
+        ] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let cache = CachePaths::new(root.path());
+            let mirror = structured_mirror(host, "debian");
+            let write = |leaf: &str, body: &[u8]| {
+                let path = cache.entry_file(CacheLayout::Dists, mirror.site(), Path::new(leaf));
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+                std::fs::write(path, body).expect("write");
+            };
+            for (leaf, date) in [("InRelease", inrelease_date), ("Release", release_date)] {
+                let hex = if leaf == chosen { &sha256 } else { &stale };
+                let release = format!(
+                    "Origin: Test\nDate: {date}\nSHA256:\n {hex} {} main/binary-amd64/Packages\n",
+                    packages.len(),
+                );
+                write(&format!("sid_{leaf}"), release.as_bytes());
+            }
+            write("sid_main_binary-amd64_Packages", packages.as_bytes());
+
+            let reg = ChecksumRegistry::new(NonZero::new(100).expect("non-zero"));
+            let ingested = ingest_cached_suite(
+                &reg,
+                cache,
+                &mirror,
+                "sid",
+                &[("main", "binary-amd64")],
+                64 * 1024,
+            )
+            .await;
+            assert_eq!(ingested, 1, "{host}");
+            assert_eq!(
+                reg.lookup(
+                    host,
+                    "debian",
+                    "debian/dists/sid/main/binary-amd64/Packages"
+                ),
+                Some(packages_sha),
+                "{host}"
+            );
+            assert_eq!(
+                reg.lookup(host, "debian", "hello_1.0_amd64.deb"),
+                Some(deb_sha),
+                "{host}"
+            );
+            let snapshot = mirror_indexes::snapshot();
+            let suite = snapshot[mirror.to_string().as_str()]
+                .suite("sid")
+                .expect("chosen Release recorded for dashboard");
+            assert_eq!(
+                suite.header.date,
+                index_parser::parse_release_header(&format!("Date: {newer}\n")).date,
+                "{host}"
+            );
         }
     }
 
