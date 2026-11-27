@@ -18,8 +18,9 @@
 //! upstream 304 revalidating one. A 304 for a suite not recorded yet (the
 //! first revalidation after a restart, whose touch ingest is still running)
 //! is held as a pending confirmation the ingest applies, so the revalidation
-//! time wins over the file's mtime whichever lands first. So nothing is
-//! known before the first `apt update` after a restart, and nothing at all
+//! time wins over the file's mtime whichever lands first. After a restart
+//! the suites come back with the startup ingest of the cached indexes
+//! (`integrity::ingest_cached_indexes`), and nothing is known at all
 //! without `verify_checksums`, which gates the ingest. Not covered:
 //! signatures, per-component `Release` files, flat repositories, cleanup's
 //! own `Release` reads.

@@ -13,6 +13,8 @@ use engine::{UnitStats, run_mirror_units};
 #[cfg(not(feature = "hyper"))]
 pub(crate) use fetch::{FetchFailure, IndexAnswer};
 use model::classify_mirror;
+// The registry's startup ingest trusts a cached index on the same check.
+pub(crate) use verify::{Verdict, verify_cache_file};
 
 use std::{
     path::Path,
