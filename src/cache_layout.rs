@@ -432,10 +432,11 @@ pub(crate) struct ConnectionDetails {
     /// `request_dispatch::decide_request`, so the active-downloads key, the
     /// on-disk site, the DB rows and the logs all name the alias' main host.
     pub(crate) mirror: Mirror,
-    /// The host the client named, which is where the upstream fetch goes
-    /// (an alias is a real mirror serving the same content; the alias
-    /// mapping only unifies the cache identity).  Equal to `mirror.host()`
-    /// unless an alias matched.
+    /// Where the upstream fetch goes: the host the client named (an alias
+    /// is a real mirror serving the same content; the alias mapping only
+    /// unifies the cache identity), or the main host of its group when
+    /// `remaps` lists that name.  Equal to `mirror.host()` unless an alias
+    /// of a plain `aliases` group matched.
     pub(crate) upstream_host: ClientHost,
     pub(crate) debname: String,
     pub(crate) resource_kind: ResourceKind,
@@ -567,14 +568,14 @@ impl ConnectionDetails {
         self.mirror.site()
     }
 
-    /// The `host[:port]` authority of the upstream the fetch dials: the
-    /// host the client named, on the mirror's port.
+    /// The `host[:port]` authority of the upstream the fetch dials:
+    /// [`Self::upstream_host`] on the mirror's port.
     #[must_use]
     pub(crate) fn upstream_authority(&self) -> Cow<'_, str> {
         self.upstream_host.format_authority(self.mirror.port())
     }
 
-    /// Dial the client-named host while retaining the canonical cache identity.
+    /// Dial the upstream host while retaining the canonical cache identity.
     #[cfg(feature = "splice")]
     #[must_use]
     pub(crate) fn upstream_endpoint(&self) -> crate::splice::UpstreamEndpoint<'_> {

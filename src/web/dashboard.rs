@@ -1004,7 +1004,9 @@ fn build_configuration_html(rd: &RuntimeDetails) -> String {
         "Allowed Tunnel Mirrors",
         rd.config.https_tunnel_allowed_mirrors.len(),
     );
-    t.row("Aliases", rd.config.aliases.len());
+    let remaps = rd.config.aliases.iter().filter(|a| a.remap).count();
+    t.row("Aliases", rd.config.aliases.len() - remaps);
+    t.row("Remaps", remaps);
     t.row("Allowed Clients", rd.config.allowed_proxy_clients.len());
     t.finish()
 }

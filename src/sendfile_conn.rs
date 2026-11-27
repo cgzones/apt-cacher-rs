@@ -1024,7 +1024,7 @@ async fn try_sendfile_request(
             #[cfg(feature = "splice")]
             DispatchOutcome::Passthrough(PassthroughRequest {
                 reason,
-                requested_host,
+                upstream_host,
                 canonical_host,
                 requested_port,
                 request_received_at,
@@ -1052,7 +1052,7 @@ async fn try_sendfile_request(
                 );
 
                 let endpoint = UpstreamEndpoint {
-                    host: &requested_host,
+                    host: &upstream_host,
                     port: requested_port,
                 };
 

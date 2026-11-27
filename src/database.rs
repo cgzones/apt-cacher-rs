@@ -1773,6 +1773,7 @@ mod retention_tests {
                 .expect("host")
                 .into_cache_host(),
             aliases: vec![ClientHost::new("deb.example.org").expect("host")],
+            remap: false,
         }];
         db.merge_alias_rows(&aliases)
             .await
@@ -1801,6 +1802,7 @@ mod retention_tests {
                 .expect("host")
                 .into_cache_host(),
             aliases: vec![ClientHost::new("ftp.example.org").expect("host")],
+            remap: false,
         }];
         let merged = db.merge_alias_rows(&aliases).await.expect("merge");
         assert_eq!(merged, 2);
@@ -1871,6 +1873,7 @@ mod retention_tests {
             let aliases = [Alias {
                 main: ClientHost::new(hosts[0]).expect("host").into_cache_host(),
                 aliases: members,
+                remap: false,
             }];
             assert_eq!(db.merge_alias_rows(&aliases).await.expect("merge"), 2);
             assert_eq!(db.merge_alias_rows(&aliases).await.expect("repeat"), 0);

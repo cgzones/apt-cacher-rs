@@ -581,19 +581,35 @@ impl<'de> Deserialize<'de> for CacheHost {
 pub(crate) struct Alias {
     pub(crate) main: CacheHost,
     pub(crate) aliases: Vec<ClientHost>,
+    /// Whether the group came from `remaps`: a request naming one of its
+    /// aliases is fetched from `main` instead of the host the client named.
+    /// Never read from the configuration; set at config load, which folds
+    /// the `remaps` groups into [`Config::aliases`].
+    #[serde(skip)]
+    pub(crate) remap: bool,
 }
 
-/// Resolve a client-supplied host through `aliases` to its on-disk cache
-/// identity; `None` when `host` is no alias of any configured group.
+/// Resolve a client-supplied host through `aliases` to the group listing
+/// it; `None` when `host` is no alias of any configured group.
 ///
 /// `aliases[].aliases` must be sorted (done at config load) for the binary
 /// search.
 #[must_use]
-pub(crate) fn resolve_alias<'a>(aliases: &'a [Alias], host: &ClientHost) -> Option<&'a CacheHost> {
+pub(crate) fn resolve_alias_group<'a>(
+    aliases: &'a [Alias],
+    host: &ClientHost,
+) -> Option<&'a Alias> {
     aliases
         .iter()
         .find(|alias| alias.aliases.binary_search(host).is_ok())
-        .map(|alias| &alias.main)
+}
+
+/// Resolve a client-supplied host through `aliases` to its on-disk cache
+/// identity; `None` when `host` is no alias of any configured group.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn resolve_alias<'a>(aliases: &'a [Alias], host: &ClientHost) -> Option<&'a CacheHost> {
+    resolve_alias_group(aliases, host).map(|alias| &alias.main)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -848,7 +864,14 @@ pub(crate) struct Config {
     #[serde(deserialize_with = "from_nonzero_u64")]
     pub(crate) usage_retention_days: Option<NonZero<u64>>,
 
+    /// The `aliases` groups and, once the configuration is validated, the
+    /// `remaps` groups too (marked by [`Alias::remap`]): every consumer of
+    /// the cache identity treats the two alike.
     pub(crate) aliases: Vec<Alias>,
+
+    /// Alias groups whose downloads go to the common name.  Only holds the
+    /// configured value until validation moves it into [`Self::aliases`].
+    pub(crate) remaps: Vec<Alias>,
 
     pub(crate) allowed_mirrors: Vec<ConfigDomainName>,
 
@@ -1065,6 +1088,7 @@ impl Default for Config {
             byhash_retention_days: nonzero!(90),
             usage_retention_days: Some(nonzero!(30)),
             aliases: Vec::new(),
+            remaps: Vec::new(),
             allowed_mirrors: Vec::new(),
             allowed_mirror_ports: vec![nonzero!(80), nonzero!(443)],
             http_only_mirrors: Vec::new(),
@@ -1606,6 +1630,14 @@ impl Config {
             );
         }
 
+        // A remap is an alias whose downloads go to the common name as
+        // well, so the two share one list, one set of conflict rules and
+        // one `Database::merge_alias_rows` migration.
+        for mut remap in std::mem::take(&mut self.remaps) {
+            remap.remap = true;
+            self.aliases.push(remap);
+        }
+
         for alias in &mut self.aliases {
             alias.aliases.sort_unstable();
         }
@@ -1663,6 +1695,17 @@ impl Config {
                         alias.main
                     ));
                 }
+
+                // An alias of a plain group is a mirror of its own, which
+                // may well be left out; a remapped name serves no purpose
+                // but to be requested.
+                for host in alias.aliases.iter().filter(|_| alias.remap) {
+                    if !self.allowed_mirrors.iter().any(|a| a.permits(host)) {
+                        warnings.push(format!(
+                            "remaps entry `{host}` is not permitted by allowed_mirrors; requests naming it are refused"
+                        ));
+                    }
+                }
             }
         }
 
@@ -1689,6 +1732,18 @@ impl Config {
                 "aliases",
                 self.aliases
                     .iter()
+                    .filter(|alias| !alias.remap)
+                    .flat_map(|alias| {
+                        std::iter::once::<&DomainName>(&alias.main)
+                            .chain(alias.aliases.iter().map(|a| &**a))
+                    })
+                    .collect(),
+            ),
+            (
+                "remaps",
+                self.aliases
+                    .iter()
+                    .filter(|alias| alias.remap)
                     .flat_map(|alias| {
                         std::iter::once::<&DomainName>(&alias.main)
                             .chain(alias.aliases.iter().map(|a| &**a))
@@ -2515,6 +2570,7 @@ mod test {
         Alias {
             main: cah(main),
             aliases,
+            remap: false,
         }
     }
 
@@ -3285,6 +3341,62 @@ mod test {
         let resolved =
             resolve_alias(&cfg.aliases, &clh("ftp.us.debian.org")).expect("alias resolves");
         assert_eq!(resolved.as_str(), "deb.debian.org");
+    }
+
+    #[test]
+    fn remaps_join_the_alias_groups_marked_as_remaps() {
+        let mut cfg = Config::from_toml(
+            "aliases = [ ['deb.debian.org', ['ftp.us.debian.org']] ]\n\
+             remaps = [ ['archive.ubuntu.com', ['ubuntu.internal', 'apt.internal']] ]",
+        )
+        .expect("config parses");
+        cfg.validate().expect("disjoint groups are valid");
+        assert_eq!(cfg.remaps, [], "validation moves the groups into `aliases`");
+        for (host, main, remap) in [
+            ("ftp.us.debian.org", "deb.debian.org", false),
+            ("apt.internal", "archive.ubuntu.com", true),
+            ("ubuntu.internal", "archive.ubuntu.com", true),
+        ] {
+            let group = resolve_alias_group(&cfg.aliases, &clh(host)).expect("alias resolves");
+            assert_eq!(group.main.as_str(), main, "{host}");
+            assert_eq!(group.remap, remap, "{host}");
+        }
+    }
+
+    #[test]
+    fn remaps_share_the_alias_conflict_rules() {
+        for (case, input) in [
+            (
+                "a host aliased and remapped",
+                "aliases = [ ['deb.debian.org', ['x.debian.org']] ]\n\
+                 remaps = [ ['other.debian.org', ['x.debian.org']] ]",
+            ),
+            (
+                "a remap of an alias' main",
+                "aliases = [ ['deb.debian.org', ['a.debian.org']] ]\n\
+                 remaps = [ ['b.debian.org', ['deb.debian.org']] ]",
+            ),
+        ] {
+            let mut cfg = Config::from_toml(input).expect("config parses");
+            let err = cfg.validate().expect_err(case).to_string();
+            assert!(err.contains("conflicts with alias"), "{case}: {err}");
+        }
+    }
+
+    #[test]
+    fn remapped_name_outside_allowed_mirrors_warns() {
+        let warnings = warnings_for(
+            "allowed_mirrors = [ 'deb.debian.org', 'ftp.us.debian.org' ]\n\
+             allowed_proxy_clients = [ '127.0.0.1' ]\n\
+             aliases = [ ['ftp.us.debian.org', ['ftp.de.debian.org']] ]\n\
+             remaps = [ ['deb.debian.org', ['debian.internal']] ]",
+        );
+        let unpermitted: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.contains("is not permitted by allowed_mirrors"))
+            .collect();
+        assert_eq!(unpermitted.len(), 1, "{warnings:?}");
+        assert!(unpermitted[0].starts_with("remaps entry `debian.internal`"));
     }
 
     // -----------------------------------------------------------------
