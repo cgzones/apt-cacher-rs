@@ -53,7 +53,7 @@ use crate::{
     fd_usage, flat_blocklist, global_config, global_webif_hosts,
     healthcheck::{self, filesystem_space},
     humanfmt::HumanFmt,
-    metrics,
+    integrity, metrics,
     request_dispatch::ClientAcls,
     runtime_details,
     sqlite_error::SqlxErrorReport,
@@ -364,6 +364,16 @@ pub(crate) async fn main_loop(
                 );
             }
         }
+    }
+
+    // Register the digests of the indexes already cached. In the background:
+    // a download committing before it is done is cached unverified, as
+    // before.
+    if config.verify_checksums {
+        let database = database.clone();
+        tokio::task::spawn(async move {
+            integrity::ingest_cached_indexes(&database).await;
+        });
     }
 
     // Scheme cache initialization task (hyper backend only — the splice-only

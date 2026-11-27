@@ -576,6 +576,24 @@ pub(crate) fn parse_release_checksums<'a>(
     })
 }
 
+/// [`parse_release_checksums`] over the `SHA512:` section too, for a caller
+/// matching a cached file named by either digest (by-hash).
+pub(crate) fn parse_release_digests<'a>(
+    content: &'a str,
+    mut wanted: impl FnMut(&str) -> bool + 'a,
+) -> impl Iterator<Item = (&'a str, Digest)> + 'a {
+    release_hash_entries(content).filter_map(move |entry| {
+        let Ok((section, hex, path)) = entry else {
+            return None;
+        };
+        let path = strip_leading_dot_segments(path);
+        if !is_safe_filename_relpath(path) || !wanted(path) {
+            return None;
+        }
+        Some((path, byhash_digest_for_algo(section, hex)?))
+    })
+}
+
 /// The dates in a `Release`/`InRelease` header paragraph, as unix seconds:
 /// `Date:` (when the archive generated it) and `Valid-Until:` (after which
 /// apt refuses it). Either is `None` when missing or unparsable.

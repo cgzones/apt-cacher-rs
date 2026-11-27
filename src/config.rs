@@ -987,7 +987,8 @@ pub(crate) struct Config {
 
     /// Upper bound on the in-memory checksum registry (entries). The registry
     /// maps `(host, mirror_path, resource key)` to an expected digest, populated
-    /// by parsing index files as they flow through. At the cap, the oldest
+    /// by parsing index files as they flow through, and at startup from the
+    /// cached ones. At the cap, the oldest
     /// entries are evicted in bulk. One full Debian `main`/amd64 `Packages` is
     /// ~64k entries.
     pub(crate) verify_checksums_max_entries: NonZero<usize>,

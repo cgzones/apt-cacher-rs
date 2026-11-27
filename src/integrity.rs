@@ -24,6 +24,8 @@
 //! restart, an eviction from its scope, or a skipped or transiently failed
 //! ingest. Every backend calls [`note_cached_index_touch`] where it answers
 //! an index from cache; `ingest_ledger` keeps that cheap for a warm index.
+//! At startup [`ingest_cached_indexes`] registers the indexes already
+//! cached, which a client whose lists are current never requests again.
 
 use std::borrow::Cow;
 use std::collections::{BinaryHeap, VecDeque};
@@ -35,12 +37,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 
+use coarsetime::Instant;
 use hashbrown::{
     DefaultHashBuilder, Equivalent, HashMap, HashTable, hash_map::EntryRef, hash_table::AbsentEntry,
 };
 use parking_lot::Mutex;
 use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::error::ErrorReport;
 use crate::fs_open::{count_cache_failure, hint_sequential_read, nofollow_nonblock_options};
@@ -48,14 +51,22 @@ use crate::ingest_ledger::{Claim, IngestLedger, Outcome};
 use crate::limits::{self, PackagesCompression};
 use crate::mem_usage::{ARC_HEADER, Footprint, buffer_bytes};
 use crate::{
-    cache_layout::{ByHashContent, CacheEntryKey, ConnectionDetails, ResourceKind},
+    cache_layout::{
+        ByHashContent, CacheEntryKey, CacheLayout, ConnectionDetails, ResourceKind, dists_debname,
+    },
+    cache_paths::CachePaths,
     cache_quota::QuotaReservation,
-    deb_mirror::{Mirror, normalize_uri_path},
+    cleanup::{Verdict, verify_cache_file},
+    database::Database,
+    deb_mirror::{Mirror, MirrorKind, normalize_uri_path},
     guards::DownloadWriteLease,
+    humanfmt::HumanFmt,
     index_parser::{self, Digest, HashAlgo, ReleaseHeader, StanzaStream, StreamedDigest},
     metrics,
     mirror_indexes::{self, SuiteIndex},
     partial_file::TempPath,
+    permitted_host_cache::mirror_permitted,
+    sqlite_error::SqlxErrorReport,
     verified_marker::{self, FileIdentity},
 };
 use crate::{
@@ -334,7 +345,8 @@ impl Equivalent<Arc<RegistryScope>> for RegistryScopeRef<'_> {
 
 /// Bounded in-memory map from `(authority, mirror_path)` scope and per-scope
 /// lookup key to an expected SHA256 digest, populated from `Packages` /
-/// `Release` index files. Lost on restart. FIFO bulk eviction at the
+/// `Release` index files. Lost on restart, and rebuilt from the cached
+/// indexes by [`ingest_cached_indexes`]. FIFO bulk eviction at the
 /// configured cap, checked once per insert batch (so the count may pass the
 /// cap by up to one batch).
 ///
@@ -1439,11 +1451,7 @@ fn schedule_ingest(file: &IndexFile<'_>) -> bool {
     let registry = global_checksum_registry();
     let (authority, mirror_path) = (file.mirror.format_authority(), file.mirror.path());
     let epoch = registry.scope_epoch(authority, mirror_path);
-    let slots = match &kind {
-        IngestKind::Release { release_dir: _ } => &RELEASE_INGEST_SLOTS,
-        IngestKind::Packages { compression: _ } => &INGEST_SLOTS,
-    };
-    let (claim, slot) = match admit(&INGEST_LEDGER, slots, file.path, epoch) {
+    let (claim, slot) = match admit(&INGEST_LEDGER, kind.slots(), file.path, epoch) {
         Admission::Nothing => return false,
         Admission::Refused => {
             metrics::INGEST_SKIPPED_QUEUE_FULL.increment();
@@ -1498,8 +1506,6 @@ pub(crate) fn note_release_revalidated(conn_details: &ConnectionDetails, raw_uri
     );
 }
 
-/// One claimed path's ingest, run again while commits keep replacing the
-/// file under it.
 async fn run_ingest_job(
     mut claim: Claim<'static>,
     // Held for the whole job, reruns included; see `INGEST_SLOTS`.
@@ -1508,16 +1514,204 @@ async fn run_ingest_job(
     mirror: Mirror,
     buffer_size: usize,
 ) {
-    let registry = global_checksum_registry();
+    ingest_claimed(
+        global_checksum_registry(),
+        &mut claim,
+        &kind,
+        &mirror,
+        buffer_size,
+    )
+    .await;
+}
+
+/// One claimed path's ingest, run again while commits keep replacing the
+/// file under it.
+async fn ingest_claimed(
+    registry: &ChecksumRegistry,
+    claim: &mut Claim<'_>,
+    kind: &IngestKind,
+    mirror: &Mirror,
+    buffer_size: usize,
+) {
     let (authority, mirror_path) = (mirror.format_authority(), mirror.path());
     loop {
-        let result = ingest_once(registry, &kind, &mirror, claim.path(), buffer_size).await;
+        let result = ingest_once(registry, kind, mirror, claim.path(), buffer_size).await;
         let outcome = ingest_outcome(&result);
         log_ingest_result(&result, outcome, authority, mirror_path, claim.path());
         if !claim.finish(outcome, registry.scope_epoch(authority, mirror_path)) {
             return;
         }
     }
+}
+
+/// Register the digests of the indexes already cached, which the registry
+/// otherwise learns only when a client pulls them again: after a restart a
+/// client whose lists are current revalidates `InRelease` and fetches
+/// `.deb`s, so those would be cached unverified until the index changes
+/// upstream (weeks, for a stable release).
+///
+/// Per active origin's suite, its cached `InRelease`/`Release` is ingested
+/// as a touch would, then each `(component, architecture)`'s first cached
+/// `Packages` index whose content is one the cached `Release` lists (see
+/// [`ingest_cached_suite`]). A suite whose cached index is stale or absent
+/// registers nothing, as on a cold cache.
+///
+/// Runs in the background and nothing waits for it: a download committing
+/// before its mirror's indexes are registered is cached unverified, as
+/// before. The registry's cap and eviction apply as to any ingest.
+pub(crate) async fn ingest_cached_indexes(database: &Database) {
+    let started = Instant::now();
+    let origins = match database.get_origins().await {
+        Ok(origins) => origins,
+        Err(err) => {
+            metrics::DB_OPERATION_FAILED.increment();
+            error!(
+                "Failed to read the origins to register the digests of cached indexes; downloads are verified only once a client pulls their index again:  {}",
+                SqlxErrorReport(&err)
+            );
+            return;
+        }
+    };
+    let config = global_config();
+    let now: std::time::Duration = coarsetime::Clock::now_since_epoch().into();
+    let mut suites: HashMap<(Mirror, &str), Vec<(&str, &str)>> = HashMap::new();
+    for origin in origins.iter().filter(|origin| {
+        origin.is_active(now) && mirror_permitted(config, &origin.host, origin.port())
+    }) {
+        let mirror = Mirror::new(
+            origin.host.clone(),
+            origin.port(),
+            origin.mirror_path.as_str().into(),
+            MirrorKind::Structured,
+        );
+        suites
+            .entry((mirror, origin.distribution.as_str()))
+            .or_default()
+            .push((origin.component.as_str(), origin.architecture.as_str()));
+    }
+    // One suite at a time, so a client's ingest still finds a decode permit.
+    let registry = global_checksum_registry();
+    let mut indexes = 0;
+    for ((mirror, distribution), scopes) in &suites {
+        indexes += ingest_cached_suite(
+            registry,
+            CachePaths::global(),
+            mirror,
+            distribution,
+            scopes,
+            config.buffer_size,
+        )
+        .await;
+    }
+    info!(
+        "Registered the digests of {indexes} cached Packages indexes of {} suites in {}",
+        suites.len(),
+        HumanFmt::Time(started.elapsed().into())
+    );
+}
+
+/// One suite of [`ingest_cached_indexes`]; how many `Packages` indexes it
+/// ingested. A cached `Packages` file is ingested only if cleanup's
+/// [`verify_cache_file`] matches it against a digest the cached `Release`
+/// lists for it (`InRelease` first, as apt prefers it): the by-hash file of
+/// that digest, or the by-name file. The verified marker a commit stamps
+/// spares a file the re-read.
+async fn ingest_cached_suite(
+    registry: &ChecksumRegistry,
+    cache: CachePaths<'_>,
+    mirror: &Mirror,
+    distribution: &str,
+    scopes: &[(&str, &str)],
+    buffer_size: usize,
+) -> usize {
+    let mirror_path = mirror.path();
+    let release_dir = if mirror_path.is_empty() {
+        format!("dists/{distribution}")
+    } else {
+        format!("{mirror_path}/dists/{distribution}")
+    };
+    let mut release = None;
+    for leaf in ["InRelease", "Release"] {
+        let path = cache.entry_file(
+            CacheLayout::Dists,
+            mirror.site(),
+            Path::new(&format!("{distribution}_{leaf}")),
+        );
+        // Most suites cache only one of the two; a missing one is no failure.
+        if tokio::fs::symlink_metadata(&path).await.is_ok() {
+            let kind = IngestKind::Release {
+                release_dir: release_dir.clone(),
+            };
+            ingest_awaited(registry, &kind, mirror, &path, buffer_size).await;
+            release.get_or_insert(path);
+        }
+    }
+    let Some(release) = release else {
+        return 0;
+    };
+    // A failed read was reported by the ingest of the same file.
+    let Ok(content) = read_release_to_string(&release).await else {
+        return 0;
+    };
+
+    let mut ingested = 0;
+    'scope: for &(component, architecture) in scopes {
+        let dir = format!("{component}/{architecture}/");
+        let listed = index_parser::parse_release_digests(&content, |rel| {
+            rel.strip_prefix(dir.as_str())
+                .is_some_and(|leaf| PackagesCompression::from_filename(leaf).is_some())
+        });
+        for (rel, digest) in listed {
+            let leaf = rel.rsplit_once('/').map_or(rel, |(_, leaf)| leaf);
+            let compression = PackagesCompression::from_filename(leaf);
+            let by_hash = cache.entry_file(
+                CacheLayout::DistsByHash,
+                mirror.site(),
+                Path::new(&index_parser::hex_encode(digest.as_slice())),
+            );
+            let by_name = cache.entry_file(
+                CacheLayout::Dists,
+                mirror.site(),
+                Path::new(&dists_debname(distribution, component, architecture, leaf)),
+            );
+            for path in [by_hash, by_name] {
+                // A commit replacing the file after this check brings its
+                // own verification and ingest.
+                if matches!(
+                    verify_cache_file(path.clone(), digest.clone()).await,
+                    Verdict::Match
+                ) {
+                    let kind = IngestKind::Packages { compression };
+                    ingest_awaited(registry, &kind, mirror, &path, buffer_size).await;
+                    ingested += 1;
+                    continue 'scope;
+                }
+            }
+        }
+    }
+    ingested
+}
+
+/// [`schedule_ingest`] for a caller that can wait: the slot is awaited
+/// rather than refused, so the startup pass leaves the queue to client
+/// touches.
+async fn ingest_awaited(
+    registry: &ChecksumRegistry,
+    kind: &IngestKind,
+    mirror: &Mirror,
+    path: &Path,
+    buffer_size: usize,
+) {
+    let epoch = registry.scope_epoch(mirror.format_authority(), mirror.path());
+    let Some(mut claim) = INGEST_LEDGER.claim(path, epoch) else {
+        return;
+    };
+    let _slot = kind
+        .slots()
+        .acquire()
+        .await
+        .expect("the ingest slots are never closed");
+    ingest_claimed(registry, &mut claim, kind, mirror, buffer_size).await;
 }
 
 async fn ingest_once(
@@ -1592,6 +1786,15 @@ enum IngestKind {
     Release {
         release_dir: String,
     },
+}
+
+impl IngestKind {
+    fn slots(&self) -> &'static Semaphore {
+        match self {
+            Self::Release { release_dir: _ } => &RELEASE_INGEST_SLOTS,
+            Self::Packages { compression: _ } => &INGEST_SLOTS,
+        }
+    }
 }
 
 /// The facts that decide whether and how a cached file is ingested, taken
@@ -2863,6 +3066,85 @@ mod tests {
             ),
             Some(pkg_sha),
         );
+    }
+
+    /// After a restart, a package verifies against the cached index the
+    /// cached `Release` names, and only that one.
+    #[tokio::test]
+    async fn a_restart_registers_the_cached_index_the_cached_release_names() {
+        use sha2::Digest as _;
+
+        let deb_sha = [0x5au8; 32];
+        let packages = format!(
+            "Package: hello\nFilename: pool/main/h/hello/hello_1.0_amd64.deb\nSHA256: {}\n",
+            index_parser::hex_encode(&deb_sha),
+        );
+        let sha256 = index_parser::hex_encode(&sha2::Sha256::digest(&packages));
+        let sha512 = index_parser::hex_encode(&sha2::Sha512::digest(&packages));
+        let stale = "00".repeat(32);
+        let mirror = structured_mirror("deb.debian.org", "debian");
+        let by_name = "sid_main_binary-amd64_Packages";
+        let (by_hash, dists) = (CacheLayout::DistsByHash, CacheLayout::Dists);
+        for (label, listed, index_at, registered) in [
+            (
+                "SHA256 by-hash",
+                Some(("SHA256", &sha256)),
+                Some((by_hash, &*sha256)),
+                true,
+            ),
+            (
+                "SHA512 by-hash",
+                Some(("SHA512", &sha512)),
+                Some((by_hash, &*sha512)),
+                true,
+            ),
+            (
+                "by-name",
+                Some(("SHA256", &sha256)),
+                Some((dists, by_name)),
+                true,
+            ),
+            (
+                "stale by-name",
+                Some(("SHA256", &stale)),
+                Some((dists, by_name)),
+                false,
+            ),
+            ("no Release cached", None, Some((by_hash, &*sha256)), false),
+            ("no index cached", Some(("SHA256", &sha256)), None, false),
+        ] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let cache = CachePaths::new(root.path());
+            let write = |layout, leaf: &str, body: &[u8]| {
+                let path = cache.entry_file(layout, mirror.site(), Path::new(leaf));
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+                std::fs::write(path, body).expect("write");
+            };
+            if let Some((section, hex)) = listed {
+                let release = format!(
+                    "Origin: Test\n{section}:\n {hex} {} main/binary-amd64/Packages\n",
+                    packages.len(),
+                );
+                write(dists, "sid_InRelease", release.as_bytes());
+            }
+            if let Some((layout, leaf)) = index_at {
+                write(layout, leaf, packages.as_bytes());
+            }
+
+            let reg = ChecksumRegistry::new(NonZero::new(100).expect("non-zero"));
+            let ingested = ingest_cached_suite(
+                &reg,
+                cache,
+                &mirror,
+                "sid",
+                &[("main", "binary-amd64")],
+                64 * 1024,
+            )
+            .await;
+            let lookup = reg.lookup("deb.debian.org", "debian", "hello_1.0_amd64.deb");
+            assert_eq!(lookup, registered.then_some(deb_sha), "{label}");
+            assert_eq!(ingested, usize::from(registered), "{label}");
+        }
     }
 
     fn release_file(

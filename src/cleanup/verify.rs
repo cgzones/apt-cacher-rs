@@ -9,7 +9,7 @@ use crate::verified_marker::{FileIdentity, has_valid_marker, stamp};
 
 /// Outcome of verifying a cache file against an expected digest.
 #[derive(Debug)]
-pub(super) enum Verdict {
+pub(crate) enum Verdict {
     Match,
     /// The digest differs and the file kept its [`FileIdentity`] during
     /// hashing. `size` is the on-disk size observed before hashing, which the
@@ -168,7 +168,7 @@ static VERIFY_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(
 /// mirrors' microsecond marker checks. The hash job keeps the descriptor the
 /// first job opened, so its type and identity checks still hold for the file
 /// it reads.
-pub(super) async fn verify_cache_file(path: PathBuf, expected: Digest) -> Verdict {
+pub(crate) async fn verify_cache_file(path: PathBuf, expected: Digest) -> Verdict {
     let (opened, path, expected) = match tokio::task::spawn_blocking(move || {
         let opened = open_and_check_marker(&path, &expected);
         (opened, path, expected)
