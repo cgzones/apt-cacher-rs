@@ -1675,6 +1675,15 @@ impl Config {
         self.https_tunnel_allowed_ports.sort_unstable();
         self.https_tunnel_allowed_mirrors.sort_unstable();
 
+        for alias in self.aliases.iter().filter(|alias| alias.remap) {
+            if !self.allowed_mirrors.iter().any(|a| a.permits(&alias.main)) {
+                invalid!(
+                    "remap target `{}` is not permitted by allowed_mirrors",
+                    alias.main
+                );
+            }
+        }
+
         if !self.allowed_mirrors.is_empty() {
             for mirror in &self.http_only_mirrors {
                 let Some(mirror) = mirror.host() else {
@@ -1689,7 +1698,7 @@ impl Config {
             }
 
             for alias in &self.aliases {
-                if !self.allowed_mirrors.iter().any(|a| a.permits(&alias.main)) {
+                if !alias.remap && !self.allowed_mirrors.iter().any(|a| a.permits(&alias.main)) {
                     warnings.push(format!(
                         "alias target `{}` is not permitted by allowed_mirrors",
                         alias.main
@@ -3346,7 +3355,8 @@ mod test {
     #[test]
     fn remaps_join_the_alias_groups_marked_as_remaps() {
         let mut cfg = Config::from_toml(
-            "aliases = [ ['deb.debian.org', ['ftp.us.debian.org']] ]\n\
+            "allowed_mirrors = [ 'archive.ubuntu.com' ]\n\
+             aliases = [ ['deb.debian.org', ['ftp.us.debian.org']] ]\n\
              remaps = [ ['archive.ubuntu.com', ['ubuntu.internal', 'apt.internal']] ]",
         )
         .expect("config parses");
@@ -3380,6 +3390,29 @@ mod test {
             let mut cfg = Config::from_toml(input).expect("config parses");
             let err = cfg.validate().expect_err(case).to_string();
             assert!(err.contains("conflicts with alias"), "{case}: {err}");
+        }
+    }
+
+    #[test]
+    fn remap_targets_must_be_permitted_by_allowed_mirrors() {
+        for (allowed_mirrors, permitted) in [
+            ("[ 'debian.internal' ]", false),
+            ("[]", false),
+            ("[ 'deb.debian.org' ]", true),
+            ("[ '*.debian.org' ]", true),
+        ] {
+            let input = format!(
+                "allowed_mirrors = {allowed_mirrors}\n\
+                 remaps = [ ['deb.debian.org', ['debian.internal']] ]"
+            );
+            let mut cfg = Config::from_toml(&input).expect("config parses");
+            let result = cfg.validate();
+            if permitted {
+                assert!(result.is_ok(), "input `{input}` must validate: {result:?}");
+            } else {
+                let err = result.expect_err("unpermitted remap target must be rejected");
+                assert!(err.to_string().contains("deb.debian.org"), "{input}: {err}");
+            }
         }
     }
 
