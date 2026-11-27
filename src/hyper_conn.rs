@@ -24,7 +24,7 @@ use http::{
         IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, LOCATION, RANGE, USER_AGENT,
         VIA,
     },
-    uri::PathAndQuery,
+    uri::{Authority, PathAndQuery},
 };
 use http_body::{Body, Frame};
 use http_body_util::{BodyExt as _, Empty};
@@ -1878,13 +1878,15 @@ async fn serve_new_file_worker(
     }
     // RFC 3986 §3.2.2: IPv6 addresses must be bracketed in Host headers.
     // The upstream authority, not the canonical mirror: an aliased request
-    // dials the host the client named. Replaced together with `req_uri`
-    // when a redirect is followed, so every later request (a refetch after
-    // a resume anomaly) names the host it is sent to.
-    let mut host = HeaderValue::from_str(&conn_details.upstream_authority())
-        .expect("connection host should be valid");
+    // dials the host the client named, a remapped one its group's main
+    // host. Replaced together with `req_uri` when a redirect is followed,
+    // so every later request (a refetch after a resume anomaly) names the
+    // host it is sent to.
+    let upstream_authority = conn_details.upstream_authority();
+    let mut host =
+        HeaderValue::from_str(&upstream_authority).expect("connection host should be valid");
 
-    let mut req_uri = Cow::Borrowed(req.uri());
+    let mut req_uri = upstream_uri(req.uri(), &upstream_authority);
 
     if let Some(why) = verify_throttle::refusal(conn_details, "Rejecting") {
         return Ok(decline_with_response(ibarrier, why).await);
@@ -2717,7 +2719,7 @@ async fn pre_process_client_request(
 
     let PassthroughRequest {
         reason: passthrough_reason,
-        requested_host,
+        upstream_host,
         canonical_host,
         requested_port,
         request_received_at: passthrough_request_received_at,
@@ -2752,7 +2754,12 @@ async fn pre_process_client_request(
     // never the client's own header, and the client's own `Accept-Encoding`
     // stays behind too: a coding the upstream picked for it could be one it
     // cannot decode. The redirect follow below reuses these headers.
-    let (parts, _body) = req.into_parts();
+    let (mut parts, _body) = req.into_parts();
+    if let Cow::Owned(uri) =
+        upstream_uri(&parts.uri, &upstream_host.format_authority(requested_port))
+    {
+        parts.uri = uri;
+    }
     let host = parts
         .uri
         .authority()
@@ -2797,7 +2804,7 @@ async fn pre_process_client_request(
 
     if let Some(moved_uri) = followed_redirect_location(
         &fwd_response,
-        &requested_host.format_authority(requested_port),
+        &upstream_host.format_authority(requested_port),
         parts.uri.path(),
     ) {
         debug!("Requested URI: {}, Moved URI: {moved_uri}", parts.uri);
@@ -2832,7 +2839,7 @@ async fn pre_process_client_request(
     passthrough_response(
         fwd_response,
         Subject::Passthrough {
-            host: requested_host.format_authority(requested_port).into_owned(),
+            host: upstream_host.format_authority(requested_port).into_owned(),
             path: request_path,
             client,
             request_received_at: passthrough_request_received_at,
@@ -2840,6 +2847,28 @@ async fn pre_process_client_request(
             relay_slot,
         },
     )
+}
+
+/// The URI the upstream is asked for: `uri` as the client sent it, unless
+/// the dispatcher chose another `upstream_authority` than the one it names.
+/// That is the case for a host listed in `remaps`, whose requests go to the
+/// main host of its group (and for a non-canonical spelling of the
+/// authority, which this replaces by the canonical one).
+fn upstream_uri<'a>(uri: &'a Uri, upstream_authority: &str) -> Cow<'a, Uri> {
+    if uri.scheme().is_none()
+        || uri
+            .authority()
+            .is_none_or(|auth| auth.as_str() == upstream_authority)
+    {
+        return Cow::Borrowed(uri);
+    }
+
+    let mut parts = uri.clone().into_parts();
+    parts.authority = Some(
+        Authority::try_from(upstream_authority)
+            .expect("a validated host and port are an authority"),
+    );
+    Cow::Owned(Uri::from_parts(parts).expect("valid parts"))
 }
 
 /// Build a `Host` header value matching the authority of the absolute `uri`,
@@ -3146,7 +3175,9 @@ fn log_client_connection_error(client: ClientInfo, err: &hyper::Error) {
 
 #[cfg(test)]
 mod tests {
-    use super::{LoggedHeaderValue, Uri, host_header_from_uri};
+    use std::borrow::Cow;
+
+    use super::{LoggedHeaderValue, Uri, host_header_from_uri, upstream_uri};
     use crate::{
         cache_layout::CachedFlavor, upstream_head::FetchMode, xattr_helpers::XattrValue as _,
     };
@@ -3655,6 +3686,41 @@ mod tests {
         let big = frame_lengths(SINGLE_FRAME_MAX + 1, 4096).await;
         assert_eq!(big.iter().sum::<usize>(), SINGLE_FRAME_MAX + 1);
         assert!(big.iter().all(|&len| len <= 4096), "{big:?}");
+    }
+
+    #[test]
+    fn upstream_uri_swaps_only_a_differing_authority() {
+        for (uri, authority, upstream) in [
+            (
+                "http://debian.internal/debian/dists/sid/InRelease?x=1",
+                "deb.debian.org",
+                Some("http://deb.debian.org/debian/dists/sid/InRelease?x=1"),
+            ),
+            (
+                "http://debian.internal:8080/debian/",
+                "deb.debian.org:8080",
+                Some("http://deb.debian.org:8080/debian/"),
+            ),
+            (
+                "http://debian.internal/debian/",
+                "[2001:db8::1]",
+                Some("http://[2001:db8::1]/debian/"),
+            ),
+            (
+                "http://DEB.debian.org:80/debian/",
+                "deb.debian.org",
+                Some("http://deb.debian.org/debian/"),
+            ),
+            ("http://deb.debian.org/debian/", "deb.debian.org", None),
+            ("/debian/", "deb.debian.org", None),
+        ] {
+            let uri: Uri = uri.parse().unwrap();
+            let swapped = match upstream_uri(&uri, authority) {
+                Cow::Owned(swapped) => Some(swapped.to_string()),
+                Cow::Borrowed(_) => None,
+            };
+            assert_eq!(swapped.as_deref(), upstream, "{uri}");
+        }
     }
 
     #[test]

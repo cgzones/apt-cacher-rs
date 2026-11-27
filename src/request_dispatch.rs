@@ -41,7 +41,7 @@ use crate::{
     cache_layout::{self, ClassifyError, ConnectionDetails, MAX_DEBNAME_LEN, StorageError},
     client_info::ClientInfo,
     client_trouble::{self, Trouble},
-    config::{Alias, CacheHost, ClientHost, Config, IpNetOrAddr, resolve_alias},
+    config::{Alias, CacheHost, ClientHost, Config, IpNetOrAddr, resolve_alias_group},
     deb_mirror::{
         Mirror, is_diff_request_path, is_unsafe_cache_path, is_unsafe_proxy_path,
         normalize_uri_path, parse_request_path,
@@ -516,10 +516,11 @@ pub(crate) enum DispatchOutcome {
 #[derive(Debug)]
 pub(crate) struct PassthroughRequest {
     pub(crate) reason: PassthroughReason,
-    /// The host the client named, which the upstream is dialled at.
-    pub(crate) requested_host: ClientHost,
-    /// The alias' main host, or `requested_host` when it names none: the
-    /// host a passthrough's `Origin` row is recorded under.
+    /// The host the upstream is dialled at: the one the client named, or
+    /// the group's main host when `remaps` lists that name.
+    pub(crate) upstream_host: ClientHost,
+    /// The alias' main host, or the host the client named when it is no
+    /// alias: the host a passthrough's `Origin` row is recorded under.
     pub(crate) canonical_host: ClientHost,
     pub(crate) requested_port: Option<NonZero<u16>>,
     pub(crate) request_received_at: PreciseInstant,
@@ -561,7 +562,7 @@ pub(crate) fn dispatch_request(
     if let DispatchOutcome::Passthrough(passthrough) = &decision {
         // Exactly-once: dispatch runs once per request, including a handoff.
         record_uncacheable(
-            &passthrough.requested_host,
+            &passthrough.upstream_host,
             requested_port,
             split_query(path_and_query).0,
         );
@@ -610,10 +611,15 @@ fn decide_request(
 
     // Resolve the alias exactly once, for both verdicts: the `Mirror` every
     // store keys on, and a passthrough's `Origin` row, name the alias' main
-    // host, while the upstream fetch still dials the host the client named.
-    let aliased_host = resolve_alias(aliases, &requested_host);
+    // host, while the upstream fetch still dials the host the client named,
+    // unless the group is a remap: its main host is dialled as well.
+    let alias = resolve_alias_group(aliases, &requested_host);
+    let aliased_host = alias.map(|alias| &alias.main);
     let canonical_host =
         || aliased_host.map_or_else(|| requested_host.clone(), CacheHost::to_client_host);
+    let remapped_host = alias
+        .filter(|alias| alias.remap)
+        .map(|alias| alias.main.to_client_host());
 
     let passthrough_reason: PassthroughReason = match parse_request_path(&normalized) {
         None => {
@@ -678,7 +684,7 @@ fn decide_request(
                         client: *client,
                         request_received_at,
                         mirror,
-                        upstream_host: requested_host,
+                        upstream_host: remapped_host.unwrap_or(requested_host),
                         debname: class.debname,
                         resource_kind: class.resource_kind,
                         origin_fields: class.origin_fields.map(Box::new),
@@ -750,7 +756,7 @@ fn decide_request(
     DispatchOutcome::Passthrough(PassthroughRequest {
         reason: passthrough_reason,
         canonical_host: canonical_host(),
-        requested_host,
+        upstream_host: remapped_host.unwrap_or(requested_host),
         requested_port,
         request_received_at,
     })
@@ -1257,6 +1263,7 @@ mod tests {
         let aliases = [Alias {
             main: main.clone().into_cache_host(),
             aliases: vec![alias.clone()],
+            remap: false,
         }];
         let decision = decide_request(
             "/debian/pool/main/f/firefox/firefox_1.0_amd64.deb",
@@ -1287,6 +1294,7 @@ mod tests {
         let aliases = [Alias {
             main: main.clone().into_cache_host(),
             aliases: vec![alias.clone()],
+            remap: false,
         }];
         for (host, canonical) in [(&alias, &main), (&main, &main)] {
             let decision = decide_request(
@@ -1311,20 +1319,60 @@ mod tests {
             );
             let hosts = if let DispatchOutcome::Passthrough(PassthroughRequest {
                 reason: _,
-                requested_host,
+                upstream_host,
                 canonical_host,
                 requested_port: _,
                 request_received_at: _,
             }) = decision
             {
-                Some((requested_host, canonical_host))
+                Some((upstream_host, canonical_host))
             } else {
                 None
             };
-            let (requested_host, canonical_host) = hosts.expect("asserted above");
-            assert_eq!(&requested_host, host);
+            let (upstream_host, canonical_host) = hosts.expect("asserted above");
+            assert_eq!(&upstream_host, host);
             assert_eq!(&canonical_host, canonical);
         }
+    }
+
+    /// A `remaps` group differs from an alias in one thing: the fetch goes
+    /// to the main host too, for a cached request and a passthrough alike.
+    #[test]
+    fn remapped_alias_is_fetched_from_the_main_host() {
+        use crate::config::Alias;
+        let main = ClientHost::new("deb.debian.org").expect("valid host");
+        let alias = ClientHost::new("debian.internal").expect("valid host");
+        let aliases = [Alias {
+            main: main.clone().into_cache_host(),
+            aliases: vec![alias.clone()],
+            remap: true,
+        }];
+        let decide = |path| {
+            decide_request(
+                path,
+                alias.clone(),
+                None,
+                &local_client(),
+                &aliases,
+                true,
+                never_flat_blocked,
+                PreciseInstant::now(),
+            )
+        };
+
+        let conn_details =
+            expect_cache(decide("/debian/pool/main/f/firefox/firefox_1.0_amd64.deb"));
+        assert_eq!(conn_details.mirror.host(), &main);
+        assert_eq!(conn_details.upstream_host, main);
+        assert_eq!(conn_details.upstream_authority(), "deb.debian.org");
+
+        let passthrough = match decide("/debian/dists/sid/main/binary-amd64/Packages?x=1") {
+            DispatchOutcome::Passthrough(passthrough) => Some(passthrough),
+            DispatchOutcome::Cache(_) | DispatchOutcome::Reject(_) => None,
+        }
+        .expect("a query string is passed through");
+        assert_eq!(passthrough.upstream_host, main);
+        assert_eq!(passthrough.canonical_host, main);
     }
 
     #[derive(Debug, PartialEq, Eq)]
